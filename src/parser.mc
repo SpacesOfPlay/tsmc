@@ -1577,7 +1577,9 @@ private Node* parse_namespace_rest(Parser* p, i32 flags) {
     }
     i32 mark = p.scratch.len;
     if eat(p, TOK_DOT) {
-        vec_push(&p.scratch, parse_namespace_rest(p, flags));
+        Node* inner = parse_namespace_rest(p, flags);
+        inner.flags |= NF_EXPORTED;
+        vec_push(&p.scratch, inner);
         n.kids = finish_kids(p, mark);
         return nfin(p, n);
     }

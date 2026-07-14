@@ -160,7 +160,7 @@ i32 main() {
         "(program (enum:2 F (enum-member (ident X))))",
         "const enum");
     check_ast("namespace A.B { export const x = 1; }",
-        "(program (namespace A (namespace B (export (var:2 (declarator (ident x) (number 1.0)))))))",
+        "(program (namespace A (namespace:134217728 B (export (var:2 (declarator (ident x) (number 1.0)))))))",
         "nested namespace");
 
     // TS erased constructs

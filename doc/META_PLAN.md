@@ -162,8 +162,10 @@ Each milestone lands with its own tests and a green test suite.
   modules syntax, full type-annotation grammar (parsed, retained in
   AST as opaque spans or dropped nodes).
 - **M4 — lowering.** Type stripping; enum/namespace/parameter-property
-  lowering; scope analysis (hoisting, TDZ, capture lists).
-- **M5 — VM core.** Bytecode + compiler + dispatch loop. Functions,
+  lowering to plain ES-shaped AST.
+- **M5 — VM core.** Bytecode + compiler + dispatch loop. Scope
+  analysis (hoisting, TDZ, captures) fused with the compiler, whose
+  slot allocation dictates its shape. Functions,
   closures, control flow, arithmetic with JS coercion rules, objects,
   arrays, prototypes, `this`, `new`, try/catch/finally, `typeof`,
   strict equality and `==` coercions. First `tsmc hello.ts`.
