@@ -54,6 +54,8 @@ struct FScope {
     i32 depth;
     bool is_arrow;
     bool has_rest;
+    bool is_gen;
+    bool is_async;
     Vec<i32> break_jumps;
     Vec<i32> cont_jumps;
     Vec<LoopCtx> loops;
@@ -103,6 +105,8 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.depth = 0;
     fs.is_arrow = is_arrow;
     fs.has_rest = false;
+    fs.is_gen = false;
+    fs.is_async = false;
     vec_init<i32>(&fs.break_jumps, 8);
     vec_init<i32>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -1169,6 +1173,49 @@ private void compile_expr(Compiler* co, Node* n) {
         compile_class_expr(co, n);
         return;
     }
+    if k == N_YIELD {
+        if !co.cur.is_gen {
+            cerror(co, n, "yield outside a generator");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        if (n.flags & NF_DELEGATE) != 0 {
+            // yield*: iterate the operand, yielding each value; the
+            // expression result is the inner iterator's return value
+            compile_expr(co, n.a);
+            ch_op(ch, OP_GET_ITER);
+            i32 t_it = alloc_slot(co.cur);
+            ch_op_u16(ch, OP_SETLOCAL, t_it);
+            ch_op(ch, OP_POP);
+            i32 lstart = ch_pos(ch);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op(ch, OP_ITER_NEXT);       // [value, done]
+            i32 jdone = ch_jump(ch, OP_JUMPT);
+            ch_op(ch, OP_YIELD);           // yield value; discard resume input
+            ch_op(ch, OP_POP);
+            ch_op_u16(ch, OP_JUMP, lstart);
+            ch_patch(ch, jdone);           // [value] — the final iterator value
+            co.cur.cur_slots--;
+            return;
+        }
+        if n.a != null {
+            compile_expr(co, n.a);
+        } else {
+            ch_op(ch, OP_UNDEF);
+        }
+        ch_op(ch, OP_YIELD);
+        return;
+    }
+    if k == N_AWAIT {
+        if !co.cur.is_async {
+            cerror(co, n, "await outside an async function");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        compile_expr(co, n.a);
+        ch_op(ch, OP_YIELD);
+        return;
+    }
     cerror(co, n, "expression not supported yet");
     ch_op(ch, OP_UNDEF);
 }
@@ -1180,9 +1227,8 @@ private void compile_expr(Compiler* co, Node* n) {
 private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields) {
     FScope fs;
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
-    if (f.flags & (NF_ASYNC | NF_GENERATOR)) != 0 {
-        cerror(co, f, "async and generator functions are not supported yet");
-    }
+    fs.is_gen = (f.flags & NF_GENERATOR) != 0;
+    fs.is_async = (f.flags & NF_ASYNC) != 0;
     co.cur = &fs;
     scan_inner(&fs.inner, f, true);
     for i32 i = 0; i < n_fields; i++ {
@@ -1260,7 +1306,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         ch_op(&fs.ch, OP_RETURN);
     }
 
-    FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest);
+    FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
+        fs.is_gen, fs.is_async);
     co.cur = fs.parent;
     fscope_free(&fs);
     return t;
@@ -1605,24 +1652,18 @@ private LoopCtx make_loop_ctx(Compiler* co, bool is_loop) {
     return lc;
 }
 
-// for-of / for-in over arrays, strings, and (for-in) object keys.
-private void compile_for_each(Compiler* co, Node* n) {
+// for-in over own enumerable keys (index-based over a keys snapshot).
+private void compile_for_in(Compiler* co, Node* n) {
     FScope* fs = co.cur;
     Chunk* ch = &fs.ch;
-    bool is_in = n.kind == N_FOR_IN;
 
     fs.depth++;
     i32 saved_binds = fs.binds.len;
     i32 saved_slots = fs.cur_slots;
 
     compile_expr(co, n.b);
-    i32 jskip = -1;
-    if is_in {
-        jskip = ch_jump(ch, OP_JUMP_NULLISH);
-        ch_op(ch, OP_KEYS);
-    } else {
-        ch_op(ch, OP_CHECK_ITERABLE);
-    }
+    i32 jskip = ch_jump(ch, OP_JUMP_NULLISH);
+    ch_op(ch, OP_KEYS);
     i32 t_obj = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_obj);
     ch_op(ch, OP_POP);
@@ -1636,30 +1677,24 @@ private void compile_for_each(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_SETLOCAL, t_len);
     ch_op(ch, OP_POP);
 
-    // loop-variable bindings (declared once; fresh boxes per iteration)
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
     if n.a.kind == N_VAR {
-        Node* d = *(n.a.kids.items);
-        pattern = d.a;
+        pattern = (*(n.a.kids.items)).a;
         declare_pattern(co, pattern, 2);
     }
     i32 bind_end = fs.binds.len;
 
     LoopCtx lc = make_loop_ctx(co, true);
-
     i32 lcond = ch_pos(ch);
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
     ch_op_u16(ch, OP_GETLOCAL, t_len);
     ch_op(ch, OP_LT);
     i32 jend = ch_jump(ch, OP_JUMPF);
 
-    // fresh boxes so closures capture per-iteration values
     for i32 i = bind_start; i < bind_end; i++ {
         CBind b = vec_get(&fs.binds, i);
-        if b.is_cell {
-            ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot);
-        }
+        if b.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot); }
     }
     ch_op_u16(ch, OP_GETLOCAL, t_obj);
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
@@ -1683,7 +1718,63 @@ private void compile_for_each(Compiler* co, Node* n) {
     ch_op(ch, OP_POP);
     ch_op_u16(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
-    if jskip >= 0 { ch_patch(ch, jskip); }
+    ch_patch(ch, jskip);
+    patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+
+    fs.binds.len = saved_binds;
+    fs.cur_slots = saved_slots;
+    fs.depth--;
+}
+
+// for-of via the iterator protocol.
+private void compile_for_of(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+
+    fs.depth++;
+    i32 saved_binds = fs.binds.len;
+    i32 saved_slots = fs.cur_slots;
+
+    compile_expr(co, n.b);
+    ch_op(ch, OP_GET_ITER);
+    i32 t_iter = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_iter);
+    ch_op(ch, OP_POP);
+
+    i32 bind_start = fs.binds.len;
+    Node* pattern = null;
+    if n.a.kind == N_VAR {
+        pattern = (*(n.a.kids.items)).a;
+        declare_pattern(co, pattern, 2);
+    }
+    i32 bind_end = fs.binds.len;
+
+    LoopCtx lc = make_loop_ctx(co, true);
+    i32 lcond = ch_pos(ch);
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op(ch, OP_ITER_NEXT);       // [value, done]
+    i32 jend = ch_jump(ch, OP_JUMPT);
+
+    for i32 i = bind_start; i < bind_end; i++ {
+        CBind b = vec_get(&fs.binds, i);
+        if b.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot); }
+    }
+    // value is on the stack
+    if pattern != null {
+        compile_destructure(co, pattern, true);
+    } else {
+        compile_destructure(co, n.a, false);
+    }
+
+    vec_push(&fs.loops, lc);
+    compile_stmt(co, n.c);
+    ignore vec_pop(&fs.loops);
+
+    i32 lcont = ch_pos(ch);
+    patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_patch(ch, jend);
+    ch_op(ch, OP_POP);             // drop the final value under done
     patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
 
     fs.binds.len = saved_binds;
@@ -1800,8 +1891,16 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.depth--;
         return;
     }
-    if k == N_FOR_OF || k == N_FOR_IN {
-        compile_for_each(co, n);
+    if k == N_FOR_OF {
+        if (n.flags & NF_AWAIT) != 0 {
+            cerror(co, n, "for await is not supported yet");
+            return;
+        }
+        compile_for_of(co, n);
+        return;
+    }
+    if k == N_FOR_IN {
+        compile_for_in(co, n);
         return;
     }
     if k == N_BREAK || k == N_CONTINUE {
@@ -2030,7 +2129,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     str empty;
     empty.data = null;
     empty.len = 0;
-    FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false);
+    FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false, false, false);
     co.cur = null;
     fscope_free(&fs);
     return t;

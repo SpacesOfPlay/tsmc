@@ -19,6 +19,13 @@ const i32 GC_FUNCTION = 3;
 const i32 GC_NATIVE   = 4;
 const i32 GC_BOX      = 5;
 const i32 GC_ACCESSOR = 6;
+const i32 GC_SYMBOL   = 7;
+const i32 GC_GENERATOR = 8;
+
+const i32 GEN_START = 0;
+const i32 GEN_SUSPENDED = 1;
+const i32 GEN_RUNNING = 2;
+const i32 GEN_DONE = 3;
 
 const i32 OBJF_ARRAY = 1;
 
@@ -133,6 +140,27 @@ struct JsAccessor {
     Value set;
 }
 
+// Symbols carry a property-key id in a reserved space (high bit set)
+// so symbol-keyed properties share the ordinary tables.
+struct JsSymbol {
+    GcCell head;
+    u32 id;
+    Value desc;
+}
+
+// Suspended frame image of a generator or async function.
+struct JsGenerator {
+    GcCell head;
+    JsFunction* fun;
+    Value this_val;
+    i32 state;           // GEN_*
+    i32 resume_ip;
+    Value* saved;        // slots + operand stack at suspension
+    i32 saved_len;
+    i32* handler_data;   // open try handlers: (sp_rel, ip) pairs
+    i32 n_handlers;
+}
+
 // --- GC hooks ---------------------------------------------------------
 
 private void mark_props(GcHeap* h, PropList* p) {
@@ -178,6 +206,19 @@ void js_trace(GcHeap* h, GcCell* c) {
         gc_mark_value(h, a.set);
         return;
     }
+    if c.kind == GC_SYMBOL {
+        gc_mark_value(h, cast(JsSymbol*, c).desc);
+        return;
+    }
+    if c.kind == GC_GENERATOR {
+        JsGenerator* g = cast(JsGenerator*, c);
+        if g.fun != null { gc_mark_cell(h, &g.fun.head); }
+        gc_mark_value(h, g.this_val);
+        for i32 i = 0; i < g.saved_len; i++ {
+            gc_mark_value(h, *(g.saved + i));
+        }
+        return;
+    }
     eprint("gc: unknown runtime cell kind {}\n", c.kind);
     exit(70);
 }
@@ -197,6 +238,12 @@ void js_finalize(GcCell* c) {
     }
     if c.kind == GC_NATIVE {
         props_free(&cast(JsNative*, c).props);
+        return;
+    }
+    if c.kind == GC_GENERATOR {
+        JsGenerator* g = cast(JsGenerator*, c);
+        if g.saved != null { free(g.saved); }
+        if g.handler_data != null { free(g.handler_data); }
         return;
     }
 }
@@ -255,6 +302,21 @@ JsAccessor* js_new_accessor(GcHeap* h) {
     return a;
 }
 
+JsSymbol* js_new_symbol(GcHeap* h, u32 id, Value desc) {
+    JsSymbol* s = cast(JsSymbol*, gc_alloc(h, GC_SYMBOL, sizeof(JsSymbol)));
+    s.id = id;
+    s.desc = desc;
+    return s;
+}
+
+JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
+    JsGenerator* g = cast(JsGenerator*, gc_alloc(h, GC_GENERATOR, sizeof(JsGenerator)));
+    g.fun = fun;
+    g.this_val = this_val;
+    g.state = GEN_START;
+    return g;
+}
+
 // --- value helpers ------------------------------------------------------
 
 bool value_is_kind(Value v, i32 kind) {
@@ -269,7 +331,11 @@ bool value_is_native(Value v)  { return value_is_kind(v, GC_NATIVE); }
 bool value_is_callable(Value v){ return value_is_function(v) || value_is_native(v); }
 
 bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
+bool value_is_symbol(Value v)   { return value_is_kind(v, GC_SYMBOL); }
+bool value_is_generator(Value v){ return value_is_kind(v, GC_GENERATOR); }
 
+JsSymbol* value_as_symbol(Value v)       { return cast(JsSymbol*, value_as_cell(v)); }
+JsGenerator* value_as_generator(Value v) { return cast(JsGenerator*, value_as_cell(v)); }
 JsAccessor* value_as_accessor(Value v) { return cast(JsAccessor*, value_as_cell(v)); }
 JsObject* value_as_object(Value v)     { return cast(JsObject*, value_as_cell(v)); }
 JsFunction* value_as_function(Value v) { return cast(JsFunction*, value_as_cell(v)); }

@@ -1990,6 +1990,427 @@ private Value nat_error_tostring(void* vmp, Value callee, Value thisv, Value* ar
     return r;
 }
 
+// --- Symbol -----------------------------------------------------------------------
+
+private Value nat_symbol_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value desc = arg_at(args, argc, 0);
+    if !value_is_undefined(desc) {
+        desc = js_to_string_value(vm, desc);
+    }
+    return vm_new_symbol(vm, desc);
+}
+
+// --- array / string iterators ------------------------------------------------------
+
+private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    Value src = me.env0;
+    i32 i = value_as_int(me.env1);
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&r.head));
+    i32 len = 0;
+    if value_is_array(src) { len = value_as_object(src).elen; }
+    else if value_is_string(src) { len = value_as_string(src).len; }
+    if i >= len {
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
+        js_set_prop(r, vm_atom(vm, "value"), value_undefined());
+    } else {
+        me.env1 = value_int(i + 1);
+        Value v;
+        if value_is_array(src) {
+            v = js_array_get(value_as_object(src), i);
+        } else {
+            str view = gc_string_view(value_as_string(src));
+            str one;
+            one.data = view.data + i;
+            one.len = 1;
+            v = new_str(vm, one);
+        }
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
+        js_set_prop(r, vm_atom(vm, "value"), v);
+    }
+    return vm_pop_ret(vm, value_cell(&r.head));
+}
+
+private Value make_index_iterator(VM* vm, Value src) {
+    JsObject* it = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&it.head));
+    JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
+    nx.env0 = src;
+    nx.env1 = value_int(0);
+    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    return vm_pop_ret(vm, value_cell(&it.head));
+}
+
+private Value nat_arr_symiter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_index_iterator(as_vm(vmp), thisv);
+}
+
+// --- generators ------------------------------------------------------------------------
+
+private Value gen_result(VM* vm, Value val, bool done) {
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&r.head));
+    js_set_prop(r, vm_atom(vm, "value"), val);
+    js_set_prop(r, vm_atom(vm, "done"), value_bool(done));
+    return vm_pop_ret(vm, value_cell(&r.head));
+}
+
+private Value nat_gen_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_generator(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "next on a non-generator");
+        return value_undefined();
+    }
+    JsGenerator* g = value_as_generator(thisv);
+    if g.state == GEN_DONE {
+        return gen_result(vm, value_undefined(), true);
+    }
+    vm_push(vm, thisv);
+    Value res = vm_gen_resume(vm, g, arg_at(args, argc, 0), false);
+    if vm.has_pending {
+        vm_pop(vm);
+        return value_undefined();
+    }
+    vm_push(vm, res);
+    Value r = gen_result(vm, res, g.state == GEN_DONE);
+    vm.sp -= 2;
+    return r;
+}
+
+private Value nat_gen_return(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if value_is_generator(thisv) {
+        value_as_generator(thisv).state = GEN_DONE;
+    }
+    return gen_result(vm, arg_at(args, argc, 0), true);
+}
+
+private Value nat_gen_throw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_generator(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "throw on a non-generator");
+        return value_undefined();
+    }
+    JsGenerator* g = value_as_generator(thisv);
+    if g.state == GEN_DONE || g.state == GEN_START {
+        g.state = GEN_DONE;
+        vm_throw(vm, arg_at(args, argc, 0));
+        return value_undefined();
+    }
+    vm_push(vm, thisv);
+    Value res = vm_gen_resume(vm, g, arg_at(args, argc, 0), true);
+    if vm.has_pending {
+        vm_pop(vm);
+        return value_undefined();
+    }
+    vm_push(vm, res);
+    Value r = gen_result(vm, res, g.state == GEN_DONE);
+    vm.sp -= 2;
+    return r;
+}
+
+private Value nat_gen_symiter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return thisv;
+}
+
+// --- Promise -----------------------------------------------------------------------------
+
+private Value nat_resolve_fn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value a = arg_at(args, argc, 0);
+    gc_root(&vm.heap, a);
+    vm_promise_settle(vm, me.env0, a, false);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_reject_fn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value a = arg_at(args, argc, 0);
+    gc_root(&vm.heap, a);
+    vm_promise_settle(vm, me.env0, a, true);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_promise_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value executor = arg_at(args, argc, 0);
+    if !value_is_callable(executor) {
+        vm_throw_error(vm, ERR_TYPE, "Promise executor is not a function");
+        return value_undefined();
+    }
+    Value p = vm_promise_new(vm);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, p);
+    JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    res.env0 = p;
+    gc_root(&vm.heap, value_cell(&res.head));
+    JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    rej.env0 = p;
+    gc_root(&vm.heap, value_cell(&rej.head));
+    Value[2] ca = { value_cell(&res.head), value_cell(&rej.head) };
+    ignore vm_call_value(vm, executor, value_undefined(), &ca[0], 2);
+    if vm.has_pending {
+        Value e = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        gc_root(&vm.heap, e);
+        vm_promise_settle(vm, p, e, true);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+private Value nat_promise_resolve(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value v = arg_at(args, argc, 0);
+    if vm_is_promise(vm, v) { return v; }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, v);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, v, false);
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+private Value nat_promise_reject(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value v = arg_at(args, argc, 0);
+    gc_root(&vm.heap, v);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, v, true);
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+private Value nat_promise_then(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !vm_is_promise(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "then on a non-promise");
+        return value_undefined();
+    }
+    return vm_promise_then(vm, thisv, arg_at(args, argc, 0), arg_at(args, argc, 1));
+}
+
+private Value nat_promise_catch(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !vm_is_promise(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "catch on a non-promise");
+        return value_undefined();
+    }
+    return vm_promise_then(vm, thisv, value_undefined(), arg_at(args, argc, 0));
+}
+
+// finally: run the callback on both paths, forwarding the settlement.
+private Value nat_finally_pass(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    if value_is_callable(me.env0) {
+        Value dummy = value_undefined();
+        ignore vm_call_value(vm, me.env0, value_undefined(), &dummy, 0);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return arg_at(args, argc, 0);
+}
+
+private Value nat_promise_finally(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !vm_is_promise(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "finally on a non-promise");
+        return value_undefined();
+    }
+    Value cb = arg_at(args, argc, 0);
+    i32 rm = gc_root_mark(&vm.heap);
+    JsNative* onf = js_new_native(&vm.heap, &nat_finally_pass, "finally");
+    onf.env0 = cb;
+    gc_root(&vm.heap, value_cell(&onf.head));
+    Value r = vm_promise_then(vm, thisv, value_cell(&onf.head), value_cell(&onf.head));
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// Promise.all: collects an array of results; rejects on the first
+// rejection. Uses a shared state object counted down by element natives.
+private Value nat_all_elem(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    JsObject* st = value_as_object(me.env0);   // { results, remaining, promise }
+    i32 idx = value_as_int(me.env1);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value resultsv;
+    ignore js_get_prop(st, vm_atom(vm, "results"), &resultsv);
+    js_array_set(value_as_object(resultsv), idx, arg_at(args, argc, 0));
+    Value remv;
+    ignore js_get_prop(st, vm_atom(vm, "remaining"), &remv);
+    i32 rem = value_as_int(remv) - 1;
+    js_set_prop(st, vm_atom(vm, "remaining"), value_int(rem));
+    if rem == 0 {
+        Value pv;
+        ignore js_get_prop(st, vm_atom(vm, "promise"), &pv);
+        gc_root(&vm.heap, pv);
+        vm_promise_settle(vm, pv, resultsv, false);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_all_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    JsObject* st = value_as_object(me.env0);
+    Value pv;
+    ignore js_get_prop(st, vm_atom(vm, "promise"), &pv);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, pv);
+    Value a = arg_at(args, argc, 0);
+    gc_root(&vm.heap, a);
+    vm_promise_settle(vm, pv, a, true);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_promise_all(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value list = arg_at(args, argc, 0);
+    if !value_is_array(list) {
+        vm_throw_error(vm, ERR_TYPE, "Promise.all expects an array");
+        return value_undefined();
+    }
+    JsObject* items = value_as_object(list);
+    i32 n = items.elen;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    JsObject* st = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&st.head));
+    JsObject* results = js_new_array(&vm.heap, vm.array_proto);
+    js_array_set_length(results, n);
+    js_set_prop(st, vm_atom(vm, "results"), value_cell(&results.head));
+    js_set_prop(st, vm_atom(vm, "remaining"), value_int(n));
+    js_set_prop(st, vm_atom(vm, "promise"), p);
+    if n == 0 {
+        vm_promise_settle(vm, p, value_cell(&results.head), false);
+        gc_root_reset(&vm.heap, rm);
+        return p;
+    }
+    for i32 i = 0; i < n; i++ {
+        Value ev = js_array_get(items, i);
+        Value evp;
+        if vm_is_promise(vm, ev) {
+            evp = ev;
+        } else {
+            evp = vm_promise_new(vm);
+            vm_push(vm, evp);
+            vm_promise_settle(vm, evp, ev, false);
+            vm_pop(vm);
+        }
+        vm_push(vm, evp);
+        JsNative* onf = js_new_native(&vm.heap, &nat_all_elem, "all");
+        onf.env0 = value_cell(&st.head);
+        onf.env1 = value_int(i);
+        vm_push(vm, value_cell(&onf.head));
+        JsNative* onr = js_new_native(&vm.heap, &nat_all_rej, "all");
+        onr.env0 = value_cell(&st.head);
+        Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
+        ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
+        vm_pop(vm);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+private Value nat_race_settle(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value a = arg_at(args, argc, 0);
+    gc_root(&vm.heap, a);
+    vm_promise_settle(vm, me.env0, a, me.env1.bits == value_bool(true).bits);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_promise_race(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value list = arg_at(args, argc, 0);
+    if !value_is_array(list) {
+        vm_throw_error(vm, ERR_TYPE, "Promise.race expects an array");
+        return value_undefined();
+    }
+    JsObject* items = value_as_object(list);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    for i32 i = 0; i < items.elen; i++ {
+        Value ev = js_array_get(items, i);
+        Value evp;
+        if vm_is_promise(vm, ev) {
+            evp = ev;
+        } else {
+            evp = vm_promise_new(vm);
+            vm_push(vm, evp);
+            vm_promise_settle(vm, evp, ev, false);
+            vm_pop(vm);
+        }
+        vm_push(vm, evp);
+        JsNative* onf = js_new_native(&vm.heap, &nat_race_settle, "race");
+        onf.env0 = p;
+        onf.env1 = value_bool(false);
+        vm_push(vm, value_cell(&onf.head));
+        JsNative* onr = js_new_native(&vm.heap, &nat_race_settle, "race");
+        onr.env0 = p;
+        onr.env1 = value_bool(true);
+        Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
+        ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
+        vm_pop(vm);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+// --- timers ------------------------------------------------------------------------------
+
+private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cbfn = arg_at(args, argc, 0);
+    if !value_is_callable(cbfn) { return value_int(0); }
+    f64 delay = argc > 1 ? js_to_number(*(args + 1)) : 0.0;
+    if delay != delay || delay < 0.0 { delay = 0.0; }
+    return value_int(vm_add_timer(vm, cbfn, delay));
+}
+
+private Value nat_clear_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    vm_clear_timer(vm, to_int_arg(arg_at(args, argc, 0)));
+    return value_undefined();
+}
+
+private Value nat_queue_microtask(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cbfn = arg_at(args, argc, 0);
+    if value_is_callable(cbfn) {
+        // schedule via an already-resolved promise reaction
+        i32 rm = gc_root_mark(&vm.heap);
+        Value p = vm_promise_new(vm);
+        gc_root(&vm.heap, p);
+        vm_promise_settle(vm, p, value_undefined(), false);
+        ignore vm_promise_then(vm, p, cbfn, value_undefined());
+        gc_root_reset(&vm.heap, rm);
+    }
+    return value_undefined();
+}
+
 // --- install -------------------------------------------------------------------------------------
 
 private void def_method(VM* vm, JsObject* obj, str name, NativeFn f) {
@@ -2175,6 +2596,44 @@ void builtins_install(VM* vm) {
     ignore def_global_fn(vm, "parseFloat", &nat_parsefloat);
     ignore def_global_fn(vm, "isNaN", &nat_global_isnan);
     ignore def_global_fn(vm, "isFinite", &nat_global_isfinite);
+
+    // Symbol
+    JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
+    props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
+
+    // Array/String iterators via Symbol.iterator
+    u32 iter_id = vm_sym_iterator_id(vm);
+    JsNative* arr_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
+    js_set_prop(vm.array_proto, iter_id, value_cell(&arr_it.head));
+    JsNative* str_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
+    js_set_prop(vm.string_proto, iter_id, value_cell(&str_it.head));
+
+    // Generator.prototype
+    vm.generator_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_method(vm, vm.generator_proto, "next", &nat_gen_next);
+    def_method(vm, vm.generator_proto, "return", &nat_gen_return);
+    def_method(vm, vm.generator_proto, "throw", &nat_gen_throw);
+    JsNative* gen_it = js_new_native(&vm.heap, &nat_gen_symiter, "[Symbol.iterator]");
+    js_set_prop(vm.generator_proto, iter_id, value_cell(&gen_it.head));
+
+    // Promise
+    vm.promise_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* promise_ctor = def_global_fn(vm, "Promise", &nat_promise_ctor);
+    props_set(&promise_ctor.props, vm.atom_prototype, value_cell(&vm.promise_proto.head));
+    def_static(vm, promise_ctor, "resolve", &nat_promise_resolve);
+    def_static(vm, promise_ctor, "reject", &nat_promise_reject);
+    def_static(vm, promise_ctor, "all", &nat_promise_all);
+    def_static(vm, promise_ctor, "race", &nat_promise_race);
+    def_method(vm, vm.promise_proto, "then", &nat_promise_then);
+    def_method(vm, vm.promise_proto, "catch", &nat_promise_catch);
+    def_method(vm, vm.promise_proto, "finally", &nat_promise_finally);
+
+    // timers and microtasks
+    ignore def_global_fn(vm, "setTimeout", &nat_set_timeout);
+    ignore def_global_fn(vm, "clearTimeout", &nat_clear_timeout);
+    ignore def_global_fn(vm, "setInterval", &nat_set_timeout);
+    ignore def_global_fn(vm, "clearInterval", &nat_clear_timeout);
+    ignore def_global_fn(vm, "queueMicrotask", &nat_queue_microtask);
 
     // console.warn / console.info
     Value* cv = intmap_get<Value>(&vm.globals, bi_atom(vm, "console"));

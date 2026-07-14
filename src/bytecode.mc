@@ -73,7 +73,11 @@ enum Op {
     OP_JUMP_NULLISH, // u16; top nullish: pop, jump
     OP_JUMP_NULLISH_METH, // u16; peek(1) nullish: pop 2, jump
     OP_CHECK_ITERABLE,   // top must be an array or string
-    OP_KEYS          // [v] -> array of own enumerable key strings
+    OP_KEYS,         // [v] -> array of own enumerable key strings
+
+    OP_YIELD,        // suspend the generator frame; top is the value
+    OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
+    OP_ITER_NEXT     // [iter] -> [value, done]
 }
 
 struct TmplUpval {
@@ -86,6 +90,8 @@ struct FnTemplate {
     i32 n_params;
     i32 n_slots;
     bool has_rest;       // last param collects surplus arguments
+    bool is_gen;         // calls build a generator object
+    bool is_async;       // calls build generator state + promise
     u8* code;
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook
@@ -155,9 +161,12 @@ i32 ch_pos(Chunk* ch) {
 }
 
 // Moves the chunk's contents into a heap-owned template.
-FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool has_rest) {
+FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool has_rest,
+        bool is_gen, bool is_async) {
     FnTemplate* t = new(FnTemplate);
     t.has_rest = has_rest;
+    t.is_gen = is_gen;
+    t.is_async = is_async;
     if name.len > 0 {
         u8* nb = alloc<u8>(name.len);
         memcpy(nb, name.data, name.len);

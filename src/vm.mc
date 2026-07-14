@@ -32,12 +32,32 @@ struct Frame {
     i32 base;
     Value this_val;
     bool is_ctor;
+    JsGenerator* gen;   // non-null while running a generator/async body
 }
 
 struct Handler {
     i32 frame_count;
     i32 sp;
     i32 ip;
+}
+
+const i32 JOB_REACTION = 0;    // a=handler, b=arg, c=promise2
+const i32 JOB_ASYNC_STEP = 1;  // a=generator, b=result promise, c=input
+
+struct VmJob {
+    i32 kind;
+    bool flag;      // reject path / throw resume
+    Value a;
+    Value b;
+    Value c;
+}
+
+struct VmTimer {
+    i32 id;
+    bool alive;
+    f64 due;
+    i64 seq;
+    Value cb;
 }
 
 struct VM {
@@ -66,6 +86,22 @@ struct VM {
     JsObject* function_proto;
     JsObject*[5] error_protos;   // indexed by ERR_*
     u64 rng;
+    JsObject* generator_proto;
+    JsObject* promise_proto;
+    Vec<VmJob> jobs;         // microtask FIFO (head index avoids shifting)
+    i32 job_head;
+    Vec<VmTimer> timers;
+    i32 next_timer_id;
+    i64 timer_seq;
+    Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
+    Value sym_iterator;      // well-known Symbol.iterator
+    u32 sym_iterator_id;
+    u32 atom_pstate;
+    u32 atom_pvalue;
+    u32 atom_pcbs;
+    u32 atom_value;
+    u32 atom_done;
+    u32 atom_next;
 }
 
 const i32 ERR_ERROR = 0;
@@ -118,6 +154,25 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
     for i32 i = 0; i < 5; i++ {
         if vm.error_protos[i] != null { gc_mark_cell(h, &vm.error_protos[i].head); }
+    }
+    if vm.generator_proto != null { gc_mark_cell(h, &vm.generator_proto.head); }
+    if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
+    for i32 i = vm.job_head; i < vm.jobs.len; i++ {
+        VmJob* j = vm.jobs.data + i;
+        gc_mark_value(h, j.a);
+        gc_mark_value(h, j.b);
+        gc_mark_value(h, j.c);
+    }
+    for i32 i = 0; i < vm.timers.len; i++ {
+        gc_mark_value(h, (vm.timers.data + i).cb);
+    }
+    for i32 i = 0; i < vm.symbols.len; i++ {
+        gc_mark_value(h, vec_get(&vm.symbols, i));
+    }
+    gc_mark_value(h, vm.sym_iterator);
+    for i32 i = 0; i < vm.fp; i++ {
+        Frame* fr = vm.frames + i;
+        if fr.gen != null { gc_mark_cell(h, &fr.gen.head); }
     }
     if vm.has_pending { gc_mark_value(h, vm.pending); }
 }
@@ -282,15 +337,22 @@ private Value num_norm(f64 v) {
     return value_number(v);
 }
 
+// Fills `lit` with a borrowed constant for special values and returns
+// true; otherwise the caller must format `v` with the owned path.
+private bool num_special(f64 v, str* lit) {
+    if v != v { *lit = "NaN"; return true; }
+    if v == 1.0e308 * 10.0 { *lit = "Infinity"; return true; }
+    if v == -1.0e308 * 10.0 { *lit = "-Infinity"; return true; }
+    if v == 0.0 { *lit = "0"; return true; }   // ±0
+    return false;
+}
+
+// Owned decimal string for a finite, non-zero number.
 private string js_num_format(f64 v) {
-    if v != v { return string("NaN"); }
-    if v == 1.0e308 * 10.0 { return string("Infinity"); }
-    if v == -1.0e308 * 10.0 { return string("-Infinity"); }
     i64 iv = cast(i64, v);
-    if cast(f64, iv) == v && (v != 0.0 || 1.0 / v > 0.0) {
+    if cast(f64, iv) == v {
         return format("{}", iv);
     }
-    if v == 0.0 { return string("0"); }   // -0
     return format_f64(v);
 }
 
@@ -298,7 +360,13 @@ private string js_num_format(f64 v) {
 Value js_to_string_value(VM* vm, Value v) {
     if value_is_string(v) { return v; }
     if value_is_number(v) {
-        string s = js_num_format(js_to_number(v));
+        f64 d = js_to_number(v);
+        str lit;
+        if num_special(d, &lit) {
+            GcString* g = gc_new_string(&vm.heap, lit);
+            return value_cell(&g.head);
+        }
+        string s = js_num_format(d);
         GcString* g = gc_new_string(&vm.heap, s);
         free(s);
         return value_cell(&g.head);
@@ -317,6 +385,19 @@ Value js_to_string_value(VM* vm, Value v) {
     }
     if have {
         GcString* g = gc_new_string(&vm.heap, lit);
+        return value_cell(&g.head);
+    }
+    if value_is_symbol(v) {
+        JsSymbol* sy = value_as_symbol(v);
+        str_buf sb;
+        str_buf_init(&sb);
+        str_buf_add(&sb, "Symbol(");
+        if value_is_string(sy.desc) {
+            str_buf_add(&sb, gc_string_view(value_as_string(sy.desc)));
+        }
+        str_buf_add(&sb, ")");
+        GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+        str_buf_free(&sb);
         return value_cell(&g.head);
     }
     if value_is_array(v) {
@@ -470,6 +551,10 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
         if vm.boolean_proto != null { ignore js_get_prop(vm.boolean_proto, a, out); }
         return true;
     }
+    if value_is_generator(objv) {
+        if vm.generator_proto != null { ignore js_get_prop(vm.generator_proto, a, out); }
+        return true;
+    }
     return true;
 }
 
@@ -556,12 +641,22 @@ private i32 val_to_index(Value v) {
 }
 
 // Key value → property atom; key must stay rooted by the caller.
+// Symbols map to their reserved id.
 private u32 key_to_atom(VM* vm, Value key) {
+    if value_is_symbol(key) { return value_as_symbol(key).id; }
     Value s = js_to_string_value(vm, key);
     vpush(vm, s);
     u32 a = atom_intern(&vm.atoms, gc_string_view(value_as_string(s)));
     vm.sp--;
     return a;
+}
+
+// Symbol keys and %-hidden atoms stay out of enumeration.
+bool vm_enumerable_key(VM* vm, u32 key) {
+    if (key & 0x80000000) != 0 { return false; }
+    str nm = atom_name(&vm.atoms, key);
+    if nm.len > 0 && *(nm.data) == '%' { return false; }
+    return true;
 }
 
 // --- globals ------------------------------------------------------------------------
@@ -644,7 +739,27 @@ void vm_init(VM* vm) {
         vm.error_protos[i] = null;
     }
     vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
+    vm.generator_proto = null;
+    vm.promise_proto = null;
+    vec_init<VmJob>(&vm.jobs, 8);
+    vm.job_head = 0;
+    vec_init<VmTimer>(&vm.timers, 4);
+    vm.next_timer_id = 1;
+    vm.timer_seq = 0;
+    vec_init<Value>(&vm.symbols, 8);
+    vm.sym_iterator = value_undefined();
+    vm.sym_iterator_id = 0;
+    vm.atom_pstate = atom_intern(&vm.atoms, "%state");
+    vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
+    vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
+    vm.atom_value = atom_intern(&vm.atoms, "value");
+    vm.atom_done = atom_intern(&vm.atoms, "done");
+    vm.atom_next = atom_intern(&vm.atoms, "next");
     vm_install_globals(vm);
+    // Symbol.iterator: allocated first so its id is stable and shared
+    Value itsym = vm_new_symbol(vm, value_undefined());
+    vm.sym_iterator = itsym;
+    vm.sym_iterator_id = value_as_symbol(itsym).id;
 }
 
 void vm_destroy(VM* vm) {
@@ -653,6 +768,9 @@ void vm_destroy(VM* vm) {
         template_free(vec_get(&vm.troots, i));
     }
     vec_free(&vm.troots);
+    vec_free(&vm.jobs);
+    vec_free(&vm.timers);
+    vec_free(&vm.symbols);
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
@@ -692,9 +810,39 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
     Frame* fr = vm.frames + (vm.fp - 1);
     FnTemplate* t = fr.tmpl;
     u8* code = t.code;
-    i32 ip = 0;
+    i32 ip = fr.ret_ip;   // 0 for calls; the resume point for generators
 
     while true {
+        // top-of-loop so resuming a generator with a pending throw
+        // unwinds before its first opcode
+        if vm.has_pending {
+            Handler* htop = vm.handlers + (vm.hp - 1);
+            if vm.hp > 0 && htop.frame_count >= stop_fp {
+                vm.hp--;
+                Handler* h = vm.handlers + vm.hp;
+                vm.fp = h.frame_count;
+                vm.sp = h.sp;
+                fr = vm.frames + (vm.fp - 1);
+                t = fr.tmpl;
+                code = t.code;
+                ip = h.ip;
+                vpush(vm, vm.pending);
+                vm.pending = value_undefined();
+                vm.has_pending = false;
+            } else {
+                while vm.hp > 0 {
+                    Handler* hh = vm.handlers + (vm.hp - 1);
+                    if hh.frame_count < stop_fp { break; }
+                    vm.hp--;
+                }
+                while vm.fp >= stop_fp {
+                    Frame* pf = vm.frames + (vm.fp - 1);
+                    if pf.gen != null { pf.gen.state = GEN_DONE; }
+                    vm.fp--;
+                }
+                return 1;
+            }
+        }
         i32 op = *(code + ip);
         ip++;
         switch op {
@@ -896,6 +1044,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 else if value_is_number(v) { s = "number"; }
                 else if value_is_bool(v) { s = "boolean"; }
                 else if value_is_string(v) { s = "string"; }
+                else if value_is_symbol(v) { s = "symbol"; }
                 else if value_is_function(v) || value_is_native(v) { s = "function"; }
                 GcString* g = gc_new_string(&vm.heap, s);
                 vm.sp--;
@@ -1077,7 +1226,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else if value_is_function(fnv) {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
-                        if vm.fp >= VM_FRAMES_MAX
+                        if ft.is_gen {
+                            Value gv = make_generator_from_call(vm, f, argc);
+                            vpush(vm, gv);
+                        } else if ft.is_async {
+                            Value rp = make_async_from_call(vm, f, argc);
+                            vpush(vm, rp);
+                        } else if vm.fp >= VM_FRAMES_MAX
                             || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
                             vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
                         } else {
@@ -1093,6 +1248,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.base = base;
                             nf.this_val = thisv;
                             nf.is_ctor = op == OP_NEW;
+                            nf.gen = null;
                             vm.fp++;
                             fr = nf;
                             t = ft;
@@ -1341,7 +1497,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             js_array_set(d, d.elen, value_cell(&g.head));
                         }
                     } else {
-                        vm_throw_error(vm, ERR_TYPE, "value is not spreadable");
+                        // general iterables via the protocol
+                        Value it;
+                        if vm_get_iterator(vm, src, &it) {
+                            vpush(vm, it);
+                            while true {
+                                Value val;
+                                bool done = false;
+                                if !vm_iter_next(vm, vpeek(vm, 0), &val, &done) { break; }
+                                if done { break; }
+                                vpush(vm, val);
+                                js_array_set(d, d.elen, vpeek(vm, 0));
+                                vm.sp--;
+                            }
+                            vm.sp--;
+                        }
                     }
                 }
                 if !vm.has_pending { vm.sp--; }
@@ -1362,6 +1532,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
+                        if !vm_enumerable_key(vm, pr.key) { continue; }
                         Value pv = pr.val;
                         if value_is_accessor(pv) {
                             if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
@@ -1382,6 +1553,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* ex = value_as_object(exv);
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
+                        if !vm_enumerable_key(vm, pr.key) { continue; }
                         bool skip = false;
                         for i32 j = 0; j < ex.elen; j++ {
                             Value kv = js_array_get(ex, j);
@@ -1500,38 +1672,76 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
             }
+            case OP_YIELD: {
+                JsGenerator* g = fr.gen;
+                if g == null {
+                    vm_throw_error(vm, ERR_TYPE, "yield outside a generator");
+                } else {
+                    i32 depth = vm.sp - fr.base - 1;
+                    if g.saved != null { free(g.saved); }
+                    g.saved = alloc<Value>(depth > 0 ? depth : 1);
+                    for i32 i = 0; i < depth; i++ {
+                        *(g.saved + i) = *(vm.stack + fr.base + i);
+                    }
+                    g.saved_len = depth;
+                    g.resume_ip = ip;
+                    i32 nh = 0;
+                    while vm.hp - nh > 0 {
+                        Handler* h = vm.handlers + (vm.hp - nh - 1);
+                        if h.frame_count != vm.fp { break; }
+                        nh++;
+                    }
+                    if g.handler_data != null {
+                        free(g.handler_data);
+                        g.handler_data = null;
+                    }
+                    g.n_handlers = nh;
+                    if nh > 0 {
+                        g.handler_data = alloc<i32>(nh * 2);
+                        for i32 i = 0; i < nh; i++ {
+                            Handler* h = vm.handlers + (vm.hp - nh + i);
+                            *(g.handler_data + i * 2) = h.sp - fr.base;
+                            *(g.handler_data + i * 2 + 1) = h.ip;
+                        }
+                        vm.hp -= nh;
+                    }
+                    g.state = GEN_SUSPENDED;
+                    Value out = vpop(vm);
+                    vm.sp = fr.base - 2;
+                    vpush(vm, out);
+                    vm.fp--;
+                    if vm.fp < stop_fp { return 0; }
+                    Frame* popped = vm.frames + vm.fp;
+                    fr = vm.frames + (vm.fp - 1);
+                    t = fr.tmpl;
+                    code = t.code;
+                    ip = popped.ret_ip;
+                }
+            }
+            case OP_GET_ITER: {
+                Value v = vpeek(vm, 0);
+                Value it;
+                if vm_get_iterator(vm, v, &it) {
+                    vm.sp--;
+                    vpush(vm, it);
+                }
+            }
+            case OP_ITER_NEXT: {
+                Value iter = vpeek(vm, 0);
+                Value val;
+                bool done = false;
+                if vm_iter_next(vm, iter, &val, &done) {
+                    vm.sp--;
+                    vpush(vm, val);
+                    vpush(vm, value_bool(done));
+                }
+            }
             default: {
                 eprint("vm: bad opcode {}\n", op);
                 exit(70);
             }
         }
 
-        if vm.has_pending {
-            // handlers below stop_fp belong to an outer execution
-            Handler* htop = vm.handlers + (vm.hp - 1);
-            if vm.hp > 0 && htop.frame_count >= stop_fp {
-                vm.hp--;
-                Handler* h = vm.handlers + vm.hp;
-                vm.fp = h.frame_count;
-                vm.sp = h.sp;
-                fr = vm.frames + (vm.fp - 1);
-                t = fr.tmpl;
-                code = t.code;
-                ip = h.ip;
-                vpush(vm, vm.pending);
-                vm.pending = value_undefined();
-                vm.has_pending = false;
-            } else {
-                // no handler in this execution — propagate to the caller
-                while vm.hp > 0 {
-                    Handler* hh = vm.handlers + (vm.hp - 1);
-                    if hh.frame_count < stop_fp { break; }
-                    vm.hp--;
-                }
-                while vm.fp >= stop_fp { vm.fp--; }
-                return 1;
-            }
-        }
     }
     return 0;
 }
@@ -1552,6 +1762,7 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.base = base;
     fr.this_val = value_undefined();
     fr.is_ctor = false;
+    fr.gen = null;
     vm.fp++;
     i32 status = vm_execute(vm, vm.fp);
     if status != 0 {
@@ -1612,7 +1823,9 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
             }
         }
         for i32 i = 0; i < o.props.len; i++ {
-            GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, (o.props.items + i).key));
+            u32 pk = (o.props.items + i).key;
+            if !vm_enumerable_key(vm, pk) { continue; }
+            GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, pk));
             js_array_set(arr, n, value_cell(&g.head));
             n++;
         }
@@ -1628,6 +1841,396 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     }
     vm.sp--;
     return arr;
+}
+
+// --- iterator protocol --------------------------------------------------
+
+// v stays rooted by the caller; false = threw.
+private bool vm_get_iterator(VM* vm, Value v, Value* out) {
+    Value m;
+    if !vm_get_prop_value(vm, v, vm.sym_iterator_id, &m) { return false; }
+    if !value_is_callable(m) {
+        vm_throw_error(vm, ERR_TYPE, "value is not iterable");
+        return false;
+    }
+    Value dummy = value_undefined();
+    *out = vm_call_value(vm, m, v, &dummy, 0);
+    return !vm.has_pending;
+}
+
+// iter stays rooted by the caller; consume outputs before allocating.
+private bool vm_iter_next(VM* vm, Value iter, Value* val, bool* done) {
+    Value m;
+    if !vm_get_prop_value(vm, iter, vm.atom_next, &m) { return false; }
+    if !value_is_callable(m) {
+        vm_throw_error(vm, ERR_TYPE, "iterator has no next method");
+        return false;
+    }
+    Value dummy = value_undefined();
+    Value r = vm_call_value(vm, m, iter, &dummy, 0);
+    if vm.has_pending { return false; }
+    vpush(vm, r);
+    Value dv = value_undefined();
+    Value vv = value_undefined();
+    if value_is_object(r) {
+        Value out;
+        if !vm_get_prop_value(vm, r, vm.atom_done, &out) {
+            vm.sp--;
+            return false;
+        }
+        dv = out;
+        if !vm_get_prop_value(vm, r, vm.atom_value, &out) {
+            vm.sp--;
+            return false;
+        }
+        vv = out;
+    }
+    vm.sp--;
+    *val = vv;
+    *done = js_truthy(dv);
+    return true;
+}
+
+// --- generators -----------------------------------------------------------
+
+// Consumes [fn, this, args...] from the stack; returns the generator.
+private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
+    FnTemplate* ft = f.tmpl;
+    normalize_args(vm, ft, argc);
+    Value thisv = vpeek(vm, ft.n_params);
+    JsGenerator* g = js_new_generator(&vm.heap, f, thisv);
+    i32 n = ft.n_slots;
+    g.saved = alloc<Value>(n > 0 ? n : 1);
+    for i32 i = 0; i < ft.n_params; i++ {
+        *(g.saved + i) = *(vm.stack + vm.sp - ft.n_params + i);
+    }
+    for i32 i = ft.n_params; i < n; i++ {
+        *(g.saved + i) = value_undefined();
+    }
+    g.saved_len = n;
+    g.resume_ip = 0;
+    vm.sp -= ft.n_params + 2;
+    return value_cell(&g.head);
+}
+
+// Runs the generator to its next suspension or completion. The result
+// is the yielded or returned value; g.state distinguishes. A throw
+// leaves pending set.
+Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
+    if g.state == GEN_RUNNING {
+        vm_throw_error(vm, ERR_TYPE, "generator is already running");
+        return value_undefined();
+    }
+    if g.state == GEN_DONE {
+        return value_undefined();
+    }
+    if vm.fp >= VM_FRAMES_MAX || vm.sp + g.saved_len + 8 >= VM_STACK_MAX {
+        vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
+        return value_undefined();
+    }
+    i32 entry_sp = vm.sp;
+    vpush(vm, value_undefined());   // fn slot
+    vpush(vm, value_undefined());   // this slot
+    i32 base = vm.sp;
+    for i32 i = 0; i < g.saved_len; i++ {
+        vpush(vm, *(g.saved + i));
+    }
+    for i32 i = 0; i < g.n_handlers; i++ {
+        Handler* h = vm.handlers + vm.hp;
+        h.frame_count = vm.fp + 1;
+        h.sp = base + *(g.handler_data + i * 2);
+        h.ip = *(g.handler_data + i * 2 + 1);
+        vm.hp++;
+    }
+    bool from_start = g.state == GEN_START;
+    Frame* nf = vm.frames + vm.fp;
+    nf.fun = g.fun;
+    nf.tmpl = g.fun.tmpl;
+    nf.ret_ip = g.resume_ip;
+    nf.base = base;
+    nf.this_val = g.this_val;
+    nf.is_ctor = false;
+    nf.gen = g;
+    vm.fp++;
+    g.state = GEN_RUNNING;
+    if !from_start && !is_throw {
+        vpush(vm, input);
+    }
+    if is_throw {
+        vm_throw(vm, input);
+    }
+    i32 st = vm_execute(vm, vm.fp);
+    if st != 0 {
+        g.state = GEN_DONE;
+        vm.sp = entry_sp;
+        return value_undefined();
+    }
+    Value res = vpop(vm);
+    if g.state == GEN_RUNNING { g.state = GEN_DONE; }
+    return res;
+}
+
+// --- promises ---------------------------------------------------------------
+
+bool vm_is_promise(VM* vm, Value v) {
+    if !value_is_object(v) { return false; }
+    return props_get(&value_as_object(v).props, vm.atom_pstate) != null;
+}
+
+Value vm_promise_new(VM* vm) {
+    JsObject* p = js_new_object(&vm.heap, vm.promise_proto);
+    vpush(vm, value_cell(&p.head));
+    js_set_prop(p, vm.atom_pstate, value_int(0));
+    js_set_prop(p, vm.atom_pvalue, value_undefined());
+    JsObject* cbs = js_new_array(&vm.heap, null);
+    js_set_prop(p, vm.atom_pcbs, value_cell(&cbs.head));
+    return vpop(vm);
+}
+
+private void vm_enqueue(VM* vm, i32 kind, bool flag, Value a, Value b, Value c) {
+    VmJob j;
+    j.kind = kind;
+    j.flag = flag;
+    j.a = a;
+    j.b = b;
+    j.c = c;
+    vec_push(&vm.jobs, j);
+}
+
+private Value nat_adopt_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_promise_settle(vm, me.env0, argc > 0 ? *(args) : value_undefined(), false);
+    return value_undefined();
+}
+
+private Value nat_adopt_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_promise_settle(vm, me.env0, argc > 0 ? *(args) : value_undefined(), true);
+    return value_undefined();
+}
+
+// pv and v stay rooted by the caller.
+void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
+    if !vm_is_promise(vm, pv) { return; }
+    JsObject* p = value_as_object(pv);
+    Value* st = props_get(&p.props, vm.atom_pstate);
+    if st == null || value_as_int(*st) != 0 { return; }
+    if !rejected && vm_is_promise(vm, v) {
+        // adopt the inner promise's eventual state
+        JsNative* onf = js_new_native(&vm.heap, &nat_adopt_ful, "adopt");
+        onf.env0 = pv;
+        vpush(vm, value_cell(&onf.head));
+        JsNative* onr = js_new_native(&vm.heap, &nat_adopt_rej, "adopt");
+        onr.env0 = pv;
+        Value onfv = vpop(vm);
+        ignore vm_promise_then(vm, v, onfv, value_cell(&onr.head));
+        return;
+    }
+    js_set_prop(p, vm.atom_pstate, value_int(rejected ? 2 : 1));
+    js_set_prop(p, vm.atom_pvalue, v);
+    Value* cbsv = props_get(&p.props, vm.atom_pcbs);
+    if cbsv != null && value_is_array(*cbsv) {
+        JsObject* cbs = value_as_object(*cbsv);
+        for i32 i = 0; i < cbs.elen; i++ {
+            Value triple = js_array_get(cbs, i);
+            if !value_is_array(triple) { continue; }
+            JsObject* tr = value_as_object(triple);
+            vm_enqueue(vm, JOB_REACTION, rejected,
+                js_array_get(tr, rejected ? 1 : 0), v, js_array_get(tr, 2));
+        }
+        js_array_set_length(cbs, 0);
+    }
+}
+
+// Registers reactions and returns the derived promise.
+Value vm_promise_then(VM* vm, Value pv, Value onf, Value onr) {
+    if !vm_is_promise(vm, pv) { return value_undefined(); }
+    vpush(vm, pv);
+    vpush(vm, onf);
+    vpush(vm, onr);
+    Value p2 = vm_promise_new(vm);
+    vpush(vm, p2);
+    JsObject* p = value_as_object(pv);
+    Value* st = props_get(&p.props, vm.atom_pstate);
+    i32 s = value_as_int(*st);
+    if s == 0 {
+        JsObject* tr = js_new_array(&vm.heap, null);
+        vpush(vm, value_cell(&tr.head));
+        js_array_set(tr, 0, onf);
+        js_array_set(tr, 1, onr);
+        js_array_set(tr, 2, p2);
+        Value* cbsv = props_get(&p.props, vm.atom_pcbs);
+        if cbsv != null && value_is_array(*cbsv) {
+            JsObject* cbs = value_as_object(*cbsv);
+            js_array_set(cbs, cbs.elen, vpeek(vm, 0));
+        }
+        vm.sp--;
+    } else {
+        Value* pvv = props_get(&p.props, vm.atom_pvalue);
+        vm_enqueue(vm, JOB_REACTION, s == 2, s == 1 ? onf : onr, *pvv, p2);
+    }
+    vm.sp -= 4;
+    return p2;
+}
+
+// --- async driver ---------------------------------------------------------------
+
+private Value nat_async_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_async_step(vm, me.env0, me.env1, argc > 0 ? *(args) : value_undefined(), false);
+    return value_undefined();
+}
+
+private Value nat_async_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_async_step(vm, me.env0, me.env1, argc > 0 ? *(args) : value_undefined(), true);
+    return value_undefined();
+}
+
+// Advances an async body one await at a time; settles rpv at the end.
+void vm_async_step(VM* vm, Value genv, Value rpv, Value input, bool is_throw) {
+    JsGenerator* g = value_as_generator(genv);
+    vpush(vm, genv);
+    vpush(vm, rpv);
+    vpush(vm, input);
+    Value res = vm_gen_resume(vm, g, input, is_throw);
+    if vm.has_pending {
+        Value e = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        vpush(vm, e);
+        vm_promise_settle(vm, rpv, e, true);
+        vm.sp -= 4;
+        return;
+    }
+    vpush(vm, res);
+    if g.state == GEN_DONE {
+        vm_promise_settle(vm, rpv, res, false);
+        vm.sp -= 4;
+        return;
+    }
+    if vm_is_promise(vm, res) {
+        JsNative* onf = js_new_native(&vm.heap, &nat_async_ful, "step");
+        onf.env0 = genv;
+        onf.env1 = rpv;
+        vpush(vm, value_cell(&onf.head));
+        JsNative* onr = js_new_native(&vm.heap, &nat_async_rej, "step");
+        onr.env0 = genv;
+        onr.env1 = rpv;
+        Value onfv = vpop(vm);
+        ignore vm_promise_then(vm, res, onfv, value_cell(&onr.head));
+    } else {
+        vm_enqueue(vm, JOB_ASYNC_STEP, false, genv, rpv, res);
+    }
+    vm.sp -= 4;
+}
+
+private Value make_async_from_call(VM* vm, JsFunction* f, i32 argc) {
+    Value genv = make_generator_from_call(vm, f, argc);
+    vpush(vm, genv);
+    Value rp = vm_promise_new(vm);
+    vpush(vm, rp);
+    vm_async_step(vm, genv, rp, value_undefined(), false);
+    vm.sp -= 2;
+    return rp;
+}
+
+// --- timers and the event loop -----------------------------------------------------
+
+i32 vm_add_timer(VM* vm, Value cbfn, f64 delay) {
+    VmTimer tm;
+    tm.id = vm.next_timer_id;
+    vm.next_timer_id++;
+    tm.alive = true;
+    tm.due = delay;
+    tm.seq = vm.timer_seq;
+    vm.timer_seq++;
+    tm.cb = cbfn;
+    vec_push(&vm.timers, tm);
+    return tm.id;
+}
+
+void vm_clear_timer(VM* vm, i32 id) {
+    for i32 i = 0; i < vm.timers.len; i++ {
+        VmTimer* tm = vm.timers.data + i;
+        if tm.id == id { tm.alive = false; }
+    }
+}
+
+// Drains microtasks, then fires timers in (delay, order) sequence —
+// virtual time, no sleeping. 1 = uncaught exception in a job.
+i32 vm_run_event_loop(VM* vm) {
+    while true {
+        while vm.job_head < vm.jobs.len {
+            VmJob j = vec_get(&vm.jobs, vm.job_head);
+            vm.job_head++;
+            if j.kind == JOB_REACTION {
+                vpush(vm, j.c);
+                if value_is_callable(j.a) {
+                    Value[1] ca = { j.b };
+                    Value r = vm_call_value(vm, j.a, value_undefined(), &ca[0], 1);
+                    if vm.has_pending {
+                        Value e = vm.pending;
+                        vm.has_pending = false;
+                        vm.pending = value_undefined();
+                        vpush(vm, e);
+                        vm_promise_settle(vm, j.c, e, true);
+                        vm.sp--;
+                    } else {
+                        vpush(vm, r);
+                        vm_promise_settle(vm, j.c, r, false);
+                        vm.sp--;
+                    }
+                } else {
+                    vm_promise_settle(vm, j.c, j.b, j.flag);
+                }
+                vm.sp--;
+            } else {
+                vm_async_step(vm, j.a, j.b, j.c, j.flag);
+            }
+            if vm.has_pending {
+                Value e = vm.pending;
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                print_uncaught(vm, e);
+                return 1;
+            }
+        }
+        vm.jobs.len = 0;
+        vm.job_head = 0;
+        i32 best = -1;
+        for i32 i = 0; i < vm.timers.len; i++ {
+            VmTimer* tm = vm.timers.data + i;
+            if !tm.alive { continue; }
+            if best < 0 {
+                best = i;
+                continue;
+            }
+            VmTimer* bt = vm.timers.data + best;
+            if tm.due < bt.due || (tm.due == bt.due && tm.seq < bt.seq) { best = i; }
+        }
+        if best < 0 { break; }
+        VmTimer* bt2 = vm.timers.data + best;
+        Value cbfn = bt2.cb;
+        bt2.alive = false;
+        vpush(vm, cbfn);
+        Value dummy = value_undefined();
+        ignore vm_call_value(vm, cbfn, value_undefined(), &dummy, 0);
+        vm.sp--;
+        if vm.has_pending {
+            Value e = vm.pending;
+            vm.has_pending = false;
+            vm.pending = value_undefined();
+            print_uncaught(vm, e);
+            return 1;
+        }
+    }
+    vm.timers.len = 0;
+    return 0;
 }
 
 // Stack already holds fn, this, args. Pops them; returns the result.
@@ -1649,6 +2252,8 @@ Value vm_call_stack(VM* vm, i32 argc) {
     }
     JsFunction* f = value_as_function(fnv);
     FnTemplate* ft = f.tmpl;
+    if ft.is_gen { return make_generator_from_call(vm, f, argc); }
+    if ft.is_async { return make_async_from_call(vm, f, argc); }
     if vm.fp >= VM_FRAMES_MAX || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
         vm.sp = entry_sp;
         vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
@@ -1666,6 +2271,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.base = base;
     nf.this_val = thisv;
     nf.is_ctor = false;
+    nf.gen = null;
     vm.fp++;
     i32 st = vm_execute(vm, vm.fp);
     if st != 0 {
@@ -1697,9 +2303,32 @@ void vm_pop(VM* vm) {
     vm.sp--;
 }
 
+// Pops one rooting slot and returns v — for `return vm_pop_ret(vm, x);`.
+Value vm_pop_ret(VM* vm, Value v) {
+    vm.sp--;
+    return v;
+}
+
 f64 js_string_to_number(str s) {
     return vm_str_to_num(s);
 }
+
+// Fresh symbol with a reserved property-key id (high bit set).
+Value vm_new_symbol(VM* vm, Value desc) {
+    u32 id = 0x80000000 | cast(u32, vm.symbols.len);
+    JsSymbol* s = js_new_symbol(&vm.heap, id, desc);
+    Value v = value_cell(&s.head);
+    vec_push(&vm.symbols, v);
+    return v;
+}
+
+u32 vm_atom(VM* vm, str name) {
+    return atom_intern(&vm.atoms, name);
+}
+
+JsObject* vm_generator_proto(VM* vm) { return vm.generator_proto; }
+JsObject* vm_promise_proto(VM* vm) { return vm.promise_proto; }
+u32 vm_sym_iterator_id(VM* vm) { return vm.sym_iterator_id; }
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.
 i32 vm_run_source(VM* vm, str src, str src_name) {
@@ -1724,6 +2353,9 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         gc_root_reset(&vm.heap, rmark);
         if d.n_errors == 0 {
             status = vm_run_template(vm, t);
+            if status == 0 {
+                status = vm_run_event_loop(vm);
+            }
         }
     }
     if d.n_errors > 0 {

@@ -1,0 +1,5 @@
+start
+sync
+awaited 3
+all 10+20+30 = 60
+done
