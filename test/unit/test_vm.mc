@@ -129,7 +129,7 @@ i32 main() {
 
     // status codes
     check_status("throw { name: 'X', message: 'y' };", 1, "uncaught exit 1");
-    check_status("class A {}", 2, "unsupported exit 2");
+    check_status("async function f() {}", 2, "unsupported exit 2");
     check_status("syntax error here(", 2, "parse error exit 2");
 
     // GC stress: collect on every allocation through the full pipeline

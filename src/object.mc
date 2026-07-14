@@ -18,6 +18,7 @@ const i32 GC_OBJECT   = 2;
 const i32 GC_FUNCTION = 3;
 const i32 GC_NATIVE   = 4;
 const i32 GC_BOX      = 5;
+const i32 GC_ACCESSOR = 6;
 
 const i32 OBJF_ARRAY = 1;
 
@@ -125,6 +126,13 @@ struct JsBox {
     Value v;
 }
 
+// Accessor property payload; lives as the property's stored value.
+struct JsAccessor {
+    GcCell head;
+    Value get;
+    Value set;
+}
+
 // --- GC hooks ---------------------------------------------------------
 
 private void mark_props(GcHeap* h, PropList* p) {
@@ -162,6 +170,12 @@ void js_trace(GcHeap* h, GcCell* c) {
     if c.kind == GC_BOX {
         JsBox* b = cast(JsBox*, c);
         gc_mark_value(h, b.v);
+        return;
+    }
+    if c.kind == GC_ACCESSOR {
+        JsAccessor* a = cast(JsAccessor*, c);
+        gc_mark_value(h, a.get);
+        gc_mark_value(h, a.set);
         return;
     }
     eprint("gc: unknown runtime cell kind {}\n", c.kind);
@@ -234,6 +248,13 @@ JsBox* js_new_box(GcHeap* h, Value v) {
     return b;
 }
 
+JsAccessor* js_new_accessor(GcHeap* h) {
+    JsAccessor* a = cast(JsAccessor*, gc_alloc(h, GC_ACCESSOR, sizeof(JsAccessor)));
+    a.get = value_undefined();
+    a.set = value_undefined();
+    return a;
+}
+
 // --- value helpers ------------------------------------------------------
 
 bool value_is_kind(Value v, i32 kind) {
@@ -247,6 +268,9 @@ bool value_is_function(Value v){ return value_is_kind(v, GC_FUNCTION); }
 bool value_is_native(Value v)  { return value_is_kind(v, GC_NATIVE); }
 bool value_is_callable(Value v){ return value_is_function(v) || value_is_native(v); }
 
+bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
+
+JsAccessor* value_as_accessor(Value v) { return cast(JsAccessor*, value_as_cell(v)); }
 JsObject* value_as_object(Value v)     { return cast(JsObject*, value_as_cell(v)); }
 JsFunction* value_as_function(Value v) { return cast(JsFunction*, value_as_cell(v)); }
 JsNative* value_as_native(Value v)     { return cast(JsNative*, value_as_cell(v)); }

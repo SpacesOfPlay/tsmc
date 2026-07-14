@@ -58,7 +58,22 @@ enum Op {
 
     OP_TRY_PUSH,     // u16 catch target
     OP_TRY_POP,
-    OP_THROW
+    OP_THROW,
+
+    OP_SETPROTO,     // [obj, proto] pops proto, keeps obj
+    OP_DEFGETTER,    // u16 name; [obj, fn] pops fn, keeps obj
+    OP_DEFSETTER,    // u16 name; [obj, fn] pops fn, keeps obj
+    OP_ARR_APPEND,   // [arr, v] pops v, keeps arr
+    OP_ARR_SPREAD,   // [arr, src] pops src; appends elements/chars
+    OP_OBJ_SPREAD,   // [obj, src] pops src; copies own props
+    OP_OBJ_REST,     // u16 const idx of excluded-keys array; [src] -> rest obj
+    OP_ARR_SLICE_FROM, // u16 start; [arr/str] -> new array of the tail
+    OP_CALL_ARRAY,   // [fn, this, argsarr] -> result
+    OP_NEW_ARRAY,    // [ctor, argsarr] -> instance
+    OP_JUMP_NULLISH, // u16; top nullish: pop, jump
+    OP_JUMP_NULLISH_METH, // u16; peek(1) nullish: pop 2, jump
+    OP_CHECK_ITERABLE,   // top must be an array or string
+    OP_KEYS          // [v] -> array of own enumerable key strings
 }
 
 struct TmplUpval {
@@ -70,6 +85,7 @@ struct FnTemplate {
     str name;            // owned copy
     i32 n_params;
     i32 n_slots;
+    bool has_rest;       // last param collects surplus arguments
     u8* code;
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook
@@ -139,8 +155,9 @@ i32 ch_pos(Chunk* ch) {
 }
 
 // Moves the chunk's contents into a heap-owned template.
-FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots) {
+FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool has_rest) {
     FnTemplate* t = new(FnTemplate);
+    t.has_rest = has_rest;
     if name.len > 0 {
         u8* nb = alloc<u8>(name.len);
         memcpy(nb, name.data, name.len);

@@ -173,10 +173,10 @@ Each milestone lands with its own tests and a green test suite.
   Error. Property descriptors as needed by these.
 - **M7 — modern syntax surface.** Destructuring, spread/rest, template
   literals, optional chaining, nullish coalescing, getters/setters,
-  computed properties, symbols, iterators, `for-of`, classes with
+  computed properties, `for-of`/`for-in`, labels, classes with
   inheritance.
-- **M8 — async.** Generators, Promise, async/await, microtask queue,
-  event loop, `setTimeout`.
+- **M8 — async.** Generators, symbols and the iterator protocol,
+  Promise, async/await, microtask queue, event loop, `setTimeout`.
 - **M9 — collections & regex.** Map/Set, Date, regex engine +
   String/RegExp integration.
 - **M10 — modules.** ESM import/export, module registry, relative

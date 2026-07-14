@@ -77,36 +77,9 @@ private Value nat_object_ctor(void* vmp, Value callee, Value thisv, Value* args,
     return value_cell(&o.head);
 }
 
-// Pushes own enumerable keys of o into arr (rooted by the caller).
-private void collect_keys(VM* vm, JsObject* o, JsObject* arr) {
-    i32 n = arr.elen;
-    if (o.obj_flags & OBJF_ARRAY) != 0 {
-        for i32 i = 0; i < o.elen; i++ {
-            string s = format("{}", i);
-            Value ks = new_str(vm, s);
-            free(s);
-            js_array_set(arr, n, ks);
-            n++;
-        }
-    }
-    for i32 i = 0; i < o.props.len; i++ {
-        str nm = atom_name(&vm.atoms, (o.props.items + i).key);
-        Value ks = new_str(vm, nm);
-        js_array_set(arr, n, ks);
-        n++;
-    }
-}
-
 private Value nat_object_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
-    i32 rm = gc_root_mark(&vm.heap);
-    gc_root(&vm.heap, value_cell(&arr.head));
-    Value ov = arg_at(args, argc, 0);
-    if value_is_object(ov) {
-        collect_keys(vm, value_as_object(ov), arr);
-    }
-    gc_root_reset(&vm.heap, rm);
+    JsObject* arr = vm_own_keys(vm, arg_at(args, argc, 0));
     return value_cell(&arr.head);
 }
 
@@ -126,7 +99,14 @@ private Value nat_object_values(void* vmp, Value callee, Value thisv, Value* arg
             }
         }
         for i32 i = 0; i < o.props.len; i++ {
-            js_array_set(arr, n, (o.props.items + i).val);
+            Value pv = (o.props.items + i).val;
+            if value_is_accessor(pv) {
+                if !vm_get_prop_value(vm, ov, (o.props.items + i).key, &pv) {
+                    gc_root_reset(&vm.heap, rm);
+                    return value_undefined();
+                }
+            }
+            js_array_set(arr, n, pv);
             n++;
         }
     }
@@ -156,11 +136,19 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
             }
         }
         for i32 i = 0; i < o.props.len; i++ {
+            u32 pk = (o.props.items + i).key;
+            Value pv = (o.props.items + i).val;
+            if value_is_accessor(pv) {
+                if !vm_get_prop_value(vm, ov, pk, &pv) {
+                    gc_root_reset(&vm.heap, rm);
+                    return value_undefined();
+                }
+            }
             JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
             js_array_set(arr, n, value_cell(&pair.head));
-            Value ks = new_str(vm, atom_name(&vm.atoms, (o.props.items + i).key));
+            Value ks = new_str(vm, atom_name(&vm.atoms, pk));
             js_array_set(pair, 0, ks);
-            js_array_set(pair, 1, (o.props.items + i).val);
+            js_array_set(pair, 1, pv);
             n++;
         }
     }
@@ -187,7 +175,12 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
             }
         }
         for i32 i = 0; i < src.props.len; i++ {
-            js_set_prop(t, (src.props.items + i).key, (src.props.items + i).val);
+            u32 pk = (src.props.items + i).key;
+            Value pv = (src.props.items + i).val;
+            if value_is_accessor(pv) {
+                if !vm_get_prop_value(vm, sv2, pk, &pv) { return value_undefined(); }
+            }
+            js_set_prop(t, pk, pv);
         }
     }
     return tv;
@@ -1561,10 +1554,17 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
         bool first = true;
         for i32 i = 0; i < o.props.len; i++ {
             Prop* p = o.props.items + i;
-            if value_is_undefined(p.val) || value_is_callable(p.val) { continue; }
+            Value pval = p.val;
+            if value_is_accessor(pval) {
+                if !vm_get_prop_value(vm, v, p.key, &pval) {
+                    ignore vec_pop(seen);
+                    return false;
+                }
+            }
+            if value_is_undefined(pval) || value_is_callable(pval) { continue; }
             str_buf sub;
             str_buf_init(&sub);
-            if !json_write(vm, &sub, p.val, seen, indent, depth + 1) {
+            if !json_write(vm, &sub, pval, seen, indent, depth + 1) {
                 str_buf_free(&sub);
                 if vm.has_pending {
                     ignore vec_pop(seen);

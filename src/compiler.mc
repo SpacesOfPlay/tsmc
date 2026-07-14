@@ -2,8 +2,10 @@
 //
 // Scope analysis is fused with emission: an inner-name scan decides
 // which bindings become heap boxes, var hoisting runs per function,
-// let/const get TDZ holes at block entry. Unsupported constructs get
-// "not supported yet" diagnostics. See doc/DESIGN_bytecode.md.
+// let/const get TDZ holes at block entry. Classes compile against a
+// hidden %super binding; destructuring desugars through temp slots;
+// optional chains share a nil exit. See doc/DESIGN_bytecode.md and
+// doc/PLAN_M7_modern.md.
 
 import vec;
 import str;
@@ -15,6 +17,8 @@ import value;
 import gc;
 import atom;
 import bytecode;
+import bump;
+import object;
 
 struct CBind {
     str name;
@@ -32,7 +36,8 @@ struct CUp {
 }
 
 struct LoopCtx {
-    bool is_loop;      // false for switch (break only)
+    bool is_loop;      // false for switch and labeled blocks
+    str label;
     i32 break_mark;
     i32 cont_mark;
     i32 fin_depth;
@@ -48,6 +53,7 @@ struct FScope {
     i32 cur_slots;
     i32 depth;
     bool is_arrow;
+    bool has_rest;
     Vec<i32> break_jumps;
     Vec<i32> cont_jumps;
     Vec<LoopCtx> loops;
@@ -58,18 +64,30 @@ struct Compiler {
     DiagList* diags;
     GcHeap* heap;
     AtomTable* atoms;
+    Bump* arena;
     FScope* cur;
+    str pending_label;
 }
 
-void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms) {
+void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
     co.diags = diags;
     co.heap = heap;
     co.atoms = atoms;
+    co.arena = arena;
     co.cur = null;
+    co.pending_label.data = null;
+    co.pending_label.len = 0;
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
     diag_add(co.diags, DIAG_ERROR, n.span, msg);
+}
+
+private str take_label(Compiler* co) {
+    str l = co.pending_label;
+    co.pending_label.data = null;
+    co.pending_label.len = 0;
+    return l;
 }
 
 // --- scopes -------------------------------------------------------------
@@ -84,6 +102,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.cur_slots = 0;
     fs.depth = 0;
     fs.is_arrow = is_arrow;
+    fs.has_rest = false;
     vec_init<i32>(&fs.break_jumps, 8);
     vec_init<i32>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -168,13 +187,13 @@ private i32 resolve_upval(FScope* fs, str name) {
 private Value num_value(f64 v) {
     i32 i = cast(i32, v);
     if cast(f64, i) == v {
-        if v == 0.0 && 1.0 / v < 0.0 { return value_number(v); }   // -0
+        if v == 0.0 && 1.0 / v < 0.0 { return value_number(v); }
         return value_int(i);
     }
     return value_number(v);
 }
 
-// Compile-time GC strings stay rooted until the VM owns the templates.
+// Compile-time GC values stay rooted until the VM owns the templates.
 private i32 str_const(Compiler* co, str s) {
     GcString* gs = gc_new_string(co.heap, s);
     Value v = value_cell(&gs.head);
@@ -187,6 +206,37 @@ private i32 name_const(Compiler* co, str name) {
     return ch_add_const(&co.cur.ch, value_int(cast(i32, a)));
 }
 
+// Numeric property keys stringify the JS way: 1, not 1.0.
+private i32 num_key_const(Compiler* co, f64 num) {
+    i64 iv = cast(i64, num);
+    string s;
+    if cast(f64, iv) == num {
+        s = format("{}", iv);
+    } else {
+        s = format("{}", num);
+    }
+    i32 ci = name_const(co, s);
+    free(s);
+    return ci;
+}
+
+private i32 prop_key_const(Compiler* co, Node* key) {
+    if key.kind == N_NUMBER { return num_key_const(co, key.num); }
+    return name_const(co, key.name);
+}
+
+private str hidden_name(Compiler* co, str prefix, i32 n) {
+    string s = format("{}{}", prefix, n);
+    str view = s;
+    u8* copy = cast(u8*, bump_alloc(co.arena, view.len + 1));
+    memcpy(copy, view.data, view.len);
+    str r;
+    r.data = copy;
+    r.len = view.len;
+    free(s);
+    return r;
+}
+
 // --- inner-name scan ---------------------------------------------------------
 
 private void scan_all_names(StrMap<i32>* set, Node* n) {
@@ -197,6 +247,9 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
     if n.kind == N_THIS {
         strmap_set<i32>(set, "this", 1);
     }
+    if n.kind == N_SUPER {
+        strmap_set<i32>(set, "%super", 1);
+    }
     scan_all_names(set, n.a);
     scan_all_names(set, n.b);
     scan_all_names(set, n.c);
@@ -206,7 +259,7 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
     }
 }
 
-// Collects names used by nested functions of fn (not fn itself).
+// Collects names used by nested functions of n (not n itself).
 private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
     if n == null { return; }
     if n.kind == N_FUNCTION && !root {
@@ -222,13 +275,69 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
     }
 }
 
+// --- binding declaration helpers ------------------------------------------------
+
+private void declare_lexical(Compiler* co, str name, bool is_const) {
+    FScope* fs = co.cur;
+    i32 bi = declare(co, name, is_const, true);
+    CBind b = vec_get(&fs.binds, bi);
+    if b.is_cell {
+        ch_op_u16(&fs.ch, OP_NEWCELL_HOLE, b.slot);
+    } else {
+        ch_op_u16(&fs.ch, OP_SETHOLE, b.slot);
+    }
+}
+
+private void declare_plain(Compiler* co, str name) {
+    FScope* fs = co.cur;
+    i32 bi = declare(co, name, false, false);
+    CBind b = vec_get(&fs.binds, bi);
+    if b.is_cell {
+        ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
+    }
+}
+
+// Walks a binding pattern applying `mode` per name:
+// 0 lexical let, 1 lexical const, 2 plain, 3 hoisted var.
+private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
+    if pat == null { return; }
+    i32 k = pat.kind;
+    if k == N_IDENT {
+        if mode == 0 { declare_lexical(co, pat.name, false); }
+        if mode == 1 { declare_lexical(co, pat.name, true); }
+        if mode == 2 { declare_plain(co, pat.name); }
+        if mode == 3 { hoist_declare_var(co, pat); }
+        return;
+    }
+    if k == N_ASSIGN_PATTERN || k == N_REST {
+        declare_pattern(co, pat.a, mode);
+        return;
+    }
+    if k == N_ARRAY_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* e = *(pat.kids.items + i);
+            if e.kind == N_HOLE { continue; }
+            declare_pattern(co, e, mode);
+        }
+        return;
+    }
+    if k == N_OBJECT_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pp = *(pat.kids.items + i);
+            if pp.kind == N_REST {
+                declare_pattern(co, pp.a, mode);
+            } else {
+                declare_pattern(co, pp.b, mode);
+            }
+        }
+        return;
+    }
+    cerror(co, pat, "unsupported binding pattern");
+}
+
 // --- var hoisting ----------------------------------------------------------
 
 private void hoist_declare_var(Compiler* co, Node* id) {
-    if id.kind != N_IDENT {
-        cerror(co, id, "destructuring is not supported yet");
-        return;
-    }
     FScope* fs = co.cur;
     i32 li = find_local(fs, id.name);
     if li >= 0 { return; }   // var redeclaration shares the binding
@@ -245,7 +354,7 @@ private void hoist_vars(Compiler* co, Node* n) {
     if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
         for i32 i = 0; i < n.kids.len; i++ {
             Node* d = *(n.kids.items + i);
-            hoist_declare_var(co, d.a);
+            declare_pattern(co, d.a, 3);
         }
         return;
     }
@@ -283,6 +392,14 @@ private void emit_load_ident(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_GETGLOBAL, name_const(co, n.name));
 }
 
+private void emit_load_name(Compiler* co, str name, Node* at) {
+    Node tmp;
+    tmp.kind = N_IDENT;
+    tmp.name = name;
+    tmp.span = at.span;
+    emit_load_ident(co, &tmp);
+}
+
 // Emits a store that keeps the value on the stack.
 private void emit_store_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
@@ -315,6 +432,153 @@ private void emit_init_binding(Compiler* co, i32 bind_idx) {
     ch_op(&fs.ch, OP_POP);
 }
 
+private bool super_available(Compiler* co) {
+    str nm = "%super";
+    if find_local(co.cur, nm) >= 0 { return true; }
+    return resolve_upval(co.cur, nm) >= 0;
+}
+
+// --- destructuring ---------------------------------------------------------------
+
+// Consumes the value on top of the stack, storing per pattern leaf.
+// declare_mode initializes bindings; otherwise leaves are assignment
+// targets (ident, member, index).
+private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
+    Chunk* ch = &co.cur.ch;
+    i32 k = pat.kind;
+    if k == N_IDENT {
+        if declare_mode {
+            i32 li = find_local(co.cur, pat.name);
+            if li < 0 {
+                cerror(co, pat, "unresolved binding");
+                ch_op(ch, OP_POP);
+                return;
+            }
+            emit_init_binding(co, li);
+        } else {
+            emit_store_ident(co, pat);
+            ch_op(ch, OP_POP);
+        }
+        return;
+    }
+    if !declare_mode && (k == N_MEMBER || k == N_INDEX) {
+        if k == N_MEMBER && (pat.flags & (NF_OPT_CHAIN | NF_PRIVATE)) != 0 {
+            cerror(co, pat, "invalid assignment target");
+            ch_op(ch, OP_POP);
+            return;
+        }
+        i32 tmp = alloc_slot(co.cur);
+        ch_op_u16(ch, OP_SETLOCAL, tmp);
+        ch_op(ch, OP_POP);
+        compile_expr(co, pat.a);
+        if k == N_MEMBER {
+            ch_op_u16(ch, OP_GETLOCAL, tmp);
+            ch_op_u16(ch, OP_SETPROP, name_const(co, pat.name));
+        } else {
+            compile_expr(co, pat.b);
+            ch_op_u16(ch, OP_GETLOCAL, tmp);
+            ch_op(ch, OP_SETINDEX);
+        }
+        ch_op(ch, OP_POP);
+        co.cur.cur_slots--;
+        return;
+    }
+    if k == N_ASSIGN_PATTERN || (!declare_mode && k == N_ASSIGN && pat.op == TOK_EQ) {
+        ch_op(ch, OP_DUP);
+        ch_op(ch, OP_UNDEF);
+        ch_op(ch, OP_SEQ);
+        i32 j = ch_jump(ch, OP_JUMPF);
+        ch_op(ch, OP_POP);
+        compile_expr(co, pat.b);
+        ch_patch(ch, j);
+        compile_destructure(co, pat.a, declare_mode);
+        return;
+    }
+    if k == N_ARRAY_PATTERN || (!declare_mode && k == N_ARRAY) {
+        i32 tmp = alloc_slot(co.cur);
+        ch_op_u16(ch, OP_SETLOCAL, tmp);
+        ch_op(ch, OP_POP);
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* e = *(pat.kids.items + i);
+            if e.kind == N_HOLE { continue; }
+            if e.kind == N_REST || e.kind == N_SPREAD {
+                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                ch_op_u16(ch, OP_ARR_SLICE_FROM, i);
+                compile_destructure(co, e.a, declare_mode);
+                break;
+            }
+            ch_op_u16(ch, OP_GETLOCAL, tmp);
+            ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(i)));
+            ch_op(ch, OP_GETINDEX);
+            compile_destructure(co, e, declare_mode);
+        }
+        co.cur.cur_slots--;
+        return;
+    }
+    if k == N_OBJECT_PATTERN || (!declare_mode && k == N_OBJECT) {
+        i32 tmp = alloc_slot(co.cur);
+        ch_op_u16(ch, OP_SETLOCAL, tmp);
+        ch_op(ch, OP_POP);
+        Vec<i32> taken = vec_new<i32>(4);
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pp = *(pat.kids.items + i);
+            if pp.kind == N_REST || pp.kind == N_SPREAD {
+                // rest object: copy remaining own props
+                JsObject* ex = js_new_array(co.heap, null);
+                gc_root(co.heap, value_cell(&ex.head));
+                for i32 j = 0; j < taken.len; j++ {
+                    js_array_set(ex, j, value_int(vec_get(&taken, j)));
+                }
+                i32 ci = ch_add_const(ch, value_cell(&ex.head));
+                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                ch_op_u16(ch, OP_OBJ_REST, ci);
+                compile_destructure(co, pp.a, declare_mode);
+                continue;
+            }
+            Node* keyn = pp.a;
+            Node* target = pp.b;
+            if declare_mode == false && (pp.flags & NF_SHORTHAND) != 0 {
+                // cover grammar: {x} or {x = default}
+                target = pp.a;
+                if pp.b != null {
+                    // default via synthetic assign-pattern shape
+                    ch_op_u16(ch, OP_GETLOCAL, tmp);
+                    ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                    ch_op(ch, OP_DUP);
+                    ch_op(ch, OP_UNDEF);
+                    ch_op(ch, OP_SEQ);
+                    i32 j2 = ch_jump(ch, OP_JUMPF);
+                    ch_op(ch, OP_POP);
+                    compile_expr(co, pp.b);
+                    ch_patch(ch, j2);
+                    compile_destructure(co, target, declare_mode);
+                    u32 a2 = atom_intern(co.atoms, keyn.name);
+                    vec_push(&taken, cast(i32, a2));
+                    continue;
+                }
+            }
+            if (pp.flags & NF_COMPUTED) != 0 {
+                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                compile_expr(co, keyn);
+                ch_op(ch, OP_GETINDEX);
+            } else {
+                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                if keyn.kind != N_NUMBER {
+                    u32 a2 = atom_intern(co.atoms, keyn.name);
+                    vec_push(&taken, cast(i32, a2));
+                }
+            }
+            compile_destructure(co, target, declare_mode);
+        }
+        vec_free(&taken);
+        co.cur.cur_slots--;
+        return;
+    }
+    cerror(co, pat, "unsupported destructuring target");
+    ch_op(ch, OP_POP);
+}
+
 // --- expressions ------------------------------------------------------------------
 
 private i32 bin_op_code(i32 tok) {
@@ -343,7 +607,6 @@ private i32 bin_op_code(i32 tok) {
     return -1;
 }
 
-// Compound-assign operator token → underlying binary opcode.
 private i32 compound_op_code(i32 tok) {
     if tok == TOK_PLUS_EQ { return OP_ADD; }
     if tok == TOK_MINUS_EQ { return OP_SUB; }
@@ -360,6 +623,34 @@ private i32 compound_op_code(i32 tok) {
     return -1;
 }
 
+// Pushes plain args and returns argc, or builds an args array for
+// spread calls and returns -1.
+private i32 compile_args(Compiler* co, NodeList* kids) {
+    Chunk* ch = &co.cur.ch;
+    bool has_spread = false;
+    for i32 i = 0; i < kids.len; i++ {
+        if (*(kids.items + i)).kind == N_SPREAD { has_spread = true; }
+    }
+    if !has_spread {
+        for i32 i = 0; i < kids.len; i++ {
+            compile_expr(co, *(kids.items + i));
+        }
+        return kids.len;
+    }
+    ch_op_u16(ch, OP_NEWARR, 0);
+    for i32 i = 0; i < kids.len; i++ {
+        Node* arg = *(kids.items + i);
+        if arg.kind == N_SPREAD {
+            compile_expr(co, arg.a);
+            ch_op(ch, OP_ARR_SPREAD);
+        } else {
+            compile_expr(co, arg);
+            ch_op(ch, OP_ARR_APPEND);
+        }
+    }
+    return -1;
+}
+
 private void compile_assign(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     Node* t = n.a;
@@ -371,7 +662,7 @@ private void compile_assign(Compiler* co, Node* n) {
         }
         if t.kind == N_MEMBER {
             if (t.flags & (NF_OPT_CHAIN | NF_PRIVATE)) != 0 {
-                cerror(co, t, "not supported yet");
+                cerror(co, t, "invalid assignment target");
                 return;
             }
             compile_expr(co, t.a);
@@ -386,7 +677,13 @@ private void compile_assign(Compiler* co, Node* n) {
             ch_op(ch, OP_SETINDEX);
             return;
         }
-        cerror(co, t, "destructuring assignment is not supported yet");
+        if t.kind == N_ARRAY || t.kind == N_OBJECT {
+            compile_expr(co, n.b);
+            ch_op(ch, OP_DUP);
+            compile_destructure(co, t, false);
+            return;
+        }
+        cerror(co, t, "invalid assignment target");
         return;
     }
     if n.op == TOK_AMPAMP_EQ || n.op == TOK_PIPEPIPE_EQ || n.op == TOK_QUESTION_QUESTION_EQ {
@@ -467,7 +764,7 @@ private void compile_update(Compiler* co, Node* n) {
             ch_op(ch, OP_GETINDEX);
         }
         ch_op(ch, OP_TONUM);
-        ch_op_u16(ch, OP_SETLOCAL, tmp);        // old numeric value
+        ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op_u16(ch, OP_CONST, one);
         ch_op(ch, op);
         if t.kind == N_MEMBER {
@@ -485,17 +782,125 @@ private void compile_update(Compiler* co, Node* n) {
     cerror(co, t, "invalid update target");
 }
 
-private void compile_call(Compiler* co, Node* n) {
+private bool chain_has_opt(Node* n) {
+    while n != null && (n.kind == N_MEMBER || n.kind == N_INDEX || n.kind == N_CALL) {
+        if (n.flags & NF_OPT_CHAIN) != 0 { return true; }
+        if n.kind == N_CALL && n.a != null
+            && (n.a.kind == N_MEMBER || n.a.kind == N_INDEX)
+            && (n.a.flags & NF_OPT_CHAIN) != 0 {
+            return true;
+        }
+        n = n.a;
+    }
+    return false;
+}
+
+private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
     Chunk* ch = &co.cur.ch;
-    if (n.flags & NF_OPT_CHAIN) != 0 {
-        cerror(co, n, "optional chaining is not supported yet");
+    i32 k = n.kind;
+    if k == N_MEMBER && (n.flags & NF_PRIVATE) == 0 && n.a.kind != N_SUPER {
+        emit_chain(co, n.a, nils);
+        if (n.flags & NF_OPT_CHAIN) != 0 {
+            vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
+        }
+        ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
         return;
     }
+    if k == N_INDEX {
+        emit_chain(co, n.a, nils);
+        if (n.flags & NF_OPT_CHAIN) != 0 {
+            vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
+        }
+        compile_expr(co, n.b);
+        ch_op(ch, OP_GETINDEX);
+        return;
+    }
+    if k == N_CALL {
+        Node* callee = n.a;
+        if callee.kind == N_MEMBER && (callee.flags & NF_PRIVATE) == 0
+            && callee.a.kind != N_SUPER {
+            emit_chain(co, callee.a, nils);
+            if (callee.flags & NF_OPT_CHAIN) != 0 {
+                vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
+            }
+            ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+        } else if callee.kind == N_INDEX {
+            emit_chain(co, callee.a, nils);
+            if (callee.flags & NF_OPT_CHAIN) != 0 {
+                vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
+            }
+            compile_expr(co, callee.b);
+            ch_op(ch, OP_GETMETHOD_DYN);
+        } else {
+            emit_chain(co, callee, nils);
+            if (n.flags & NF_OPT_CHAIN) != 0 {
+                vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
+            }
+            ch_op(ch, OP_UNDEF);
+            i32 c = compile_args(co, &n.kids);
+            if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
+            return;
+        }
+        if (n.flags & NF_OPT_CHAIN) != 0 {
+            vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH_METH));
+        }
+        i32 c = compile_args(co, &n.kids);
+        if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
+        return;
+    }
+    compile_expr(co, n);
+}
+
+private void compile_opt_chain(Compiler* co, Node* n) {
+    Chunk* ch = &co.cur.ch;
+    Vec<i32> nils = vec_new<i32>(4);
+    emit_chain(co, n, &nils);
+    i32 jend = ch_jump(ch, OP_JUMP);
+    while nils.len > 0 {
+        ch_patch(ch, vec_pop(&nils));
+    }
+    ch_op(ch, OP_UNDEF);
+    ch_patch(ch, jend);
+    vec_free(&nils);
+}
+
+private void compile_call(Compiler* co, Node* n) {
+    Chunk* ch = &co.cur.ch;
     Node* callee = n.a;
-    if callee.kind == N_MEMBER && (callee.flags & (NF_OPT_CHAIN | NF_PRIVATE)) == 0 {
+    if callee.kind == N_SUPER {
+        if !super_available(co) {
+            cerror(co, n, "super outside a derived class constructor");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        emit_load_name(co, "%super", n);
+        ch_op(ch, OP_THIS);
+        i32 c = compile_args(co, &n.kids);
+        if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
+        return;
+    }
+    if callee.kind == N_MEMBER && callee.a.kind == N_SUPER {
+        if !super_available(co) {
+            cerror(co, n, "super outside a class method");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        emit_load_name(co, "%super", n);
+        ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+        ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
+        ch_op(ch, OP_THIS);
+        i32 c = compile_args(co, &n.kids);
+        if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
+        return;
+    }
+    if chain_has_opt(n) {
+        compile_opt_chain(co, n);
+        return;
+    }
+    if callee.kind == N_MEMBER && (callee.flags & NF_PRIVATE) == 0 {
         compile_expr(co, callee.a);
         ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
-    } else if callee.kind == N_INDEX && (callee.flags & NF_OPT_CHAIN) == 0 {
+    } else if callee.kind == N_INDEX {
         compile_expr(co, callee.a);
         compile_expr(co, callee.b);
         ch_op(ch, OP_GETMETHOD_DYN);
@@ -503,16 +908,8 @@ private void compile_call(Compiler* co, Node* n) {
         compile_expr(co, callee);
         ch_op(ch, OP_UNDEF);
     }
-    for i32 i = 0; i < n.kids.len; i++ {
-        Node* arg = *(n.kids.items + i);
-        if arg.kind == N_SPREAD {
-            cerror(co, arg, "spread arguments are not supported yet");
-            ch_op(ch, OP_UNDEF);
-        } else {
-            compile_expr(co, arg);
-        }
-    }
-    ch_op_u16(ch, OP_CALL, n.kids.len);
+    i32 c = compile_args(co, &n.kids);
+    if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
 }
 
 private void compile_expr(Compiler* co, Node* n) {
@@ -534,13 +931,10 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_IDENT { emit_load_ident(co, n); return; }
     if k == N_THIS {
         if co.cur.is_arrow {
-            Node tmp;
-            tmp.kind = N_IDENT;
-            tmp.name = "this";
-            tmp.span = n.span;
             FScope* fs = co.cur;
-            if find_local(fs, tmp.name) >= 0 || resolve_upval(fs, tmp.name) >= 0 {
-                emit_load_ident(co, &tmp);
+            str nm = "this";
+            if find_local(fs, nm) >= 0 || resolve_upval(fs, nm) >= 0 {
+                emit_load_name(co, nm, n);
                 return;
             }
         }
@@ -548,18 +942,36 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_ARRAY {
+        bool has_spread = false;
+        for i32 i = 0; i < n.kids.len; i++ {
+            if (*(n.kids.items + i)).kind == N_SPREAD { has_spread = true; }
+        }
+        if !has_spread {
+            for i32 i = 0; i < n.kids.len; i++ {
+                Node* e = *(n.kids.items + i);
+                if e.kind == N_HOLE {
+                    ch_op(ch, OP_UNDEF);
+                } else {
+                    compile_expr(co, e);
+                }
+            }
+            ch_op_u16(ch, OP_NEWARR, n.kids.len);
+            return;
+        }
+        ch_op_u16(ch, OP_NEWARR, 0);
         for i32 i = 0; i < n.kids.len; i++ {
             Node* e = *(n.kids.items + i);
-            if e.kind == N_HOLE {
+            if e.kind == N_SPREAD {
+                compile_expr(co, e.a);
+                ch_op(ch, OP_ARR_SPREAD);
+            } else if e.kind == N_HOLE {
                 ch_op(ch, OP_UNDEF);
-            } else if e.kind == N_SPREAD {
-                cerror(co, e, "spread is not supported yet");
-                ch_op(ch, OP_UNDEF);
+                ch_op(ch, OP_ARR_APPEND);
             } else {
                 compile_expr(co, e);
+                ch_op(ch, OP_ARR_APPEND);
             }
         }
-        ch_op_u16(ch, OP_NEWARR, n.kids.len);
         return;
     }
     if k == N_OBJECT {
@@ -567,11 +979,20 @@ private void compile_expr(Compiler* co, Node* n) {
         for i32 i = 0; i < n.kids.len; i++ {
             Node* p = *(n.kids.items + i);
             if p.kind == N_SPREAD {
-                cerror(co, p, "object spread is not supported yet");
+                compile_expr(co, p.a);
+                ch_op(ch, OP_OBJ_SPREAD);
                 continue;
             }
             if (p.flags & (NF_GETTER | NF_SETTER)) != 0 {
-                cerror(co, p, "getters and setters are not supported yet");
+                if (p.flags & NF_COMPUTED) != 0 {
+                    cerror(co, p, "computed accessors are not supported yet");
+                    continue;
+                }
+                ch_op(ch, OP_DUP);
+                compile_expr(co, p.b);
+                i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
+                ch_op_u16(ch, aop, prop_key_const(co, p.a));
+                ch_op(ch, OP_POP);
                 continue;
             }
             if (p.flags & NF_COMPUTED) != 0 {
@@ -582,37 +1003,22 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_POP);
                 continue;
             }
+            if (p.flags & NF_SHORTHAND) != 0 && p.b != null {
+                cerror(co, p, "shorthand initializer outside destructuring");
+                continue;
+            }
             ch_op(ch, OP_DUP);
             if p.b != null {
                 compile_expr(co, p.b);
             } else {
-                // shorthand { x }
-                Node tmp;
-                tmp.kind = N_IDENT;
-                tmp.name = p.a.name;
-                tmp.span = p.span;
-                emit_load_ident(co, &tmp);
+                emit_load_name(co, p.a.name, p);
             }
-            if p.a.kind == N_NUMBER {
-                // numeric keys stringify the JS way: 1, not 1.0
-                i64 iv = cast(i64, p.a.num);
-                string s;
-                if cast(f64, iv) == p.a.num {
-                    s = format("{}", iv);
-                } else {
-                    s = format("{}", p.a.num);
-                }
-                ch_op_u16(ch, OP_SETPROP, name_const(co, s));
-                free(s);
-            } else {
-                ch_op_u16(ch, OP_SETPROP, name_const(co, p.a.name));
-            }
+            ch_op_u16(ch, OP_SETPROP, prop_key_const(co, p.a));
             ch_op(ch, OP_POP);
         }
         return;
     }
     if k == N_TEMPLATE {
-        // fold to string concatenation; first quasi anchors stringness
         bool first = true;
         for i32 i = 0; i < n.kids.len; i++ {
             Node* e = *(n.kids.items + i);
@@ -667,7 +1073,7 @@ private void compile_expr(Compiler* co, Node* n) {
             if t.kind == N_MEMBER && (t.flags & (NF_OPT_CHAIN | NF_PRIVATE)) == 0 {
                 compile_expr(co, t.a);
                 ch_op_u16(ch, OP_DELPROP, name_const(co, t.name));
-            } else if t.kind == N_INDEX {
+            } else if t.kind == N_INDEX && (t.flags & NF_OPT_CHAIN) == 0 {
                 compile_expr(co, t.a);
                 compile_expr(co, t.b);
                 ch_op(ch, OP_DELINDEX);
@@ -707,8 +1113,24 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_UPDATE { compile_update(co, n); return; }
     if k == N_MEMBER {
-        if (n.flags & (NF_OPT_CHAIN | NF_PRIVATE)) != 0 {
-            cerror(co, n, "not supported yet");
+        if n.a.kind == N_SUPER {
+            if !super_available(co) {
+                cerror(co, n, "super outside a class method");
+                ch_op(ch, OP_UNDEF);
+                return;
+            }
+            emit_load_name(co, "%super", n);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+            return;
+        }
+        if (n.flags & NF_PRIVATE) != 0 {
+            cerror(co, n, "private class members are not supported yet");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        if chain_has_opt(n) {
+            compile_opt_chain(co, n);
             return;
         }
         compile_expr(co, n.a);
@@ -716,8 +1138,8 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_INDEX {
-        if (n.flags & NF_OPT_CHAIN) != 0 {
-            cerror(co, n, "optional chaining is not supported yet");
+        if chain_has_opt(n) {
+            compile_opt_chain(co, n);
             return;
         }
         compile_expr(co, n.a);
@@ -728,16 +1150,8 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_CALL { compile_call(co, n); return; }
     if k == N_NEW {
         compile_expr(co, n.a);
-        for i32 i = 0; i < n.kids.len; i++ {
-            Node* arg = *(n.kids.items + i);
-            if arg.kind == N_SPREAD {
-                cerror(co, arg, "spread arguments are not supported yet");
-                ch_op(ch, OP_UNDEF);
-            } else {
-                compile_expr(co, arg);
-            }
-        }
-        ch_op_u16(ch, OP_NEW, n.kids.len);
+        i32 c = compile_args(co, &n.kids);
+        if c >= 0 { ch_op_u16(ch, OP_NEW, c); } else { ch_op(ch, OP_NEW_ARRAY); }
         return;
     }
     if k == N_SEQ {
@@ -751,13 +1165,19 @@ private void compile_expr(Compiler* co, Node* n) {
         compile_function(co, n);
         return;
     }
+    if k == N_CLASS {
+        compile_class_expr(co, n);
+        return;
+    }
     cerror(co, n, "expression not supported yet");
     ch_op(ch, OP_UNDEF);
 }
 
 // --- functions ---------------------------------------------------------------------
 
-private void compile_function(Compiler* co, Node* f) {
+// Compiles f into a template. `fields` (class members) inject
+// this-assignments into the body after a leading super() call.
+private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields) {
     FScope fs;
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
     if (f.flags & (NF_ASYNC | NF_GENERATOR)) != 0 {
@@ -765,24 +1185,28 @@ private void compile_function(Compiler* co, Node* f) {
     }
     co.cur = &fs;
     scan_inner(&fs.inner, f, true);
+    for i32 i = 0; i < n_fields; i++ {
+        scan_inner(&fs.inner, *(fields + i), true);
+    }
 
     // params
     i32 n_params = 0;
     for i32 i = 0; i < f.kids.len; i++ {
         Node* prm = *(f.kids.items + i);
         if (prm.flags & NF_REST) != 0 {
-            cerror(co, prm, "rest parameters are not supported yet");
+            fs.has_rest = true;
+            if i != f.kids.len - 1 {
+                cerror(co, prm, "rest parameter must be last");
+            }
         }
-        if prm.a.kind != N_IDENT {
-            cerror(co, prm, "destructured parameters are not supported yet");
-            declare(co, "", false, false);
-            n_params++;
-            continue;
+        if prm.a.kind == N_IDENT {
+            ignore declare(co, prm.a.name, false, false);
+        } else {
+            ignore declare(co, hidden_name(co, "%p", i), false, false);
         }
-        declare(co, prm.a.name, false, false);
         n_params++;
     }
-    // defaults, then boxing of captured params
+    // defaults
     for i32 i = 0; i < f.kids.len; i++ {
         Node* prm = *(f.kids.items + i);
         if prm.b == null { continue; }
@@ -795,11 +1219,21 @@ private void compile_function(Compiler* co, Node* f) {
         ch_op(&fs.ch, OP_POP);
         ch_patch(&fs.ch, j);
     }
+    // boxing of captured params
     for i32 i = 0; i < n_params; i++ {
         CBind b = vec_get(&fs.binds, i);
         if b.is_cell {
             ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
         }
+    }
+    // pattern params destructure into their names
+    for i32 i = 0; i < f.kids.len; i++ {
+        Node* prm = *(f.kids.items + i);
+        if prm.a.kind == N_IDENT { continue; }
+        declare_pattern(co, prm.a, 2);
+        CBind pb = vec_get(&fs.binds, i);
+        ch_op_u16(&fs.ch, pb.is_cell ? OP_GETCELL : OP_GETLOCAL, pb.slot);
+        compile_destructure(co, prm.a, true);
     }
     // implicit `this` binding for arrows below
     if !fs.is_arrow && strmap_get<i32>(&fs.inner, "this") != null {
@@ -815,7 +1249,7 @@ private void compile_function(Compiler* co, Node* f) {
 
     if f.a != null && f.a.kind == N_BLOCK {
         hoist_vars(co, f.a);
-        compile_block_stmts(co, &f.a.kids);
+        compile_block_stmts_ex(co, &f.a.kids, fields, n_fields);
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_RETURN);
     } else if f.a != null {
@@ -826,11 +1260,200 @@ private void compile_function(Compiler* co, Node* f) {
         ch_op(&fs.ch, OP_RETURN);
     }
 
-    FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots);
+    FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest);
     co.cur = fs.parent;
     fscope_free(&fs);
+    return t;
+}
+
+private void compile_function(Compiler* co, Node* f) {
+    FnTemplate* t = compile_function_tmpl(co, f, null, 0);
     vec_push(&co.cur.ch.subs, t);
     ch_op_u16(&co.cur.ch, OP_CLOSURE, co.cur.ch.subs.len - 1);
+}
+
+// --- classes -----------------------------------------------------------------------
+
+private Node* cnode(Compiler* co, i32 kind) {
+    Node* n = cast(Node*, bump_alloc(co.arena, cast(i32, sizeof(Node))));
+    n.kind = kind;
+    return n;
+}
+
+private NodeList clist1(Compiler* co, Node* n0) {
+    NodeList l;
+    l.len = 1;
+    l.items = cast(Node**, bump_alloc(co.arena, 8));
+    *(l.items) = n0;
+    return l;
+}
+
+// constructor(...args) { super(...args); }  — or an empty body for
+// base classes.
+private Node* build_default_ctor(Compiler* co, bool derived) {
+    Node* f = cnode(co, N_FUNCTION);
+    Node* body = cnode(co, N_BLOCK);
+    f.a = body;
+    if !derived { return f; }
+    Node* prm = cnode(co, N_PARAM);
+    prm.flags = NF_REST;
+    Node* pid = cnode(co, N_IDENT);
+    pid.name = "%args";
+    prm.a = pid;
+    f.kids = clist1(co, prm);
+    Node* call = cnode(co, N_CALL);
+    call.a = cnode(co, N_SUPER);
+    Node* sp = cnode(co, N_SPREAD);
+    Node* aid = cnode(co, N_IDENT);
+    aid.name = "%args";
+    sp.a = aid;
+    call.kids = clist1(co, sp);
+    Node* st = cnode(co, N_EXPR_STMT);
+    st.a = call;
+    body.kids = clist1(co, st);
+    return f;
+}
+
+private bool member_is_field(Node* m) {
+    if m.kind != N_CLASS_MEMBER { return false; }
+    if (m.flags & NF_STATIC) != 0 { return false; }
+    if m.b != null && m.b.kind == N_FUNCTION { return false; }
+    return true;
+}
+
+// Leaves the class constructor function on the stack.
+private void compile_class_expr(Compiler* co, Node* c) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+    bool derived = c.a != null;
+
+    fs.depth++;
+    i32 saved_binds = fs.binds.len;
+    i32 saved_slots = fs.cur_slots;
+
+    if derived {
+        compile_expr(co, c.a);
+        i32 bi = declare(co, "%super", true, false);
+        CBind* bp = fs.binds.data + bi;
+        bp.is_cell = true;
+        ch_op_u16(ch, OP_NEWCELL_UNDEF, bp.slot);
+        ch_op_u16(ch, OP_SETCELL, bp.slot);
+        ch_op(ch, OP_POP);
+    }
+
+    // partition members
+    Vec<NodePtr> fields = vec_new<NodePtr>(4);
+    Node* ctor_member = null;
+    for i32 i = 0; i < c.kids.len; i++ {
+        Node* m = *(c.kids.items + i);
+        if m.kind != N_CLASS_MEMBER { continue; }
+        if m.a != null && m.a.kind == N_PRIVATE_IDENT {
+            cerror(co, m, "private class members are not supported yet");
+            continue;
+        }
+        if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
+            && (m.flags & (NF_GETTER | NF_SETTER)) == 0
+            && m.a != null && m.a.kind == N_IDENT && str_equal(m.a.name, "constructor") {
+            ctor_member = m;
+            continue;
+        }
+        if member_is_field(m) {
+            vec_push(&fields, m);
+        }
+    }
+
+    // constructor template
+    Node* ctor_fn = null;
+    if ctor_member != null {
+        ctor_fn = ctor_member.b;
+    } else {
+        ctor_fn = build_default_ctor(co, derived);
+    }
+    FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len);
+    vec_push(&ch.subs, ct);
+    ch_op_u16(ch, OP_CLOSURE, ch.subs.len - 1);
+
+    i32 t_ctor = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_ctor);
+    ch_op(ch, OP_POP);
+
+    // C.prototype: fresh object chained to the parent's prototype
+    ch_op(ch, OP_NEWOBJ);
+    if derived {
+        emit_load_name(co, "%super", c);
+        ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+        ch_op(ch, OP_SETPROTO);
+    }
+    i32 t_proto = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_proto);
+    ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+    ch_op_u16(ch, OP_SETPROP, name_const(co, "constructor"));
+    ch_op(ch, OP_POP);
+    ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+    ch_op_u16(ch, OP_GETLOCAL, t_proto);
+    ch_op_u16(ch, OP_SETPROP, name_const(co, "prototype"));
+    ch_op(ch, OP_POP);
+
+    // members
+    for i32 i = 0; i < c.kids.len; i++ {
+        Node* m = *(c.kids.items + i);
+        if m.kind == N_STATIC_BLOCK { continue; }
+        if m.kind != N_CLASS_MEMBER || m == ctor_member { continue; }
+        if m.a != null && m.a.kind == N_PRIVATE_IDENT { continue; }
+        bool is_static = (m.flags & NF_STATIC) != 0;
+        bool is_method = m.b != null && m.b.kind == N_FUNCTION;
+        bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
+        if is_method {
+            ch_op_u16(ch, OP_GETLOCAL, is_static ? t_ctor : t_proto);
+            if (m.flags & NF_COMPUTED) != 0 {
+                if is_acc {
+                    cerror(co, m, "computed accessors are not supported yet");
+                    ch_op(ch, OP_POP);
+                    continue;
+                }
+                compile_expr(co, m.a);
+                compile_function(co, m.b);
+                ch_op(ch, OP_SETINDEX);
+                ch_op(ch, OP_POP);
+            } else if is_acc {
+                compile_function(co, m.b);
+                i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
+                ch_op_u16(ch, aop, prop_key_const(co, m.a));
+                ch_op(ch, OP_POP);
+            } else {
+                compile_function(co, m.b);
+                ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+                ch_op(ch, OP_POP);
+            }
+            continue;
+        }
+        if is_static {
+            ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+            if (m.flags & NF_COMPUTED) != 0 {
+                compile_expr(co, m.a);
+                if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+                ch_op(ch, OP_SETINDEX);
+            } else {
+                if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+                ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+            }
+            ch_op(ch, OP_POP);
+        }
+        // instance fields run inside the constructor
+    }
+    // static blocks execute at class creation, in order
+    for i32 i = 0; i < c.kids.len; i++ {
+        Node* m = *(c.kids.items + i);
+        if m.kind == N_STATIC_BLOCK {
+            compile_stmt(co, m.a);
+        }
+    }
+
+    ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+    vec_free(&fields);
+    fs.binds.len = saved_binds;
+    fs.cur_slots = saved_slots;
+    fs.depth--;
 }
 
 // --- statements ------------------------------------------------------------------------
@@ -850,29 +1473,37 @@ private void compile_var_stmt(Compiler* co, Node* n) {
     bool lexical = (n.flags & (NF_LET | NF_CONST)) != 0;
     for i32 i = 0; i < n.kids.len; i++ {
         Node* d = *(n.kids.items + i);
-        if d.a.kind != N_IDENT {
-            cerror(co, d, "destructuring is not supported yet");
-            continue;
-        }
-        i32 li = find_local(co.cur, d.a.name);
-        if li < 0 {
-            cerror(co, d, "unresolved declaration");
-            continue;
-        }
-        if d.b != null {
-            compile_expr(co, d.b);
-            emit_init_binding(co, li);
-        } else if lexical {
-            if (n.flags & NF_CONST) != 0 {
-                cerror(co, d, "const declaration needs an initializer");
+        if d.a.kind == N_IDENT {
+            i32 li = find_local(co.cur, d.a.name);
+            if li < 0 {
+                cerror(co, d, "unresolved declaration");
+                continue;
             }
-            ch_op(&co.cur.ch, OP_UNDEF);
-            emit_init_binding(co, li);
+            if d.b != null {
+                compile_expr(co, d.b);
+                emit_init_binding(co, li);
+            } else if lexical {
+                if (n.flags & NF_CONST) != 0 {
+                    cerror(co, d, "const declaration needs an initializer");
+                }
+                ch_op(&co.cur.ch, OP_UNDEF);
+                emit_init_binding(co, li);
+            }
+            continue;
         }
+        // pattern declarator
+        if d.b == null {
+            cerror(co, d, "destructuring declaration needs an initializer");
+            continue;
+        }
+        compile_expr(co, d.b);
+        compile_destructure(co, d.a, true);
     }
 }
 
-private void compile_block_stmts(Compiler* co, NodeList* list) {
+// Block statement list with optional class-field injection after a
+// leading super() call (constructors only).
+private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields, i32 n_fields) {
     FScope* fs = co.cur;
     fs.depth++;
     i32 saved_binds = fs.binds.len;
@@ -884,26 +1515,18 @@ private void compile_block_stmts(Compiler* co, NodeList* list) {
         if s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0 {
             for i32 j = 0; j < s.kids.len; j++ {
                 Node* d = *(s.kids.items + j);
-                if d.a.kind != N_IDENT { continue; }
-                i32 bi = declare(co, d.a.name, (s.flags & NF_CONST) != 0, true);
-                CBind b = vec_get(&fs.binds, bi);
-                if b.is_cell {
-                    ch_op_u16(&fs.ch, OP_NEWCELL_HOLE, b.slot);
-                } else {
-                    ch_op_u16(&fs.ch, OP_SETHOLE, b.slot);
-                }
+                declare_pattern(co, d.a, (s.flags & NF_CONST) != 0 ? 1 : 0);
             }
+        }
+        if s.kind == N_CLASS && s.name.len > 0 {
+            declare_lexical(co, s.name, false);
         }
     }
     // function declarations bind and initialize first
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if s.kind == N_FUNCTION && s.name.len > 0 {
-            i32 bi = declare(co, s.name, false, false);
-            CBind b = vec_get(&fs.binds, bi);
-            if b.is_cell {
-                ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
-            }
+            declare_plain(co, s.name);
         }
     }
     for i32 i = 0; i < list.len; i++ {
@@ -914,15 +1537,53 @@ private void compile_block_stmts(Compiler* co, NodeList* list) {
             emit_init_binding(co, li);
         }
     }
+
+    bool injected = n_fields == 0;
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if s.kind == N_FUNCTION && s.name.len > 0 { continue; }
+        if !injected {
+            bool first_is_super = i == 0 && s.kind == N_EXPR_STMT && s.a != null
+                && s.a.kind == N_CALL && s.a.a != null && s.a.a.kind == N_SUPER;
+            if first_is_super {
+                compile_stmt(co, s);
+                emit_field_inits(co, fields, n_fields);
+                injected = true;
+                continue;
+            }
+            emit_field_inits(co, fields, n_fields);
+            injected = true;
+        }
         compile_stmt(co, s);
+    }
+    if !injected {
+        emit_field_inits(co, fields, n_fields);
     }
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
     fs.depth--;
+}
+
+private void compile_block_stmts(Compiler* co, NodeList* list) {
+    compile_block_stmts_ex(co, list, null, 0);
+}
+
+private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
+    Chunk* ch = &co.cur.ch;
+    for i32 i = 0; i < n_fields; i++ {
+        Node* m = *(fields + i);
+        ch_op(ch, OP_THIS);
+        if (m.flags & NF_COMPUTED) != 0 {
+            compile_expr(co, m.a);
+            if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+            ch_op(ch, OP_SETINDEX);
+        } else {
+            if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+            ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+        }
+        ch_op(ch, OP_POP);
+    }
 }
 
 private void patch_jumps(Compiler* co, Vec<i32>* jumps, i32 mark, i32 target) {
@@ -931,6 +1592,103 @@ private void patch_jumps(Compiler* co, Vec<i32>* jumps, i32 mark, i32 target) {
         i32 at = vec_pop(jumps);
         ch_patch_to(ch, at, target);
     }
+}
+
+private LoopCtx make_loop_ctx(Compiler* co, bool is_loop) {
+    FScope* fs = co.cur;
+    LoopCtx lc;
+    lc.is_loop = is_loop;
+    lc.label = take_label(co);
+    lc.break_mark = fs.break_jumps.len;
+    lc.cont_mark = fs.cont_jumps.len;
+    lc.fin_depth = fs.finallys.len;
+    return lc;
+}
+
+// for-of / for-in over arrays, strings, and (for-in) object keys.
+private void compile_for_each(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+    bool is_in = n.kind == N_FOR_IN;
+
+    fs.depth++;
+    i32 saved_binds = fs.binds.len;
+    i32 saved_slots = fs.cur_slots;
+
+    compile_expr(co, n.b);
+    i32 jskip = -1;
+    if is_in {
+        jskip = ch_jump(ch, OP_JUMP_NULLISH);
+        ch_op(ch, OP_KEYS);
+    } else {
+        ch_op(ch, OP_CHECK_ITERABLE);
+    }
+    i32 t_obj = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_obj);
+    ch_op(ch, OP_POP);
+    i32 t_idx = alloc_slot(fs);
+    ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(0)));
+    ch_op_u16(ch, OP_SETLOCAL, t_idx);
+    ch_op(ch, OP_POP);
+    i32 t_len = alloc_slot(fs);
+    ch_op_u16(ch, OP_GETLOCAL, t_obj);
+    ch_op_u16(ch, OP_GETPROP, name_const(co, "length"));
+    ch_op_u16(ch, OP_SETLOCAL, t_len);
+    ch_op(ch, OP_POP);
+
+    // loop-variable bindings (declared once; fresh boxes per iteration)
+    i32 bind_start = fs.binds.len;
+    Node* pattern = null;
+    if n.a.kind == N_VAR {
+        Node* d = *(n.a.kids.items);
+        pattern = d.a;
+        declare_pattern(co, pattern, 2);
+    }
+    i32 bind_end = fs.binds.len;
+
+    LoopCtx lc = make_loop_ctx(co, true);
+
+    i32 lcond = ch_pos(ch);
+    ch_op_u16(ch, OP_GETLOCAL, t_idx);
+    ch_op_u16(ch, OP_GETLOCAL, t_len);
+    ch_op(ch, OP_LT);
+    i32 jend = ch_jump(ch, OP_JUMPF);
+
+    // fresh boxes so closures capture per-iteration values
+    for i32 i = bind_start; i < bind_end; i++ {
+        CBind b = vec_get(&fs.binds, i);
+        if b.is_cell {
+            ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot);
+        }
+    }
+    ch_op_u16(ch, OP_GETLOCAL, t_obj);
+    ch_op_u16(ch, OP_GETLOCAL, t_idx);
+    ch_op(ch, OP_GETINDEX);
+    if pattern != null {
+        compile_destructure(co, pattern, true);
+    } else {
+        compile_destructure(co, n.a, false);
+    }
+
+    vec_push(&fs.loops, lc);
+    compile_stmt(co, n.c);
+    ignore vec_pop(&fs.loops);
+
+    i32 lcont = ch_pos(ch);
+    patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+    ch_op_u16(ch, OP_GETLOCAL, t_idx);
+    ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(1)));
+    ch_op(ch, OP_ADD);
+    ch_op_u16(ch, OP_SETLOCAL, t_idx);
+    ch_op(ch, OP_POP);
+    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_patch(ch, jend);
+    if jskip >= 0 { ch_patch(ch, jskip); }
+    patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+
+    fs.binds.len = saved_binds;
+    fs.cur_slots = saved_slots;
+    fs.depth--;
 }
 
 private void compile_stmt(Compiler* co, Node* n) {
@@ -962,17 +1720,13 @@ private void compile_stmt(Compiler* co, Node* n) {
         return;
     }
     if k == N_WHILE {
+        LoopCtx lc = make_loop_ctx(co, true);
         i32 lcond = ch_pos(ch);
         compile_expr(co, n.a);
         i32 jend = ch_jump(ch, OP_JUMPF);
-        LoopCtx lc;
-        lc.is_loop = true;
-        lc.break_mark = fs.break_jumps.len;
-        lc.cont_mark = fs.cont_jumps.len;
-        lc.fin_depth = fs.finallys.len;
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.b);
-        vec_pop(&fs.loops);
+        ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcond);
         ch_op_u16(ch, OP_JUMP, lcond);
         ch_patch(ch, jend);
@@ -980,15 +1734,11 @@ private void compile_stmt(Compiler* co, Node* n) {
         return;
     }
     if k == N_DO_WHILE {
+        LoopCtx lc = make_loop_ctx(co, true);
         i32 lstart = ch_pos(ch);
-        LoopCtx lc;
-        lc.is_loop = true;
-        lc.break_mark = fs.break_jumps.len;
-        lc.cont_mark = fs.cont_jumps.len;
-        lc.fin_depth = fs.finallys.len;
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.a);
-        vec_pop(&fs.loops);
+        ignore vec_pop(&fs.loops);
         i32 lcond = ch_pos(ch);
         patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcond);
         compile_expr(co, n.b);
@@ -1000,19 +1750,13 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.depth++;
         i32 saved_binds = fs.binds.len;
         i32 saved_slots = fs.cur_slots;
+        i32 bind_start = fs.binds.len;
         if n.a != null {
             if n.a.kind == N_VAR {
                 if (n.a.flags & (NF_LET | NF_CONST)) != 0 {
                     for i32 j = 0; j < n.a.kids.len; j++ {
                         Node* d = *(n.a.kids.items + j);
-                        if d.a.kind != N_IDENT { continue; }
-                        i32 bi = declare(co, d.a.name, (n.a.flags & NF_CONST) != 0, true);
-                        CBind b = vec_get(&fs.binds, bi);
-                        if b.is_cell {
-                            ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot);
-                        } else {
-                            ch_op_u16(ch, OP_SETHOLE, b.slot);
-                        }
+                        declare_pattern(co, d.a, (n.a.flags & NF_CONST) != 0 ? 1 : 0);
                     }
                 }
                 compile_var_stmt(co, n.a);
@@ -1021,22 +1765,29 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_op(ch, OP_POP);
             }
         }
+        i32 bind_end = fs.binds.len;
+        LoopCtx lc = make_loop_ctx(co, true);
         i32 lcond = ch_pos(ch);
         i32 jend = -1;
         if n.b != null {
             compile_expr(co, n.b);
             jend = ch_jump(ch, OP_JUMPF);
         }
-        LoopCtx lc;
-        lc.is_loop = true;
-        lc.break_mark = fs.break_jumps.len;
-        lc.cont_mark = fs.cont_jumps.len;
-        lc.fin_depth = fs.finallys.len;
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.d);
-        vec_pop(&fs.loops);
+        ignore vec_pop(&fs.loops);
         i32 lcont = ch_pos(ch);
         patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+        // per-iteration boxes for captured loop variables
+        for i32 i = bind_start; i < bind_end; i++ {
+            CBind b = vec_get(&fs.binds, i);
+            if b.is_cell {
+                ch_op_u16(ch, OP_GETCELL, b.slot);
+                ch_op_u16(ch, OP_SETLOCAL, b.slot);
+                ch_op(ch, OP_POP);
+                ch_op_u16(ch, OP_CELLIFY, b.slot);
+            }
+        }
         if n.c != null {
             compile_expr(co, n.c);
             ch_op(ch, OP_POP);
@@ -1049,25 +1800,47 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.depth--;
         return;
     }
+    if k == N_FOR_OF || k == N_FOR_IN {
+        compile_for_each(co, n);
+        return;
+    }
     if k == N_BREAK || k == N_CONTINUE {
+        i32 li = -1;
         if n.name.len > 0 {
-            cerror(co, n, "labeled break/continue is not supported yet");
-            return;
-        }
-        if fs.loops.len == 0 {
-            cerror(co, n, "break/continue outside a loop");
-            return;
-        }
-        i32 li = fs.loops.len - 1;
-        if k == N_CONTINUE {
-            while li >= 0 {
-                LoopCtx c = vec_get(&fs.loops, li);
-                if c.is_loop { break; }
-                li--;
+            for i32 i = fs.loops.len - 1; i >= 0; i-- {
+                LoopCtx c = vec_get(&fs.loops, i);
+                if c.label.len > 0 && str_equal(c.label, n.name) {
+                    li = i;
+                    break;
+                }
             }
             if li < 0 {
-                cerror(co, n, "continue outside a loop");
+                cerror(co, n, "unknown label");
                 return;
+            }
+            if k == N_CONTINUE {
+                LoopCtx c = vec_get(&fs.loops, li);
+                if !c.is_loop {
+                    cerror(co, n, "continue target is not a loop");
+                    return;
+                }
+            }
+        } else {
+            if fs.loops.len == 0 {
+                cerror(co, n, "break/continue outside a loop");
+                return;
+            }
+            li = fs.loops.len - 1;
+            if k == N_CONTINUE {
+                while li >= 0 {
+                    LoopCtx c = vec_get(&fs.loops, li);
+                    if c.is_loop { break; }
+                    li--;
+                }
+                if li < 0 {
+                    cerror(co, n, "continue outside a loop");
+                    return;
+                }
             }
         }
         LoopCtx lc = vec_get(&fs.loops, li);
@@ -1107,12 +1880,11 @@ private void compile_stmt(Compiler* co, Node* n) {
         compile_stmt(co, n.a);
         ch_op(ch, OP_TRY_POP);
         if fin != null {
-            vec_pop(&fs.finallys);
+            ignore vec_pop(&fs.finallys);
             compile_stmt(co, fin);
         }
         i32 jend = ch_jump(ch, OP_JUMP);
         ch_patch(ch, jtry);
-        // exception value is on the stack here
         if n.b != null {
             Node* cat = n.b;
             i32 jfin = -1;
@@ -1123,20 +1895,10 @@ private void compile_stmt(Compiler* co, Node* n) {
             fs.depth++;
             i32 saved_binds = fs.binds.len;
             i32 saved_slots = fs.cur_slots;
-            if cat.a != null && cat.a.kind == N_IDENT {
-                i32 bi = declare(co, cat.a.name, false, false);
-                CBind b = vec_get(&fs.binds, bi);
-                if b.is_cell {
-                    ch_op_u16(ch, OP_NEWCELL_UNDEF, b.slot);
-                    ch_op_u16(ch, OP_SETCELL, b.slot);
-                } else {
-                    ch_op_u16(ch, OP_SETLOCAL, b.slot);
-                }
-                ch_op(ch, OP_POP);
+            if cat.a != null {
+                declare_pattern(co, cat.a, 2);
+                compile_destructure(co, cat.a, true);
             } else {
-                if cat.a != null {
-                    cerror(co, cat.a, "destructured catch bindings are not supported yet");
-                }
                 ch_op(ch, OP_POP);
             }
             compile_stmt(co, cat.b);
@@ -1144,7 +1906,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             fs.cur_slots = saved_slots;
             fs.depth--;
             if fin != null {
-                vec_pop(&fs.finallys);
+                ignore vec_pop(&fs.finallys);
                 ch_op(ch, OP_TRY_POP);
                 compile_stmt(co, fin);
                 i32 jend2 = ch_jump(ch, OP_JUMP);
@@ -1154,7 +1916,6 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_patch(ch, jend2);
             }
         } else {
-            // try/finally: run finally, rethrow
             compile_stmt(co, fin);
             ch_op(ch, OP_THROW);
         }
@@ -1168,6 +1929,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         ch_op(ch, OP_POP);
         Vec<i32> case_jumps = vec_new<i32>(8);
         i32 default_idx = -1;
+        LoopCtx lc = make_loop_ctx(co, false);
         for i32 i = 0; i < n.kids.len; i++ {
             Node* c = *(n.kids.items + i);
             if c.a == null {
@@ -1181,11 +1943,6 @@ private void compile_stmt(Compiler* co, Node* n) {
             vec_push(&case_jumps, ch_jump(ch, OP_JUMPT));
         }
         i32 jdefault = ch_jump(ch, OP_JUMP);
-        LoopCtx lc;
-        lc.is_loop = false;
-        lc.break_mark = fs.break_jumps.len;
-        lc.cont_mark = fs.cont_jumps.len;
-        lc.fin_depth = fs.finallys.len;
         vec_push(&fs.loops, lc);
         fs.depth++;
         i32 saved_binds = fs.binds.len;
@@ -1206,31 +1963,52 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.binds.len = saved_binds;
         fs.cur_slots = saved_slots;
         fs.depth--;
-        vec_pop(&fs.loops);
+        ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
-        fs.cur_slots--;   // release tmp
+        fs.cur_slots--;
         vec_free(&case_jumps);
         return;
     }
+    if k == N_LABELED {
+        Node* body = n.a;
+        i32 bk = body != null ? body.kind : N_EMPTY;
+        if bk == N_WHILE || bk == N_DO_WHILE || bk == N_FOR || bk == N_FOR_OF
+            || bk == N_FOR_IN || bk == N_SWITCH {
+            co.pending_label = n.name;
+            compile_stmt(co, body);
+            co.pending_label.data = null;
+            co.pending_label.len = 0;
+            return;
+        }
+        LoopCtx lc = make_loop_ctx(co, false);
+        lc.label = n.name;
+        vec_push(&fs.loops, lc);
+        compile_stmt(co, body);
+        ignore vec_pop(&fs.loops);
+        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        return;
+    }
     if k == N_FUNCTION {
-        // function expression statement (named ones bind at block entry)
         compile_function(co, n);
         ch_op(ch, OP_POP);
         return;
     }
-    if k == N_DEBUGGER { return; }
     if k == N_CLASS {
-        cerror(co, n, "classes are not supported yet");
+        if n.name.len > 0 {
+            i32 li = find_local(fs, n.name);
+            compile_class_expr(co, n);
+            if li >= 0 {
+                emit_init_binding(co, li);
+            } else {
+                ch_op(ch, OP_POP);
+            }
+        } else {
+            compile_class_expr(co, n);
+            ch_op(ch, OP_POP);
+        }
         return;
     }
-    if k == N_FOR_OF || k == N_FOR_IN {
-        cerror(co, n, "for-of and for-in are not supported yet");
-        return;
-    }
-    if k == N_LABELED {
-        cerror(co, n, "labeled statements are not supported yet");
-        return;
-    }
+    if k == N_DEBUGGER { return; }
     if k == N_IMPORT || k == N_EXPORT {
         cerror(co, n, "modules are not supported yet");
         return;
@@ -1252,7 +2030,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     str empty;
     empty.data = null;
     empty.len = 0;
-    FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots);
+    FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false);
     co.cur = null;
     fscope_free(&fs);
     return t;

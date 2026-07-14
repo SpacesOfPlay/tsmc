@@ -473,6 +473,22 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     return true;
 }
 
+// Resolves accessor properties through their getter; false = threw.
+bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
+    if !get_prop_atom(vm, objv, a, out) { return false; }
+    if value_is_accessor(*out) {
+        JsAccessor* ac = value_as_accessor(*out);
+        if !value_is_callable(ac.get) {
+            *out = value_undefined();
+            return true;
+        }
+        Value dummy = value_undefined();
+        *out = vm_call_value(vm, ac.get, objv, &dummy, 0);
+        return !vm.has_pending;
+    }
+    return true;
+}
+
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
@@ -485,6 +501,28 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             }
             vm_throw_error(vm, ERR_RANGE, "invalid array length");
             return false;
+        }
+        // a setter anywhere on the chain intercepts the write
+        JsObject* cur = o;
+        while cur != null {
+            Value* pv = props_get(&cur.props, a);
+            if pv != null {
+                if value_is_accessor(*pv) {
+                    JsAccessor* ac = value_as_accessor(*pv);
+                    if value_is_callable(ac.set) {
+                        Value[1] sa = { v };
+                        ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
+                        return !vm.has_pending;
+                    }
+                    return true;   // getter-only property: write ignored
+                }
+                if cur == o {
+                    *pv = v;
+                    return true;
+                }
+                break;
+            }
+            cur = cur.proto;
         }
         js_set_prop(o, a, v);
         return true;
@@ -1043,14 +1081,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
                             vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
                         } else {
-                            while argc < ft.n_params {
-                                vpush(vm, value_undefined());
-                                argc++;
-                            }
-                            while argc > ft.n_params {
-                                vm.sp--;
-                                argc--;
-                            }
+                            normalize_args(vm, ft, argc);
                             i32 base = vm.sp - ft.n_params;
                             for i32 i = ft.n_params; i < ft.n_slots; i++ {
                                 vpush(vm, value_undefined());
@@ -1104,7 +1135,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
                 Value out;
-                if get_prop_atom(vm, vpeek(vm, 0), a, &out) {
+                if vm_get_prop_value(vm, vpeek(vm, 0), a, &out) {
                     vm.sp--;
                     vpush(vm, out);
                 }
@@ -1152,7 +1183,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 u32 a = key_to_atom(vm, key);
                 Value out;
-                if get_prop_atom(vm, objv, a, &out) {
+                if vm_get_prop_value(vm, objv, a, &out) {
                     vm.sp -= 2;
                     vpush(vm, out);
                 }
@@ -1181,7 +1212,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 Value objv = vpeek(vm, 0);
                 Value out;
-                if get_prop_atom(vm, objv, a, &out) {
+                if vm_get_prop_value(vm, objv, a, &out) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
@@ -1197,10 +1228,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     if idx >= 0 {
                         out = js_array_get(value_as_object(objv), idx);
                     } else {
-                        ok = get_prop_atom(vm, objv, key_to_atom(vm, key), &out);
+                        ok = vm_get_prop_value(vm, objv, key_to_atom(vm, key), &out);
                     }
                 } else {
-                    ok = get_prop_atom(vm, objv, key_to_atom(vm, key), &out);
+                    ok = vm_get_prop_value(vm, objv, key_to_atom(vm, key), &out);
                 }
                 if ok {
                     vm.sp -= 2;
@@ -1249,6 +1280,226 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_TRY_POP: { vm.hp--; }
             case OP_THROW: { vm_throw(vm, vpop(vm)); }
+            case OP_SETPROTO: {
+                Value protov = vpop(vm);
+                Value objv = vpeek(vm, 0);
+                if value_is_object(objv) {
+                    JsObject* p = null;
+                    if value_is_object(protov) { p = value_as_object(protov); }
+                    value_as_object(objv).proto = p;
+                }
+            }
+            case OP_DEFGETTER, OP_DEFSETTER: {
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
+                ip += 2;
+                Value fnv2 = vpeek(vm, 0);
+                Value objv = vpeek(vm, 1);
+                PropList* props = null;
+                if value_is_object(objv) { props = &value_as_object(objv).props; }
+                else if value_is_function(objv) { props = &value_as_function(objv).props; }
+                else if value_is_native(objv) { props = &value_as_native(objv).props; }
+                if props != null {
+                    Value* ex = props_get(props, a);
+                    JsAccessor* ac = null;
+                    if ex != null && value_is_accessor(*ex) {
+                        ac = value_as_accessor(*ex);
+                    } else {
+                        ac = js_new_accessor(&vm.heap);
+                        props_set(props, a, value_cell(&ac.head));
+                    }
+                    if op == OP_DEFGETTER { ac.get = fnv2; } else { ac.set = fnv2; }
+                }
+                vm.sp--;
+            }
+            case OP_ARR_APPEND: {
+                Value v = vpeek(vm, 0);
+                Value arrv = vpeek(vm, 1);
+                if value_is_array(arrv) {
+                    JsObject* d = value_as_object(arrv);
+                    js_array_set(d, d.elen, v);
+                }
+                vm.sp--;
+            }
+            case OP_ARR_SPREAD: {
+                Value src = vpeek(vm, 0);
+                Value arrv = vpeek(vm, 1);
+                if value_is_array(arrv) {
+                    JsObject* d = value_as_object(arrv);
+                    if value_is_array(src) {
+                        JsObject* s = value_as_object(src);
+                        for i32 i = 0; i < s.elen; i++ {
+                            js_array_set(d, d.elen, js_array_get(s, i));
+                        }
+                    } else if value_is_string(src) {
+                        i32 len = value_as_string(src).len;
+                        for i32 i = 0; i < len; i++ {
+                            str view = gc_string_view(value_as_string(src));
+                            str one;
+                            one.data = view.data + i;
+                            one.len = 1;
+                            GcString* g = gc_new_string(&vm.heap, one);
+                            js_array_set(d, d.elen, value_cell(&g.head));
+                        }
+                    } else {
+                        vm_throw_error(vm, ERR_TYPE, "value is not spreadable");
+                    }
+                }
+                if !vm.has_pending { vm.sp--; }
+            }
+            case OP_OBJ_SPREAD: {
+                Value src = vpeek(vm, 0);
+                Value dstv = vpeek(vm, 1);
+                if value_is_object(dstv) && value_is_object(src) {
+                    JsObject* d = value_as_object(dstv);
+                    JsObject* s = value_as_object(src);
+                    if (s.obj_flags & OBJF_ARRAY) != 0 {
+                        for i32 i = 0; i < s.elen; i++ {
+                            string ks = format("{}", i);
+                            u32 a2 = atom_intern(&vm.atoms, ks);
+                            free(ks);
+                            js_set_prop(d, a2, js_array_get(s, i));
+                        }
+                    }
+                    for i32 i = 0; i < s.props.len; i++ {
+                        Prop* pr = s.props.items + i;
+                        Value pv = pr.val;
+                        if value_is_accessor(pv) {
+                            if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
+                        }
+                        js_set_prop(d, pr.key, pv);
+                    }
+                }
+                if !vm.has_pending { vm.sp--; }
+            }
+            case OP_OBJ_REST: {
+                Value exv = *(t.consts + rd_u16(code, ip));
+                ip += 2;
+                Value src = vpeek(vm, 0);
+                JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+                vpush(vm, value_cell(&r.head));
+                if value_is_object(src) && value_is_object(exv) {
+                    JsObject* s = value_as_object(src);
+                    JsObject* ex = value_as_object(exv);
+                    for i32 i = 0; i < s.props.len; i++ {
+                        Prop* pr = s.props.items + i;
+                        bool skip = false;
+                        for i32 j = 0; j < ex.elen; j++ {
+                            Value kv = js_array_get(ex, j);
+                            if value_is_int(kv) && cast(u32, value_as_int(kv)) == pr.key {
+                                skip = true;
+                                break;
+                            }
+                        }
+                        if skip { continue; }
+                        Value pv = pr.val;
+                        if value_is_accessor(pv) {
+                            if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
+                        }
+                        js_set_prop(r, pr.key, pv);
+                    }
+                }
+                if !vm.has_pending {
+                    Value rv = vpop(vm);
+                    vm.sp--;
+                    vpush(vm, rv);
+                }
+            }
+            case OP_ARR_SLICE_FROM: {
+                i32 start = rd_u16(code, ip);
+                ip += 2;
+                Value src = vpeek(vm, 0);
+                JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+                vpush(vm, value_cell(&out.head));
+                i32 n = 0;
+                if value_is_array(src) {
+                    JsObject* s = value_as_object(src);
+                    for i32 i = start; i < s.elen; i++ {
+                        js_array_set(out, n, js_array_get(s, i));
+                        n++;
+                    }
+                } else if value_is_string(src) {
+                    i32 len = value_as_string(src).len;
+                    for i32 i = start; i < len; i++ {
+                        str view = gc_string_view(value_as_string(src));
+                        str one;
+                        one.data = view.data + i;
+                        one.len = 1;
+                        GcString* g = gc_new_string(&vm.heap, one);
+                        js_array_set(out, n, value_cell(&g.head));
+                        n++;
+                    }
+                }
+                Value ov = vpop(vm);
+                vm.sp--;
+                vpush(vm, ov);
+            }
+            case OP_CALL_ARRAY, OP_NEW_ARRAY: {
+                if op == OP_NEW_ARRAY {
+                    Value fnv2 = vpeek(vm, 1);
+                    if !value_is_callable(fnv2) {
+                        vm_throw_error(vm, ERR_TYPE, "not a constructor");
+                    } else {
+                        Value protov = ensure_prototype(vm, fnv2);
+                        JsObject* proto = null;
+                        if value_is_object(protov) { proto = value_as_object(protov); }
+                        JsObject* inst = js_new_object(&vm.heap, proto);
+                        // [ctor, arr] -> [ctor, inst, arr]
+                        Value arr = vpeek(vm, 0);
+                        *(vm.stack + vm.sp - 1) = value_cell(&inst.head);
+                        vpush(vm, arr);
+                    }
+                }
+                if !vm.has_pending {
+                    Value arrv = vpeek(vm, 0);
+                    i32 n = 0;
+                    if value_is_array(arrv) { n = value_as_object(arrv).elen; }
+                    if vm.sp + n + 8 >= VM_STACK_MAX {
+                        vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
+                    } else {
+                        JsObject* aobj = value_as_object(arrv);
+                        for i32 i = 0; i < n; i++ {
+                            vpush(vm, js_array_get(aobj, i));
+                        }
+                        // drop the array slot beneath the args
+                        for i32 i = 0; i < n; i++ {
+                            *(vm.stack + vm.sp - n - 1 + i) = *(vm.stack + vm.sp - n + i);
+                        }
+                        vm.sp--;
+                        Value instv = vpeek(vm, n);
+                        Value res = vm_call_stack(vm, n);
+                        if op == OP_NEW_ARRAY && !value_is_object(res) { res = instv; }
+                        vpush(vm, res);
+                    }
+                }
+            }
+            case OP_JUMP_NULLISH: {
+                i32 target = rd_u16(code, ip);
+                ip += 2;
+                if is_nullish(vpeek(vm, 0)) {
+                    vm.sp--;
+                    ip = target;
+                }
+            }
+            case OP_JUMP_NULLISH_METH: {
+                i32 target = rd_u16(code, ip);
+                ip += 2;
+                if is_nullish(vpeek(vm, 1)) {
+                    vm.sp -= 2;
+                    ip = target;
+                }
+            }
+            case OP_CHECK_ITERABLE: {
+                Value v = vpeek(vm, 0);
+                if !value_is_array(v) && !value_is_string(v) {
+                    vm_throw_error(vm, ERR_TYPE, "value is not iterable");
+                }
+            }
+            case OP_KEYS: {
+                Value src = vpeek(vm, 0);
+                JsObject* arr = vm_own_keys(vm, src);
+                vm.sp--;
+                vpush(vm, value_cell(&arr.head));
+            }
             default: {
                 eprint("vm: bad opcode {}\n", op);
                 exit(70);
@@ -1314,6 +1565,71 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     return status;
 }
 
+// Aligns pushed args with the template's slots: fill/trim, or collect
+// surplus into the rest array bound to the last parameter.
+private void normalize_args(VM* vm, FnTemplate* ft, i32 argc) {
+    if ft.has_rest {
+        i32 named = ft.n_params - 1;
+        i32 extra = argc > named ? argc - named : 0;
+        JsObject* rest = js_new_array(&vm.heap, vm.array_proto);
+        for i32 i = 0; i < extra; i++ {
+            js_array_set(rest, i, *(vm.stack + vm.sp - extra + i));
+        }
+        vm.sp -= extra;
+        i32 have = argc - extra;
+        while have < named {
+            vpush(vm, value_undefined());
+            have++;
+        }
+        vpush(vm, value_cell(&rest.head));
+        return;
+    }
+    while argc < ft.n_params {
+        vpush(vm, value_undefined());
+        argc++;
+    }
+    while argc > ft.n_params {
+        vm.sp--;
+        argc--;
+    }
+}
+
+// Own enumerable keys as an array of strings; strings enumerate their
+// indices. Result is unrooted — consume before the next allocation.
+JsObject* vm_own_keys(VM* vm, Value objv) {
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vpush(vm, value_cell(&arr.head));
+    i32 n = 0;
+    if value_is_object(objv) {
+        JsObject* o = value_as_object(objv);
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            for i32 i = 0; i < o.elen; i++ {
+                string s = format("{}", i);
+                GcString* g = gc_new_string(&vm.heap, s);
+                free(s);
+                js_array_set(arr, n, value_cell(&g.head));
+                n++;
+            }
+        }
+        for i32 i = 0; i < o.props.len; i++ {
+            GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, (o.props.items + i).key));
+            js_array_set(arr, n, value_cell(&g.head));
+            n++;
+        }
+    } else if value_is_string(objv) {
+        i32 len = value_as_string(objv).len;
+        for i32 i = 0; i < len; i++ {
+            string s = format("{}", i);
+            GcString* g = gc_new_string(&vm.heap, s);
+            free(s);
+            js_array_set(arr, n, value_cell(&g.head));
+            n++;
+        }
+    }
+    vm.sp--;
+    return arr;
+}
+
 // Stack already holds fn, this, args. Pops them; returns the result.
 // On throw, pending stays set and undefined comes back.
 Value vm_call_stack(VM* vm, i32 argc) {
@@ -1338,14 +1654,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
         vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
         return value_undefined();
     }
-    while argc < ft.n_params {
-        vpush(vm, value_undefined());
-        argc++;
-    }
-    while argc > ft.n_params {
-        vm.sp--;
-        argc--;
-    }
+    normalize_args(vm, ft, argc);
     i32 base = vm.sp - ft.n_params;
     for i32 i = ft.n_params; i < ft.n_slots; i++ {
         vpush(vm, value_undefined());
@@ -1409,7 +1718,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
     if d.n_errors == 0 {
         i32 rmark = gc_root_mark(&vm.heap);
         Compiler co;
-        compiler_init(&co, &d, &vm.heap, &vm.atoms);
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
         FnTemplate* t = compile_program(&co, prog);
         vec_push(&vm.troots, t);
         gc_root_reset(&vm.heap, rmark);
