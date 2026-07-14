@@ -22,11 +22,23 @@ struct Diag {
 struct DiagList {
     Vec<Diag> list;
     i32 n_errors;
+    i32 muted;          // > 0 while parsing speculatively
+    i32 n_suppressed;   // adds dropped while muted
 }
 
 void diags_init(DiagList* d) {
     vec_init<Diag>(&d.list, 8);
     d.n_errors = 0;
+    d.muted = 0;
+    d.n_suppressed = 0;
+}
+
+void diags_mute(DiagList* d) {
+    d.muted++;
+}
+
+void diags_unmute(DiagList* d) {
+    d.muted--;
 }
 
 void diags_free(DiagList* d) {
@@ -40,6 +52,10 @@ void diags_free(DiagList* d) {
 
 // The message is copied; callers keep ownership of theirs.
 void diag_add(DiagList* d, i32 severity, Span span, str message) {
+    if d.muted > 0 {
+        d.n_suppressed++;
+        return;
+    }
     u8* copy = alloc<u8>(message.len + 1);
     if message.len > 0 { memcpy(copy, message.data, message.len); }
     Diag dg;

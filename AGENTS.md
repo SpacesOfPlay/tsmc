@@ -117,9 +117,10 @@ project-specific.
 
 ## ts-minc conventions
 
-- **Tagged unions for variants.** Tokens, AST nodes, and interpreter
-  values use `union` with exhaustive `switch` — not integer tag
-  constants.
+- **Kinds and variants.** Wide, growing variant sets — token kinds,
+  AST nodes — use `enum` kinds over shared structs; consumers switch
+  on the kinds they handle. Tagged unions serve small, closed variant
+  sets where exhaustiveness pays (Option/Result-style returns).
 - **Two allocation worlds.** Compile-phase data (tokens, AST) lives in
   arenas (`lib/mem.mc`), one per phase, freed wholesale. Runtime JS
   values live in the GC heap (`src/gc.mc`) and are never freed
