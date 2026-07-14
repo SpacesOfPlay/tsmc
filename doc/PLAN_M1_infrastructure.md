@@ -23,11 +23,6 @@ assertions in `test/helpers/check.mc`.
   probe logic — minc generics parameterize the value type only; a
   generic key would need hash/eq abstraction that isn't worth it for
   two instances. Keys are borrowed; callers own key lifetime.
-- **Generics constraint** (compiler 0.9.8): a field or local of nested
-  generic type (`Slot<V>*`) does not unify inside generic functions.
-  Generic struct fields must use the type parameter directly (`V*`),
-  hence the parallel-array map layout. Locals infer with `var`;
-  generic-to-generic calls pass `<V>` explicitly.
 - **Atoms**: `StrMap<u32>` from name to id, `Vec<str>` from id to name.
   The table owns copied name bytes (plain allocations, freed on table
   teardown). Atoms are never collected — acceptable until dynamic
