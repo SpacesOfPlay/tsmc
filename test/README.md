@@ -6,8 +6,9 @@ Run everything with `./build.ps1 test` (Windows) or `./build.sh test`
 ## Tiers
 
 - **`unit/*.mc`** — standalone minc programs, one per module under test.
-  Each compiles on its own and exits 0 on pass. Print a short diagnostic
-  to stderr before returning nonzero so failures are readable.
+  Each compiles on its own and exits 0 on pass. Shared assertions live
+  in `helpers/check.mc` (outside the runner's glob); tests import it
+  with a relative path and return `check_done()` from `main`.
 - **CLI smoke** — flag handling and exit codes, checked inline by the
   build scripts.
 - **`run/<name>.ts` + `run/<name>.expected`** — golden end-to-end tests.
