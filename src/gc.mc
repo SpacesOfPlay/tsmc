@@ -8,6 +8,8 @@
 import vec;
 import value;
 
+// Kinds 0..1 are built in; higher kinds belong to the runtime layer,
+// which registers tracer/finalizer hooks for them.
 enum GcKind {
     GC_STRING,
     GC_PAIR,
@@ -21,6 +23,9 @@ struct GcCell {
 }
 
 type CellPtr = GcCell*;
+type GcTraceFn = fn(GcHeap*, GcCell*): void;
+type GcFinalizeFn = fn(GcCell*): void;
+type GcMarkRootsFn = fn(GcHeap*, void*): void;
 
 const i64 GC_MIN_THRESHOLD = 262144;
 
@@ -33,6 +38,10 @@ struct GcHeap {
     i64 n_collections;
     Vec<Value> roots;
     Vec<CellPtr> mark_stack;
+    GcTraceFn tracer;         // child marking for runtime kinds
+    GcFinalizeFn finalizer;   // frees a cell's non-GC allocations
+    GcMarkRootsFn mark_roots; // extra roots (VM stack, globals, …)
+    void* mark_ctx;
 }
 
 void gc_init(GcHeap* h) {
@@ -44,12 +53,17 @@ void gc_init(GcHeap* h) {
     h.n_collections = 0;
     vec_init<Value>(&h.roots, 16);
     vec_init<CellPtr>(&h.mark_stack, 64);
+    h.tracer = null;
+    h.finalizer = null;
+    h.mark_roots = null;
+    h.mark_ctx = null;
 }
 
 void gc_destroy(GcHeap* h) {
     GcCell* c = h.all;
     while c != null {
         GcCell* n = c.next;
+        if h.finalizer != null { h.finalizer(c); }
         free(c);
         c = n;
     }
@@ -98,8 +112,12 @@ private void gc_trace(GcHeap* h, GcCell* c) {
             gc_mark_value(h, p.b);
         }
         default: {
-            eprint("gc: cell kind {} has no trace\n", c.kind);
-            exit(70);
+            if h.tracer != null {
+                h.tracer(h, c);
+            } else {
+                eprint("gc: cell kind {} has no trace\n", c.kind);
+                exit(70);
+            }
         }
     }
 }
@@ -107,6 +125,7 @@ private void gc_trace(GcHeap* h, GcCell* c) {
 // --- collect -------------------------------------------------------
 
 void gc_collect(GcHeap* h) {
+    if h.mark_roots != null { h.mark_roots(h, h.mark_ctx); }
     for i32 i = 0; i < h.roots.len; i++ {
         gc_mark_value(h, vec_get(&h.roots, i));
     }
@@ -127,6 +146,7 @@ void gc_collect(GcHeap* h) {
             link = &c.next;
         } else {
             *link = c.next;
+            if h.finalizer != null { h.finalizer(c); }
             free(c);
         }
     }

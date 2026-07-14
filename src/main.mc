@@ -1,15 +1,14 @@
 // main.mc — tsmc CLI entry point.
 //
-// Exit codes: 0 success, 1 script error, 2 usage or I/O error,
-// 3 feature not implemented yet.
+// Exit codes: 0 success, 1 uncaught exception, 2 usage, I/O, or
+// compile errors.
 
 import str;
 import file;
+import vm;
 
 const i32 EXIT_OK = 0;
-const i32 EXIT_SCRIPT_ERROR = 1;
 const i32 EXIT_USAGE = 2;
-const i32 EXIT_UNIMPLEMENTED = 3;
 
 private void print_usage() {
     print("usage: tsmc <script.ts>\n");
@@ -40,7 +39,13 @@ i32 main() {
     }
     defer free(src.data);
 
-    // Interpreter pipeline lands in later milestones.
-    eprint("tsmc: cannot run '{}': interpreter not implemented\n", arg);
-    return EXIT_UNIMPLEMENTED;
+    str source;
+    source.data = src.data;
+    source.len = src.len;
+
+    VM m;
+    vm_init(&m);
+    i32 status = vm_run_source(&m, source, arg);
+    vm_destroy(&m);
+    return status;
 }

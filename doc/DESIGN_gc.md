@@ -7,8 +7,12 @@ Decision: **precise, non-moving mark-sweep**, designed in from M1.
 - Correct collection of arbitrary object graphs, including cycles.
 - Stable addresses: a cell never moves, so native code can hold raw
   pointers across allocations as long as the cell is rooted.
-- No finalizers: every cell is one allocation, freed by `free()` alone.
-- All state hangs off `GcHeap` (inside the runtime struct); no globals.
+- Minimal destructors: cells prefer one inline allocation, but kinds
+  with dynamic parts (property tables, element arrays) register a
+  finalizer hook that frees them at sweep and teardown.
+- All state hangs off `GcHeap` (inside the runtime struct); no
+  globals. Runtime kinds plug in via tracer/finalizer/mark-roots
+  hooks so the heap stays generic.
 
 Non-goals for now: moving/compacting, generations, incremental marking.
 The design leaves room (cell header has spare bits; allocation is

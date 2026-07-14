@@ -1,0 +1,193 @@
+// bytecode.mc — opcode set, function templates, chunk writer.
+//
+// One-byte opcodes, little-endian u16 operands, absolute jumps.
+// Templates are plain allocations owned by the VM; their constants
+// are marked as GC roots by the VM's mark hook.
+
+import vec;
+import value;
+
+enum Op {
+    OP_CONST,        // u16 const idx
+    OP_UNDEF, OP_NULL, OP_TRUE, OP_FALSE,
+    OP_POP, OP_DUP, OP_DUP2,
+    OP_THIS,
+
+    OP_GETLOCAL,     // u16 slot
+    OP_SETLOCAL,     // u16 slot; keeps value on stack
+    OP_GETLOCAL_CHK, // TDZ-checked read
+    OP_SETHOLE,      // u16 slot := hole
+    OP_NEWCELL_UNDEF,// u16 slot := box(undefined)
+    OP_NEWCELL_HOLE, // u16 slot := box(hole)
+    OP_CELLIFY,      // u16 slot := box(slot)
+    OP_GETCELL, OP_SETCELL, OP_GETCELL_CHK,      // u16 slot holding a box
+    OP_GETUPVAL, OP_SETUPVAL, OP_GETUPVAL_CHK,   // u16 upvalue index
+    OP_GETGLOBAL,    // u16 const idx (name string); throws when missing
+    OP_GETGLOBAL_SOFT,   // pushes undefined when missing (typeof)
+    OP_SETGLOBAL,    // u16 const idx; keeps value
+
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
+    OP_NEG, OP_TONUM,
+    OP_NOT, OP_BITNOT, OP_TYPEOF,
+    OP_EQ, OP_NEQ, OP_SEQ, OP_SNEQ,
+    OP_LT, OP_GT, OP_LE, OP_GE,
+    OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_USHR,
+    OP_INSTANCEOF, OP_IN,
+
+    OP_JUMP,         // u16 target
+    OP_JUMPF,        // pop; jump when falsy
+    OP_JUMPT,        // pop; jump when truthy
+    OP_JF_KEEP,      // falsy: jump, keep; else pop      (&&)
+    OP_JT_KEEP,      // truthy: jump, keep; else pop     (||)
+    OP_JNN_KEEP,     // not nullish: jump, keep; else pop (??)
+
+    OP_CLOSURE,      // u16 sub-template idx
+    OP_CALL,         // u16 argc; stack: fn this args...
+    OP_NEW,          // u16 argc; stack: ctor args...
+    OP_RETURN,
+
+    OP_NEWOBJ,
+    OP_NEWARR,       // u16 element count popped
+    OP_GETPROP,      // u16 const idx (name)
+    OP_SETPROP,      // u16 const idx; pops obj, keeps value
+    OP_GETINDEX, OP_SETINDEX,
+    OP_GETMETHOD,    // u16 const idx; pops obj, pushes fn then obj
+    OP_GETMETHOD_DYN,// pops key, obj; pushes fn then obj
+    OP_DELPROP,      // u16 const idx
+    OP_DELINDEX,
+
+    OP_TRY_PUSH,     // u16 catch target
+    OP_TRY_POP,
+    OP_THROW
+}
+
+struct TmplUpval {
+    bool from_parent_slot;   // else from parent's upvalues
+    i32 index;
+}
+
+struct FnTemplate {
+    str name;            // owned copy
+    i32 n_params;
+    i32 n_slots;
+    u8* code;
+    i32 code_len;
+    Value* consts;       // GC-rooted via the VM mark hook
+    i32 n_consts;
+    TmplUpval* upvals;
+    i32 n_upvals;
+    FnTemplate** subs;
+    i32 n_subs;
+}
+
+type TmplPtr = FnTemplate*;
+
+struct Chunk {
+    Vec<u8> code;
+    Vec<Value> consts;
+    Vec<TmplUpval> upvals;
+    Vec<TmplPtr> subs;
+}
+
+void chunk_init(Chunk* ch) {
+    vec_init<u8>(&ch.code, 64);
+    vec_init<Value>(&ch.consts, 8);
+    vec_init<TmplUpval>(&ch.upvals, 4);
+    vec_init<TmplPtr>(&ch.subs, 4);
+}
+
+void ch_op(Chunk* ch, i32 op) {
+    vec_push(&ch.code, cast(u8, op));
+}
+
+void ch_u16(Chunk* ch, i32 v) {
+    vec_push(&ch.code, cast(u8, v));
+    vec_push(&ch.code, cast(u8, v >> 8));
+}
+
+void ch_op_u16(Chunk* ch, i32 op, i32 v) {
+    ch_op(ch, op);
+    ch_u16(ch, v);
+}
+
+i32 ch_add_const(Chunk* ch, Value v) {
+    vec_push(&ch.consts, v);
+    return ch.consts.len - 1;
+}
+
+// Emits a jump with a placeholder target; returns the patch position.
+i32 ch_jump(Chunk* ch, i32 op) {
+    ch_op(ch, op);
+    i32 at = ch.code.len;
+    ch_u16(ch, 0xFFFF);
+    return at;
+}
+
+void ch_patch(Chunk* ch, i32 at) {
+    i32 target = ch.code.len;
+    vec_set(&ch.code, at, cast(u8, target));
+    vec_set(&ch.code, at + 1, cast(u8, target >> 8));
+}
+
+void ch_patch_to(Chunk* ch, i32 at, i32 target) {
+    vec_set(&ch.code, at, cast(u8, target));
+    vec_set(&ch.code, at + 1, cast(u8, target >> 8));
+}
+
+i32 ch_pos(Chunk* ch) {
+    return ch.code.len;
+}
+
+// Moves the chunk's contents into a heap-owned template.
+FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots) {
+    FnTemplate* t = new(FnTemplate);
+    if name.len > 0 {
+        u8* nb = alloc<u8>(name.len);
+        memcpy(nb, name.data, name.len);
+        t.name.data = nb;
+        t.name.len = name.len;
+    }
+    t.n_params = n_params;
+    t.n_slots = n_slots;
+    t.code_len = ch.code.len;
+    t.code = alloc<u8>(ch.code.len + 1);
+    memcpy(t.code, ch.code.data, ch.code.len);
+    t.n_consts = ch.consts.len;
+    if t.n_consts > 0 {
+        t.consts = alloc<Value>(t.n_consts);
+        for i32 i = 0; i < t.n_consts; i++ {
+            *(t.consts + i) = vec_get(&ch.consts, i);
+        }
+    }
+    t.n_upvals = ch.upvals.len;
+    if t.n_upvals > 0 {
+        t.upvals = alloc<TmplUpval>(t.n_upvals);
+        for i32 i = 0; i < t.n_upvals; i++ {
+            *(t.upvals + i) = vec_get(&ch.upvals, i);
+        }
+    }
+    t.n_subs = ch.subs.len;
+    if t.n_subs > 0 {
+        t.subs = cast(FnTemplate**, alloc(cast(i64, t.n_subs) * 8));
+        for i32 i = 0; i < t.n_subs; i++ {
+            *(t.subs + i) = vec_get(&ch.subs, i);
+        }
+    }
+    vec_free(&ch.code);
+    vec_free(&ch.consts);
+    vec_free(&ch.upvals);
+    vec_free(&ch.subs);
+    return t;
+}
+
+void template_free(FnTemplate* t) {
+    for i32 i = 0; i < t.n_subs; i++ {
+        template_free(*(t.subs + i));
+    }
+    if t.name.data != null { free(t.name.data); }
+    free(t.code);
+    if t.consts != null { free(t.consts); }
+    if t.upvals != null { free(t.upvals); }
+    if t.subs != null { free(t.subs); }
+    free(t);
+}
