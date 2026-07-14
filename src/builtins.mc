@@ -20,6 +20,10 @@ private VM* as_vm(void* p) {
     return cast(VM*, p);
 }
 
+private bool bi_nullish(Value v) {
+    return value_is_null(v) || value_is_undefined(v);
+}
+
 private Value arg_at(Value* args, i32 argc, i32 i) {
     if i < argc { return *(args + i); }
     return value_undefined();
@@ -2034,14 +2038,24 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
     return vm_pop_ret(vm, value_cell(&r.head));
 }
 
+private Value nat_return_this(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return thisv;
+}
+
 private Value make_index_iterator(VM* vm, Value src) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, src);
     JsObject* it = js_new_object(&vm.heap, vm.object_proto);
-    vm_push(vm, value_cell(&it.head));
+    gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
     nx.env0 = src;
     nx.env1 = value_int(0);
     js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
-    return vm_pop_ret(vm, value_cell(&it.head));
+    // an iterator is itself iterable
+    JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
+    js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&it.head);
 }
 
 private Value nat_arr_symiter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2411,6 +2425,762 @@ private Value nat_queue_microtask(void* vmp, Value callee, Value thisv, Value* a
     return value_undefined();
 }
 
+// --- Map and Set ------------------------------------------------------------------
+
+// Finds the live slot index of key, or -1.
+private i32 map_find(JsMap* mp, Value key) {
+    for i32 i = 0; i < mp.len; i++ {
+        if *(mp.live + i) && js_same_value_zero(*(mp.keys + i), key) { return i; }
+    }
+    return -1;
+}
+
+private void map_put(JsMap* mp, Value key, Value val) {
+    i32 at = map_find(mp, key);
+    if at >= 0 {
+        *(mp.vals + at) = val;
+        return;
+    }
+    map_reserve(mp);
+    *(mp.keys + mp.len) = key;
+    *(mp.vals + mp.len) = val;
+    *(mp.live + mp.len) = true;
+    mp.len++;
+    mp.count++;
+}
+
+private JsMap* this_map(VM* vm, Value thisv) {
+    if value_is_map(thisv) { return value_as_map(thisv); }
+    vm_throw_error(vm, ERR_TYPE, "receiver is not a Map or Set");
+    return null;
+}
+
+private Value make_map(VM* vm, Value iterable, bool is_set) {
+    JsMap* mp = js_new_map(&vm.heap, is_set ? vm_set_proto(vm) : vm_map_proto(vm), is_set);
+    if bi_nullish(iterable) { return value_cell(&mp.head); }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&mp.head));
+    if value_is_array(iterable) {
+        JsObject* a = value_as_object(iterable);
+        for i32 i = 0; i < a.elen; i++ {
+            Value e = js_array_get(a, i);
+            if is_set {
+                map_put(mp, e, value_undefined());
+            } else if value_is_array(e) {
+                JsObject* pair = value_as_object(e);
+                map_put(mp, js_array_get(pair, 0), js_array_get(pair, 1));
+            }
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&mp.head);
+}
+
+private Value nat_map_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_map(as_vm(vmp), arg_at(args, argc, 0), false);
+}
+
+private Value nat_set_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_map(as_vm(vmp), arg_at(args, argc, 0), true);
+}
+
+private Value nat_map_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    map_put(mp, arg_at(args, argc, 0), arg_at(args, argc, 1));
+    return thisv;
+}
+
+private Value nat_set_add(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    map_put(mp, arg_at(args, argc, 0), value_undefined());
+    return thisv;
+}
+
+private Value nat_map_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    i32 at = map_find(mp, arg_at(args, argc, 0));
+    if at < 0 { return value_undefined(); }
+    return *(mp.vals + at);
+}
+
+private Value nat_map_has(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    return value_bool(map_find(mp, arg_at(args, argc, 0)) >= 0);
+}
+
+private Value nat_map_delete(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    i32 at = map_find(mp, arg_at(args, argc, 0));
+    if at < 0 { return value_bool(false); }
+    *(mp.live + at) = false;
+    mp.count--;
+    return value_bool(true);
+}
+
+private Value nat_map_clear(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    mp.len = 0;
+    mp.count = 0;
+    return value_undefined();
+}
+
+private Value nat_map_size(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_int(0); }
+    return value_int(mp.count);
+}
+
+private Value nat_map_foreach(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    for i32 i = 0; i < mp.len; i++ {
+        if !*(mp.live + i) { continue; }
+        Value key = *(mp.keys + i);
+        Value val = mp.is_set ? key : *(mp.vals + i);
+        Value[3] ca = { val, key, thisv };
+        ignore vm_call_value(vm, fun, value_undefined(), &ca[0], 3);
+        if vm.has_pending { break; }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// Snapshot entries into an array (keys, values, or [k,v] pairs).
+private Value map_collect(VM* vm, JsMap* mp, i32 mode) {
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&arr.head));
+    i32 n = 0;
+    for i32 i = 0; i < mp.len; i++ {
+        if !*(mp.live + i) { continue; }
+        Value key = *(mp.keys + i);
+        if mode == 0 {
+            js_array_set(arr, n, key);
+        } else if mode == 1 {
+            js_array_set(arr, n, mp.is_set ? key : *(mp.vals + i));
+        } else {
+            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+            js_array_set(arr, n, value_cell(&pair.head));
+            js_array_set(pair, 0, key);
+            js_array_set(pair, 1, mp.is_set ? key : *(mp.vals + i));
+        }
+        n++;
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&arr.head);
+}
+
+private Value nat_map_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    return make_index_iterator(vm, map_collect(vm, mp, 0));
+}
+
+private Value nat_map_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    return make_index_iterator(vm, map_collect(vm, mp, 1));
+}
+
+private Value nat_map_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    return make_index_iterator(vm, map_collect(vm, mp, 2));
+}
+
+// --- Date -------------------------------------------------------------------------------
+
+private f64 date_ms(VM* vm, Value thisv) {
+    if !value_is_object(thisv) { return 0.0 / 0.0; }
+    Value t;
+    if js_get_prop(value_as_object(thisv), bi_atom(vm, "%t"), &t) {
+        return js_to_number(t);
+    }
+    return 0.0 / 0.0;
+}
+
+private bool is_leap(i64 y) {
+    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+private i32 days_in_month(i64 y, i32 m) {
+    i32[12] dm = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if m == 1 && is_leap(y) { return 29; }
+    return dm[m];
+}
+
+struct DateParts {
+    i64 year;
+    i32 month;
+    i32 day;
+    i32 hour;
+    i32 min;
+    i32 sec;
+    i32 ms;
+    i32 wday;
+}
+
+// Decomposes a UTC millisecond timestamp.
+private DateParts date_decompose(f64 t) {
+    DateParts d;
+    i64 ms_total = cast(i64, t);
+    i64 days = ms_total / 86400000;
+    i64 rem = ms_total % 86400000;
+    if rem < 0 { rem += 86400000; days--; }
+    d.ms = cast(i32, rem % 1000);
+    rem = rem / 1000;
+    d.sec = cast(i32, rem % 60);
+    rem = rem / 60;
+    d.min = cast(i32, rem % 60);
+    d.hour = cast(i32, rem / 60);
+    d.wday = cast(i32, ((days % 7) + 11) % 7);   // 1970-01-01 was Thursday(4)
+    i64 y = 1970;
+    while true {
+        i64 dy = is_leap(y) ? 366 : 365;
+        if days >= dy { days -= dy; y++; }
+        else if days < 0 { y--; days += is_leap(y) ? 366 : 365; }
+        else { break; }
+    }
+    d.year = y;
+    i32 mo = 0;
+    while true {
+        i32 dim = days_in_month(y, mo);
+        if days >= dim { days -= dim; mo++; }
+        else { break; }
+    }
+    d.month = mo;
+    d.day = cast(i32, days) + 1;
+    return d;
+}
+
+private f64 date_compose(i64 y, i32 mo, i32 day, i32 hr, i32 mi, i32 se, i32 mms) {
+    while mo < 0 { mo += 12; y--; }
+    while mo >= 12 { mo -= 12; y++; }
+    i64 days = 0;
+    if y >= 1970 {
+        for i64 yy = 1970; yy < y; yy++ { days += is_leap(yy) ? 366 : 365; }
+    } else {
+        for i64 yy = y; yy < 1970; yy++ { days -= is_leap(yy) ? 366 : 365; }
+    }
+    for i32 m = 0; m < mo; m++ { days += days_in_month(y, m); }
+    days += day - 1;
+    return cast(f64, days) * 86400000.0 + cast(f64, hr) * 3600000.0
+        + cast(f64, mi) * 60000.0 + cast(f64, se) * 1000.0 + cast(f64, mms);
+}
+
+private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* d;
+    if value_is_object(thisv) { d = value_as_object(thisv); }
+    else { d = js_new_object(&vm.heap, vm_date_proto(vm)); }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&d.head));
+    f64 t;
+    if argc == 0 {
+        t = vm_now_millis(vm);
+    } else if argc == 1 {
+        t = js_to_number(*(args));
+    } else {
+        i64 y = cast(i64, js_to_number(*(args)));
+        i32 mo = to_int_arg(arg_at(args, argc, 1));
+        i32 day = argc > 2 ? to_int_arg(*(args + 2)) : 1;
+        i32 hr = argc > 3 ? to_int_arg(*(args + 3)) : 0;
+        i32 mi = argc > 4 ? to_int_arg(*(args + 4)) : 0;
+        i32 se = argc > 5 ? to_int_arg(*(args + 5)) : 0;
+        i32 mms = argc > 6 ? to_int_arg(*(args + 6)) : 0;
+        t = date_compose(y, mo, day, hr, mi, se, mms);
+    }
+    js_set_prop(d, bi_atom(vm, "%t"), value_number(t));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&d.head);
+}
+
+private Value nat_date_now(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return js_number_value(vm_now_millis(vm));
+}
+
+private Value nat_date_gettime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return js_number_value(date_ms(vm, thisv));
+}
+
+private Value nat_date_getfullyear(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return js_number_value(cast(f64, date_decompose(date_ms(vm, thisv)).year));
+}
+private Value nat_date_getmonth(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).month);
+}
+private Value nat_date_getdate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).day);
+}
+private Value nat_date_getday(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).wday);
+}
+private Value nat_date_gethours(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).hour);
+}
+private Value nat_date_getminutes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).min);
+}
+private Value nat_date_getseconds(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).sec);
+}
+private Value nat_date_getms(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).ms);
+}
+
+private void pad2(str_buf* sb, i32 v) {
+    if v < 10 { str_buf_add(sb, "0"); }
+    string s = format("{}", v);
+    str_buf_add(sb, s);
+    free(s);
+}
+
+private Value nat_date_toiso(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    DateParts d = date_decompose(date_ms(vm, thisv));
+    str_buf sb;
+    str_buf_init(&sb);
+    string y = format("{}", d.year);
+    if d.year < 1000 { str_buf_add(&sb, "0"); }
+    if d.year < 100 { str_buf_add(&sb, "0"); }
+    if d.year < 10 { str_buf_add(&sb, "0"); }
+    str_buf_add(&sb, y);
+    free(y);
+    str_buf_add(&sb, "-");
+    pad2(&sb, d.month + 1);
+    str_buf_add(&sb, "-");
+    pad2(&sb, d.day);
+    str_buf_add(&sb, "T");
+    pad2(&sb, d.hour);
+    str_buf_add(&sb, ":");
+    pad2(&sb, d.min);
+    str_buf_add(&sb, ":");
+    pad2(&sb, d.sec);
+    str_buf_add(&sb, ".");
+    if d.ms < 100 { str_buf_add(&sb, "0"); }
+    if d.ms < 10 { str_buf_add(&sb, "0"); }
+    string mss = format("{}", d.ms);
+    str_buf_add(&sb, mss);
+    free(mss);
+    str_buf_add(&sb, "Z");
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+// --- RegExp -----------------------------------------------------------------------------
+
+private Value nat_regexp_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value pat = arg_at(args, argc, 0);
+    if vm_is_regexp(vm, pat) && argc < 2 { return pat; }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value src;
+    if vm_is_regexp(vm, pat) {
+        ignore js_get_prop(value_as_object(pat), vm_atom(vm, "source"), &src);
+    } else if value_is_undefined(pat) {
+        src = new_str(vm, "");
+    } else {
+        src = js_to_string_value(vm, pat);
+    }
+    gc_root(&vm.heap, src);
+    Value flagsv = arg_at(args, argc, 1);
+    str flags = "";
+    if !value_is_undefined(flagsv) {
+        Value fv = js_to_string_value(vm, flagsv);
+        gc_root(&vm.heap, fv);
+        flags = sview(fv);
+    }
+    Value re = vm_new_regexp(vm, sview(src), flags);
+    gc_root_reset(&vm.heap, rm);
+    return re;
+}
+
+// Runs the compiled prog; on match builds a result array with index +
+// input, advances lastIndex for global/sticky. Returns null value on
+// no match. `re` and `subject` stay rooted by the caller.
+private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
+    RegexProg* prog = vm_regexp_prog(vm, re);
+    if prog == null { return value_null(); }
+    str s = sview(subjectv);
+    i32 start = 0;
+    Value liv;
+    if js_get_prop(value_as_object(re), vm_atom_lastindex(vm), &liv) {
+        if regex_is_global(prog) || regex_is_sticky(prog) { start = to_int_arg(liv); }
+    }
+    if start < 0 { start = 0; }
+    i32 ncap = 2 * (regex_ngroups(prog) + 1);
+    i32* caps = alloc<i32>(ncap);
+    bool ok = regex_exec(prog, s, start, caps);
+    if !ok {
+        free(caps);
+        if regex_is_global(prog) || regex_is_sticky(prog) {
+            js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
+        }
+        return value_null();
+    }
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&arr.head));
+    i32 ng = regex_ngroups(prog);
+    for i32 g = 0; g <= ng; g++ {
+        i32 gs = *(caps + 2 * g);
+        i32 ge = *(caps + 2 * g + 1);
+        if gs < 0 {
+            js_array_set(arr, g, value_undefined());
+        } else {
+            str sub;
+            sub.data = s.data + gs;
+            sub.len = ge - gs;
+            js_array_set(arr, g, new_str(vm, sub));
+        }
+    }
+    js_set_prop(arr, vm_atom_index(vm), value_int(*(caps + 0)));
+    js_set_prop(arr, bi_atom(vm, "input"), subjectv);
+    if regex_is_global(prog) || regex_is_sticky(prog) {
+        js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(*(caps + 1)));
+    }
+    free(caps);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&arr.head);
+}
+
+private Value nat_regexp_exec(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !vm_is_regexp(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "exec on a non-regexp");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_regexp_test(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !vm_is_regexp(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "test on a non-regexp");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2);
+    gc_root_reset(&vm.heap, rm);
+    return value_bool(!value_is_null(r));
+}
+
+private Value nat_regexp_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value src;
+    Value flg;
+    ignore js_get_prop(value_as_object(thisv), vm_atom(vm, "source"), &src);
+    ignore js_get_prop(value_as_object(thisv), vm_atom(vm, "flags"), &flg);
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "/");
+    if value_is_string(src) { str_buf_add(&sb, sview(src)); }
+    str_buf_add(&sb, "/");
+    if value_is_string(flg) { str_buf_add(&sb, sview(flg)); }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// String.prototype.match / matchAll / search / split(regex) /
+// replace(regex): coerce a RegExp argument and drive exec.
+
+private Value str_regexp_arg(VM* vm, Value v) {
+    if vm_is_regexp(vm, v) { return v; }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, v);
+    gc_root(&vm.heap, sv2);
+    Value re = vm_new_regexp(vm, sview(sv2), "");
+    gc_root_reset(&vm.heap, rm);
+    return re;
+}
+
+private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    Value re = str_regexp_arg(vm, arg_at(args, argc, 0));
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, re);
+    RegexProg* prog = vm_regexp_prog(vm, re);
+    if prog != null && regex_is_global(prog) {
+        // return an array of all whole matches
+        JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&out.head));
+        js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
+        i32 n = 0;
+        i32 guard = 0;
+        while guard < 1000000 {
+            guard++;
+            Value mv = regexp_exec_impl(vm, re, sv2);
+            if value_is_null(mv) { break; }
+            gc_root(&vm.heap, mv);
+            Value whole = js_array_get(value_as_object(mv), 0);
+            js_array_set(out, n, whole);
+            n++;
+            // advance past a zero-width match so lastIndex progresses
+            if value_is_string(whole) && value_as_string(whole).len == 0 {
+                Value liv;
+                ignore js_get_prop(value_as_object(re), vm_atom_lastindex(vm), &liv);
+                js_set_prop(value_as_object(re), vm_atom_lastindex(vm),
+                    value_int(to_int_arg(liv) + 1));
+            }
+        }
+        gc_root_reset(&vm.heap, rm);
+        if n == 0 { return value_null(); }
+        return value_cell(&out.head);
+    }
+    Value r = regexp_exec_impl(vm, re, sv2);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_str_search(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    Value re = str_regexp_arg(vm, arg_at(args, argc, 0));
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, re);
+    RegexProg* prog = vm_regexp_prog(vm, re);
+    i32 result = -1;
+    if prog != null {
+        i32 ncap = 2 * (regex_ngroups(prog) + 1);
+        i32* caps = alloc<i32>(ncap);
+        if regex_exec(prog, sview(sv2), 0, caps) { result = *(caps + 0); }
+        free(caps);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_int(result);
+}
+
+// Substitutes $1..$9, $&, $$ in a replacement template.
+private void append_replacement(VM* vm, str_buf* sb, str tmpl, str subject, i32* caps, i32 ng) {
+    i32 i = 0;
+    while i < tmpl.len {
+        u8 c = *(tmpl.data + i);
+        if c == '$' && i + 1 < tmpl.len {
+            u8 n = *(tmpl.data + i + 1);
+            if n == '$' { str_buf_add(sb, "$"); i += 2; continue; }
+            if n == '&' {
+                str m;
+                m.data = subject.data + *(caps + 0);
+                m.len = *(caps + 1) - *(caps + 0);
+                str_buf_add(sb, m);
+                i += 2;
+                continue;
+            }
+            if n >= '0' && n <= '9' {
+                i32 nd = n;
+                i32 g = nd - '0';
+                i32 adv = 2;
+                if i + 2 < tmpl.len {
+                    u8 n2 = *(tmpl.data + i + 2);
+                    if n2 >= '0' && n2 <= '9' {
+                        i32 n2d = n2;
+                        i32 g2 = g * 10 + (n2d - '0');
+                        if g2 <= ng { g = g2; adv = 3; }
+                    }
+                }
+                if g >= 1 && g <= ng {
+                    i32 gs = *(caps + 2 * g);
+                    i32 ge = *(caps + 2 * g + 1);
+                    if gs >= 0 {
+                        str sub;
+                        sub.data = subject.data + gs;
+                        sub.len = ge - gs;
+                        str_buf_add(sb, sub);
+                    }
+                    i += adv;
+                    continue;
+                }
+            }
+        }
+        str one;
+        one.data = tmpl.data + i;
+        one.len = 1;
+        str_buf_add(sb, one);
+        i++;
+    }
+}
+
+private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
+    RegexProg* prog = vm_regexp_prog(vm, re);
+    if prog == null { return sv2; }
+    str s = sview(sv2);
+    bool global = regex_is_global(prog);
+    bool fn_repl = value_is_callable(repl);
+    i32 ng = regex_ngroups(prog);
+    i32 ncap = 2 * (ng + 1);
+    i32* caps = alloc<i32>(ncap);
+    str_buf sb;
+    str_buf_init(&sb);
+    i32 rm = gc_root_mark(&vm.heap);
+    i32 pos = 0;
+    Value rtmpl = value_undefined();
+    if !fn_repl {
+        rtmpl = js_to_string_value(vm, repl);
+        gc_root(&vm.heap, rtmpl);
+    }
+    while pos <= s.len {
+        if !regex_exec(prog, s, pos, caps) { break; }
+        i32 ms = *(caps + 0);
+        i32 me = *(caps + 1);
+        str pre;
+        pre.data = s.data + pos;
+        pre.len = ms - pos;
+        str_buf_add(&sb, pre);
+        if fn_repl {
+            i32 nargs = ng + 3;
+            Value* ca = alloc<Value>(nargs);
+            for i32 g = 0; g <= ng; g++ {
+                i32 gs = *(caps + 2 * g);
+                i32 ge = *(caps + 2 * g + 1);
+                if gs < 0 {
+                    *(ca + g) = value_undefined();
+                } else {
+                    str sub;
+                    sub.data = s.data + gs;
+                    sub.len = ge - gs;
+                    *(ca + g) = new_str(vm, sub);
+                }
+            }
+            *(ca + ng + 1) = value_int(ms);
+            *(ca + ng + 2) = sv2;
+            Value fr = vm_call_value(vm, repl, value_undefined(), ca, nargs);
+            free(ca);
+            if vm.has_pending { break; }
+            gc_root(&vm.heap, fr);
+            Value frs = js_to_string_value(vm, fr);
+            gc_root(&vm.heap, frs);
+            str_buf_add(&sb, sview(frs));
+        } else {
+            append_replacement(vm, &sb, sview(rtmpl), s, caps, ng);
+        }
+        if me > pos {
+            pos = me;
+        } else {
+            // zero-width match: emit one char and advance
+            if pos < s.len {
+                str one;
+                one.data = s.data + pos;
+                one.len = 1;
+                str_buf_add(&sb, one);
+            }
+            pos++;
+        }
+        if !global { break; }
+    }
+    str tail;
+    tail.data = s.data + pos;
+    tail.len = s.len - pos;
+    if pos <= s.len { str_buf_add(&sb, tail); }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    free(caps);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// Extends String.prototype.replace to accept a RegExp first argument.
+private Value nat_str_replace_x(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value pat = arg_at(args, argc, 0);
+    if vm_is_regexp(vm, pat) {
+        i32 rm = gc_root_mark(&vm.heap);
+        Value sv2 = js_to_string_value(vm, thisv);
+        gc_root(&vm.heap, sv2);
+        Value r = regexp_replace(vm, sv2, pat, arg_at(args, argc, 1));
+        gc_root_reset(&vm.heap, rm);
+        return r;
+    }
+    return str_replace_impl(vm, thisv, args, argc, false);
+}
+
+private Value nat_str_split_x(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value sep = arg_at(args, argc, 0);
+    if !vm_is_regexp(vm, sep) {
+        return nat_str_split(vmp, callee, thisv, args, argc);
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str s = sview(sv2);
+    RegexProg* prog = vm_regexp_prog(vm, sep);
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&out.head));
+    i32 ncap = 2 * (regex_ngroups(prog) + 1);
+    i32* caps = alloc<i32>(ncap);
+    i32 last = 0;
+    i32 pos = 0;
+    i32 n = 0;
+    while pos <= s.len {
+        if !regex_exec(prog, s, pos, caps) { break; }
+        i32 ms = *(caps + 0);
+        i32 me = *(caps + 1);
+        if me == last && ms == last {
+            pos++;
+            continue;
+        }
+        str part;
+        part.data = s.data + last;
+        part.len = ms - last;
+        js_array_set(out, n, new_str(vm, part));
+        n++;
+        last = me;
+        pos = me > pos ? me : pos + 1;
+    }
+    str tail;
+    tail.data = s.data + last;
+    tail.len = s.len - last;
+    js_array_set(out, n, new_str(vm, tail));
+    free(caps);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&out.head);
+}
+
 // --- install -------------------------------------------------------------------------------------
 
 private void def_method(VM* vm, JsObject* obj, str name, NativeFn f) {
@@ -2431,6 +3201,14 @@ private void def_static(VM* vm, JsNative* ctor, str name, NativeFn f) {
 
 private void def_value(VM* vm, JsObject* obj, str name, Value v) {
     js_set_prop(obj, bi_atom(vm, name), v);
+}
+
+// Installs a getter-only accessor property.
+private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
+    JsNative* g = js_new_native(&vm.heap, getter, name);
+    JsAccessor* ac = js_new_accessor(&vm.heap);
+    ac.get = value_cell(&g.head);
+    js_set_prop(obj, bi_atom(vm, name), value_cell(&ac.head));
 }
 
 void builtins_install(VM* vm) {
@@ -2506,9 +3284,12 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.string_proto, "repeat", &nat_str_repeat);
     def_method(vm, vm.string_proto, "padStart", &nat_str_padstart);
     def_method(vm, vm.string_proto, "padEnd", &nat_str_padend);
-    def_method(vm, vm.string_proto, "replace", &nat_str_replace);
+    def_method(vm, vm.string_proto, "replace", &nat_str_replace_x);
     def_method(vm, vm.string_proto, "replaceAll", &nat_str_replaceall);
     def_method(vm, vm.string_proto, "toString", &nat_str_tostring);
+    def_method(vm, vm.string_proto, "split", &nat_str_split_x);
+    def_method(vm, vm.string_proto, "match", &nat_str_match);
+    def_method(vm, vm.string_proto, "search", &nat_str_search);
 
     // Number / Boolean
     JsNative* number_ctor = def_global_fn(vm, "Number", &nat_number_ctor);
@@ -2627,6 +3408,65 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.promise_proto, "then", &nat_promise_then);
     def_method(vm, vm.promise_proto, "catch", &nat_promise_catch);
     def_method(vm, vm.promise_proto, "finally", &nat_promise_finally);
+
+    // Map
+    vm.map_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* map_ctor = def_global_fn(vm, "Map", &nat_map_ctor);
+    props_set(&map_ctor.props, vm.atom_prototype, value_cell(&vm.map_proto.head));
+    def_method(vm, vm.map_proto, "set", &nat_map_set);
+    def_method(vm, vm.map_proto, "get", &nat_map_get);
+    def_method(vm, vm.map_proto, "has", &nat_map_has);
+    def_method(vm, vm.map_proto, "delete", &nat_map_delete);
+    def_method(vm, vm.map_proto, "clear", &nat_map_clear);
+    def_method(vm, vm.map_proto, "forEach", &nat_map_foreach);
+    def_method(vm, vm.map_proto, "keys", &nat_map_keys);
+    def_method(vm, vm.map_proto, "values", &nat_map_values);
+    def_method(vm, vm.map_proto, "entries", &nat_map_entries);
+    def_accessor(vm, vm.map_proto, "size", &nat_map_size);
+    JsNative* map_it = js_new_native(&vm.heap, &nat_map_entries, "[Symbol.iterator]");
+    js_set_prop(vm.map_proto, iter_id, value_cell(&map_it.head));
+
+    // Set
+    vm.set_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* set_ctor = def_global_fn(vm, "Set", &nat_set_ctor);
+    props_set(&set_ctor.props, vm.atom_prototype, value_cell(&vm.set_proto.head));
+    def_method(vm, vm.set_proto, "add", &nat_set_add);
+    def_method(vm, vm.set_proto, "has", &nat_map_has);
+    def_method(vm, vm.set_proto, "delete", &nat_map_delete);
+    def_method(vm, vm.set_proto, "clear", &nat_map_clear);
+    def_method(vm, vm.set_proto, "forEach", &nat_map_foreach);
+    def_method(vm, vm.set_proto, "keys", &nat_map_keys);
+    def_method(vm, vm.set_proto, "values", &nat_map_values);
+    def_method(vm, vm.set_proto, "entries", &nat_map_entries);
+    def_accessor(vm, vm.set_proto, "size", &nat_map_size);
+    JsNative* set_it = js_new_native(&vm.heap, &nat_map_values, "[Symbol.iterator]");
+    js_set_prop(vm.set_proto, iter_id, value_cell(&set_it.head));
+
+    // Date
+    vm.date_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* date_ctor = def_global_fn(vm, "Date", &nat_date_ctor);
+    props_set(&date_ctor.props, vm.atom_prototype, value_cell(&vm.date_proto.head));
+    def_static(vm, date_ctor, "now", &nat_date_now);
+    def_method(vm, vm.date_proto, "getTime", &nat_date_gettime);
+    def_method(vm, vm.date_proto, "valueOf", &nat_date_gettime);
+    def_method(vm, vm.date_proto, "getFullYear", &nat_date_getfullyear);
+    def_method(vm, vm.date_proto, "getMonth", &nat_date_getmonth);
+    def_method(vm, vm.date_proto, "getDate", &nat_date_getdate);
+    def_method(vm, vm.date_proto, "getDay", &nat_date_getday);
+    def_method(vm, vm.date_proto, "getHours", &nat_date_gethours);
+    def_method(vm, vm.date_proto, "getMinutes", &nat_date_getminutes);
+    def_method(vm, vm.date_proto, "getSeconds", &nat_date_getseconds);
+    def_method(vm, vm.date_proto, "getMilliseconds", &nat_date_getms);
+    def_method(vm, vm.date_proto, "toISOString", &nat_date_toiso);
+    def_method(vm, vm.date_proto, "toJSON", &nat_date_toiso);
+
+    // RegExp
+    vm.regexp_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* regexp_ctor = def_global_fn(vm, "RegExp", &nat_regexp_ctor);
+    props_set(&regexp_ctor.props, vm.atom_prototype, value_cell(&vm.regexp_proto.head));
+    def_method(vm, vm.regexp_proto, "test", &nat_regexp_test);
+    def_method(vm, vm.regexp_proto, "exec", &nat_regexp_exec);
+    def_method(vm, vm.regexp_proto, "toString", &nat_regexp_tostring);
 
     // timers and microtasks
     ignore def_global_fn(vm, "setTimeout", &nat_set_timeout);

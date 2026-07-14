@@ -77,7 +77,8 @@ enum Op {
 
     OP_YIELD,        // suspend the generator frame; top is the value
     OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
-    OP_ITER_NEXT     // [iter] -> [value, done]
+    OP_ITER_NEXT,    // [iter] -> [value, done]
+    OP_REGEX         // u16 source const, u16 flags const -> RegExp object
 }
 
 struct TmplUpval {

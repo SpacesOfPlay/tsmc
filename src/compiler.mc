@@ -932,6 +932,14 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_NULL { ch_op(ch, OP_NULL); return; }
+    if k == N_REGEX {
+        i32 src = str_const(co, n.name);
+        i32 flags = str_const(co, n.aux);
+        ch_op(ch, OP_REGEX);
+        ch_u16(ch, src);
+        ch_u16(ch, flags);
+        return;
+    }
     if k == N_IDENT { emit_load_ident(co, n); return; }
     if k == N_THIS {
         if co.cur.is_arrow {

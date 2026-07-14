@@ -21,6 +21,7 @@ const i32 GC_BOX      = 5;
 const i32 GC_ACCESSOR = 6;
 const i32 GC_SYMBOL   = 7;
 const i32 GC_GENERATOR = 8;
+const i32 GC_MAP      = 9;
 
 const i32 GEN_START = 0;
 const i32 GEN_SUSPENDED = 1;
@@ -133,6 +134,20 @@ struct JsBox {
     Value v;
 }
 
+// Map/Set: insertion-ordered entries; deletion tombstones a slot to
+// preserve order. Set stores keys and ignores vals.
+struct JsMap {
+    GcCell head;
+    JsObject* proto;
+    Value* keys;
+    Value* vals;
+    bool* live;
+    i32 len;      // slots used, including tombstones
+    i32 cap;
+    i32 count;    // live entries
+    bool is_set;
+}
+
 // Accessor property payload; lives as the property's stored value.
 struct JsAccessor {
     GcCell head;
@@ -219,6 +234,17 @@ void js_trace(GcHeap* h, GcCell* c) {
         }
         return;
     }
+    if c.kind == GC_MAP {
+        JsMap* mp = cast(JsMap*, c);
+        if mp.proto != null { gc_mark_cell(h, &mp.proto.head); }
+        for i32 i = 0; i < mp.len; i++ {
+            if *(mp.live + i) {
+                gc_mark_value(h, *(mp.keys + i));
+                gc_mark_value(h, *(mp.vals + i));
+            }
+        }
+        return;
+    }
     eprint("gc: unknown runtime cell kind {}\n", c.kind);
     exit(70);
 }
@@ -244,6 +270,13 @@ void js_finalize(GcCell* c) {
         JsGenerator* g = cast(JsGenerator*, c);
         if g.saved != null { free(g.saved); }
         if g.handler_data != null { free(g.handler_data); }
+        return;
+    }
+    if c.kind == GC_MAP {
+        JsMap* mp = cast(JsMap*, c);
+        if mp.keys != null { free(mp.keys); }
+        if mp.vals != null { free(mp.vals); }
+        if mp.live != null { free(mp.live); }
         return;
     }
 }
@@ -317,6 +350,33 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
     return g;
 }
 
+JsMap* js_new_map(GcHeap* h, JsObject* proto, bool is_set) {
+    JsMap* mp = cast(JsMap*, gc_alloc(h, GC_MAP, sizeof(JsMap)));
+    mp.proto = proto;
+    mp.is_set = is_set;
+    return mp;
+}
+
+// Grows the parallel arrays to hold one more slot.
+void map_reserve(JsMap* mp) {
+    if mp.len < mp.cap { return; }
+    i32 ncap = mp.cap * 2;
+    if ncap < 8 { ncap = 8; }
+    Value* nk = alloc<Value>(ncap);
+    Value* nv = alloc<Value>(ncap);
+    bool* nl = alloc<bool>(ncap);
+    for i32 i = 0; i < mp.len; i++ {
+        *(nk + i) = *(mp.keys + i);
+        *(nv + i) = *(mp.vals + i);
+        *(nl + i) = *(mp.live + i);
+    }
+    if mp.keys != null { free(mp.keys); free(mp.vals); free(mp.live); }
+    mp.keys = nk;
+    mp.vals = nv;
+    mp.live = nl;
+    mp.cap = ncap;
+}
+
 // --- value helpers ------------------------------------------------------
 
 bool value_is_kind(Value v, i32 kind) {
@@ -333,9 +393,11 @@ bool value_is_callable(Value v){ return value_is_function(v) || value_is_native(
 bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
 bool value_is_symbol(Value v)   { return value_is_kind(v, GC_SYMBOL); }
 bool value_is_generator(Value v){ return value_is_kind(v, GC_GENERATOR); }
+bool value_is_map(Value v)      { return value_is_kind(v, GC_MAP); }
 
 JsSymbol* value_as_symbol(Value v)       { return cast(JsSymbol*, value_as_cell(v)); }
 JsGenerator* value_as_generator(Value v) { return cast(JsGenerator*, value_as_cell(v)); }
+JsMap* value_as_map(Value v)             { return cast(JsMap*, value_as_cell(v)); }
 JsAccessor* value_as_accessor(Value v) { return cast(JsAccessor*, value_as_cell(v)); }
 JsObject* value_as_object(Value v)     { return cast(JsObject*, value_as_cell(v)); }
 JsFunction* value_as_function(Value v) { return cast(JsFunction*, value_as_cell(v)); }
@@ -345,6 +407,15 @@ GcString* value_as_string(Value v)     { return cast(GcString*, value_as_cell(v)
 
 bool value_is_array(Value v) {
     return value_is_object(v) && (value_as_object(v).obj_flags & OBJF_ARRAY) != 0;
+}
+
+// A constructor's return value counts as an object (replaces the new
+// instance) for anything that isn't a primitive: strings and symbols
+// are primitives, everything else on the heap is a reference.
+bool value_is_reference(Value v) {
+    if !value_is_cell(v) { return false; }
+    i32 k = value_as_cell(v).kind;
+    return k != GC_STRING && k != GC_SYMBOL;
 }
 
 // --- property access ------------------------------------------------------

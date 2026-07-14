@@ -20,6 +20,9 @@ import lower;
 import compiler;
 import math;
 import format_f64;
+import regex;
+
+type RegexProgPtr = RegexProg*;
 
 const i32 VM_STACK_MAX = 16384;
 const i32 VM_FRAMES_MAX = 256;
@@ -88,6 +91,16 @@ struct VM {
     u64 rng;
     JsObject* generator_proto;
     JsObject* promise_proto;
+    JsObject* regexp_proto;
+    JsObject* map_proto;
+    JsObject* set_proto;
+    JsObject* date_proto;
+    Vec<RegexProgPtr> regexps;
+    u32 atom_rx;
+    u32 atom_source;
+    u32 atom_flags;
+    u32 atom_lastindex;
+    u32 atom_index;
     Vec<VmJob> jobs;         // microtask FIFO (head index avoids shifting)
     i32 job_head;
     Vec<VmTimer> timers;
@@ -157,6 +170,10 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     if vm.generator_proto != null { gc_mark_cell(h, &vm.generator_proto.head); }
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
+    if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
+    if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
+    if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
+    if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
         VmJob* j = vm.jobs.data + i;
         gc_mark_value(h, j.a);
@@ -445,6 +462,20 @@ bool js_strict_eq(Value a, Value b) {
     return value_same_bits(a, b);
 }
 
+// Map/Set key equality: strict, except NaN equals NaN and +0 equals -0.
+bool js_same_value_zero(Value a, Value b) {
+    if value_is_number(a) && value_is_number(b) {
+        f64 x = js_to_number(a);
+        f64 y = js_to_number(b);
+        if x != x && y != y { return true; }
+        return x == y;
+    }
+    if value_is_string(a) && value_is_string(b) {
+        return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
+    }
+    return value_same_bits(a, b);
+}
+
 private bool is_nullish(Value v) {
     return value_is_null(v) || value_is_undefined(v);
 }
@@ -553,6 +584,11 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     }
     if value_is_generator(objv) {
         if vm.generator_proto != null { ignore js_get_prop(vm.generator_proto, a, out); }
+        return true;
+    }
+    if value_is_map(objv) {
+        JsObject* mproto = value_as_map(objv).proto;
+        if mproto != null { ignore js_get_prop(mproto, a, out); }
         return true;
     }
     return true;
@@ -741,6 +777,16 @@ void vm_init(VM* vm) {
     vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
     vm.generator_proto = null;
     vm.promise_proto = null;
+    vm.regexp_proto = null;
+    vm.map_proto = null;
+    vm.set_proto = null;
+    vm.date_proto = null;
+    vec_init<RegexProgPtr>(&vm.regexps, 4);
+    vm.atom_rx = atom_intern(&vm.atoms, "%rx");
+    vm.atom_source = atom_intern(&vm.atoms, "source");
+    vm.atom_flags = atom_intern(&vm.atoms, "flags");
+    vm.atom_lastindex = atom_intern(&vm.atoms, "lastIndex");
+    vm.atom_index = atom_intern(&vm.atoms, "index");
     vec_init<VmJob>(&vm.jobs, 8);
     vm.job_head = 0;
     vec_init<VmTimer>(&vm.timers, 4);
@@ -771,6 +817,10 @@ void vm_destroy(VM* vm) {
     vec_free(&vm.jobs);
     vec_free(&vm.timers);
     vec_free(&vm.symbols);
+    for i32 i = 0; i < vm.regexps.len; i++ {
+        regex_free(vec_get(&vm.regexps, i));
+    }
+    vec_free(&vm.regexps);
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
@@ -1220,7 +1270,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     if value_is_native(fnv) {
                         JsNative* na = value_as_native(fnv);
                         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
-                        if op == OP_NEW && !value_is_object(res) { res = thisv; }
+                        if op == OP_NEW && !value_is_reference(res) { res = thisv; }
                         vm.sp -= argc + 2;
                         vpush(vm, res);
                     } else if value_is_function(fnv) {
@@ -1262,7 +1312,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_RETURN: {
                 Value res = vpop(vm);
-                if fr.is_ctor && !value_is_object(res) { res = fr.this_val; }
+                if fr.is_ctor && !value_is_reference(res) { res = fr.this_val; }
                 vm.sp = fr.base - 2;
                 vpush(vm, res);
                 vm.fp--;
@@ -1639,7 +1689,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         vm.sp--;
                         Value instv = vpeek(vm, n);
                         Value res = vm_call_stack(vm, n);
-                        if op == OP_NEW_ARRAY && !value_is_object(res) { res = instv; }
+                        if op == OP_NEW_ARRAY && !value_is_reference(res) { res = instv; }
                         vpush(vm, res);
                     }
                 }
@@ -1735,6 +1785,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, val);
                     vpush(vm, value_bool(done));
                 }
+            }
+            case OP_REGEX: {
+                Value srcv = *(t.consts + rd_u16(code, ip));
+                ip += 2;
+                Value flgv = *(t.consts + rd_u16(code, ip));
+                ip += 2;
+                Value re = vm_new_regexp(vm, gc_string_view(value_as_string(srcv)),
+                    gc_string_view(value_as_string(flgv)));
+                if !vm.has_pending { vpush(vm, re); }
             }
             default: {
                 eprint("vm: bad opcode {}\n", op);
@@ -2329,6 +2388,76 @@ u32 vm_atom(VM* vm, str name) {
 JsObject* vm_generator_proto(VM* vm) { return vm.generator_proto; }
 JsObject* vm_promise_proto(VM* vm) { return vm.promise_proto; }
 u32 vm_sym_iterator_id(VM* vm) { return vm.sym_iterator_id; }
+
+// --- regex integration ---------------------------------------------------
+
+// Builds a RegExp object; throws SyntaxError on a bad pattern.
+Value vm_new_regexp(VM* vm, str source, str flags) {
+    RegexProg* prog = regex_compile(source, flags);
+    if prog == null {
+        vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression");
+        return value_undefined();
+    }
+    i32 idx = vm.regexps.len;
+    vec_push(&vm.regexps, prog);
+    JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
+    vpush(vm, value_cell(&re.head));
+    js_set_prop(re, vm.atom_rx, value_int(idx));
+    GcString* src = gc_new_string(&vm.heap, source);
+    js_set_prop(re, vm.atom_source, value_cell(&src.head));
+    GcString* flg = gc_new_string(&vm.heap, flags);
+    js_set_prop(re, vm.atom_flags, value_cell(&flg.head));
+    js_set_prop(re, vm.atom_lastindex, value_int(0));
+    js_set_prop(re, atom_intern(&vm.atoms, "global"), value_bool(prog.global));
+    return vpop(vm);
+}
+
+bool vm_is_regexp(VM* vm, Value v) {
+    if !value_is_object(v) { return false; }
+    return props_get(&value_as_object(v).props, vm.atom_rx) != null;
+}
+
+RegexProg* vm_regexp_prog(VM* vm, Value re) {
+    Value* idx = props_get(&value_as_object(re).props, vm.atom_rx);
+    if idx == null { return null; }
+    return vec_get(&vm.regexps, value_as_int(*idx));
+}
+
+u32 vm_atom_lastindex(VM* vm) { return vm.atom_lastindex; }
+u32 vm_atom_index(VM* vm) { return vm.atom_index; }
+
+JsObject* vm_regexp_proto(VM* vm) { return vm.regexp_proto; }
+JsObject* vm_map_proto(VM* vm) { return vm.map_proto; }
+JsObject* vm_set_proto(VM* vm) { return vm.set_proto; }
+JsObject* vm_date_proto(VM* vm) { return vm.date_proto; }
+
+// Milliseconds since the Unix epoch (UTC). Platform-specific.
+when os(windows) {
+    private extern "kernel32.dll" void GetSystemTimeAsFileTime(u64* ft);
+    f64 vm_now_millis(VM* vm) {
+        u64 ft = 0;
+        GetSystemTimeAsFileTime(&ft);
+        // FILETIME: 100ns ticks since 1601-01-01; epoch delta in ms.
+        i64 ticks = cast(i64, ft);
+        return cast(f64, ticks) / 10000.0 - 11644473600000.0;
+    }
+}
+else {
+    private struct vm_timeval { i64 tv_sec; i64 tv_usec; }
+    when os(macos) || os(ios) {
+        private extern "libSystem.B.dylib" i32 gettimeofday(vm_timeval* tv, void* tz);
+    }
+    else {
+        private extern "libc.so.6" i32 gettimeofday(vm_timeval* tv, void* tz);
+    }
+    f64 vm_now_millis(VM* vm) {
+        vm_timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        ignore gettimeofday(&tv, null);
+        return cast(f64, tv.tv_sec) * 1000.0 + cast(f64, tv.tv_usec) / 1000.0;
+    }
+}
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.
 i32 vm_run_source(VM* vm, str src, str src_name) {
