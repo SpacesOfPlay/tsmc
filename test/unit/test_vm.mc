@@ -12,7 +12,7 @@ import "../../src/vm.mc";
 Value[32] g_probes;
 i32 g_probe_n = 0;
 
-Value probe_native(void* vmp, Value thisv, Value* args, i32 argc) {
+Value probe_native(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     if argc > 0 && g_probe_n < 32 {
         g_probes[g_probe_n] = *(args);
         g_probe_n++;

@@ -1,0 +1,8 @@
+{"name":"tsmc","tags":["ts","minc"],"version":1}
+minc
+{
+  "a": [
+    1,
+    2
+  ]
+}

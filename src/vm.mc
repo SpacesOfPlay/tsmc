@@ -57,6 +57,29 @@ struct VM {
     u32 atom_prototype;
     u32 atom_name;
     u32 atom_message;
+    // well-known prototypes; null until builtins_install
+    JsObject* object_proto;
+    JsObject* array_proto;
+    JsObject* string_proto;
+    JsObject* number_proto;
+    JsObject* boolean_proto;
+    JsObject* function_proto;
+    JsObject*[5] error_protos;   // indexed by ERR_*
+    u64 rng;
+}
+
+const i32 ERR_ERROR = 0;
+const i32 ERR_TYPE = 1;
+const i32 ERR_RANGE = 2;
+const i32 ERR_REF = 3;
+const i32 ERR_SYNTAX = 4;
+
+str vm_error_kind_name(i32 kind) {
+    if kind == ERR_TYPE { return "TypeError"; }
+    if kind == ERR_RANGE { return "RangeError"; }
+    if kind == ERR_REF { return "ReferenceError"; }
+    if kind == ERR_SYNTAX { return "SyntaxError"; }
+    return "Error";
 }
 
 // --- roots -----------------------------------------------------------
@@ -86,6 +109,15 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 i = 0; i < vm.troots.len; i++ {
         mark_template(h, vec_get(&vm.troots, i));
+    }
+    if vm.object_proto != null { gc_mark_cell(h, &vm.object_proto.head); }
+    if vm.array_proto != null { gc_mark_cell(h, &vm.array_proto.head); }
+    if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
+    if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
+    if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
+    if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
+    for i32 i = 0; i < 5; i++ {
+        if vm.error_protos[i] != null { gc_mark_cell(h, &vm.error_protos[i].head); }
     }
     if vm.has_pending { gc_mark_value(h, vm.pending); }
 }
@@ -310,7 +342,7 @@ Value js_to_string_value(VM* vm, Value v) {
     return value_cell(&g.head);
 }
 
-private i32 js_str_cmp(str a, str b) {
+i32 js_str_cmp(str a, str b) {
     i32 n = a.len;
     if b.len < n { n = b.len; }
     for i32 i = 0; i < n; i++ {
@@ -357,29 +389,36 @@ void vm_throw(VM* vm, Value v) {
     vm.has_pending = true;
 }
 
-void vm_throw_error(VM* vm, str name, str msg) {
-    JsObject* e = js_new_object(&vm.heap, null);
+Value vm_make_error(VM* vm, i32 kind, str msg) {
+    JsObject* proto = vm.error_protos[kind];
+    JsObject* e = js_new_object(&vm.heap, proto);
     vpush(vm, value_cell(&e.head));
-    GcString* ns = gc_new_string(&vm.heap, name);
-    js_set_prop(e, vm.atom_name, value_cell(&ns.head));
+    if proto == null {
+        GcString* ns = gc_new_string(&vm.heap, vm_error_kind_name(kind));
+        js_set_prop(e, vm.atom_name, value_cell(&ns.head));
+    }
     GcString* ms = gc_new_string(&vm.heap, msg);
     js_set_prop(e, vm.atom_message, value_cell(&ms.head));
-    vm_throw(vm, vpop(vm));
+    return vpop(vm);
+}
+
+void vm_throw_error(VM* vm, i32 kind, str msg) {
+    vm_throw(vm, vm_make_error(vm, kind, msg));
 }
 
 // --- property helpers -----------------------------------------------------------
 
 private Value ensure_prototype(VM* vm, Value fnv) {
-    IntMap<Value>* props = null;
+    PropList* props = null;
     if value_is_function(fnv) { props = &value_as_function(fnv).props; }
     if value_is_native(fnv) { props = &value_as_native(fnv).props; }
     if props == null { return value_undefined(); }
-    Value* p = intmap_get<Value>(props, vm.atom_prototype);
+    Value* p = props_get(props, vm.atom_prototype);
     if p != null { return *p; }
-    JsObject* pr = js_new_object(&vm.heap, null);
+    JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
     if value_is_function(fnv) { props = &value_as_function(fnv).props; }
     if value_is_native(fnv) { props = &value_as_native(fnv).props; }
-    intmap_set<Value>(props, vm.atom_prototype, value_cell(&pr.head));
+    props_set(props, vm.atom_prototype, value_cell(&pr.head));
     return value_cell(&pr.head);
 }
 
@@ -400,41 +439,66 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = ensure_prototype(vm, objv);
             return true;
         }
-        IntMap<Value>* props = value_is_function(objv)
-            ? &value_as_function(objv).props
-            : &value_as_native(objv).props;
-        Value* p = intmap_get<Value>(props, a);
-        if p != null { *out = *p; }
+        PropList* props = null;
+        if value_is_function(objv) { props = &value_as_function(objv).props; }
+        if value_is_native(objv) { props = &value_as_native(objv).props; }
+        Value* p = props_get(props, a);
+        if p != null {
+            *out = *p;
+            return true;
+        }
+        if vm.function_proto != null { ignore js_get_prop(vm.function_proto, a, out); }
         return true;
     }
     if value_is_string(objv) {
         if a == vm.atom_length {
             *out = value_int(value_as_string(objv).len);
+            return true;
         }
+        if vm.string_proto != null { ignore js_get_prop(vm.string_proto, a, out); }
         return true;
     }
     if is_nullish(objv) {
-        vm_throw_error(vm, "TypeError", "cannot read properties of null or undefined");
+        vm_throw_error(vm, ERR_TYPE, "cannot read properties of null or undefined");
         return false;
+    }
+    if value_is_number(objv) {
+        if vm.number_proto != null { ignore js_get_prop(vm.number_proto, a, out); }
+        return true;
+    }
+    if value_is_bool(objv) {
+        if vm.boolean_proto != null { ignore js_get_prop(vm.boolean_proto, a, out); }
+        return true;
     }
     return true;
 }
 
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
     if value_is_object(objv) {
-        js_set_prop(value_as_object(objv), a, v);
+        JsObject* o = value_as_object(objv);
+        if (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
+            f64 n = js_to_number(v);
+            i32 ni = cast(i32, n);
+            if cast(f64, ni) == n && ni >= 0 {
+                js_array_set_length(o, ni);
+                return true;
+            }
+            vm_throw_error(vm, ERR_RANGE, "invalid array length");
+            return false;
+        }
+        js_set_prop(o, a, v);
         return true;
     }
     if value_is_function(objv) {
-        intmap_set<Value>(&value_as_function(objv).props, a, v);
+        props_set(&value_as_function(objv).props, a, v);
         return true;
     }
     if value_is_native(objv) {
-        intmap_set<Value>(&value_as_native(objv).props, a, v);
+        props_set(&value_as_native(objv).props, a, v);
         return true;
     }
     if is_nullish(objv) {
-        vm_throw_error(vm, "TypeError", "cannot set properties of null or undefined");
+        vm_throw_error(vm, ERR_TYPE, "cannot set properties of null or undefined");
         return false;
     }
     return true;
@@ -489,11 +553,11 @@ private Value native_console_out(VM* vm, Value* args, i32 argc, bool to_err) {
     return value_undefined();
 }
 
-private Value native_console_log(void* vmp, Value thisv, Value* args, i32 argc) {
+private Value native_console_log(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return native_console_out(cast(VM*, vmp), args, argc, false);
 }
 
-private Value native_console_error(void* vmp, Value thisv, Value* args, i32 argc) {
+private Value native_console_error(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return native_console_out(cast(VM*, vmp), args, argc, true);
 }
 
@@ -532,6 +596,16 @@ void vm_init(VM* vm) {
     vm.atom_prototype = atom_intern(&vm.atoms, "prototype");
     vm.atom_name = atom_intern(&vm.atoms, "name");
     vm.atom_message = atom_intern(&vm.atoms, "message");
+    vm.object_proto = null;
+    vm.array_proto = null;
+    vm.string_proto = null;
+    vm.number_proto = null;
+    vm.boolean_proto = null;
+    vm.function_proto = null;
+    for i32 i = 0; i < 5; i++ {
+        vm.error_protos[i] = null;
+    }
+    vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
     vm_install_globals(vm);
 }
 
@@ -609,7 +683,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value v = *(vm.stack + fr.base + rd_u16(code, ip));
                 ip += 2;
                 if value_is_hole(v) {
-                    vm_throw_error(vm, "ReferenceError", "cannot access variable before initialization");
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
                     vpush(vm, v);
                 }
@@ -647,7 +721,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;
                 if value_is_hole(b.v) {
-                    vm_throw_error(vm, "ReferenceError", "cannot access variable before initialization");
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
                     vpush(vm, b.v);
                 }
@@ -666,7 +740,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
                 ip += 2;
                 if value_is_hole(b.v) {
-                    vm_throw_error(vm, "ReferenceError", "cannot access variable before initialization");
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
                     vpush(vm, b.v);
                 }
@@ -687,7 +761,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     str nm = atom_name(&vm.atoms, a);
                     string msg = format("{} is not defined", nm);
-                    vm_throw_error(vm, "ReferenceError", msg);
+                    vm_throw_error(vm, ERR_REF, msg);
                     free(msg);
                 }
             }
@@ -851,7 +925,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value ctor = vpeek(vm, 0);
                 Value v = vpeek(vm, 1);
                 if !value_is_callable(ctor) {
-                    vm_throw_error(vm, "TypeError", "right-hand side of instanceof is not callable");
+                    vm_throw_error(vm, ERR_TYPE, "right-hand side of instanceof is not callable");
                 } else {
                     Value protov = ensure_prototype(vm, ctor);
                     bool r = false;
@@ -874,7 +948,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value objv = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 if !value_is_object(objv) {
-                    vm_throw_error(vm, "TypeError", "'in' requires an object");
+                    vm_throw_error(vm, ERR_TYPE, "'in' requires an object");
                 } else {
                     JsObject* o = value_as_object(objv);
                     bool r = false;
@@ -940,7 +1014,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if op == OP_NEW {
                     fnv = vpeek(vm, argc);
                     if !value_is_callable(fnv) {
-                        vm_throw_error(vm, "TypeError", "not a constructor");
+                        vm_throw_error(vm, ERR_TYPE, "not a constructor");
                     } else {
                         Value protov = ensure_prototype(vm, fnv);
                         JsObject* proto = null;
@@ -958,7 +1032,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     thisv = vpeek(vm, argc);
                     if value_is_native(fnv) {
                         JsNative* na = value_as_native(fnv);
-                        Value res = na.fun(cast(void*, vm), thisv, vm.stack + vm.sp - argc, argc);
+                        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
                         if op == OP_NEW && !value_is_object(res) { res = thisv; }
                         vm.sp -= argc + 2;
                         vpush(vm, res);
@@ -967,7 +1041,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         FnTemplate* ft = f.tmpl;
                         if vm.fp >= VM_FRAMES_MAX
                             || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
-                            vm_throw_error(vm, "RangeError", "maximum call stack size exceeded");
+                            vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
                         } else {
                             while argc < ft.n_params {
                                 vpush(vm, value_undefined());
@@ -995,7 +1069,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             ip = 0;
                         }
                     } else {
-                        vm_throw_error(vm, "TypeError", "not a function");
+                        vm_throw_error(vm, ERR_TYPE, "not a function");
                     }
                 }
             }
@@ -1013,13 +1087,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip = popped.ret_ip;
             }
             case OP_NEWOBJ: {
-                JsObject* o = js_new_object(&vm.heap, null);
+                JsObject* o = js_new_object(&vm.heap, vm.object_proto);
                 vpush(vm, value_cell(&o.head));
             }
             case OP_NEWARR: {
                 i32 n = rd_u16(code, ip);
                 ip += 2;
-                JsObject* arr = js_new_array(&vm.heap);
+                JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
                 for i32 i = 0; i < n; i++ {
                     js_array_set(arr, i, *(vm.stack + vm.sp - n + i));
                 }
@@ -1164,7 +1238,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 target = rd_u16(code, ip);
                 ip += 2;
                 if vm.hp >= VM_HANDLERS_MAX {
-                    vm_throw_error(vm, "RangeError", "too many nested try blocks");
+                    vm_throw_error(vm, ERR_RANGE, "too many nested try blocks");
                 } else {
                     Handler* h = vm.handlers + vm.hp;
                     h.frame_count = vm.fp;
@@ -1197,10 +1271,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.pending = value_undefined();
                 vm.has_pending = false;
             } else {
-                Value e = vm.pending;
-                vm.has_pending = false;
-                vm.pending = value_undefined();
-                print_uncaught(vm, e);
+                // no handler in this execution — propagate to the caller
+                while vm.hp > 0 {
+                    Handler* hh = vm.handlers + (vm.hp - 1);
+                    if hh.frame_count < stop_fp { break; }
+                    vm.hp--;
+                }
                 while vm.fp >= stop_fp { vm.fp--; }
                 return 1;
             }
@@ -1227,9 +1303,93 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.is_ctor = false;
     vm.fp++;
     i32 status = vm_execute(vm, vm.fp);
+    if status != 0 {
+        Value e = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        print_uncaught(vm, e);
+    }
     vm.sp = saved_sp;
     vm.hp = 0;
     return status;
+}
+
+// Stack already holds fn, this, args. Pops them; returns the result.
+// On throw, pending stays set and undefined comes back.
+Value vm_call_stack(VM* vm, i32 argc) {
+    i32 entry_sp = vm.sp - argc - 2;
+    Value fnv = vpeek(vm, argc + 1);
+    Value thisv = vpeek(vm, argc);
+    if value_is_native(fnv) {
+        JsNative* na = value_as_native(fnv);
+        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        vm.sp = entry_sp;
+        return res;
+    }
+    if !value_is_function(fnv) {
+        vm.sp = entry_sp;
+        vm_throw_error(vm, ERR_TYPE, "not a function");
+        return value_undefined();
+    }
+    JsFunction* f = value_as_function(fnv);
+    FnTemplate* ft = f.tmpl;
+    if vm.fp >= VM_FRAMES_MAX || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
+        vm.sp = entry_sp;
+        vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
+        return value_undefined();
+    }
+    while argc < ft.n_params {
+        vpush(vm, value_undefined());
+        argc++;
+    }
+    while argc > ft.n_params {
+        vm.sp--;
+        argc--;
+    }
+    i32 base = vm.sp - ft.n_params;
+    for i32 i = ft.n_params; i < ft.n_slots; i++ {
+        vpush(vm, value_undefined());
+    }
+    Frame* nf = vm.frames + vm.fp;
+    nf.fun = f;
+    nf.tmpl = ft;
+    nf.ret_ip = 0;
+    nf.base = base;
+    nf.this_val = thisv;
+    nf.is_ctor = false;
+    vm.fp++;
+    i32 st = vm_execute(vm, vm.fp);
+    if st != 0 {
+        vm.sp = entry_sp;
+        return value_undefined();
+    }
+    return vpop(vm);
+}
+
+Value vm_call_value(VM* vm, Value fnv, Value thisv, Value* args, i32 argc) {
+    vpush(vm, fnv);
+    vpush(vm, thisv);
+    for i32 i = 0; i < argc; i++ {
+        vpush(vm, *(args + i));
+    }
+    return vm_call_stack(vm, argc);
+}
+
+Value js_number_value(f64 v) {
+    return num_norm(v);
+}
+
+// Rooting hook for natives: values on the VM stack survive collection.
+void vm_push(VM* vm, Value v) {
+    vpush(vm, v);
+}
+
+void vm_pop(VM* vm) {
+    vm.sp--;
+}
+
+f64 js_string_to_number(str s) {
+    return vm_str_to_num(s);
 }
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.

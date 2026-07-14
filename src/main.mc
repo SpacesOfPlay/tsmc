@@ -6,6 +6,7 @@
 import str;
 import file;
 import vm;
+import builtins;
 
 const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
@@ -45,6 +46,7 @@ i32 main() {
 
     VM m;
     vm_init(&m);
+    builtins_install(&m);
     i32 status = vm_run_source(&m, source, arg);
     vm_destroy(&m);
     return status;

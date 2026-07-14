@@ -1,10 +1,11 @@
 // object.mc — runtime object kinds on the GC heap.
 //
-// Objects carry a property table (atom → Value), a prototype link,
-// and an optional dense array part. Functions and natives are their
-// own kinds with a small property table (fn.prototype). Boxes hold
-// captured variables. This module registers the heap's tracer and
-// finalizer hooks for these kinds.
+// Property tables are insertion-ordered {atom, value} arrays: JS
+// enumeration order comes for free and objects stay small until a
+// shapes optimization pass. Objects carry a prototype link and an
+// optional dense array part. Natives carry three env slots so bound
+// functions and similar wrappers need no extra kinds. This module
+// registers the heap's tracer and finalizer hooks.
 
 import vec;
 import map;
@@ -22,11 +23,77 @@ const i32 OBJF_ARRAY = 1;
 
 struct FnTemplate;
 
+struct Prop {
+    u32 key;
+    Value val;
+}
+
+struct PropList {
+    Prop* items;
+    i32 len;
+    i32 cap;
+}
+
+void props_init(PropList* p) {
+    p.items = null;
+    p.len = 0;
+    p.cap = 0;
+}
+
+void props_free(PropList* p) {
+    if p.items != null { free(p.items); }
+    props_init(p);
+}
+
+Value* props_get(PropList* p, u32 key) {
+    for i32 i = 0; i < p.len; i++ {
+        Prop* pr = p.items + i;
+        if pr.key == key { return &pr.val; }
+    }
+    return null;
+}
+
+void props_set(PropList* p, u32 key, Value v) {
+    Value* ex = props_get(p, key);
+    if ex != null {
+        *ex = v;
+        return;
+    }
+    if p.len >= p.cap {
+        i32 ncap = p.cap * 2;
+        if ncap < 4 { ncap = 4; }
+        Prop* ni = alloc<Prop>(ncap);
+        for i32 i = 0; i < p.len; i++ {
+            *(ni + i) = *(p.items + i);
+        }
+        if p.items != null { free(p.items); }
+        p.items = ni;
+        p.cap = ncap;
+    }
+    Prop* pr = p.items + p.len;
+    pr.key = key;
+    pr.val = v;
+    p.len++;
+}
+
+bool props_remove(PropList* p, u32 key) {
+    for i32 i = 0; i < p.len; i++ {
+        if (p.items + i).key == key {
+            for i32 j = i; j + 1 < p.len; j++ {
+                *(p.items + j) = *(p.items + j + 1);
+            }
+            p.len--;
+            return true;
+        }
+    }
+    return false;
+}
+
 struct JsObject {
     GcCell head;
     i32 obj_flags;
     JsObject* proto;
-    IntMap<Value> props;   // atom → value
+    PropList props;
     Value* elems;          // dense array part
     i32 elen;
     i32 ecap;
@@ -37,17 +104,20 @@ struct JsFunction {
     FnTemplate* tmpl;
     Value* upvals;         // boxes, one per template upvalue
     i32 n_upvals;
-    IntMap<Value> props;   // fn.prototype and friends
+    PropList props;
 }
 
 // ctx is the owning VM; typed as void* to keep layering one-way.
-type NativeFn = fn(void*, Value, Value*, i32): Value;
+type NativeFn = fn(void*, Value, Value, Value*, i32): Value;
 
 struct JsNative {
     GcCell head;
     NativeFn fun;
     str name;              // static or atom-owned view
-    IntMap<Value> props;
+    PropList props;
+    Value env0;            // bound target / wrapper state
+    Value env1;
+    Value env2;
 }
 
 struct JsBox {
@@ -57,12 +127,9 @@ struct JsBox {
 
 // --- GC hooks ---------------------------------------------------------
 
-private void mark_props(GcHeap* h, IntMap<Value>* m) {
-    for i32 i = 0; i < m.cap; i++ {
-        IntSlot<Value>* sl = m.slots + i;
-        if sl.state == SLOT_USED {
-            gc_mark_value(h, sl.val);
-        }
+private void mark_props(GcHeap* h, PropList* p) {
+    for i32 i = 0; i < p.len; i++ {
+        gc_mark_value(h, (p.items + i).val);
     }
 }
 
@@ -87,6 +154,9 @@ void js_trace(GcHeap* h, GcCell* c) {
     if c.kind == GC_NATIVE {
         JsNative* n = cast(JsNative*, c);
         mark_props(h, &n.props);
+        gc_mark_value(h, n.env0);
+        gc_mark_value(h, n.env1);
+        gc_mark_value(h, n.env2);
         return;
     }
     if c.kind == GC_BOX {
@@ -101,19 +171,18 @@ void js_trace(GcHeap* h, GcCell* c) {
 void js_finalize(GcCell* c) {
     if c.kind == GC_OBJECT {
         JsObject* o = cast(JsObject*, c);
-        intmap_free<Value>(&o.props);
+        props_free(&o.props);
         if o.elems != null { free(o.elems); }
         return;
     }
     if c.kind == GC_FUNCTION {
         JsFunction* f = cast(JsFunction*, c);
-        intmap_free<Value>(&f.props);
+        props_free(&f.props);
         if f.upvals != null { free(f.upvals); }
         return;
     }
     if c.kind == GC_NATIVE {
-        JsNative* n = cast(JsNative*, c);
-        intmap_free<Value>(&n.props);
+        props_free(&cast(JsNative*, c).props);
         return;
     }
 }
@@ -123,12 +192,12 @@ void js_finalize(GcCell* c) {
 JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     JsObject* o = cast(JsObject*, gc_alloc(h, GC_OBJECT, sizeof(JsObject)));
     o.proto = proto;
-    intmap_init<Value>(&o.props);
+    props_init(&o.props);
     return o;
 }
 
-JsObject* js_new_array(GcHeap* h) {
-    JsObject* o = js_new_object(h, null);
+JsObject* js_new_array(GcHeap* h, JsObject* proto) {
+    JsObject* o = js_new_object(h, proto);
     o.obj_flags |= OBJF_ARRAY;
     return o;
 }
@@ -144,7 +213,7 @@ JsFunction* js_new_function(GcHeap* h, FnTemplate* t, i32 n_upvals) {
             *(f.upvals + i) = value_undefined();
         }
     }
-    intmap_init<Value>(&f.props);
+    props_init(&f.props);
     return f;
 }
 
@@ -152,7 +221,10 @@ JsNative* js_new_native(GcHeap* h, NativeFn fun, str name) {
     JsNative* n = cast(JsNative*, gc_alloc(h, GC_NATIVE, sizeof(JsNative)));
     n.fun = fun;
     n.name = name;
-    intmap_init<Value>(&n.props);
+    props_init(&n.props);
+    n.env0 = value_undefined();
+    n.env1 = value_undefined();
+    n.env2 = value_undefined();
     return n;
 }
 
@@ -191,7 +263,7 @@ bool value_is_array(Value v) {
 bool js_get_prop(JsObject* o, u32 key, Value* out) {
     JsObject* cur = o;
     while cur != null {
-        Value* v = intmap_get<Value>(&cur.props, key);
+        Value* v = props_get(&cur.props, key);
         if v != null {
             *out = *v;
             return true;
@@ -202,7 +274,7 @@ bool js_get_prop(JsObject* o, u32 key, Value* out) {
 }
 
 void js_set_prop(JsObject* o, u32 key, Value v) {
-    intmap_set<Value>(&o.props, key, v);
+    props_set(&o.props, key, v);
 }
 
 bool js_has_prop(JsObject* o, u32 key) {
@@ -211,7 +283,7 @@ bool js_has_prop(JsObject* o, u32 key) {
 }
 
 bool js_delete_prop(JsObject* o, u32 key) {
-    return intmap_remove<Value>(&o.props, key);
+    return props_remove(&o.props, key);
 }
 
 // --- array elements ---------------------------------------------------------
@@ -240,4 +312,17 @@ void js_array_set(JsObject* o, i32 idx, Value v) {
     }
     *(o.elems + idx) = v;
     if idx >= o.elen { o.elen = idx + 1; }
+}
+
+// Truncates or undefined-extends the dense part.
+void js_array_set_length(JsObject* o, i32 n) {
+    if n < 0 { return; }
+    if n < o.elen {
+        o.elen = n;
+        return;
+    }
+    if n > 0 {
+        js_array_set(o, n - 1, value_undefined());
+    }
+    o.elen = n;
 }
