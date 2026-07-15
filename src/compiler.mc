@@ -35,11 +35,17 @@ struct CUp {
     bool tdz;
 }
 
+// A pending break/continue jump, tagged with the loop it targets so an
+// inner loop never patches a jump aimed at an outer (labeled) loop.
+struct BrkJump {
+    i32 at;
+    i32 loop_id;
+}
+
 struct LoopCtx {
     bool is_loop;      // false for switch and labeled blocks
     str label;
-    i32 break_mark;
-    i32 cont_mark;
+    i32 id;
     i32 fin_depth;
 }
 
@@ -56,10 +62,11 @@ struct FScope {
     bool has_rest;
     bool is_gen;
     bool is_async;
-    Vec<i32> break_jumps;
-    Vec<i32> cont_jumps;
+    Vec<BrkJump> break_jumps;
+    Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
     Vec<NodePtr> finallys;
+    i32 loop_id_counter;
 }
 
 // A name imported into the current module: read live from a
@@ -118,10 +125,11 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.has_rest = false;
     fs.is_gen = false;
     fs.is_async = false;
-    vec_init<i32>(&fs.break_jumps, 8);
-    vec_init<i32>(&fs.cont_jumps, 8);
+    vec_init<BrkJump>(&fs.break_jumps, 8);
+    vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
     vec_init<NodePtr>(&fs.finallys, 4);
+    fs.loop_id_counter = 1;
 }
 
 private void fscope_free(FScope* fs) {
@@ -1665,12 +1673,20 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
     }
 }
 
-private void patch_jumps(Compiler* co, Vec<i32>* jumps, i32 mark, i32 target) {
+// Patches every jump aimed at loop_id to target, removing them.
+private void patch_jumps(Compiler* co, Vec<BrkJump>* jumps, i32 loop_id, i32 target) {
     Chunk* ch = &co.cur.ch;
-    while jumps.len > mark {
-        i32 at = vec_pop(jumps);
-        ch_patch_to(ch, at, target);
+    i32 w = 0;
+    for i32 i = 0; i < jumps.len; i++ {
+        BrkJump bj = vec_get(jumps, i);
+        if bj.loop_id == loop_id {
+            ch_patch_to(ch, bj.at, target);
+        } else {
+            vec_set(jumps, w, bj);
+            w++;
+        }
     }
+    jumps.len = w;
 }
 
 private LoopCtx make_loop_ctx(Compiler* co, bool is_loop) {
@@ -1678,8 +1694,8 @@ private LoopCtx make_loop_ctx(Compiler* co, bool is_loop) {
     LoopCtx lc;
     lc.is_loop = is_loop;
     lc.label = take_label(co);
-    lc.break_mark = fs.break_jumps.len;
-    lc.cont_mark = fs.cont_jumps.len;
+    lc.id = fs.loop_id_counter;
+    fs.loop_id_counter++;
     lc.fin_depth = fs.finallys.len;
     return lc;
 }
@@ -1742,7 +1758,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ignore vec_pop(&fs.loops);
 
     i32 lcont = ch_pos(ch);
-    patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+    patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
     ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(1)));
     ch_op(ch, OP_ADD);
@@ -1751,7 +1767,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_patch(ch, jskip);
-    patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+    patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
@@ -1803,11 +1819,11 @@ private void compile_for_of(Compiler* co, Node* n) {
     ignore vec_pop(&fs.loops);
 
     i32 lcont = ch_pos(ch);
-    patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+    patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
     ch_op_u16(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the final value under done
-    patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+    patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
@@ -1850,10 +1866,10 @@ private void compile_stmt(Compiler* co, Node* n) {
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.b);
         ignore vec_pop(&fs.loops);
-        patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcond);
+        patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
         ch_op_u16(ch, OP_JUMP, lcond);
         ch_patch(ch, jend);
-        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
     }
     if k == N_DO_WHILE {
@@ -1863,10 +1879,10 @@ private void compile_stmt(Compiler* co, Node* n) {
         compile_stmt(co, n.a);
         ignore vec_pop(&fs.loops);
         i32 lcond = ch_pos(ch);
-        patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcond);
+        patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
         compile_expr(co, n.b);
         ch_op_u16(ch, OP_JUMPT, lstart);
-        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
     }
     if k == N_FOR {
@@ -1900,7 +1916,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         compile_stmt(co, n.d);
         ignore vec_pop(&fs.loops);
         i32 lcont = ch_pos(ch);
-        patch_jumps(co, &fs.cont_jumps, lc.cont_mark, lcont);
+        patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
         // per-iteration boxes for captured loop variables
         for i32 i = bind_start; i < bind_end; i++ {
             CBind b = vec_get(&fs.binds, i);
@@ -1917,7 +1933,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         }
         ch_op_u16(ch, OP_JUMP, lcond);
         if jend >= 0 { ch_patch(ch, jend); }
-        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         fs.binds.len = saved_binds;
         fs.cur_slots = saved_slots;
         fs.depth--;
@@ -1977,10 +1993,13 @@ private void compile_stmt(Compiler* co, Node* n) {
         LoopCtx lc = vec_get(&fs.loops, li);
         inline_finallys(co, lc.fin_depth);
         i32 j = ch_jump(ch, OP_JUMP);
+        BrkJump bj;
+        bj.at = j;
+        bj.loop_id = lc.id;
         if k == N_BREAK {
-            vec_push(&fs.break_jumps, j);
+            vec_push(&fs.break_jumps, bj);
         } else {
-            vec_push(&fs.cont_jumps, j);
+            vec_push(&fs.cont_jumps, bj);
         }
         return;
     }
@@ -2095,7 +2114,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.cur_slots = saved_slots;
         fs.depth--;
         ignore vec_pop(&fs.loops);
-        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         fs.cur_slots--;
         vec_free(&case_jumps);
         return;
@@ -2116,7 +2135,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         vec_push(&fs.loops, lc);
         compile_stmt(co, body);
         ignore vec_pop(&fs.loops);
-        patch_jumps(co, &fs.break_jumps, lc.break_mark, ch_pos(ch));
+        patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
     }
     if k == N_FUNCTION {

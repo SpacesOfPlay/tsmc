@@ -1,0 +1,16 @@
+console.log(0.1 + 0.2);
+console.log(1 / 3);
+console.log((123.456).toFixed(2));
+console.log((255).toString(16), (255).toString(2), (8).toString(8));
+console.log(1e21, 1e-7, 1.5e300);
+console.log(0.0001, 100000000000000000000);
+console.log(-0, 1 / -0);
+console.log(Number("  42  "), Number("0x1F"), Number(""), Number("nope"));
+console.log(parseInt("0xFF"), parseInt("42px"), parseInt("11", 2), parseFloat("3.14xyz"));
+console.log(Math.max(), Math.min(), Math.round(2.5), Math.round(-2.5), Math.round(2.4));
+console.log(5 % 3, -5 % 3, 5 % -3, 5.5 % 2);
+console.log(2 ** 10, 2 ** -1, 0 ** 0);
+console.log(Number.isInteger(5), Number.isInteger(5.5), Number.isNaN(NaN), Number.isFinite(Infinity));
+console.log(10 / 0, -10 / 0, 0 / 0);
+console.log(~5, 5 & 3, 5 | 2, 5 ^ 1, 1 << 30, -8 >> 1, -8 >>> 28);
+console.log(String(123), String(1.5), String(NaN), String(Infinity), String(-0));

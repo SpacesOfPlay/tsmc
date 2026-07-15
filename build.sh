@@ -143,20 +143,40 @@ run_bench() {
     [ "$n" -eq 0 ] && echo "  (none)"
 }
 
+run_diff() {
+    build_tsmc
+    step "differential (vs node)"
+    node_bin="${NODE:-$(command -v node 2>/dev/null)}"
+    if [ -z "$node_bin" ]; then echo "  skipped - node not found (set NODE)"; return; fi
+    n_fail=0
+    for f in "$PROJECT_DIR"/test/diff/*.js; do
+        [ -e "$f" ] || continue
+        name="$(basename "$f" .js)"
+        if [ "$("$node_bin" "$f" 2>&1)" = "$("$OUT_EXE" "$f" 2>&1)" ]; then
+            pass "$name"
+        else
+            fail "$name (differs from node)"; n_fail=$((n_fail + 1))
+        fi
+    done
+    [ "$n_fail" -eq 0 ] || { fail "$n_fail differ"; exit 1; }
+}
+
 case "${1:-help}" in
     build) build_tsmc ;;
     test)  run_tests ;;
     bench) run_bench ;;
+    diff)  run_diff ;;
     clean)
         step "clean"
         rm -rf "$BUILD_DIR"
         pass "removed build/"
         ;;
     *)
-        echo "usage: ./build.sh <build|test|bench|clean>"
+        echo "usage: ./build.sh <build|test|bench|diff|clean>"
         echo "  build   compile build/tsmc"
         echo "  test    build, then run unit + cli + golden run tests"
         echo "  bench   build, then time bench/*.ts"
+        echo "  diff    build, then diff test/diff/*.js vs node"
         echo "  clean   remove build/"
         ;;
 esac

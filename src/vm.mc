@@ -369,13 +369,121 @@ private bool num_special(f64 v, str* lit) {
     return false;
 }
 
-// Owned decimal string for a finite, non-zero number.
+// Owned decimal string for a finite, non-zero number, matching
+// ECMAScript Number::toString (7.1.12.1): shortest digits from Ryu,
+// placed per the spec — plain decimal for -6 < n <= 21, else
+// exponential with e+/e- notation.
 private string js_num_format(f64 v) {
-    i64 iv = cast(i64, v);
-    if cast(f64, iv) == v {
-        return format("{}", iv);
+    bool neg = v < 0.0;
+    f64 av = neg ? -v : v;
+
+    // small integers: exact and cheap
+    i64 iv = cast(i64, av);
+    if cast(f64, iv) == av && av < 1.0e15 {
+        return neg ? format("-{}", iv) : format("{}", iv);
     }
-    return format_f64(v);
+
+    // shortest round-trip digits from Ryu, then re-place the point
+    string fs = format_f64(av);
+    str f = fs;
+    // split mantissa / exponent
+    i32 epos = -1;
+    for i32 i = 0; i < f.len; i++ {
+        u8 c = *(f.data + i);
+        if c == 'e' || c == 'E' { epos = i; break; }
+    }
+    i32 e_extra = 0;
+    i32 base_end = f.len;
+    if epos >= 0 {
+        base_end = epos;
+        i32 sign = 1;
+        i32 j = epos + 1;
+        if j < f.len && (*(f.data + j) == '+' || *(f.data + j) == '-') {
+            if *(f.data + j) == '-' { sign = -1; }
+            j++;
+        }
+        i32 ev = 0;
+        while j < f.len {
+            i32 dc = *(f.data + j);
+            ev = ev * 10 + (dc - '0');
+            j++;
+        }
+        e_extra = sign * ev;
+    }
+    // digits of the mantissa and the point position within them
+    u8[40] digits;
+    i32 nd = 0;
+    i32 point = -1;
+    for i32 i = 0; i < base_end; i++ {
+        u8 c = *(f.data + i);
+        if c == '.' {
+            point = nd;
+        } else if c >= '0' && c <= '9' {
+            if nd < 40 { digits[nd] = c; nd++; }
+        }
+    }
+    if point < 0 { point = nd; }
+    // ES's n: digits to the left of the decimal point after the exp shift
+    i32 n = point + e_extra;
+    // strip leading zeros
+    i32 start = 0;
+    while start < nd - 1 && digits[start] == '0' { start++; n--; }
+    // strip trailing zeros
+    i32 end = nd;
+    while end > start + 1 && digits[end - 1] == '0' { end--; }
+    i32 k = end - start;
+    free(fs);
+
+    str_buf sb;
+    str_buf_init(&sb);
+    if neg { str_buf_add(&sb, "-"); }
+    str s;
+    s.data = &digits[start];
+    s.len = k;
+
+    if k <= n && n <= 21 {
+        str_buf_add(&sb, s);
+        for i32 i = 0; i < n - k; i++ { str_buf_add(&sb, "0"); }
+    } else if 0 < n && n <= 21 {
+        str head;
+        head.data = &digits[start];
+        head.len = n;
+        str tail;
+        tail.data = &digits[start + n];
+        tail.len = k - n;
+        str_buf_add(&sb, head);
+        str_buf_add(&sb, ".");
+        str_buf_add(&sb, tail);
+    } else if -6 < n && n <= 0 {
+        str_buf_add(&sb, "0.");
+        for i32 i = 0; i < -n; i++ { str_buf_add(&sb, "0"); }
+        str_buf_add(&sb, s);
+    } else {
+        // exponential: d.ddd e(+/-)(n-1)
+        u8[1] first;
+        first[0] = digits[start];
+        str fd;
+        fd.data = &first[0];
+        fd.len = 1;
+        str_buf_add(&sb, fd);
+        if k > 1 {
+            str rest;
+            rest.data = &digits[start + 1];
+            rest.len = k - 1;
+            str_buf_add(&sb, ".");
+            str_buf_add(&sb, rest);
+        }
+        i32 exp = n - 1;
+        str_buf_add(&sb, "e");
+        if exp >= 0 { str_buf_add(&sb, "+"); } else { str_buf_add(&sb, "-"); }
+        i32 ae = exp < 0 ? -exp : exp;
+        string es = format("{}", ae);
+        str_buf_add(&sb, es);
+        free(es);
+    }
+    string result = string(str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return result;
 }
 
 // Returns a string Value; caller roots it (usually by pushing).
@@ -712,12 +820,178 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
     return value_cell(&n.head);
 }
 
+private bool inspect_ident_key(str k) {
+    if k.len == 0 { return false; }
+    u8 c0 = *(k.data);
+    if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_' || c0 == '$') {
+        return false;
+    }
+    for i32 i = 1; i < k.len; i++ {
+        u8 c = *(k.data + i);
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_' || c == '$') {
+            return false;
+        }
+    }
+    return true;
+}
+
+private void inspect_quoted(str_buf* sb, str s) {
+    str_buf_add(sb, "'");
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c == '\'' { str_buf_add(sb, "\\'"); }
+        else if c == '\\' { str_buf_add(sb, "\\\\"); }
+        else if c == '\n' { str_buf_add(sb, "\\n"); }
+        else {
+            str one;
+            one.data = s.data + i;
+            one.len = 1;
+            str_buf_add(sb, one);
+        }
+    }
+    str_buf_add(sb, "'");
+}
+
+// Node-like single-line inspect. `nested` quotes strings; the seen set
+// guards cycles; depth bounds recursion.
+private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, Vec<u64>* seen) {
+    if value_is_string(v) {
+        if nested { inspect_quoted(sb, gc_string_view(value_as_string(v))); }
+        else { str_buf_add(sb, gc_string_view(value_as_string(v))); }
+        return;
+    }
+    if value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0 {
+        str_buf_add(sb, "-0");
+        return;
+    }
+    if value_is_number(v) || value_is_bool(v) || value_is_null(v)
+        || value_is_undefined(v) || value_is_symbol(v) {
+        i32 rm = gc_root_mark(&vm.heap);
+        Value s = js_to_string_value(vm, v);
+        gc_root(&vm.heap, s);
+        str_buf_add(sb, gc_string_view(value_as_string(s)));
+        gc_root_reset(&vm.heap, rm);
+        return;
+    }
+    if value_is_function(v) || value_is_native(v) {
+        str nm;
+        nm.data = null;
+        nm.len = 0;
+        if value_is_native(v) { nm = value_as_native(v).name; }
+        else if value_as_function(v).tmpl != null { nm = value_as_function(v).tmpl.name; }
+        if nm.len > 0 {
+            str_buf_add(sb, "[Function: ");
+            str_buf_add(sb, nm);
+            str_buf_add(sb, "]");
+        } else {
+            str_buf_add(sb, "[Function (anonymous)]");
+        }
+        return;
+    }
+    if value_is_array(v) || value_is_object(v) {
+        u64 id = v.bits;
+        for i32 i = 0; i < seen.len; i++ {
+            if vec_get(seen, i) == id { str_buf_add(sb, "[Circular]"); return; }
+        }
+        JsObject* o = value_as_object(v);
+        bool is_arr = (o.obj_flags & OBJF_ARRAY) != 0;
+        if depth < 0 {
+            str_buf_add(sb, is_arr ? "[Array]" : "[Object]");
+            return;
+        }
+        vec_push(seen, id);
+        if is_arr {
+            if o.elen == 0 { str_buf_add(sb, "[]"); }
+            else {
+                str_buf_add(sb, "[ ");
+                for i32 i = 0; i < o.elen; i++ {
+                    if i > 0 { str_buf_add(sb, ", "); }
+                    inspect_into(vm, sb, js_array_get(o, i), depth - 1, true, seen);
+                }
+                str_buf_add(sb, " ]");
+            }
+        } else {
+            i32 n = 0;
+            str_buf tmp;
+            str_buf_init(&tmp);
+            for i32 i = 0; i < o.props.len; i++ {
+                u32 key = (o.props.items + i).key;
+                if !vm_enumerable_key(vm, key) { continue; }
+                if n > 0 { str_buf_add(&tmp, ", "); }
+                str kn = atom_name(&vm.atoms, key);
+                if inspect_ident_key(kn) { str_buf_add(&tmp, kn); }
+                else { inspect_quoted(&tmp, kn); }
+                str_buf_add(&tmp, ": ");
+                Value pv = (o.props.items + i).val;
+                if value_is_accessor(pv) {
+                    str_buf_add(&tmp, "[Getter]");
+                } else {
+                    inspect_into(vm, &tmp, pv, depth - 1, true, seen);
+                }
+                n++;
+            }
+            if n == 0 { str_buf_add(sb, "{}"); }
+            else {
+                str_buf_add(sb, "{ ");
+                str_buf_add(sb, str_buf_to_str(&tmp));
+                str_buf_add(sb, " }");
+            }
+            str_buf_free(&tmp);
+        }
+        ignore vec_pop(seen);
+        return;
+    }
+    if value_is_map(v) {
+        JsMap* mp = value_as_map(v);
+        if mp.is_set { str_buf_add(sb, "Set("); } else { str_buf_add(sb, "Map("); }
+        string cnt = format("{}", mp.count);
+        str_buf_add(sb, cnt);
+        free(cnt);
+        str_buf_add(sb, ") ");
+        if mp.count == 0 { str_buf_add(sb, "{}"); return; }
+        str_buf_add(sb, "{ ");
+        i32 n = 0;
+        for i32 i = 0; i < mp.len; i++ {
+            if !*(mp.live + i) { continue; }
+            if n > 0 { str_buf_add(sb, ", "); }
+            inspect_into(vm, sb, *(mp.keys + i), depth - 1, true, seen);
+            if !mp.is_set {
+                str_buf_add(sb, " => ");
+                inspect_into(vm, sb, *(mp.vals + i), depth - 1, true, seen);
+            }
+            n++;
+        }
+        str_buf_add(sb, " }");
+        return;
+    }
+    str_buf_add(sb, "[object]");
+}
+
+// Display form for console: primitives as ToString (with -0 shown),
+// objects/arrays via a Node-like inspect.
+Value js_console_string(VM* vm, Value v) {
+    if value_is_object(v) || value_is_array(v) || value_is_map(v)
+        || value_is_function(v) || value_is_native(v)
+        || (value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0) {
+        str_buf sb;
+        str_buf_init(&sb);
+        Vec<u64> seen = vec_new<u64>(8);
+        inspect_into(vm, &sb, v, 4, false, &seen);
+        vec_free(&seen);
+        GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+        str_buf_free(&sb);
+        return value_cell(&g.head);
+    }
+    return js_to_string_value(vm, v);
+}
+
 private Value native_console_out(VM* vm, Value* args, i32 argc, bool to_err) {
     for i32 i = 0; i < argc; i++ {
         if i > 0 {
             if to_err { eprint(" "); } else { print(" "); }
         }
-        Value s = js_to_string_value(vm, *(args + i));
+        Value s = js_console_string(vm, *(args + i));
         vpush(vm, s);
         str view = gc_string_view(value_as_string(s));
         if to_err { eprint("{}", view); } else { print("{}", view); }

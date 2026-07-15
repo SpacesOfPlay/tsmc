@@ -640,6 +640,123 @@ private Value nat_arr_reduce(void* vmp, Value callee, Value thisv, Value* args, 
     return acc;
 }
 
+private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 i = a.elen - 1;
+    Value acc;
+    if argc > 1 {
+        acc = *(args + 1);
+    } else {
+        if a.elen == 0 {
+            vm_throw_error(vm, ERR_TYPE, "reduce of empty array with no initial value");
+            return value_undefined();
+        }
+        acc = js_array_get(a, i);
+        i--;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    while i >= 0 {
+        gc_root(&vm.heap, acc);
+        Value[4] cargs = { acc, js_array_get(a, i), value_int(i), thisv };
+        acc = vm_call_value(vm, fun, value_undefined(), &cargs[0], 4);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+        i--;
+    }
+    return acc;
+}
+
+private Value nat_arr_at(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    i32 i = to_int_arg(arg_at(args, argc, 0));
+    if i < 0 { i += a.elen; }
+    if i < 0 || i >= a.elen { return value_undefined(); }
+    return js_array_get(a, i);
+}
+
+private Value nat_arr_findlast(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    for i32 i = a.elen - 1; i >= 0; i-- {
+        Value e = js_array_get(a, i);
+        Value[3] ca = { e, value_int(i), thisv };
+        Value r = vm_call_value(vm, fun, value_undefined(), &ca[0], 3);
+        if vm.has_pending { return value_undefined(); }
+        if js_truthy(r) { return e; }
+    }
+    return value_undefined();
+}
+
+// Flattens one level (arrays only) into dst.
+private void flatten_into(VM* vm, JsObject* src, JsObject* dst, i32 depth) {
+    for i32 i = 0; i < src.elen; i++ {
+        Value e = js_array_get(src, i);
+        if depth > 0 && value_is_array(e) {
+            flatten_into(vm, value_as_object(e), dst, depth - 1);
+        } else {
+            js_array_set(dst, dst.elen, e);
+        }
+    }
+}
+
+private Value nat_arr_flat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    i32 depth = argc > 0 && !value_is_undefined(*(args)) ? to_int_arg(*(args)) : 1;
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&out.head));
+    flatten_into(vm, a, out, depth);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&out.head);
+}
+
+private Value nat_arr_flatmap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&out.head));
+    for i32 i = 0; i < a.elen; i++ {
+        Value[3] ca = { js_array_get(a, i), value_int(i), thisv };
+        Value r = vm_call_value(vm, fun, value_undefined(), &ca[0], 3);
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+        gc_root(&vm.heap, r);
+        if value_is_array(r) {
+            JsObject* ro = value_as_object(r);
+            for i32 j = 0; j < ro.elen; j++ {
+                js_array_set(out, out.elen, js_array_get(ro, j));
+            }
+        } else {
+            js_array_set(out, out.elen, r);
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&out.head);
+}
+
 private Value nat_arr_reverse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* a = this_array(vm, thisv);
@@ -965,9 +1082,15 @@ private Value nat_str_split(void* vmp, Value callee, Value thisv, Value* args, i
     Value sepsv = js_to_string_value(vm, sepv);
     gc_root(&vm.heap, sepsv);
     str sep = sview(sepsv);
+    i32 limit = -1;
+    if argc > 1 && !value_is_undefined(*(args + 1)) {
+        limit = to_int_arg(*(args + 1));
+        if limit < 0 { limit = 0; }
+    }
     i32 n = 0;
     if sep.len == 0 {
         for i32 i = 0; i < s.len; i++ {
+            if limit >= 0 && n >= limit { break; }
             str one;
             one.data = s.data + i;
             one.len = 1;
@@ -976,7 +1099,9 @@ private Value nat_str_split(void* vmp, Value callee, Value thisv, Value* args, i
         }
     } else {
         i32 at = 0;
+        bool capped = false;
         while true {
+            if limit >= 0 && n >= limit { capped = true; break; }
             i32 f = str_find_from(s, sep, at);
             if f < 0 { break; }
             str part;
@@ -986,10 +1111,12 @@ private Value nat_str_split(void* vmp, Value callee, Value thisv, Value* args, i
             n++;
             at = f + sep.len;
         }
-        str tail;
-        tail.data = s.data + at;
-        tail.len = s.len - at;
-        js_array_set(arr, n, new_str(vm, tail));
+        if !capped && (limit < 0 || n < limit) {
+            str tail;
+            tail.data = s.data + at;
+            tail.len = s.len - at;
+            js_array_set(arr, n, new_str(vm, tail));
+        }
     }
     gc_root_reset(&vm.heap, rm);
     return value_cell(&arr.head);
@@ -1122,6 +1249,94 @@ private Value nat_str_replaceall(void* vmp, Value callee, Value thisv, Value* ar
 
 private Value nat_str_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return js_to_string_value(as_vm(vmp), thisv);
+}
+
+private Value nat_str_concat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, sview(sv2));
+    for i32 i = 0; i < argc; i++ {
+        Value a = js_to_string_value(vm, *(args + i));
+        gc_root(&vm.heap, a);
+        str_buf_add(&sb, sview(a));
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_str_at(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str s = sview(sv2);
+    i32 i = to_int_arg(arg_at(args, argc, 0));
+    if i < 0 { i += s.len; }
+    Value r;
+    if i < 0 || i >= s.len {
+        r = value_undefined();
+    } else {
+        str one;
+        one.data = s.data + i;
+        one.len = 1;
+        r = new_str(vm, one);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value str_trim_side(VM* vm, Value thisv, bool left, bool right) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str s = sview(sv2);
+    i32 a = 0;
+    i32 b = s.len;
+    if left { while a < b && is_ws_byte(*(s.data + a)) { a++; } }
+    if right { while b > a && is_ws_byte(*(s.data + b - 1)) { b--; } }
+    str sub;
+    sub.data = s.data + a;
+    sub.len = b - a;
+    Value r = new_str(vm, sub);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_str_trimstart(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return str_trim_side(as_vm(vmp), thisv, true, false);
+}
+private Value nat_str_trimend(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return str_trim_side(as_vm(vmp), thisv, false, true);
+}
+
+private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&o.head));
+    Value src = arg_at(args, argc, 0);
+    if value_is_array(src) {
+        JsObject* a = value_as_object(src);
+        for i32 i = 0; i < a.elen; i++ {
+            Value pair = js_array_get(a, i);
+            if value_is_array(pair) {
+                JsObject* p = value_as_object(pair);
+                Value ks = js_to_string_value(vm, js_array_get(p, 0));
+                vm_push(vm, ks);
+                u32 atom = bi_atom(vm, sview(ks));
+                vm_pop(vm);
+                js_set_prop(o, atom, js_array_get(p, 1));
+            }
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&o.head);
 }
 
 // --- Number / Boolean ------------------------------------------------------------
@@ -1915,7 +2130,7 @@ private Value console_write(VM* vm, Value* args, i32 argc, bool to_err) {
             if to_err { eprint(" "); } else { print(" "); }
         }
         i32 rm = gc_root_mark(&vm.heap);
-        Value s = js_to_string_value(vm, *(args + i));
+        Value s = js_console_string(vm, *(args + i));
         gc_root(&vm.heap, s);
         if to_err { eprint("{}", sview(s)); } else { print("{}", sview(s)); }
         gc_root_reset(&vm.heap, rm);
@@ -3233,6 +3448,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "assign", &nat_object_assign);
     def_static(vm, object_ctor, "create", &nat_object_create);
     def_static(vm, object_ctor, "getPrototypeOf", &nat_object_getproto);
+    def_static(vm, object_ctor, "fromEntries", &nat_object_fromentries);
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
 
@@ -3256,10 +3472,15 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "filter", &nat_arr_filter);
     def_method(vm, vm.array_proto, "forEach", &nat_arr_foreach);
     def_method(vm, vm.array_proto, "reduce", &nat_arr_reduce);
+    def_method(vm, vm.array_proto, "reduceRight", &nat_arr_reduceright);
     def_method(vm, vm.array_proto, "some", &nat_arr_some);
     def_method(vm, vm.array_proto, "every", &nat_arr_every);
     def_method(vm, vm.array_proto, "find", &nat_arr_find);
     def_method(vm, vm.array_proto, "findIndex", &nat_arr_findindex);
+    def_method(vm, vm.array_proto, "findLast", &nat_arr_findlast);
+    def_method(vm, vm.array_proto, "at", &nat_arr_at);
+    def_method(vm, vm.array_proto, "flat", &nat_arr_flat);
+    def_method(vm, vm.array_proto, "flatMap", &nat_arr_flatmap);
     def_method(vm, vm.array_proto, "reverse", &nat_arr_reverse);
     def_method(vm, vm.array_proto, "sort", &nat_arr_sort);
     def_method(vm, vm.array_proto, "fill", &nat_arr_fill);
@@ -3287,6 +3508,11 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.string_proto, "replace", &nat_str_replace_x);
     def_method(vm, vm.string_proto, "replaceAll", &nat_str_replaceall);
     def_method(vm, vm.string_proto, "toString", &nat_str_tostring);
+    def_method(vm, vm.string_proto, "valueOf", &nat_str_tostring);
+    def_method(vm, vm.string_proto, "at", &nat_str_at);
+    def_method(vm, vm.string_proto, "concat", &nat_str_concat);
+    def_method(vm, vm.string_proto, "trimStart", &nat_str_trimstart);
+    def_method(vm, vm.string_proto, "trimEnd", &nat_str_trimend);
     def_method(vm, vm.string_proto, "split", &nat_str_split_x);
     def_method(vm, vm.string_proto, "match", &nat_str_match);
     def_method(vm, vm.string_proto, "search", &nat_str_search);

@@ -6,7 +6,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("build", "test", "bench", "clean", "help")]
+    [ValidateSet("build", "test", "bench", "diff", "clean", "help")]
     [string]$Command = "help"
 )
 
@@ -118,20 +118,41 @@ function Run-Bench {
     }
 }
 
+# Differential test: run test/diff/*.js through tsmc and a reference
+# node, comparing stdout. Skips cleanly if node is unavailable.
+function Run-Diff {
+    Build-Tsmc
+    Step "differential (vs node)"
+    $node = if ($env:NODE) { $env:NODE } else { (Get-Command node -ErrorAction SilentlyContinue).Source }
+    if (-not $node) { Write-Host "  skipped - node not found (set NODE)"; return }
+    $scripts = @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue | Sort-Object Name)
+    $fail = 0
+    foreach ($f in $scripts) {
+        $ref = (& $node $f.FullName 2>&1) -join "`n"
+        $got = (& $OutExe $f.FullName 2>&1) -join "`n"
+        if ($ref -eq $got) { Pass $f.BaseName }
+        else { Fail "$($f.BaseName) (differs from node)"; $fail++ }
+    }
+    if ($scripts.Count -eq 0) { Write-Host "  (none)" }
+    elseif ($fail -eq 0) { Pass "all match node" } else { Fail "$fail differ"; exit 1 }
+}
+
 switch ($Command) {
     "build" { Build-Tsmc }
     "test"  { Run-Tests }
     "bench" { Run-Bench }
+    "diff"  { Run-Diff }
     "clean" {
         Step "clean"
         if (Test-Path $BuildDir) { Remove-Item -Recurse -Force $BuildDir }
         Pass "removed build/"
     }
     "help" {
-        Write-Host "usage: ./build.ps1 <build|test|bench|clean>"
+        Write-Host "usage: ./build.ps1 <build|test|bench|diff|clean>"
         Write-Host "  build   compile build/tsmc.exe"
         Write-Host "  test    build, then run unit + cli + golden run tests"
         Write-Host "  bench   build, then time bench/*.ts"
+        Write-Host "  diff    build, then diff test/diff/*.js vs node"
         Write-Host "  clean   remove build/"
     }
 }
