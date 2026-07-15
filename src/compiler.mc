@@ -62,6 +62,13 @@ struct FScope {
     Vec<NodePtr> finallys;
 }
 
+// A name imported into the current module: read live from a
+// dependency namespace slot.
+struct ModImport {
+    str slot_name;   // "%modK"
+    str prop;        // exported name in the source module
+}
+
 struct Compiler {
     DiagList* diags;
     GcHeap* heap;
@@ -69,6 +76,8 @@ struct Compiler {
     Bump* arena;
     FScope* cur;
     str pending_label;
+    bool in_module;
+    StrMap<ModImport> mod_imports;   // valid while in_module
 }
 
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
@@ -79,6 +88,8 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.cur = null;
     co.pending_label.data = null;
     co.pending_label.len = 0;
+    co.in_module = false;
+    strmap_init<ModImport>(&co.mod_imports);
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
@@ -393,6 +404,15 @@ private void emit_load_ident(Compiler* co, Node* n) {
         ch_op_u16(&fs.ch, u.tdz ? OP_GETUPVAL_CHK : OP_GETUPVAL, ui);
         return;
     }
+    // live module import: read the dependency namespace property
+    if co.in_module {
+        ModImport* mi = strmap_get<ModImport>(&co.mod_imports, n.name);
+        if mi != null {
+            emit_load_name(co, mi.slot_name, n);
+            ch_op_u16(&fs.ch, OP_GETPROP, name_const(co, mi.prop));
+            return;
+        }
+    }
     ch_op_u16(&fs.ch, OP_GETGLOBAL, name_const(co, n.name));
 }
 
@@ -400,7 +420,7 @@ private void emit_load_name(Compiler* co, str name, Node* at) {
     Node tmp;
     tmp.kind = N_IDENT;
     tmp.name = name;
-    tmp.span = at.span;
+    if at != null { tmp.span = at.span; }
     emit_load_ident(co, &tmp);
 }
 
@@ -423,6 +443,10 @@ private void emit_store_ident(Compiler* co, Node* n) {
             cerror(co, n, "assignment to constant");
         }
         ch_op_u16(&fs.ch, OP_SETUPVAL, ui);
+        return;
+    }
+    if co.in_module && strmap_get<ModImport>(&co.mod_imports, n.name) != null {
+        cerror(co, n, "cannot assign to an imported binding");
         return;
     }
     ch_op_u16(&fs.ch, OP_SETGLOBAL, name_const(co, n.name));
@@ -2141,4 +2165,290 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     co.cur = null;
     fscope_free(&fs);
     return t;
+}
+
+// --- module compilation -----------------------------------------------------------
+
+private bool node_has_source(Node* n) {
+    return n.name.len > 0 || n.name.data != null;
+}
+
+// Registers a live import: the name reads slot_name.prop at each use.
+private void register_import(Compiler* co, str slot_name, str prop, str local) {
+    ModImport mi;
+    mi.slot_name = slot_name;
+    mi.prop = prop;
+    strmap_set<ModImport>(&co.mod_imports, local, mi);
+}
+
+// %ns.name = <local name value>. The namespace object is loaded by
+// name (it is a captured cell).
+private void mirror_export(Compiler* co, str ns_name, str name, str exported) {
+    Chunk* ch = &co.cur.ch;
+    emit_load_name(co, ns_name, null);
+    emit_load_name(co, name, null);
+    ch_op_u16(ch, OP_SETPROP, name_const(co, exported));
+    ch_op(ch, OP_POP);
+}
+
+
+// Compiles a module. out_specs receives the dependency specifiers in
+// slot order (the evaluator passes namespaces in that order).
+FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
+    FScope fs;
+    fscope_init(&fs, null, false);
+    co.cur = &fs;
+    scan_inner(&fs.inner, prog, true);
+
+    // 1. assign a dep slot per distinct specifier
+    StrMap<i32> spec_slot;
+    strmap_init<i32>(&spec_slot);
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        bool has_src = (s.kind == N_IMPORT && node_has_source(s))
+            || (s.kind == N_EXPORT && node_has_source(s));
+        if !has_src { continue; }
+        if strmap_get<i32>(&spec_slot, s.name) == null {
+            i32 slot = out_specs.len;
+            strmap_set<i32>(&spec_slot, s.name, slot);
+            vec_push(out_specs, s.name);
+        }
+    }
+    i32 n_deps = out_specs.len;
+
+    // Interned "%ns" / "%modK" names living in the arena.
+    str ns_name = hidden_name(co, "%ns", 0);
+    Vec<str> mod_names = vec_new<str>(4);
+    for i32 i = 0; i < n_deps; i++ {
+        vec_push(&mod_names, hidden_name(co, "%mod", i));
+    }
+
+    // 2. params: %ns then one per dependency. Force them to be cells so
+    //    nested functions can capture them, and cellify the incoming
+    //    argument values.
+    strmap_set<i32>(&fs.inner, ns_name, 1);
+    for i32 i = 0; i < n_deps; i++ {
+        strmap_set<i32>(&fs.inner, vec_get(&mod_names, i), 1);
+    }
+    i32 ns_slot = declare(co, ns_name, true, false);
+    Vec<i32> mod_slots = vec_new<i32>(4);
+    for i32 i = 0; i < n_deps; i++ {
+        i32 mi = declare(co, vec_get(&mod_names, i), true, false);
+        vec_push(&mod_slots, vec_get(&fs.binds, mi).slot);
+    }
+    i32 n_params = 1 + n_deps;
+    ch_op_u16(&fs.ch, OP_CELLIFY, vec_get(&fs.binds, ns_slot).slot);
+    for i32 i = 0; i < n_deps; i++ {
+        ch_op_u16(&fs.ch, OP_CELLIFY, vec_get(&mod_slots, i));
+    }
+
+    co.in_module = true;
+    strmap_free<ModImport>(&co.mod_imports);
+    strmap_init<ModImport>(&co.mod_imports);
+
+    // 3. import bindings: named/default are live (registered); namespace
+    //    imports bind the whole object as a local.
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        if s.kind != N_IMPORT { continue; }
+        if !node_has_source(s) { continue; }
+        i32* slotp = strmap_get<i32>(&spec_slot, s.name);
+        if slotp == null { continue; }
+        str slot_name = vec_get(&mod_names, *slotp);
+        if s.a != null {
+            register_import(co, slot_name, "default", s.a.name);
+        }
+        if s.b != null {
+            i32 bi = declare(co, s.b.name, true, false);
+            CBind b = vec_get(&fs.binds, bi);
+            emit_load_name(co, slot_name, null);
+            if b.is_cell {
+                ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
+                ch_op_u16(&fs.ch, OP_SETCELL, b.slot);
+            } else {
+                ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
+            }
+            ch_op(&fs.ch, OP_POP);
+        }
+        for i32 j = 0; j < s.kids.len; j++ {
+            Node* sp = *(s.kids.items + j);
+            register_import(co, slot_name, sp.name, sp.a.name);
+        }
+    }
+
+    // 4. hoist vars (unwrapping exports)
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
+        hoist_vars(co, d);
+    }
+
+    // 5. lexical/class TDZ holes at top level (before functions, whose
+    //    bodies may reference them)
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
+        if d == null { continue; }
+        if d.kind == N_VAR && (d.flags & (NF_LET | NF_CONST)) != 0 {
+            for i32 j = 0; j < d.kids.len; j++ {
+                declare_pattern(co, (*(d.kids.items + j)).a, (d.flags & NF_CONST) != 0 ? 1 : 0);
+            }
+        }
+        if d.kind == N_CLASS && d.name.len > 0 {
+            declare_lexical(co, d.name, false);
+        }
+    }
+
+    // 6. top-level function declarations (hoisted), mirrored if exported
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        bool exported = s.kind == N_EXPORT;
+        Node* d = exported && s.a != null ? s.a : s;
+        if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
+            declare_plain(co, d.name);
+        }
+    }
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        bool exported = s.kind == N_EXPORT;
+        bool is_default = exported && (s.flags & NF_DEFAULT) != 0;
+        Node* d = exported && s.a != null ? s.a : s;
+        if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
+            i32 li = find_local(&fs, d.name);
+            compile_function(co, d);
+            emit_init_binding(co, li);
+            if exported && !is_default {
+                mirror_export(co, ns_name, d.name, d.name);
+            }
+            if is_default {
+                mirror_export(co, ns_name, d.name, "default");
+            }
+        }
+    }
+
+    // 7. body
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        if s.kind == N_IMPORT { continue; }
+        if s.kind == N_FUNCTION && s.name.len > 0 { continue; }
+        if s.kind == N_EXPORT && s.a != null && s.a.kind == N_FUNCTION
+            && s.a.name.len > 0 { continue; }
+        if s.kind == N_EXPORT {
+            compile_export(co, s, ns_name, &spec_slot, &mod_names);
+            continue;
+        }
+        compile_stmt(co, s);
+    }
+
+    ch_op(&fs.ch, OP_UNDEF);
+    ch_op(&fs.ch, OP_RETURN);
+    str empty;
+    empty.data = null;
+    empty.len = 0;
+    FnTemplate* t = chunk_finish(&fs.ch, empty, n_params, fs.n_slots, false, false, false);
+    co.cur = null;
+    co.in_module = false;
+    vec_free(&mod_slots);
+    vec_free(&mod_names);
+    strmap_free<i32>(&spec_slot);
+    fscope_free(&fs);
+    return t;
+}
+
+private void collect_pattern_names(Node* pat, Vec<str>* out) {
+    if pat == null { return; }
+    if pat.kind == N_IDENT {
+        vec_push(out, pat.name);
+        return;
+    }
+    if pat.kind == N_ASSIGN_PATTERN || pat.kind == N_REST {
+        collect_pattern_names(pat.a, out);
+        return;
+    }
+    if pat.kind == N_ARRAY_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            collect_pattern_names(*(pat.kids.items + i), out);
+        }
+        return;
+    }
+    if pat.kind == N_OBJECT_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pp = *(pat.kids.items + i);
+            collect_pattern_names(pp.kind == N_REST ? pp.a : pp.b, out);
+        }
+        return;
+    }
+}
+
+private void compile_export(Compiler* co, Node* s, str ns_name,
+        StrMap<i32>* spec_slot, Vec<str>* mod_names) {
+    Chunk* ch = &co.cur.ch;
+    bool is_default = (s.flags & NF_DEFAULT) != 0;
+
+    // export * from "m" / export { a as b } from "m"
+    if node_has_source(s) {
+        i32* slotp = strmap_get<i32>(spec_slot, s.name);
+        if slotp == null { return; }
+        str mname = vec_get(mod_names, *slotp);
+        if (s.flags & NF_STAR) != 0 {
+            emit_load_name(co, ns_name, null);
+            emit_load_name(co, mname, null);
+            ch_op(ch, OP_OBJ_SPREAD);
+            ch_op(ch, OP_POP);
+            return;
+        }
+        for i32 i = 0; i < s.kids.len; i++ {
+            Node* sp = *(s.kids.items + i);
+            str exported = sp.a != null ? sp.a.name : sp.name;
+            emit_load_name(co, ns_name, null);
+            emit_load_name(co, mname, null);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, sp.name));
+            ch_op_u16(ch, OP_SETPROP, name_const(co, exported));
+            ch_op(ch, OP_POP);
+        }
+        return;
+    }
+
+    // export { a, b as c }
+    if s.a == null {
+        for i32 i = 0; i < s.kids.len; i++ {
+            Node* sp = *(s.kids.items + i);
+            str exported = sp.a != null ? sp.a.name : sp.name;
+            mirror_export(co, ns_name, sp.name, exported);
+        }
+        return;
+    }
+
+    Node* d = s.a;
+    if is_default {
+        // export default <expr | class-expr | function-expr>
+        emit_load_name(co, ns_name, null);
+        compile_expr(co, d);
+        ch_op_u16(ch, OP_SETPROP, name_const(co, "default"));
+        ch_op(ch, OP_POP);
+        return;
+    }
+
+    if d.kind == N_VAR {
+        compile_var_stmt(co, d);
+        Vec<str> names = vec_new<str>(4);
+        for i32 i = 0; i < d.kids.len; i++ {
+            collect_pattern_names((*(d.kids.items + i)).a, &names);
+        }
+        for i32 i = 0; i < names.len; i++ {
+            str nm = vec_get(&names, i);
+            mirror_export(co, ns_name, nm, nm);
+        }
+        vec_free(&names);
+        return;
+    }
+    if d.kind == N_CLASS && d.name.len > 0 {
+        i32 li = find_local(co.cur, d.name);
+        compile_class_expr(co, d);
+        if li >= 0 { emit_init_binding(co, li); } else { ch_op(ch, OP_POP); }
+        mirror_export(co, ns_name, d.name, d.name);
+        return;
+    }
+    // interface/type-alias already stripped; anything else: compile as stmt
+    compile_stmt(co, d);
 }

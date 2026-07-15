@@ -2426,6 +2426,37 @@ RegexProg* vm_regexp_prog(VM* vm, Value re) {
 u32 vm_atom_lastindex(VM* vm) { return vm.atom_lastindex; }
 u32 vm_atom_index(VM* vm) { return vm.atom_index; }
 
+// --- module support ------------------------------------------------------
+
+AtomTable* vm_atoms(VM* vm) { return &vm.atoms; }
+
+// Registers a compiled template so its constants stay GC roots.
+void vm_add_template_root(VM* vm, FnTemplate* t) {
+    vec_push(&vm.troots, t);
+}
+
+// A module namespace object, permanently rooted for the run.
+JsObject* vm_new_namespace(VM* vm) {
+    JsObject* o = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&o.head));
+    return o;
+}
+
+// Runs a module body function with the given args. 0 ok, 1 uncaught.
+i32 vm_run_module_fn(VM* vm, FnTemplate* t, Value* args, i32 nargs) {
+    JsFunction* f = js_new_function(&vm.heap, t, 0);
+    Value r = vm_call_value(vm, value_cell(&f.head), value_undefined(), args, nargs);
+    ignore r;
+    if vm.has_pending {
+        Value e = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        print_uncaught(vm, e);
+        return 1;
+    }
+    return 0;
+}
+
 JsObject* vm_regexp_proto(VM* vm) { return vm.regexp_proto; }
 JsObject* vm_map_proto(VM* vm) { return vm.map_proto; }
 JsObject* vm_set_proto(VM* vm) { return vm.set_proto; }
