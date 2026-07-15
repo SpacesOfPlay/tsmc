@@ -13,6 +13,14 @@ OUT_EXE="$BUILD_DIR/tsmc"
 
 MINC_DIR="${MINC:-$PROJECT_DIR/minc}"
 
+# Millisecond clock. GNU date has %N (nanoseconds); BSD date on macOS
+# passes the unknown %N through literally, so fall back to Perl there.
+if [ "$(date +%N)" != "N" ]; then
+    now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+else
+    now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
+fi
+
 step() { printf '\033[36m:: %s\033[0m\n' "$1"; }
 pass() { printf '\033[32m  PASS  %s\033[0m\n' "$1"; }
 fail() { printf '\033[31m  FAIL  %s\033[0m\n' "$1"; }
@@ -134,10 +142,10 @@ run_bench() {
         [ -e "$f" ] || continue
         n=$((n + 1))
         name="$(basename "$f" .ts)"
-        start=$(date +%s%N)
+        start=$(now_ms)
         out="$("$OUT_EXE" "$f" 2>&1)"
-        end=$(date +%s%N)
-        ms=$(( (end - start) / 1000000 ))
+        end=$(now_ms)
+        ms=$(( end - start ))
         printf '  %6d ms  %-12s -> %s\n' "$ms" "$name" "$out"
     done
     [ "$n" -eq 0 ] && echo "  (none)"
