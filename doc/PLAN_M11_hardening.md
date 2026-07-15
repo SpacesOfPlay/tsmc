@@ -63,3 +63,69 @@ Landed, each with a measured win or a fixed hazard:
 allocation, deep nesting, wide objects. Benchmark scripts double as
 smoke tests (must exit 0 with expected output). Large-object property
 correctness under the new hash index.
+
+## Differential conformance
+
+`test/diff/*.js` run through both `tsmc` and a reference Node, byte-for-
+byte comparing stdout (`./build.ps1 diff`). Every deviation the harness
+surfaced was fixed to match Node:
+
+- **ToPrimitive (ES 7.1.1).** `+`, comparisons, and `==` coerce
+  references via `valueOf`/`toString` ordered by hint; `Array.prototype
+  .toString` joins with `,`; `ToString` on objects routes through the
+  method path so custom `toString`/`valueOf` win everywhere.
+- **Number formatting.** `toExponential`, `toPrecision`, and a basic
+  `toLocaleString` (grouping + ≤3 fraction digits), plus the ES
+  `Number::toString` placement rules. minc's formatter has no `%e`/`%g`,
+  so the digit rounding is done by hand.
+- **Reflection.** `name`/`length` synthesized on functions and natives;
+  class constructors carry the class name; anonymous functions assigned
+  to a binding take its name (NamedEvaluation); prototypes link back to
+  their constructor.
+- **Library gaps.** Math hyperbolics/`log1p`/`expm1`/`fround`/`imul`/
+  `clz32` and constants; `JSON.stringify` replacer (function + array)
+  and `toJSON`; array `values`/`keys`/`entries`/`copyWithin`; `Array
+  .from` over any iterable or array-like; string `substr`/`localeCompare`
+  /`normalize`/`toLocale*`; `Object.getOwnPropertyNames`/`setPrototypeOf`.
+- **Error text.** Property access on `null`/`undefined` reports the
+  Node-style `Cannot read properties of X (reading 'k')`.
+- **Property descriptors.** Each property carries writable/enumerable/
+  configurable attribute bits (`Prop.flags`), objects carry a non-
+  extensible bit. `Object.defineProperty`/`defineProperties`/
+  `getOwnPropertyDescriptor`, `freeze`/`isFrozen`, `seal`/`isSealed`,
+  `preventExtensions`/`isExtensible`; enumeration honors the enumerable
+  flag and assignment honors writability/extensibility. Built-in
+  methods, static methods, constructors, and class methods install
+  non-enumerable (via `def_*` helpers and `OP_DEFMETHOD`), so
+  `Object.keys(Array.prototype)`, `Object.keys(Math)`, and
+  `Object.keys(SomeClass.prototype)` are empty like Node; class fields
+  stay enumerable.
+
+- **UTF-16 string semantics** (see `doc/DESIGN_string.md`). Strings keep
+  UTF-8/WTF-8 storage; `GcString` caches `u16len` (code-unit count),
+  computed once at creation and summed on concatenation. The whole
+  JS-visible surface — `.length`, indexing, `charAt`/`charCodeAt`/
+  `codePointAt`/`at`, `slice`/`substring`/`substr`, `indexOf`/
+  `lastIndexOf` (unit indices), `split("")`/`padStart`/`padEnd`,
+  iteration (code points via for-of/spread/`Array.from`),
+  `fromCharCode`/`fromCodePoint` — now matches Node for BMP and astral
+  text. Lone surrogates round-trip as WTF-8 and print as U+FFFD.
+  `src/ustr.mc` holds the pure helpers; ASCII fast-paths keep the common
+  case O(1) and the benchmarks flat.
+
+- **Sparse-array holes.** Array literal elisions, `Array(n)`, and
+  index-past-end assignment store a hole sentinel (`value_hole()`, shared
+  with the TDZ marker) rather than `undefined`. Holes read as `undefined`
+  but are absent from `Object.keys`/`for-in`/`in`/`hasOwnProperty`/
+  `getOwnPropertyNames`; the callback methods that skip holes (forEach,
+  map (preserving them), filter, some, every, reduce/reduceRight,
+  indexOf) skip them, while those that visit them as `undefined` (find,
+  findIndex, includes, join, fill, reverse) do; slice/concat preserve
+  holes; console prints `<N empty item(s)>`. (Surfaced a minc codegen
+  bug: `return`ing a struct-typed ternary picks the wrong branch —
+  `doc/BUG_*` in the compiler repo; worked around by binding to a local.)
+
+Known deferred gaps: no BigInt; `Object.keys` on a function doesn't list
+static fields (function own-prop enumeration); class getters/setters are
+still enumerable; string comparison uses byte order (differs from UTF-16
+only for astral vs. U+E000–U+FFFF); regex indices remain byte-based.

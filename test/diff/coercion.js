@@ -1,0 +1,18 @@
+console.log(1 + "2", "3" + 4, "5" * "6", "7" - "3", +"8", +"");
+console.log(1 == "1", 0 == "", 0 == false, null == undefined, null == 0);
+console.log(NaN == NaN, [] == "", [] == 0, [1] == 1, [1, 2] == "1,2");
+console.log(true + 1, false + "", null + 1, undefined + 1);
+console.log("" + null, "" + undefined, "" + true, "" + [], "" + [1, 2], "" + {});
+console.log(!!"", !!"a", !!0, !!1, !!null, !!undefined, !![], !!{});
+console.log(1 < 2, "a" < "b", "10" < "9", 10 < 9, "10" < 9);
+console.log([1, 2, 3] + [4, 5], {} + [], typeof (1 + "2"));
+console.log(5 & "3", "5" | 2, ~"5", "10" >> 1);
+console.log(parseInt("  0x1F  "), Number(" 42 "), Number("1e3"), Number("Infinity"));
+console.log(String([1, [2, [3]]]), String(null), String(undefined), String(Symbol ? "sym" : "no"));
+console.log(0.1 + 0.2 === 0.3, 0.1 + 0.2, (0.1 + 0.2).toFixed(1));
+console.log([] + {}, {} + [] === "[object Object]");
+console.log(1 / "a", "5" % 3, 2 ** "3", -"5");
+console.log(Boolean(""), Boolean("false"), Boolean(0), Boolean(NaN), Boolean([]));
+console.log([3, 1, 10, 2].sort().join(","));
+console.log(["b", "a", "c"].sort().join(","));
+console.log([10, 9, 8, 100, 1].sort().join(","));

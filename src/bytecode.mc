@@ -10,6 +10,7 @@ import value;
 enum Op {
     OP_CONST,        // u16 const idx
     OP_UNDEF, OP_NULL, OP_TRUE, OP_FALSE,
+    OP_HOLE,         // pushes an array-hole sentinel (elisions)
     OP_POP, OP_DUP, OP_DUP2,
     OP_THIS,
 
@@ -50,6 +51,7 @@ enum Op {
     OP_NEWARR,       // u16 element count popped
     OP_GETPROP,      // u16 const idx (name)
     OP_SETPROP,      // u16 const idx; pops obj, keeps value
+    OP_DEFMETHOD,    // u16 const idx; like SETPROP but non-enumerable
     OP_GETINDEX, OP_SETINDEX,
     OP_GETMETHOD,    // u16 const idx; pops obj, pushes fn then obj
     OP_GETMETHOD_DYN,// pops key, obj; pushes fn then obj
@@ -162,6 +164,20 @@ i32 ch_pos(Chunk* ch) {
 }
 
 // Moves the chunk's contents into a heap-owned template.
+// Replaces a template's name with an owned copy (used to give a class
+// constructor the class's name rather than "constructor").
+void tmpl_set_name(FnTemplate* t, str name) {
+    if t.name.len > 0 { free(t.name.data); }
+    t.name.data = null;
+    t.name.len = 0;
+    if name.len > 0 {
+        u8* nb = alloc<u8>(name.len);
+        memcpy(nb, name.data, name.len);
+        t.name.data = nb;
+        t.name.len = name.len;
+    }
+}
+
 FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool has_rest,
         bool is_gen, bool is_async) {
     FnTemplate* t = new(FnTemplate);

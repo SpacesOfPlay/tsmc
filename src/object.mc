@@ -29,11 +29,20 @@ const i32 GEN_RUNNING = 2;
 const i32 GEN_DONE = 3;
 
 const i32 OBJF_ARRAY = 1;
+const i32 OBJF_NONEXT = 2;   // not extensible (Object.preventExtensions)
+
+// Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
+// Object.defineProperty can clear any of them.
+const u8 PROP_WRITABLE = 1;
+const u8 PROP_ENUMERABLE = 2;
+const u8 PROP_CONFIGURABLE = 4;
+const u8 PROP_DEFAULT = 7;
 
 struct FnTemplate;
 
 struct Prop {
     u32 key;
+    u8 flags;
     Value val;
 }
 
@@ -87,12 +96,23 @@ Value* props_get(PropList* p, u32 key) {
     return null;
 }
 
-void props_set(PropList* p, u32 key, Value v) {
-    Value* ex = props_get(p, key);
-    if ex != null {
-        *ex = v;
-        return;
+// The full entry (with attribute flags), or null.
+Prop* props_entry(PropList* p, u32 key) {
+    if p.idx != null {
+        i32* pos = intmap_get<i32>(p.idx, key);
+        if pos != null { return p.items + *pos; }
+        return null;
     }
+    for i32 i = 0; i < p.len; i++ {
+        Prop* pr = p.items + i;
+        if pr.key == key { return pr; }
+    }
+    return null;
+}
+
+// Appends a fresh entry with the given attribute flags. Caller must
+// have checked the key is absent.
+private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
     if p.len >= p.cap {
         i32 ncap = p.cap * 2;
         if ncap < 4 { ncap = 4; }
@@ -108,12 +128,34 @@ void props_set(PropList* p, u32 key, Value v) {
     Prop* pr = p.items + pos;
     pr.key = key;
     pr.val = v;
+    pr.flags = flags;
     p.len++;
     if p.idx != null {
         intmap_set<i32>(p.idx, key, pos);
     } else if p.len >= PROPS_INDEX_MIN {
         props_build_index(p);
     }
+    return p.items + pos;
+}
+
+void props_set(PropList* p, u32 key, Value v) {
+    Value* ex = props_get(p, key);
+    if ex != null {
+        *ex = v;
+        return;
+    }
+    ignore props_append(p, key, v, PROP_DEFAULT);
+}
+
+// Creates or updates an entry, setting both value and attribute flags.
+void props_set_desc(PropList* p, u32 key, Value v, u8 flags) {
+    Prop* ex = props_entry(p, key);
+    if ex != null {
+        ex.val = v;
+        ex.flags = flags;
+        return;
+    }
+    ignore props_append(p, key, v, flags);
 }
 
 bool props_remove(PropList* p, u32 key) {
@@ -487,9 +529,24 @@ bool js_delete_prop(JsObject* o, u32 key) {
 
 // --- array elements ---------------------------------------------------------
 
+// Reads an element for a value: an absent slot (past the end or a hole)
+// reads as undefined. Use js_array_has / js_array_raw to detect holes.
 Value js_array_get(JsObject* o, i32 idx) {
     if idx < 0 || idx >= o.elen { return value_undefined(); }
+    Value v = *(o.elems + idx);
+    return value_is_hole(v) ? value_undefined() : v;
+}
+
+// The raw stored slot, hole and all.
+Value js_array_raw(JsObject* o, i32 idx) {
+    if idx < 0 || idx >= o.elen { return value_hole(); }
     return *(o.elems + idx);
+}
+
+// Whether index idx is a present own element (in range and not a hole).
+bool js_array_has(JsObject* o, i32 idx) {
+    if idx < 0 || idx >= o.elen { return false; }
+    return !value_is_hole(*(o.elems + idx));
 }
 
 void js_array_set(JsObject* o, i32 idx, Value v) {
@@ -506,22 +563,24 @@ void js_array_set(JsObject* o, i32 idx, Value v) {
         o.elems = ne;
         o.ecap = ncap;
     }
+    // gap between old end and idx becomes holes
     for i32 i = o.elen; i < idx; i++ {
-        *(o.elems + i) = value_undefined();
+        *(o.elems + i) = value_hole();
     }
     *(o.elems + idx) = v;
     if idx >= o.elen { o.elen = idx + 1; }
 }
 
-// Truncates or undefined-extends the dense part.
+// Truncates or hole-extends the dense part.
 void js_array_set_length(JsObject* o, i32 n) {
     if n < 0 { return; }
     if n < o.elen {
         o.elen = n;
         return;
     }
-    if n > 0 {
-        js_array_set(o, n - 1, value_undefined());
+    if n > o.elen {
+        // set the last slot to a hole, filling the gap with holes too
+        js_array_set(o, n - 1, value_hole());
     }
     o.elen = n;
 }

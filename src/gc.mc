@@ -7,6 +7,7 @@
 
 import vec;
 import value;
+import ustr;
 
 // Kinds 0..1 are built in; higher kinds belong to the runtime layer,
 // which registers tracer/finalizer hooks for them.
@@ -178,7 +179,8 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
 // String: byte payload follows the struct inline. Immutable.
 struct GcString {
     GcCell head;
-    i32 len;
+    i32 len;       // byte length (UTF-8/WTF-8 storage)
+    i32 u16len;    // cached UTF-16 code-unit count; == len iff ASCII
 }
 
 GcString* gc_new_string(GcHeap* h, str s) {
@@ -188,6 +190,10 @@ GcString* gc_new_string(GcHeap* h, str s) {
     if s.len > 0 {
         memcpy(cast(u8*, gs) + sizeof(GcString), s.data, s.len);
     }
+    str view;
+    view.data = cast(u8*, gs) + sizeof(GcString);
+    view.len = s.len;
+    gs.u16len = u16_count(view);
     return gs;
 }
 

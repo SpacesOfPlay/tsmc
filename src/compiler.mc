@@ -994,7 +994,7 @@ private void compile_expr(Compiler* co, Node* n) {
             for i32 i = 0; i < n.kids.len; i++ {
                 Node* e = *(n.kids.items + i);
                 if e.kind == N_HOLE {
-                    ch_op(ch, OP_UNDEF);
+                    ch_op(ch, OP_HOLE);
                 } else {
                     compile_expr(co, e);
                 }
@@ -1009,7 +1009,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 compile_expr(co, e.a);
                 ch_op(ch, OP_ARR_SPREAD);
             } else if e.kind == N_HOLE {
-                ch_op(ch, OP_UNDEF);
+                ch_op(ch, OP_HOLE);
                 ch_op(ch, OP_ARR_APPEND);
             } else {
                 compile_expr(co, e);
@@ -1457,6 +1457,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
         ctor_fn = build_default_ctor(co, derived);
     }
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len);
+    if c.name.len > 0 { tmpl_set_name(ct, c.name); }
     vec_push(&ch.subs, ct);
     ch_op_u16(ch, OP_CLOSURE, ch.subs.len - 1);
 
@@ -1474,7 +1475,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     i32 t_proto = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_proto);
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
-    ch_op_u16(ch, OP_SETPROP, name_const(co, "constructor"));
+    ch_op_u16(ch, OP_DEFMETHOD, name_const(co, "constructor"));
     ch_op(ch, OP_POP);
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     ch_op_u16(ch, OP_GETLOCAL, t_proto);
@@ -1509,7 +1510,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
                 ch_op(ch, OP_POP);
             } else {
                 compile_function(co, m.b);
-                ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+                ch_op_u16(ch, OP_DEFMETHOD, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
             }
             continue;
@@ -1556,6 +1557,15 @@ private void inline_finallys(Compiler* co, i32 down_to) {
     fs.finallys.len = saved;
 }
 
+// Named evaluation: an anonymous function or class assigned to a name
+// takes that name (const f = () => {} → f.name === "f").
+private void infer_name(Node* init, str name) {
+    if init == null || name.len == 0 { return; }
+    if (init.kind == N_FUNCTION || init.kind == N_CLASS) && init.name.len == 0 {
+        init.name = name;
+    }
+}
+
 private void compile_var_stmt(Compiler* co, Node* n) {
     bool lexical = (n.flags & (NF_LET | NF_CONST)) != 0;
     for i32 i = 0; i < n.kids.len; i++ {
@@ -1567,6 +1577,7 @@ private void compile_var_stmt(Compiler* co, Node* n) {
                 continue;
             }
             if d.b != null {
+                infer_name(d.b, d.a.name);
                 compile_expr(co, d.b);
                 emit_init_binding(co, li);
             } else if lexical {

@@ -13,8 +13,52 @@ import value;
 import gc;
 import atom;
 import object;
+import ustr;
 import vm;
 import math;
+
+// Platform math not covered by the math module: hyperbolic functions
+// and the accurate log1p/expm1, used by the extra Math.* methods.
+when os(windows) {
+    extern "ucrtbase.dll" f64 sinh(f64 x);
+    extern "ucrtbase.dll" f64 cosh(f64 x);
+    extern "ucrtbase.dll" f64 tanh(f64 x);
+    extern "ucrtbase.dll" f64 asinh(f64 x);
+    extern "ucrtbase.dll" f64 acosh(f64 x);
+    extern "ucrtbase.dll" f64 atanh(f64 x);
+    extern "ucrtbase.dll" f64 log1p(f64 x);
+    extern "ucrtbase.dll" f64 expm1(f64 x);
+}
+when os(linux) {
+    extern "libm.so.6" f64 sinh(f64 x);
+    extern "libm.so.6" f64 cosh(f64 x);
+    extern "libm.so.6" f64 tanh(f64 x);
+    extern "libm.so.6" f64 asinh(f64 x);
+    extern "libm.so.6" f64 acosh(f64 x);
+    extern "libm.so.6" f64 atanh(f64 x);
+    extern "libm.so.6" f64 log1p(f64 x);
+    extern "libm.so.6" f64 expm1(f64 x);
+}
+when os(android) {
+    extern "libm.so" f64 sinh(f64 x);
+    extern "libm.so" f64 cosh(f64 x);
+    extern "libm.so" f64 tanh(f64 x);
+    extern "libm.so" f64 asinh(f64 x);
+    extern "libm.so" f64 acosh(f64 x);
+    extern "libm.so" f64 atanh(f64 x);
+    extern "libm.so" f64 log1p(f64 x);
+    extern "libm.so" f64 expm1(f64 x);
+}
+when os(macos) || os(ios) {
+    extern "libSystem.B.dylib" f64 sinh(f64 x);
+    extern "libSystem.B.dylib" f64 cosh(f64 x);
+    extern "libSystem.B.dylib" f64 tanh(f64 x);
+    extern "libSystem.B.dylib" f64 asinh(f64 x);
+    extern "libSystem.B.dylib" f64 acosh(f64 x);
+    extern "libSystem.B.dylib" f64 atanh(f64 x);
+    extern "libSystem.B.dylib" f64 log1p(f64 x);
+    extern "libSystem.B.dylib" f64 expm1(f64 x);
+}
 
 private VM* as_vm(void* p) {
     return cast(VM*, p);
@@ -98,11 +142,13 @@ private Value nat_object_values(void* vmp, Value callee, Value thisv, Value* arg
         i32 n = 0;
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             for i32 i = 0; i < o.elen; i++ {
+                if !js_array_has(o, i) { continue; }
                 js_array_set(arr, n, js_array_get(o, i));
                 n++;
             }
         }
         for i32 i = 0; i < o.props.len; i++ {
+            if !prop_enumerable(vm, o.props.items + i) { continue; }
             Value pv = (o.props.items + i).val;
             if value_is_accessor(pv) {
                 if !vm_get_prop_value(vm, ov, (o.props.items + i).key, &pv) {
@@ -129,6 +175,7 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
         i32 n = 0;
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             for i32 i = 0; i < o.elen; i++ {
+                if !js_array_has(o, i) { continue; }
                 JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
                 js_array_set(arr, n, value_cell(&pair.head));
                 string s = format("{}", i);
@@ -140,6 +187,7 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
             }
         }
         for i32 i = 0; i < o.props.len; i++ {
+            if !prop_enumerable(vm, o.props.items + i) { continue; }
             u32 pk = (o.props.items + i).key;
             Value pv = (o.props.items + i).val;
             if value_is_accessor(pv) {
@@ -179,6 +227,7 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
             }
         }
         for i32 i = 0; i < src.props.len; i++ {
+            if !prop_enumerable(vm, src.props.items + i) { continue; }
             u32 pk = (src.props.items + i).key;
             Value pv = (src.props.items + i).val;
             if value_is_accessor(pv) {
@@ -208,14 +257,282 @@ private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* a
     return value_null();
 }
 
+// All own string-keyed property names, enumerable or not (arrays add
+// their indices and "length").
+private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&arr.head));
+    Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        i32 n = 0;
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            for i32 i = 0; i < o.elen; i++ {
+                if !js_array_has(o, i) { continue; }
+                string s = format("{}", i);
+                Value ks = new_str(vm, s);
+                free(s);
+                js_array_set(arr, n, ks);
+                n++;
+            }
+        }
+        for i32 i = 0; i < o.props.len; i++ {
+            u32 key = (o.props.items + i).key;
+            if (key & 0x80000000) != 0 { continue; }
+            js_array_set(arr, n, new_str(vm, atom_name(&vm.atoms, key)));
+            n++;
+        }
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            js_array_set(arr, n, new_str(vm, "length"));
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&arr.head);
+}
+
+private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    Value pv = arg_at(args, argc, 1);
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        if value_is_object(pv) {
+            o.proto = value_as_object(pv);
+        } else if value_is_null(pv) {
+            o.proto = null;
+        }
+    }
+    return ov;
+}
+
+// True if ov has an own or inherited property named `name`.
+private bool desc_has(VM* vm, Value ov, str name) {
+    if !value_is_object(ov) { return false; }
+    u32 a = atom_intern(&vm.atoms, name);
+    JsObject* o = value_as_object(ov);
+    while o != null {
+        if props_entry(&o.props, a) != null { return true; }
+        o = o.proto;
+    }
+    return false;
+}
+
+private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) {
+        vm_throw_error(vm, ERR_TYPE, "Object.defineProperty called on non-object");
+        return value_undefined();
+    }
+    JsObject* o = value_as_object(ov);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
+    gc_root(&vm.heap, kv);
+    u32 key = atom_intern(&vm.atoms, sview(kv));
+    Value desc = arg_at(args, argc, 2);
+    if !value_is_object(desc) {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "property description must be an object");
+        return value_undefined();
+    }
+
+    // start from the existing attributes, or all-false for a new property
+    Prop* existing = props_entry(&o.props, key);
+    u8 flags = existing != null ? existing.flags : 0;
+
+    Value tmp;
+    if desc_has(vm, desc, "enumerable") {
+        ignore vm_get_prop_value(vm, desc, bi_atom(vm, "enumerable"), &tmp);
+        if js_truthy(tmp) { flags = flags | PROP_ENUMERABLE; }
+        else { flags = flags & cast(u8, ~PROP_ENUMERABLE); }
+    }
+    if desc_has(vm, desc, "configurable") {
+        ignore vm_get_prop_value(vm, desc, bi_atom(vm, "configurable"), &tmp);
+        if js_truthy(tmp) { flags = flags | PROP_CONFIGURABLE; }
+        else { flags = flags & cast(u8, ~PROP_CONFIGURABLE); }
+    }
+
+    Value stored;
+    if desc_has(vm, desc, "get") || desc_has(vm, desc, "set") {
+        Value g = value_undefined();
+        Value s = value_undefined();
+        if desc_has(vm, desc, "get") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "get"), &g); }
+        if desc_has(vm, desc, "set") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "set"), &s); }
+        JsAccessor* ac = js_new_accessor(&vm.heap);
+        ac.get = value_is_callable(g) ? g : value_undefined();
+        ac.set = value_is_callable(s) ? s : value_undefined();
+        stored = value_cell(&ac.head);
+        flags = flags & cast(u8, ~PROP_WRITABLE);
+    } else {
+        Value val = value_undefined();
+        if existing != null && !value_is_accessor(existing.val) { val = existing.val; }
+        if desc_has(vm, desc, "value") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "value"), &val); }
+        if desc_has(vm, desc, "writable") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "writable"), &tmp);
+            if js_truthy(tmp) { flags = flags | PROP_WRITABLE; }
+            else { flags = flags & cast(u8, ~PROP_WRITABLE); }
+        }
+        stored = val;
+    }
+    props_set_desc(&o.props, key, stored, flags);
+    gc_root_reset(&vm.heap, rm);
+    return ov;
+}
+
+private Value nat_object_defineproperties(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    Value props = arg_at(args, argc, 1);
+    if !value_is_object(ov) || !value_is_object(props) { return ov; }
+    JsObject* p = value_as_object(props);
+    // snapshot keys first; defining may reallocate the source table
+    i32 n = p.props.len;
+    for i32 i = 0; i < n; i++ {
+        Prop* pr = p.props.items + i;
+        if !prop_enumerable(vm, pr) { continue; }
+        u32 key = pr.key;
+        Value d;
+        if !vm_get_prop_value(vm, props, key, &d) { return value_undefined(); }
+        i32 rm = gc_root_mark(&vm.heap);
+        gc_root(&vm.heap, d);
+        Value kstr = new_str(vm, atom_name(&vm.atoms, key));
+        Value[3] a2 = { ov, kstr, d };
+        ignore nat_object_defineproperty(vmp, callee, value_undefined(), &a2[0], 3);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return ov;
+}
+
+private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_undefined(); }
+    JsObject* o = value_as_object(ov);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
+    gc_root(&vm.heap, kv);
+    str kname = sview(kv);
+    u32 key = atom_intern(&vm.atoms, kname);
+
+    // array index / length live outside the property table
+    if (o.obj_flags & OBJF_ARRAY) != 0 {
+        bool is_len = str_equal(kname, "length");
+        i32 idx = -1;
+        if !is_len {
+            f64 nv = js_to_number(kv);
+            i32 ni = cast(i32, nv);
+            if cast(f64, ni) == nv && ni >= 0 && ni < o.elen { idx = ni; }
+        }
+        if is_len || idx >= 0 {
+            JsObject* d = js_new_object(&vm.heap, vm.object_proto);
+            gc_root(&vm.heap, value_cell(&d.head));
+            Value dv = is_len ? value_int(o.elen) : js_array_get(o, idx);
+            js_set_prop(d, bi_atom(vm, "value"), dv);
+            js_set_prop(d, bi_atom(vm, "writable"), value_bool(true));
+            js_set_prop(d, bi_atom(vm, "enumerable"), value_bool(!is_len));
+            js_set_prop(d, bi_atom(vm, "configurable"), value_bool(!is_len));
+            gc_root_reset(&vm.heap, rm);
+            return value_cell(&d.head);
+        }
+    }
+
+    Prop* pe = props_entry(&o.props, key);
+    if pe == null {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    JsObject* d = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&d.head));
+    if value_is_accessor(pe.val) {
+        JsAccessor* ac = value_as_accessor(pe.val);
+        js_set_prop(d, bi_atom(vm, "get"), ac.get);
+        js_set_prop(d, bi_atom(vm, "set"), ac.set);
+    } else {
+        js_set_prop(d, bi_atom(vm, "value"), pe.val);
+        js_set_prop(d, bi_atom(vm, "writable"), value_bool((pe.flags & PROP_WRITABLE) != 0));
+    }
+    js_set_prop(d, bi_atom(vm, "enumerable"), value_bool((pe.flags & PROP_ENUMERABLE) != 0));
+    js_set_prop(d, bi_atom(vm, "configurable"), value_bool((pe.flags & PROP_CONFIGURABLE) != 0));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&d.head);
+}
+
+// Clears the given attribute bits from every own property.
+private void object_lock_props(JsObject* o, u8 clear) {
+    for i32 i = 0; i < o.props.len; i++ {
+        Prop* pr = o.props.items + i;
+        pr.flags = pr.flags & cast(u8, ~clear);
+    }
+}
+
+private Value nat_object_freeze(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        object_lock_props(o, PROP_WRITABLE | PROP_CONFIGURABLE);
+        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+    }
+    return ov;
+}
+
+private Value nat_object_seal(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        object_lock_props(o, PROP_CONFIGURABLE);
+        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+    }
+    return ov;
+}
+
+private Value nat_object_preventext(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+    }
+    return ov;
+}
+
+// All own data properties satisfy a predicate over cleared bits.
+private bool object_all_locked(JsObject* o, u8 need_clear) {
+    for i32 i = 0; i < o.props.len; i++ {
+        if ((o.props.items + i).flags & need_clear) != 0 { return false; }
+    }
+    return true;
+}
+
+private Value nat_object_isfrozen(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_bool(true); }
+    JsObject* o = value_as_object(ov);
+    if (o.obj_flags & OBJF_NONEXT) == 0 { return value_bool(false); }
+    return value_bool(object_all_locked(o, PROP_WRITABLE | PROP_CONFIGURABLE));
+}
+
+private Value nat_object_issealed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_bool(true); }
+    JsObject* o = value_as_object(ov);
+    if (o.obj_flags & OBJF_NONEXT) == 0 { return value_bool(false); }
+    return value_bool(object_all_locked(o, PROP_CONFIGURABLE));
+}
+
+private Value nat_object_isextensible(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_bool(false); }
+    return value_bool((value_as_object(ov).obj_flags & OBJF_NONEXT) == 0);
+}
+
 private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     if !value_is_object(thisv) { return value_bool(false); }
     JsObject* o = value_as_object(thisv);
     Value kv = arg_at(args, argc, 0);
     if (o.obj_flags & OBJF_ARRAY) != 0 && value_is_int(kv) {
-        i32 i = value_as_int(kv);
-        return value_bool(i >= 0 && i < o.elen);
+        return value_bool(js_array_has(o, value_as_int(kv)));
     }
     i32 rm = gc_root_mark(&vm.heap);
     Value ks = js_to_string_value(vm, kv);
@@ -296,13 +613,85 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
             js_array_set(arr, i, e);
         }
     } else if value_is_string(src) {
+        // code-point iteration, applying the optional map function
         str s = sview(src);
-        for i32 i = 0; i < s.len; i++ {
+        i32 off = 0;
+        i32 idx = 0;
+        while off < s.len {
+            i32 n;
+            ignore utf8_decode(s, off, &n);
             str one;
-            one.data = s.data + i;
-            one.len = 1;
+            one.data = s.data + off;
+            one.len = n;
             Value cs = new_str(vm, one);
-            js_array_set(arr, i, cs);
+            if value_is_callable(fun) {
+                gc_root(&vm.heap, cs);
+                Value[2] cargs = { cs, value_int(idx) };
+                cs = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                if vm.has_pending {
+                    gc_root_reset(&vm.heap, rm);
+                    return value_undefined();
+                }
+            }
+            js_array_set(arr, idx, cs);
+            off += n;
+            idx++;
+        }
+    } else if value_is_object(src) || value_is_map(src) || value_is_generator(src) {
+        // iterable protocol (Set, Map, generators, custom iterables) or
+        // an array-like with a length property
+        Value itfn;
+        if vm_get_prop_value(vm, src, vm_sym_iterator_id(vm), &itfn) && value_is_callable(itfn) {
+            Value iter;
+            if !vm_get_iterator(vm, src, &iter) {
+                gc_root_reset(&vm.heap, rm);
+                return value_undefined();
+            }
+            gc_root(&vm.heap, iter);
+            i32 n = 0;
+            while true {
+                Value val;
+                bool done;
+                if !vm_iter_next(vm, iter, &val, &done) {
+                    gc_root_reset(&vm.heap, rm);
+                    return value_undefined();
+                }
+                if done { break; }
+                gc_root(&vm.heap, val);
+                if value_is_callable(fun) {
+                    Value[2] cargs = { val, value_int(n) };
+                    val = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                    if vm.has_pending {
+                        gc_root_reset(&vm.heap, rm);
+                        return value_undefined();
+                    }
+                }
+                js_array_set(arr, n, val);
+                n++;
+            }
+        } else {
+            // array-like: read length and indexed elements
+            Value lenv;
+            i32 len = 0;
+            if vm_get_prop_value(vm, src, vm.atom_length, &lenv) && value_is_number(lenv) {
+                len = to_int_arg(lenv);
+            }
+            for i32 i = 0; i < len; i++ {
+                Value e;
+                string ks = format("{}", i);
+                u32 ka = atom_intern(&vm.atoms, ks);
+                free(ks);
+                ignore vm_get_prop_value(vm, src, ka, &e);
+                if value_is_callable(fun) {
+                    Value[2] cargs = { e, value_int(i) };
+                    e = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                    if vm.has_pending {
+                        gc_root_reset(&vm.heap, rm);
+                        return value_undefined();
+                    }
+                }
+                js_array_set(arr, i, e);
+            }
         }
     }
     gc_root_reset(&vm.heap, rm);
@@ -369,6 +758,28 @@ private i32 rel_index(i32 v, i32 len) {
     return v;
 }
 
+private Value nat_arr_copywithin(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_array(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = o.elen;
+    i32 target = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, len);
+    i32 start = rel_index(argc > 1 ? to_int_arg(*(args + 1)) : 0, len);
+    i32 end = len;
+    if argc > 2 && !value_is_undefined(*(args + 2)) {
+        end = rel_index(to_int_arg(*(args + 2)), len);
+    }
+    i32 count = end - start;
+    if count > len - target { count = len - target; }
+    if count > 0 {
+        Value* tmp = alloc<Value>(count);
+        for i32 i = 0; i < count; i++ { *(tmp + i) = js_array_get(o, start + i); }
+        for i32 i = 0; i < count; i++ { js_array_set(o, target + i, *(tmp + i)); }
+        free(tmp);
+    }
+    return thisv;
+}
+
 private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* a = this_array(vm, thisv);
@@ -383,9 +794,10 @@ private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i
     gc_root(&vm.heap, value_cell(&r.head));
     i32 n = 0;
     for i32 i = start; i < end; i++ {
-        js_array_set(r, n, js_array_get(a, i));
+        js_array_set(r, n, js_array_raw(a, i));   // preserve holes
         n++;
     }
+    js_array_set_length(r, n);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&r.head);
 }
@@ -437,7 +849,7 @@ private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, 
     gc_root(&vm.heap, value_cell(&r.head));
     i32 n = 0;
     for i32 i = 0; i < a.elen; i++ {
-        js_array_set(r, n, js_array_get(a, i));
+        js_array_set(r, n, js_array_raw(a, i));   // preserve holes
         n++;
     }
     for i32 s = 0; s < argc; s++ {
@@ -445,7 +857,7 @@ private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, 
         if value_is_array(v) {
             JsObject* o = value_as_object(v);
             for i32 i = 0; i < o.elen; i++ {
-                js_array_set(r, n, js_array_get(o, i));
+                js_array_set(r, n, js_array_raw(o, i));
                 n++;
             }
         } else {
@@ -453,6 +865,7 @@ private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, 
             n++;
         }
     }
+    js_array_set_length(r, n);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&r.head);
 }
@@ -492,6 +905,7 @@ private Value nat_arr_indexof(void* vmp, Value callee, Value thisv, Value* args,
     Value needle = arg_at(args, argc, 0);
     i32 start_at = argc > 1 ? rel_index(to_int_arg(*(args + 1)), a.elen) : 0;
     for i32 i = start_at; i < a.elen; i++ {
+        if !js_array_has(a, i) { continue; }   // indexOf skips holes
         if js_strict_eq(js_array_get(a, i), needle) { return value_int(i); }
     }
     return value_int(-1);
@@ -539,8 +953,11 @@ private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) 
         out = js_new_array(&vm.heap, vm.array_proto);
         gc_root(&vm.heap, value_cell(&out.head));
     }
+    // find/findIndex visit holes as undefined; the rest skip them
+    bool skip_holes = mode != IT_FIND && mode != IT_FINDINDEX;
     i32 n = 0;
     for i32 i = 0; i < a.elen; i++ {
+        if skip_holes && !js_array_has(a, i) { continue; }
         Value e = js_array_get(a, i);
         Value[3] cargs = { e, value_int(i), thisv };
         Value r = vm_call_value(vm, fun, value_undefined(), &cargs[0], 3);
@@ -577,6 +994,8 @@ private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) 
             }
         }
     }
+    // map preserves the source length, holes and all
+    if mode == IT_MAP { js_array_set_length(out, a.elen); }
     gc_root_reset(&vm.heap, rm);
     if mode == IT_MAP || mode == IT_FILTER { return value_cell(&out.head); }
     if mode == IT_SOME { return value_bool(false); }
@@ -621,15 +1040,18 @@ private Value nat_arr_reduce(void* vmp, Value callee, Value thisv, Value* args, 
     if argc > 1 {
         acc = *(args + 1);
     } else {
-        if a.elen == 0 {
+        // seed with the first present element (skip leading holes)
+        while i < a.elen && !js_array_has(a, i) { i++; }
+        if i >= a.elen {
             vm_throw_error(vm, ERR_TYPE, "reduce of empty array with no initial value");
             return value_undefined();
         }
-        acc = js_array_get(a, 0);
-        i = 1;
+        acc = js_array_get(a, i);
+        i++;
     }
     i32 rm = gc_root_mark(&vm.heap);
     while i < a.elen {
+        if !js_array_has(a, i) { i++; continue; }
         gc_root(&vm.heap, acc);
         Value[4] cargs = { acc, js_array_get(a, i), value_int(i), thisv };
         acc = vm_call_value(vm, fun, value_undefined(), &cargs[0], 4);
@@ -654,7 +1076,8 @@ private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* a
     if argc > 1 {
         acc = *(args + 1);
     } else {
-        if a.elen == 0 {
+        while i >= 0 && !js_array_has(a, i) { i--; }
+        if i < 0 {
             vm_throw_error(vm, ERR_TYPE, "reduce of empty array with no initial value");
             return value_undefined();
         }
@@ -663,6 +1086,7 @@ private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* a
     }
     i32 rm = gc_root_mark(&vm.heap);
     while i >= 0 {
+        if !js_array_has(a, i) { i--; continue; }
         gc_root(&vm.heap, acc);
         Value[4] cargs = { acc, js_array_get(a, i), value_int(i), thisv };
         acc = vm_call_value(vm, fun, value_undefined(), &cargs[0], 4);
@@ -830,21 +1254,73 @@ private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args,
     return js_to_string_value(vm, *(args));
 }
 
+// Each argument is a UTF-16 code unit (ToUint16). Adjacent high+low
+// surrogates combine into an astral code point; a lone surrogate is
+// kept as WTF-8.
 private Value nat_string_fromcharcode(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    u8* buf = alloc<u8>(argc * 4 + 1);
-    i32 n = 0;
+    str_buf sb;
+    str_buf_init(&sb);
+    i32 i = 0;
+    while i < argc {
+        f64 d = js_to_number(*(args + i));
+        i32 unit = d == d ? (cast(i32, cast(i64, d)) & 0xFFFF) : 0;
+        if unit >= 0xD800 && unit <= 0xDBFF && i + 1 < argc {
+            f64 d2 = js_to_number(*(args + i + 1));
+            i32 low = d2 == d2 ? (cast(i32, cast(i64, d2)) & 0xFFFF) : 0;
+            if low >= 0xDC00 && low <= 0xDFFF {
+                wtf8_put_cp(&sb, 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
+                i += 2;
+                continue;
+            }
+        }
+        wtf8_put_cp(&sb, unit);
+        i++;
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+// Each argument is a Unicode code point (0..0x10FFFF).
+private Value nat_string_fromcodepoint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
     for i32 i = 0; i < argc; i++ {
         f64 d = js_to_number(*(args + i));
-        u32 cp = 0;
-        if d == d && d >= 0.0 && d <= 1114111.0 { cp = cast(u32, cast(i64, d)); }
-        n += bi_utf8_encode(buf + n, cp);
+        i32 cp = cast(i32, cast(i64, d));
+        if d != d || cast(f64, cp) != d || cp < 0 || cp > 0x10FFFF {
+            str_buf_free(&sb);
+            vm_throw_error(vm, ERR_RANGE, "Invalid code point");
+            return value_undefined();
+        }
+        wtf8_put_cp(&sb, cp);
     }
-    str s;
-    s.data = buf;
-    s.len = n;
-    Value r = new_str(vm, s);
-    free(buf);
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+// Builds the UTF-16 unit range [start, end) of a string value as a new
+// string. ASCII strings (u16len == byte len) index directly.
+private Value str_u16_range(VM* vm, Value sv, i32 start, i32 end) {
+    GcString* g = value_as_string(sv);
+    str s = gc_string_view(g);
+    if start < 0 { start = 0; }
+    if end > g.u16len { end = g.u16len; }
+    if end < start { end = start; }
+    if g.u16len == g.len {
+        str sub;
+        sub.data = s.data + start;
+        sub.len = end - start;
+        return new_str(vm, sub);
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    u16_slice_into(&sb, s, start, end);
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
     return r;
 }
 
@@ -853,14 +1329,11 @@ private Value nat_str_charat(void* vmp, Value callee, Value thisv, Value* args, 
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
     i32 i = to_int_arg(arg_at(args, argc, 0));
+    i32 ulen = value_as_string(sv2).u16len;
     Value r;
-    if i >= 0 && i < s.len {
-        str one;
-        one.data = s.data + i;
-        one.len = 1;
-        r = new_str(vm, one);
+    if i >= 0 && i < ulen {
+        r = str_u16_range(vm, sv2, i, i + 1);
     } else {
         r = new_str(vm, "");
     }
@@ -875,12 +1348,30 @@ private Value nat_str_charcodeat(void* vmp, Value callee, Value thisv, Value* ar
     gc_root(&vm.heap, sv2);
     str s = sview(sv2);
     i32 i = to_int_arg(arg_at(args, argc, 0));
+    i32 unit = u16_unit_at(s, i);
     gc_root_reset(&vm.heap, rm);
-    if i >= 0 && i < s.len {
-        i32 b = *(s.data + i);
-        return value_int(b);
-    }
+    if unit >= 0 { return value_int(unit); }
     return value_number(0.0 / 0.0);
+}
+
+private Value nat_str_codepointat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str s = sview(sv2);
+    i32 i = to_int_arg(arg_at(args, argc, 0));
+    i32 hi = u16_unit_at(s, i);
+    gc_root_reset(&vm.heap, rm);
+    if hi < 0 { return value_undefined(); }
+    // a leading high surrogate followed by a low surrogate combines
+    if hi >= 0xD800 && hi <= 0xDBFF {
+        i32 lo = u16_unit_at(s, i + 1);
+        if lo >= 0xDC00 && lo <= 0xDFFF {
+            return value_int(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+        }
+    }
+    return value_int(hi);
 }
 
 private i32 str_find_from(str hay, str needle, i32 start_at) {
@@ -903,8 +1394,13 @@ private Value nat_str_indexof(void* vmp, Value callee, Value thisv, Value* args,
     gc_root(&vm.heap, sv2);
     Value nv = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, nv);
-    i32 start_at = argc > 1 ? to_int_arg(*(args + 1)) : 0;
-    i32 r = str_find_from(sview(sv2), sview(nv), start_at);
+    GcString* hg = value_as_string(sv2);
+    str hay = gc_string_view(hg);
+    bool ascii = hg.u16len == hg.len;
+    i32 start_u = argc > 1 ? to_int_arg(*(args + 1)) : 0;
+    i32 start_b = ascii ? start_u : u16_offset(hay, start_u);
+    i32 f = str_find_from(hay, sview(nv), start_b);
+    i32 r = f < 0 ? -1 : (ascii ? f : u16_byte_to_unit(hay, f));
     gc_root_reset(&vm.heap, rm);
     return value_int(r);
 }
@@ -916,7 +1412,8 @@ private Value nat_str_lastindexof(void* vmp, Value callee, Value thisv, Value* a
     gc_root(&vm.heap, sv2);
     Value nv = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, nv);
-    str hay = sview(sv2);
+    GcString* hg = value_as_string(sv2);
+    str hay = gc_string_view(hg);
     str needle = sview(nv);
     i32 best = -1;
     i32 i = 0;
@@ -926,8 +1423,10 @@ private Value nat_str_lastindexof(void* vmp, Value callee, Value thisv, Value* a
         best = f;
         i = f + 1;
     }
+    bool ascii = hg.u16len == hg.len;
+    i32 r = best < 0 ? -1 : (ascii ? best : u16_byte_to_unit(hay, best));
     gc_root_reset(&vm.heap, rm);
-    return value_int(best);
+    return value_int(r);
 }
 
 private Value nat_str_includes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -971,17 +1470,14 @@ private Value nat_str_slice(void* vmp, Value callee, Value thisv, Value* args, i
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
-    i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, s.len);
-    i32 end = s.len;
+    i32 ulen = value_as_string(sv2).u16len;
+    i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, ulen);
+    i32 end = ulen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        end = rel_index(to_int_arg(*(args + 1)), s.len);
+        end = rel_index(to_int_arg(*(args + 1)), ulen);
     }
     if end < start { end = start; }
-    str sub;
-    sub.data = s.data + start;
-    sub.len = end - start;
-    Value r = new_str(vm, sub);
+    Value r = str_u16_range(vm, sv2, start, end);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -991,25 +1487,22 @@ private Value nat_str_substring(void* vmp, Value callee, Value thisv, Value* arg
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
+    i32 ulen = value_as_string(sv2).u16len;
     i32 a = argc > 0 ? to_int_arg(*(args)) : 0;
-    i32 b = s.len;
+    i32 b = ulen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
         b = to_int_arg(*(args + 1));
     }
     if a < 0 { a = 0; }
     if b < 0 { b = 0; }
-    if a > s.len { a = s.len; }
-    if b > s.len { b = s.len; }
+    if a > ulen { a = ulen; }
+    if b > ulen { b = ulen; }
     if a > b {
         i32 t = a;
         a = b;
         b = t;
     }
-    str sub;
-    sub.data = s.data + a;
-    sub.len = b - a;
-    Value r = new_str(vm, sub);
+    Value r = str_u16_range(vm, sv2, a, b);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -1041,6 +1534,48 @@ private Value nat_str_toupper(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_str_tolower(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return str_case_map(as_vm(vmp), thisv, false);
+}
+
+// Legacy substr(start, length) with a negative-start offset from the end.
+private Value nat_str_substr(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    i32 ulen = value_as_string(sv2).u16len;
+    i32 start = argc > 0 ? to_int_arg(*(args)) : 0;
+    if start < 0 {
+        start = ulen + start;
+        if start < 0 { start = 0; }
+    }
+    if start > ulen { start = ulen; }
+    i32 len = ulen - start;
+    if argc > 1 && !value_is_undefined(*(args + 1)) {
+        len = to_int_arg(*(args + 1));
+        if len < 0 { len = 0; }
+    }
+    if start + len > ulen { len = ulen - start; }
+    Value r = str_u16_range(vm, sv2, start, start + len);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_str_localecompare(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value av = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, av);
+    Value bv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, bv);
+    i32 c = js_str_cmp(sview(av), sview(bv));
+    gc_root_reset(&vm.heap, rm);
+    return value_int(c < 0 ? -1 : (c > 0 ? 1 : 0));
+}
+
+// Unicode normalization is a no-op: already-composed input (the common
+// case) round-trips unchanged.
+private Value nat_str_normalize(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return js_to_string_value(as_vm(vmp), thisv);
 }
 
 private bool is_ws_byte(u8 c) {
@@ -1089,12 +1624,11 @@ private Value nat_str_split(void* vmp, Value callee, Value thisv, Value* args, i
     }
     i32 n = 0;
     if sep.len == 0 {
-        for i32 i = 0; i < s.len; i++ {
+        // split into UTF-16 code units
+        i32 ulen = value_as_string(sv2).u16len;
+        for i32 i = 0; i < ulen; i++ {
             if limit >= 0 && n >= limit { break; }
-            str one;
-            one.data = s.data + i;
-            one.len = 1;
-            js_array_set(arr, n, new_str(vm, one));
+            js_array_set(arr, n, str_u16_range(vm, sv2, i, i + 1));
             n++;
         }
     } else {
@@ -1149,6 +1683,7 @@ private Value str_pad(VM* vm, Value thisv, Value* args, i32 argc, bool at_start)
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     str s = sview(sv2);
+    i32 src_u = value_as_string(sv2).u16len;
     i32 target = to_int_arg(arg_at(args, argc, 0));
     str pad = " ";
     if argc > 1 && !value_is_undefined(*(args + 1)) {
@@ -1156,19 +1691,23 @@ private Value str_pad(VM* vm, Value thisv, Value* args, i32 argc, bool at_start)
         gc_root(&vm.heap, pv);
         pad = sview(pv);
     }
-    if target <= s.len || pad.len == 0 {
+    if target <= src_u || pad.len == 0 {
         gc_root_reset(&vm.heap, rm);
         return sv2;
     }
+    i32 pad_u = u16_count(pad);
     str_buf sb;
     str_buf_init(&sb);
     if !at_start { str_buf_add(&sb, s); }
-    i32 need = target - s.len;
+    i32 need = target - src_u;   // code units to add
     while need > 0 {
-        str piece = pad;
-        if piece.len > need { piece.len = need; }
-        str_buf_add(&sb, piece);
-        need -= piece.len;
+        if need >= pad_u {
+            str_buf_add(&sb, pad);
+            need -= pad_u;
+        } else {
+            u16_slice_into(&sb, pad, 0, need);
+            need = 0;
+        }
     }
     if at_start { str_buf_add(&sb, s); }
     Value r = new_str(vm, str_buf_to_str(&sb));
@@ -1275,17 +1814,14 @@ private Value nat_str_at(void* vmp, Value callee, Value thisv, Value* args, i32 
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
+    i32 ulen = value_as_string(sv2).u16len;
     i32 i = to_int_arg(arg_at(args, argc, 0));
-    if i < 0 { i += s.len; }
+    if i < 0 { i += ulen; }
     Value r;
-    if i < 0 || i >= s.len {
+    if i < 0 || i >= ulen {
         r = value_undefined();
     } else {
-        str one;
-        one.data = s.data + i;
-        one.len = 1;
-        r = new_str(vm, one);
+        r = str_u16_range(vm, sv2, i, i + 1);
     }
     gc_root_reset(&vm.heap, rm);
     return r;
@@ -1355,6 +1891,15 @@ private Value nat_num_isinteger(void* vmp, Value callee, Value thisv, Value* arg
     if !value_is_number(v) { return value_bool(false); }
     f64 d = js_to_number(v);
     return value_bool(d == d && cast(f64, cast(i64, d)) == d);
+}
+
+private Value nat_num_issafeinteger(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    if !value_is_number(v) { return value_bool(false); }
+    f64 d = js_to_number(v);
+    if d != d { return value_bool(false); }
+    if cast(f64, cast(i64, d)) != d { return value_bool(false); }
+    return value_bool(d <= 9007199254740991.0 && d >= -9007199254740991.0);
 }
 
 private Value nat_num_isfinite(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -1556,6 +2101,220 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
     return r;
 }
 
+// Fills digits[0..sig) with the `sig` most significant decimal digits
+// of av (av > 0, finite), correctly rounded, and returns the base-10
+// exponent of the leading digit. Digits beyond the 17 a double can
+// carry are padded with '0'.
+private i32 decimal_sig(f64 av, i32 sig, u8* digits) {
+    i32 calc = sig;
+    if calc > 17 { calc = 17; }
+    i32 e = cast(i32, floor(log10(av)));
+    f64 p = pow(10.0, cast(f64, calc - 1 - e));
+    i64 scaled = cast(i64, floor(av * p + 0.5));
+    i64 lo = 1;
+    for i32 i = 0; i < calc - 1; i++ { lo = lo * 10; }
+    i64 hi = lo * 10;
+    // correct off-by-one from log10 rounding at the boundaries
+    i32 guard = 0;
+    while scaled >= hi && guard < 4 {
+        e++;
+        p = pow(10.0, cast(f64, calc - 1 - e));
+        scaled = cast(i64, floor(av * p + 0.5));
+        guard++;
+    }
+    guard = 0;
+    while scaled < lo && scaled > 0 && guard < 4 {
+        e--;
+        p = pow(10.0, cast(f64, calc - 1 - e));
+        scaled = cast(i64, floor(av * p + 0.5));
+        guard++;
+    }
+    string ds = format("{}", scaled);
+    str s = ds;
+    i32 n = s.len;
+    for i32 i = 0; i < calc; i++ {
+        digits[i] = i < n ? *(s.data + i) : cast(u8, '0');
+    }
+    for i32 i = calc; i < sig; i++ { digits[i] = '0'; }
+    free(ds);
+    return e;
+}
+
+private Value nat_num_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return js_number_value(js_to_number(thisv));
+}
+
+private Value nat_num_toexponential(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64 v = js_to_number(thisv);
+    f64 inf = 1.0e308 * 10.0;
+    if v != v { return new_str(vm, "NaN"); }
+    if v == inf { return new_str(vm, "Infinity"); }
+    if v == -inf { return new_str(vm, "-Infinity"); }
+    bool neg = v < 0.0;
+    f64 av = neg ? -v : v;
+    Value fdv = arg_at(args, argc, 0);
+    bool have_f = !value_is_undefined(fdv);
+    i32 f = have_f ? to_int_arg(fdv) : 6;
+    if f < 0 { f = 0; }
+    if f > 100 { f = 100; }
+    i32 sig = f + 1;
+    u8[128] digits;
+    i32 e = 0;
+    if av == 0.0 {
+        for i32 i = 0; i < sig; i++ { digits[i] = '0'; }
+    } else {
+        e = decimal_sig(av, sig, &digits[0]);
+    }
+    i32 nd = sig;
+    if !have_f {
+        while nd > 1 && digits[nd - 1] == '0' { nd--; }
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    if neg { str_buf_add(&sb, "-"); }
+    str d0;
+    d0.data = &digits[0];
+    d0.len = 1;
+    str_buf_add(&sb, d0);
+    if nd > 1 {
+        str_buf_add(&sb, ".");
+        str rest;
+        rest.data = &digits[1];
+        rest.len = nd - 1;
+        str_buf_add(&sb, rest);
+    }
+    str_buf_add(&sb, "e");
+    if e >= 0 { str_buf_add(&sb, "+"); } else { str_buf_add(&sb, "-"); }
+    i32 ae = e < 0 ? -e : e;
+    string es = format("{}", ae);
+    str_buf_add(&sb, es);
+    free(es);
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+private Value nat_num_toprecision(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value pv = arg_at(args, argc, 0);
+    if value_is_undefined(pv) { return js_to_string_value(vm, thisv); }
+    f64 v = js_to_number(thisv);
+    f64 inf = 1.0e308 * 10.0;
+    if v != v { return new_str(vm, "NaN"); }
+    if v == inf { return new_str(vm, "Infinity"); }
+    if v == -inf { return new_str(vm, "-Infinity"); }
+    i32 p = to_int_arg(pv);
+    if p < 1 { p = 1; }
+    if p > 100 { p = 100; }
+    bool neg = v < 0.0;
+    f64 av = neg ? -v : v;
+    u8[128] digits;
+    i32 e = 0;
+    if av == 0.0 {
+        for i32 i = 0; i < p; i++ { digits[i] = '0'; }
+    } else {
+        e = decimal_sig(av, p, &digits[0]);
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    if neg { str_buf_add(&sb, "-"); }
+    if e < -6 || e >= p {
+        str d0;
+        d0.data = &digits[0];
+        d0.len = 1;
+        str_buf_add(&sb, d0);
+        if p > 1 {
+            str_buf_add(&sb, ".");
+            str rest;
+            rest.data = &digits[1];
+            rest.len = p - 1;
+            str_buf_add(&sb, rest);
+        }
+        str_buf_add(&sb, "e");
+        if e >= 0 { str_buf_add(&sb, "+"); } else { str_buf_add(&sb, "-"); }
+        i32 ae = e < 0 ? -e : e;
+        string es = format("{}", ae);
+        str_buf_add(&sb, es);
+        free(es);
+    } else if e >= 0 {
+        i32 ip = e + 1;
+        str head;
+        head.data = &digits[0];
+        head.len = ip;
+        str_buf_add(&sb, head);
+        if ip < p {
+            str_buf_add(&sb, ".");
+            str tail;
+            tail.data = &digits[ip];
+            tail.len = p - ip;
+            str_buf_add(&sb, tail);
+        }
+    } else {
+        str_buf_add(&sb, "0.");
+        for i32 i = 0; i < -e - 1; i++ { str_buf_add(&sb, "0"); }
+        str all;
+        all.data = &digits[0];
+        all.len = p;
+        str_buf_add(&sb, all);
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+// Basic en-US locale: thousands grouping, up to 3 fraction digits.
+private Value nat_num_tolocalestring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64 v = js_to_number(thisv);
+    f64 inf = 1.0e308 * 10.0;
+    if v != v { return new_str(vm, "NaN"); }
+    if v == inf { return new_str(vm, "\xe2\x88\x9e"); }
+    if v == -inf { return new_str(vm, "-\xe2\x88\x9e"); }
+    bool neg = v < 0.0;
+    f64 av = neg ? -v : v;
+    if av >= 9.0e18 { return js_to_string_value(vm, thisv); }
+    i64 ipart = 0;
+    i32 frac = 0;
+    if av >= 1.0e15 {
+        ipart = cast(i64, av);
+    } else {
+        i64 iscaled = cast(i64, floor(av * 1000.0 + 0.5));
+        ipart = iscaled / 1000;
+        frac = cast(i32, iscaled % 1000);
+    }
+    string ips = format("{}", ipart);
+    str s = ips;
+    str_buf sb;
+    str_buf_init(&sb);
+    if neg && (ipart != 0 || frac != 0) { str_buf_add(&sb, "-"); }
+    i32 nlen = s.len;
+    for i32 i = 0; i < nlen; i++ {
+        if i > 0 && ((nlen - i) % 3) == 0 { str_buf_add(&sb, ","); }
+        str c;
+        c.data = &s.data[i];
+        c.len = 1;
+        str_buf_add(&sb, c);
+    }
+    free(ips);
+    if frac != 0 {
+        u8[3] fb;
+        fb[0] = cast(u8, '0' + (frac / 100));
+        fb[1] = cast(u8, '0' + ((frac / 10) % 10));
+        fb[2] = cast(u8, '0' + (frac % 10));
+        i32 fl = 3;
+        while fl > 0 && fb[fl - 1] == '0' { fl--; }
+        str_buf_add(&sb, ".");
+        str fs;
+        fs.data = &fb[0];
+        fs.len = fl;
+        str_buf_add(&sb, fs);
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
 // --- Math ---------------------------------------------------------------------------
 
 private Value math1(f64 v) {
@@ -1569,8 +2328,11 @@ private Value nat_math_ceil(void* vmp, Value callee, Value thisv, Value* args, i
     return math1(ceil(js_to_number(arg_at(args, argc, 0))));
 }
 private Value nat_math_round(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    // JS rounds half toward +inf
-    return math1(floor(js_to_number(arg_at(args, argc, 0)) + 0.5));
+    // JS rounds half toward +inf; -0.5..-0 round to -0
+    f64 v = js_to_number(arg_at(args, argc, 0));
+    f64 r = floor(v + 0.5);
+    if r == 0.0 && v < 0.0 { return value_number(-0.0); }
+    return math1(r);
 }
 private Value nat_math_trunc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     f64 v = js_to_number(arg_at(args, argc, 0));
@@ -1638,6 +2400,53 @@ private Value nat_math_hypot(void* vmp, Value callee, Value thisv, Value* args, 
     }
     return math1(sqrt(sum));
 }
+private Value nat_math_sinh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(sinh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_cosh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(cosh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_tanh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(tanh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_asinh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(asinh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_acosh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(acosh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_atanh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(atanh(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_log1p(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(log1p(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_expm1(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return math1(expm1(js_to_number(arg_at(args, argc, 0))));
+}
+private Value nat_math_fround(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    f64 v = js_to_number(arg_at(args, argc, 0));
+    return math1(cast(f64, cast(f32, v)));
+}
+private Value nat_math_imul(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    f64 a = js_to_number(arg_at(args, argc, 0));
+    f64 b = js_to_number(arg_at(args, argc, 1));
+    i32 ai = a != a ? 0 : cast(i32, cast(i64, a));
+    i32 bi = b != b ? 0 : cast(i32, cast(i64, b));
+    i32 r = cast(i32, cast(i64, ai) * cast(i64, bi));
+    return value_int(r);
+}
+private Value nat_math_clz32(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    f64 v = js_to_number(arg_at(args, argc, 0));
+    u32 u = v != v ? 0 : cast(u32, cast(i32, cast(i64, v)));
+    if u == 0 { return value_int(32); }
+    i32 n = 0;
+    while (u & 0x80000000) == 0 {
+        n++;
+        u = u << 1;
+    }
+    return value_int(n);
+}
 
 private Value nat_math_min(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     f64 best = 1.0e308 * 10.0;
@@ -1704,16 +2513,55 @@ private void json_escape_into(str_buf* sb, str s) {
     str_buf_add(sb, "\"");
 }
 
-private void json_indent_into(str_buf* sb, i32 indent, i32 depth) {
-    if indent <= 0 { return; }
+private void json_indent_into(str_buf* sb, str gap, i32 depth) {
+    if gap.len == 0 { return; }
     str_buf_add(sb, "\n");
-    for i32 i = 0; i < indent * depth; i++ {
-        str_buf_add(sb, " ");
+    for i32 i = 0; i < depth; i++ {
+        str_buf_add(sb, gap);
     }
 }
 
 // Returns false when the value is unrepresentable (undefined/function).
-private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent, i32 depth) {
+// gap is the per-level indent string; empty means compact.
+// Serialization state shared across the recursion: the optional
+// replacer function, the optional array-replacer allowlist of keys,
+// the indent gap, and the circular-reference guard.
+struct JsonCtx {
+    Value replacer;    // callable, else undefined
+    Vec<u32>* allow;   // atom keys, else null (array replacer)
+    str gap;
+    Vec<u64>* seen;
+}
+
+// Applies toJSON(key) then the replacer function to holder[key] = v,
+// returning the value to actually serialize.
+private Value json_transform(VM* vm, JsonCtx* ctx, Value holder, str key, Value v) {
+    if value_is_object(v) || value_is_map(v) {
+        Value tj;
+        if vm_get_prop_value(vm, v, atom_intern(&vm.atoms, "toJSON"), &tj) {
+            if value_is_callable(tj) {
+                GcString* kg = gc_new_string(&vm.heap, key);
+                Value ks = value_cell(&kg.head);
+                gc_root(&vm.heap, ks);
+                v = vm_call_value(vm, tj, v, &ks, 1);
+                if vm.has_pending { return v; }
+            }
+        }
+        if vm.has_pending { return v; }
+    }
+    if value_is_callable(ctx.replacer) {
+        GcString* kg = gc_new_string(&vm.heap, key);
+        Value[2] a;
+        a[0] = value_cell(&kg.head);
+        a[1] = v;
+        gc_root(&vm.heap, a[0]);
+        v = vm_call_value(vm, ctx.replacer, holder, &a[0], 2);
+    }
+    return v;
+}
+
+private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
+    str gap = ctx.gap;
     if value_is_undefined(v) || value_is_callable(v) || value_is_hole(v) {
         return false;
     }
@@ -1745,6 +2593,7 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
     }
     if !value_is_object(v) { return false; }
     JsObject* o = value_as_object(v);
+    Vec<u64>* seen = ctx.seen;
     u64 pid = v.bits;
     for i32 i = 0; i < seen.len; i++ {
         if vec_get(seen, i) == pid {
@@ -1757,8 +2606,15 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
         str_buf_add(sb, "[");
         for i32 i = 0; i < o.elen; i++ {
             if i > 0 { str_buf_add(sb, ","); }
-            json_indent_into(sb, indent, depth + 1);
-            if !json_write(vm, sb, js_array_get(o, i), seen, indent, depth + 1) {
+            json_indent_into(sb, gap, depth + 1);
+            i32 rm = gc_root_mark(&vm.heap);
+            string ks = format("{}", i);
+            Value child = json_transform(vm, ctx, v, ks, js_array_get(o, i));
+            free(ks);
+            gc_root(&vm.heap, child);
+            bool wrote = json_write(vm, sb, child, ctx, depth + 1);
+            gc_root_reset(&vm.heap, rm);
+            if !wrote {
                 if vm.has_pending {
                     ignore vec_pop(seen);
                     return false;
@@ -1766,24 +2622,39 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
                 str_buf_add(sb, "null");
             }
         }
-        if o.elen > 0 { json_indent_into(sb, indent, depth); }
+        if o.elen > 0 { json_indent_into(sb, gap, depth); }
         str_buf_add(sb, "]");
     } else {
         str_buf_add(sb, "{");
         bool first = true;
-        for i32 i = 0; i < o.props.len; i++ {
-            Prop* p = o.props.items + i;
-            Value pval = p.val;
-            if value_is_accessor(pval) {
-                if !vm_get_prop_value(vm, v, p.key, &pval) {
-                    ignore vec_pop(seen);
-                    return false;
-                }
+        // array replacer restricts (and orders) keys; otherwise own order
+        i32 count = ctx.allow != null ? ctx.allow.len : o.props.len;
+        for i32 i = 0; i < count; i++ {
+            u32 key = 0;
+            if ctx.allow != null {
+                key = vec_get(ctx.allow, i);
+            } else {
+                key = (o.props.items + i).key;
+                if !prop_enumerable(vm, o.props.items + i) { continue; }
             }
-            if value_is_undefined(pval) || value_is_callable(pval) { continue; }
+            Value pval;
+            if !vm_get_prop_value(vm, v, key, &pval) {
+                ignore vec_pop(seen);
+                return false;
+            }
+            i32 rm = gc_root_mark(&vm.heap);
+            Value cval = json_transform(vm, ctx, v, atom_name(&vm.atoms, key), pval);
+            gc_root(&vm.heap, cval);
+            if value_is_undefined(cval) || value_is_callable(cval) {
+                gc_root_reset(&vm.heap, rm);
+                if vm.has_pending { ignore vec_pop(seen); return false; }
+                continue;
+            }
             str_buf sub;
             str_buf_init(&sub);
-            if !json_write(vm, &sub, pval, seen, indent, depth + 1) {
+            bool wrote = json_write(vm, &sub, cval, ctx, depth + 1);
+            gc_root_reset(&vm.heap, rm);
+            if !wrote {
                 str_buf_free(&sub);
                 if vm.has_pending {
                     ignore vec_pop(seen);
@@ -1792,14 +2663,14 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
                 continue;
             }
             if !first { str_buf_add(sb, ","); }
-            json_indent_into(sb, indent, depth + 1);
-            json_escape_into(sb, atom_name(&vm.atoms, p.key));
-            str_buf_add(sb, indent > 0 ? ": " : ":");
+            json_indent_into(sb, gap, depth + 1);
+            json_escape_into(sb, atom_name(&vm.atoms, key));
+            str_buf_add(sb, gap.len > 0 ? ": " : ":");
             str_buf_add(sb, str_buf_to_str(&sub));
             str_buf_free(&sub);
             first = false;
         }
-        if !first { json_indent_into(sb, indent, depth); }
+        if !first { json_indent_into(sb, gap, depth); }
         str_buf_add(sb, "}");
     }
     ignore vec_pop(seen);
@@ -1809,23 +2680,83 @@ private bool json_write(VM* vm, str_buf* sb, Value v, Vec<u64>* seen, i32 indent
 private Value nat_json_stringify(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value v = arg_at(args, argc, 0);
-    i32 indent = 0;
-    if argc > 2 && value_is_number(*(args + 2)) {
-        indent = to_int_arg(*(args + 2));
-        if indent < 0 { indent = 0; }
-        if indent > 10 { indent = 10; }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, v);
+
+    // replacer: a function transforms values, an array allowlists keys
+    Value replacer = arg_at(args, argc, 1);
+    JsonCtx ctx;
+    ctx.replacer = value_undefined();
+    ctx.allow = null;
+    Vec<u32> allow;
+    bool have_allow = false;
+    if value_is_callable(replacer) {
+        ctx.replacer = replacer;
+    } else if value_is_array(replacer) {
+        allow = vec_new<u32>(8);
+        have_allow = true;
+        JsObject* ra = value_as_object(replacer);
+        for i32 i = 0; i < ra.elen; i++ {
+            Value e = js_array_get(ra, i);
+            bool ok = value_is_string(e) || value_is_number(e);
+            if ok {
+                i32 krm = gc_root_mark(&vm.heap);
+                Value kv = value_is_string(e) ? e : js_to_string_value(vm, e);
+                gc_root(&vm.heap, kv);
+                u32 a = atom_intern(&vm.atoms, sview(kv));
+                gc_root_reset(&vm.heap, krm);
+                bool dup = false;
+                for i32 j = 0; j < allow.len; j++ {
+                    if vec_get(&allow, j) == a { dup = true; break; }
+                }
+                if !dup { vec_push(&allow, a); }
+            }
+        }
+        ctx.allow = &allow;
     }
+
+    // the space argument: a number of spaces or a literal string (<=10)
+    str gap;
+    gap.data = null;
+    gap.len = 0;
+    u8[10] spaces;
+    Value spacev = arg_at(args, argc, 2);
+    if value_is_number(spacev) {
+        i32 n = to_int_arg(spacev);
+        if n > 10 { n = 10; }
+        for i32 i = 0; i < n; i++ { spaces[i] = ' '; }
+        gap.data = &spaces[0];
+        gap.len = n < 0 ? 0 : n;
+    } else if value_is_string(spacev) {
+        gap = sview(spacev);
+        if gap.len > 10 { gap.len = 10; }
+    }
+    ctx.gap = gap;
+
+    Vec<u64> seen = vec_new<u64>(8);
+    ctx.seen = &seen;
+
+    // root wrapper { "": value } so toJSON/replacer see the top value
+    JsObject* wrapper = js_new_object(&vm.heap, vm.object_proto);
+    Value wrapv = value_cell(&wrapper.head);
+    gc_root(&vm.heap, wrapv);
+    js_set_prop(wrapper, atom_intern(&vm.atoms, ""), v);
+    Value root = json_transform(vm, &ctx, wrapv, "", v);
+    gc_root(&vm.heap, root);
+
     str_buf sb;
     str_buf_init(&sb);
-    Vec<u64> seen = vec_new<u64>(8);
-    bool ok = json_write(vm, &sb, v, &seen, indent, 0);
+    bool ok = !vm.has_pending && json_write(vm, &sb, root, &ctx, 0);
     vec_free(&seen);
+    if have_allow { vec_free(&allow); }
     if !ok {
         str_buf_free(&sb);
+        gc_root_reset(&vm.heap, rm);
         return value_undefined();
     }
     Value r = new_str(vm, str_buf_to_str(&sb));
     str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
     return r;
 }
 
@@ -2132,7 +3063,18 @@ private Value console_write(VM* vm, Value* args, i32 argc, bool to_err) {
         i32 rm = gc_root_mark(&vm.heap);
         Value s = js_console_string(vm, *(args + i));
         gc_root(&vm.heap, s);
-        if to_err { eprint("{}", sview(s)); } else { print("{}", sview(s)); }
+        str view = sview(s);
+        // lone surrogates can't go to a UTF-8 sink; show U+FFFD
+        if wtf8_has_surrogate(view) {
+            str_buf sb;
+            str_buf_init(&sb);
+            wtf8_sanitize_into(&sb, view);
+            str clean = str_buf_to_str(&sb);
+            if to_err { eprint("{}", clean); } else { print("{}", clean); }
+            str_buf_free(&sb);
+        } else {
+            if to_err { eprint("{}", view); } else { print("{}", view); }
+        }
         gc_root_reset(&vm.heap, rm);
     }
     if to_err { eprint("\n"); } else { print("\n"); }
@@ -2237,18 +3179,35 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
         js_set_prop(r, vm_atom(vm, "value"), value_undefined());
     } else {
         me.env1 = value_int(i + 1);
-        Value v;
+        i32 kind = value_is_int(me.env2) ? value_as_int(me.env2) : 0;
+        Value elem;
         if value_is_array(src) {
-            v = js_array_get(value_as_object(src), i);
+            elem = js_array_get(value_as_object(src), i);
         } else {
+            // strings iterate by code point; `i` is a byte offset
             str view = gc_string_view(value_as_string(src));
+            i32 n;
+            ignore utf8_decode(view, i, &n);
+            me.env1 = value_int(i + n);
             str one;
             one.data = view.data + i;
-            one.len = 1;
-            v = new_str(vm, one);
+            one.len = n;
+            elem = new_str(vm, one);
+        }
+        Value outv = elem;
+        if kind == 1 {
+            outv = value_int(i);
+        } else if kind == 2 {
+            vm_push(vm, elem);
+            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+            vm_push(vm, value_cell(&pair.head));
+            js_array_set(pair, 0, value_int(i));
+            js_array_set(pair, 1, elem);
+            outv = value_cell(&pair.head);
+            vm.sp -= 2;
         }
         js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
-        js_set_prop(r, vm_atom(vm, "value"), v);
+        js_set_prop(r, vm_atom(vm, "value"), outv);
     }
     return vm_pop_ret(vm, value_cell(&r.head));
 }
@@ -2257,7 +3216,7 @@ private Value nat_return_this(void* vmp, Value callee, Value thisv, Value* args,
     return thisv;
 }
 
-private Value make_index_iterator(VM* vm, Value src) {
+private Value make_index_iterator(VM* vm, Value src, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, src);
     JsObject* it = js_new_object(&vm.heap, vm.object_proto);
@@ -2265,6 +3224,7 @@ private Value make_index_iterator(VM* vm, Value src) {
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
     nx.env0 = src;
     nx.env1 = value_int(0);
+    nx.env2 = value_int(kind);
     js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
     // an iterator is itself iterable
     JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
@@ -2274,7 +3234,19 @@ private Value make_index_iterator(VM* vm, Value src) {
 }
 
 private Value nat_arr_symiter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return make_index_iterator(as_vm(vmp), thisv);
+    return make_index_iterator(as_vm(vmp), thisv, 0);
+}
+
+private Value nat_arr_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_index_iterator(as_vm(vmp), thisv, 0);
+}
+
+private Value nat_arr_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_index_iterator(as_vm(vmp), thisv, 1);
+}
+
+private Value nat_arr_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_index_iterator(as_vm(vmp), thisv, 2);
 }
 
 // --- generators ------------------------------------------------------------------------
@@ -2686,6 +3658,29 @@ private Value make_map(VM* vm, Value iterable, bool is_set) {
                 map_put(mp, js_array_get(pair, 0), js_array_get(pair, 1));
             }
         }
+    } else {
+        // general iterables: strings, other Sets/Maps, generators
+        Value it;
+        if vm_get_iterator(vm, iterable, &it) {
+            gc_root(&vm.heap, it);
+            while true {
+                Value e;
+                bool done;
+                if !vm_iter_next(vm, it, &e, &done) { break; }
+                if done { break; }
+                gc_root(&vm.heap, e);
+                if is_set {
+                    map_put(mp, e, value_undefined());
+                } else if value_is_array(e) {
+                    JsObject* pair = value_as_object(e);
+                    map_put(mp, js_array_get(pair, 0), js_array_get(pair, 1));
+                }
+            }
+        }
+        if vm.has_pending {
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
     }
     gc_root_reset(&vm.heap, rm);
     return value_cell(&mp.head);
@@ -2810,21 +3805,21 @@ private Value nat_map_keys(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 0));
+    return make_index_iterator(vm, map_collect(vm, mp, 0), 0);
 }
 
 private Value nat_map_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 1));
+    return make_index_iterator(vm, map_collect(vm, mp, 1), 0);
 }
 
 private Value nat_map_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 2));
+    return make_index_iterator(vm, map_collect(vm, mp, 2), 0);
 }
 
 // --- Date -------------------------------------------------------------------------------
@@ -3190,6 +4185,41 @@ private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i
     return r;
 }
 
+private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    Value re = str_regexp_arg(vm, arg_at(args, argc, 0));
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, re);
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&out.head));
+    js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
+    RegexProg* prog = vm_regexp_prog(vm, re);
+    bool global = prog != null && regex_is_global(prog);
+    i32 n = 0;
+    i32 guard = 0;
+    while guard < 1000000 {
+        guard++;
+        Value m = regexp_exec_impl(vm, re, sv2);
+        if value_is_null(m) { break; }
+        gc_root(&vm.heap, m);
+        js_array_set(out, n, m);
+        n++;
+        if !global { break; }
+        Value whole = js_array_get(value_as_object(m), 0);
+        if value_is_string(whole) && value_as_string(whole).len == 0 {
+            Value liv;
+            ignore js_get_prop(value_as_object(re), vm_atom_lastindex(vm), &liv);
+            js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(to_int_arg(liv) + 1));
+        }
+    }
+    Value it = make_index_iterator(vm, value_cell(&out.head), 0);
+    gc_root_reset(&vm.heap, rm);
+    return it;
+}
+
 private Value nat_str_search(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 rm = gc_root_mark(&vm.heap);
@@ -3398,9 +4428,13 @@ private Value nat_str_split_x(void* vmp, Value callee, Value thisv, Value* args,
 
 // --- install -------------------------------------------------------------------------------------
 
+// Built-in methods/statics/accessors are non-enumerable but writable
+// and configurable, matching how JS specifies them.
+const u8 METHOD_ATTRS = PROP_WRITABLE | PROP_CONFIGURABLE;
+
 private void def_method(VM* vm, JsObject* obj, str name, NativeFn f) {
     JsNative* n = js_new_native(&vm.heap, f, name);
-    js_set_prop(obj, bi_atom(vm, name), value_cell(&n.head));
+    props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
 }
 
 private JsNative* def_global_fn(VM* vm, str name, NativeFn f) {
@@ -3411,19 +4445,25 @@ private JsNative* def_global_fn(VM* vm, str name, NativeFn f) {
 
 private void def_static(VM* vm, JsNative* ctor, str name, NativeFn f) {
     JsNative* m = js_new_native(&vm.heap, f, name);
-    props_set(&ctor.props, bi_atom(vm, name), value_cell(&m.head));
+    props_set_desc(&ctor.props, bi_atom(vm, name), value_cell(&m.head), METHOD_ATTRS);
 }
 
+// Constants (e.g. Math.PI): non-writable, non-enumerable, non-configurable.
 private void def_value(VM* vm, JsObject* obj, str name, Value v) {
-    js_set_prop(obj, bi_atom(vm, name), v);
+    props_set_desc(&obj.props, bi_atom(vm, name), v, 0);
 }
 
-// Installs a getter-only accessor property.
+// Links a prototype back to its constructor (proto.constructor = ctor).
+private void link_ctor(VM* vm, JsObject* proto, JsNative* ctor) {
+    props_set_desc(&proto.props, bi_atom(vm, "constructor"), value_cell(&ctor.head), METHOD_ATTRS);
+}
+
+// Installs a getter-only accessor property (non-enumerable, configurable).
 private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
     JsNative* g = js_new_native(&vm.heap, getter, name);
     JsAccessor* ac = js_new_accessor(&vm.heap);
     ac.get = value_cell(&g.head);
-    js_set_prop(obj, bi_atom(vm, name), value_cell(&ac.head));
+    props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
 }
 
 void builtins_install(VM* vm) {
@@ -3448,7 +4488,18 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "assign", &nat_object_assign);
     def_static(vm, object_ctor, "create", &nat_object_create);
     def_static(vm, object_ctor, "getPrototypeOf", &nat_object_getproto);
+    def_static(vm, object_ctor, "setPrototypeOf", &nat_object_setproto);
+    def_static(vm, object_ctor, "getOwnPropertyNames", &nat_object_getownnames);
     def_static(vm, object_ctor, "fromEntries", &nat_object_fromentries);
+    def_static(vm, object_ctor, "defineProperty", &nat_object_defineproperty);
+    def_static(vm, object_ctor, "defineProperties", &nat_object_defineproperties);
+    def_static(vm, object_ctor, "getOwnPropertyDescriptor", &nat_object_getownpropdesc);
+    def_static(vm, object_ctor, "freeze", &nat_object_freeze);
+    def_static(vm, object_ctor, "isFrozen", &nat_object_isfrozen);
+    def_static(vm, object_ctor, "seal", &nat_object_seal);
+    def_static(vm, object_ctor, "isSealed", &nat_object_issealed);
+    def_static(vm, object_ctor, "preventExtensions", &nat_object_preventext);
+    def_static(vm, object_ctor, "isExtensible", &nat_object_isextensible);
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
 
@@ -3484,13 +4535,20 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "reverse", &nat_arr_reverse);
     def_method(vm, vm.array_proto, "sort", &nat_arr_sort);
     def_method(vm, vm.array_proto, "fill", &nat_arr_fill);
+    def_method(vm, vm.array_proto, "toString", &nat_arr_join);
+    def_method(vm, vm.array_proto, "copyWithin", &nat_arr_copywithin);
+    def_method(vm, vm.array_proto, "values", &nat_arr_values);
+    def_method(vm, vm.array_proto, "keys", &nat_arr_keys);
+    def_method(vm, vm.array_proto, "entries", &nat_arr_entries);
 
     // String
     JsNative* string_ctor = def_global_fn(vm, "String", &nat_string_ctor);
     props_set(&string_ctor.props, vm.atom_prototype, value_cell(&vm.string_proto.head));
     def_static(vm, string_ctor, "fromCharCode", &nat_string_fromcharcode);
+    def_static(vm, string_ctor, "fromCodePoint", &nat_string_fromcodepoint);
     def_method(vm, vm.string_proto, "charAt", &nat_str_charat);
     def_method(vm, vm.string_proto, "charCodeAt", &nat_str_charcodeat);
+    def_method(vm, vm.string_proto, "codePointAt", &nat_str_codepointat);
     def_method(vm, vm.string_proto, "indexOf", &nat_str_indexof);
     def_method(vm, vm.string_proto, "lastIndexOf", &nat_str_lastindexof);
     def_method(vm, vm.string_proto, "includes", &nat_str_includes);
@@ -3513,8 +4571,14 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.string_proto, "concat", &nat_str_concat);
     def_method(vm, vm.string_proto, "trimStart", &nat_str_trimstart);
     def_method(vm, vm.string_proto, "trimEnd", &nat_str_trimend);
+    def_method(vm, vm.string_proto, "substr", &nat_str_substr);
+    def_method(vm, vm.string_proto, "localeCompare", &nat_str_localecompare);
+    def_method(vm, vm.string_proto, "normalize", &nat_str_normalize);
+    def_method(vm, vm.string_proto, "toLocaleUpperCase", &nat_str_toupper);
+    def_method(vm, vm.string_proto, "toLocaleLowerCase", &nat_str_tolower);
     def_method(vm, vm.string_proto, "split", &nat_str_split_x);
     def_method(vm, vm.string_proto, "match", &nat_str_match);
+    def_method(vm, vm.string_proto, "matchAll", &nat_str_matchall);
     def_method(vm, vm.string_proto, "search", &nat_str_search);
 
     // Number / Boolean
@@ -3522,6 +4586,7 @@ void builtins_install(VM* vm) {
     props_set(&number_ctor.props, vm.atom_prototype, value_cell(&vm.number_proto.head));
     def_static(vm, number_ctor, "isInteger", &nat_num_isinteger);
     def_static(vm, number_ctor, "isFinite", &nat_num_isfinite);
+    def_static(vm, number_ctor, "isSafeInteger", &nat_num_issafeinteger);
     def_static(vm, number_ctor, "isNaN", &nat_num_isnan);
     def_static(vm, number_ctor, "parseInt", &nat_parseint);
     def_static(vm, number_ctor, "parseFloat", &nat_parsefloat);
@@ -3533,6 +4598,10 @@ void builtins_install(VM* vm) {
     props_set(&number_ctor.props, bi_atom(vm, "NaN"), value_number(0.0 / 0.0));
     def_method(vm, vm.number_proto, "toFixed", &nat_num_tofixed);
     def_method(vm, vm.number_proto, "toString", &nat_num_tostring);
+    def_method(vm, vm.number_proto, "toExponential", &nat_num_toexponential);
+    def_method(vm, vm.number_proto, "toPrecision", &nat_num_toprecision);
+    def_method(vm, vm.number_proto, "toLocaleString", &nat_num_tolocalestring);
+    def_method(vm, vm.number_proto, "valueOf", &nat_num_valueof);
 
     JsNative* boolean_ctor = def_global_fn(vm, "Boolean", &nat_boolean_ctor);
     props_set(&boolean_ctor.props, vm.atom_prototype, value_cell(&vm.boolean_proto.head));
@@ -3563,9 +4632,26 @@ void builtins_install(VM* vm) {
     def_method(vm, math_obj, "atan", &nat_math_atan);
     def_method(vm, math_obj, "atan2", &nat_math_atan2);
     def_method(vm, math_obj, "hypot", &nat_math_hypot);
+    def_method(vm, math_obj, "sinh", &nat_math_sinh);
+    def_method(vm, math_obj, "cosh", &nat_math_cosh);
+    def_method(vm, math_obj, "tanh", &nat_math_tanh);
+    def_method(vm, math_obj, "asinh", &nat_math_asinh);
+    def_method(vm, math_obj, "acosh", &nat_math_acosh);
+    def_method(vm, math_obj, "atanh", &nat_math_atanh);
+    def_method(vm, math_obj, "log1p", &nat_math_log1p);
+    def_method(vm, math_obj, "expm1", &nat_math_expm1);
+    def_method(vm, math_obj, "fround", &nat_math_fround);
+    def_method(vm, math_obj, "imul", &nat_math_imul);
+    def_method(vm, math_obj, "clz32", &nat_math_clz32);
     def_method(vm, math_obj, "min", &nat_math_min);
     def_method(vm, math_obj, "max", &nat_math_max);
     def_method(vm, math_obj, "random", &nat_math_random);
+    def_value(vm, math_obj, "LN2", value_number(0.6931471805599453));
+    def_value(vm, math_obj, "LN10", value_number(2.302585092994046));
+    def_value(vm, math_obj, "LOG2E", value_number(1.4426950408889634));
+    def_value(vm, math_obj, "LOG10E", value_number(0.4342944819032518));
+    def_value(vm, math_obj, "SQRT2", value_number(1.4142135623730951));
+    def_value(vm, math_obj, "SQRT1_2", value_number(0.7071067811865476));
 
     // JSON
     JsObject* json_obj = js_new_object(&vm.heap, vm.object_proto);
@@ -3708,4 +4794,21 @@ void builtins_install(VM* vm) {
         def_method(vm, con, "warn", &nat_console_warn);
         def_method(vm, con, "info", &nat_console_info);
     }
+
+    // proto.constructor back-links
+    link_ctor(vm, vm.object_proto, object_ctor);
+    link_ctor(vm, vm.array_proto, array_ctor);
+    link_ctor(vm, vm.string_proto, string_ctor);
+    link_ctor(vm, vm.number_proto, number_ctor);
+    link_ctor(vm, vm.boolean_proto, boolean_ctor);
+    link_ctor(vm, vm.error_protos[ERR_ERROR], err_ctor);
+    link_ctor(vm, vm.error_protos[ERR_TYPE], te_ctor);
+    link_ctor(vm, vm.error_protos[ERR_RANGE], re_ctor);
+    link_ctor(vm, vm.error_protos[ERR_REF], fe_ctor);
+    link_ctor(vm, vm.error_protos[ERR_SYNTAX], se_ctor);
+    link_ctor(vm, vm.promise_proto, promise_ctor);
+    link_ctor(vm, vm.map_proto, map_ctor);
+    link_ctor(vm, vm.set_proto, set_ctor);
+    link_ctor(vm, vm.date_proto, date_ctor);
+    link_ctor(vm, vm.regexp_proto, regexp_ctor);
 }
