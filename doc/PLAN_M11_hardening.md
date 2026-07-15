@@ -139,9 +139,12 @@ surfaced was fixed to match Node:
   `decodeURIComponent`/`decodeURI` (UTF-8 percent-coding, `decodeURI`
   keeps reserved-char escapes).
 
-Known deferred gaps: no BigInt; `globalThis`, `structuredClone`,
-private class fields (`#x`), tagged templates, and regex named groups
-are unimplemented; `super` in a static method and `__proto__` (accessor)
+`globalThis` mirrors the built-in globals via a startup snapshot object
+(keeps the hot property path untouched; matches module scoping, where
+top-level declarations are not global properties).
+
+Known deferred gaps: no BigInt; `structuredClone`, private class fields
+(`#x`), tagged templates, and regex named groups are unimplemented; `super` in a static method and `__proto__` (accessor)
 are unsupported; `Object.keys` on a function omits static fields; class
 getters/setters stay enumerable; case mapping beyond Latin-1 (Greek,
 Cyrillic) is unmapped; string comparison uses byte order (differs from

@@ -5136,4 +5136,19 @@ void builtins_install(VM* vm) {
     link_ctor(vm, vm.set_proto, set_ctor);
     link_ctor(vm, vm.date_proto, date_ctor);
     link_ctor(vm, vm.regexp_proto, regexp_ctor);
+
+    // globalThis: an object mirroring the global bindings. Snapshotting
+    // the built-ins (rather than routing every property access to the
+    // globals table) keeps the hot property path untouched; this matches
+    // module scoping, where top-level declarations are not global props.
+    JsObject* gt = js_new_object(&vm.heap, vm.object_proto);
+    for i32 i = 0; i < vm.globals.cap; i++ {
+        IntSlot<Value>* sl = vm.globals.slots + i;
+        if sl.state == SLOT_USED {
+            props_set_desc(&gt.props, sl.key, sl.val, METHOD_ATTRS);
+        }
+    }
+    Value gtv = value_cell(&gt.head);
+    props_set_desc(&gt.props, bi_atom(vm, "globalThis"), gtv, METHOD_ATTRS);
+    vm_set_global(vm, "globalThis", gtv);
 }

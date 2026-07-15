@@ -49,3 +49,8 @@ console.log([1, 2, 2, 3].lastIndexOf(2), [1, 2, 3].lastIndexOf(9));
 console.log(encodeURIComponent("a b&c=d/e"), encodeURI("http://x.com/a b?q=1&r=2"));
 console.log(decodeURIComponent("a%20b%26c"), decodeURI("a%20b%2Fc%3Fd"));
 console.log(encodeURIComponent("café"), decodeURIComponent(encodeURIComponent("héllo wörld")));
+
+// globalThis mirrors the built-in globals
+console.log(typeof globalThis, globalThis.Math === Math, globalThis.JSON === JSON);
+console.log(globalThis.Array === Array, globalThis.globalThis === globalThis);
+console.log(globalThis.parseInt("42"), typeof globalThis.undefined, globalThis.Infinity);
