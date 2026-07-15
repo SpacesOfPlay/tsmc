@@ -2184,6 +2184,102 @@ private Value nat_decode_uri(void* vmp, Value callee, Value thisv, Value* args, 
     return uri_decode(as_vm(vmp), thisv, args, argc, false);
 }
 
+// Deep clone for structuredClone. `keys`/`clones` map an original's
+// identity to its clone so cycles and shared references are preserved.
+private Value struct_clone(VM* vm, Value v, Vec<u64>* keys, Vec<Value>* clones) {
+    if !value_is_cell(v) { return v; }        // int / double / bool / null / undefined
+    if value_is_string(v) { return v; }       // immutable: share
+    if value_is_symbol(v) || value_is_function(v) || value_is_native(v) {
+        vm_throw_error(vm, ERR_TYPE, "could not be cloned");
+        return value_undefined();
+    }
+    u64 id = v.bits;
+    for i32 i = 0; i < keys.len; i++ {
+        if vec_get(keys, i) == id { return vec_get(clones, i); }
+    }
+    if value_is_array(v) {
+        JsObject* a = value_as_object(v);
+        JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+        Value rv = value_cell(&r.head);
+        gc_root(&vm.heap, rv);
+        vec_push(keys, id);
+        vec_push(clones, rv);
+        js_array_set_length(r, a.elen);       // holes stay holes
+        for i32 i = 0; i < a.elen; i++ {
+            if !js_array_has(a, i) { continue; }
+            Value cv = struct_clone(vm, js_array_get(a, i), keys, clones);
+            if vm.has_pending { return value_undefined(); }
+            js_array_set(r, i, cv);
+        }
+        return rv;
+    }
+    if value_is_map(v) {
+        JsMap* m = value_as_map(v);
+        JsMap* r = js_new_map(&vm.heap, m.is_set ? vm_set_proto(vm) : vm_map_proto(vm), m.is_set);
+        Value rv = value_cell(&r.head);
+        gc_root(&vm.heap, rv);
+        vec_push(keys, id);
+        vec_push(clones, rv);
+        for i32 i = 0; i < m.len; i++ {
+            if !*(m.live + i) { continue; }
+            Value k = struct_clone(vm, *(m.keys + i), keys, clones);
+            if vm.has_pending { return value_undefined(); }
+            Value val = k;
+            if !m.is_set {
+                val = struct_clone(vm, *(m.vals + i), keys, clones);
+                if vm.has_pending { return value_undefined(); }
+            }
+            map_put(r, k, val);
+        }
+        return rv;
+    }
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        // Date: copy the internal timestamp into a fresh Date
+        if props_get(&o.props, bi_atom(vm, "%t")) != null {
+            Value ts;
+            ignore js_get_prop(o, bi_atom(vm, "%t"), &ts);
+            JsObject* d = js_new_object(&vm.heap, vm_date_proto(vm));
+            js_set_prop(d, bi_atom(vm, "%t"), ts);
+            Value dv = value_cell(&d.head);
+            gc_root(&vm.heap, dv);
+            vec_push(keys, id);
+            vec_push(clones, dv);
+            return dv;
+        }
+        JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+        Value rv = value_cell(&r.head);
+        gc_root(&vm.heap, rv);
+        vec_push(keys, id);
+        vec_push(clones, rv);
+        for i32 i = 0; i < o.props.len; i++ {
+            if !prop_enumerable(vm, o.props.items + i) { continue; }
+            u32 pk = (o.props.items + i).key;
+            Value pv;
+            if !vm_get_prop_value(vm, v, pk, &pv) { return value_undefined(); }
+            Value cv = struct_clone(vm, pv, keys, clones);
+            if vm.has_pending { return value_undefined(); }
+            js_set_prop(r, pk, cv);
+        }
+        return rv;
+    }
+    return v;
+}
+
+private Value nat_structured_clone(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value src = arg_at(args, argc, 0);
+    gc_root(&vm.heap, src);
+    Vec<u64> keys = vec_new<u64>(8);
+    Vec<Value> clones = vec_new<Value>(8);
+    Value r = struct_clone(vm, src, &keys, &clones);
+    vec_free(&keys);
+    vec_free(&clones);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
 private Value nat_parseint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 rm = gc_root_mark(&vm.heap);
@@ -4990,6 +5086,7 @@ void builtins_install(VM* vm) {
     }
 
     // globals
+    ignore def_global_fn(vm, "structuredClone", &nat_structured_clone);
     ignore def_global_fn(vm, "encodeURIComponent", &nat_encode_uri_comp);
     ignore def_global_fn(vm, "encodeURI", &nat_encode_uri);
     ignore def_global_fn(vm, "decodeURIComponent", &nat_decode_uri_comp);

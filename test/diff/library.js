@@ -54,3 +54,22 @@ console.log(encodeURIComponent("café"), decodeURIComponent(encodeURIComponent("
 console.log(typeof globalThis, globalThis.Math === Math, globalThis.JSON === JSON);
 console.log(globalThis.Array === Array, globalThis.globalThis === globalThis);
 console.log(globalThis.parseInt("42"), typeof globalThis.undefined, globalThis.Infinity);
+
+// structuredClone: deep, independent, preserves cycles/Map/Set/Date/holes
+const orig = { a: [1, 2], b: { c: 3 } };
+const clone = structuredClone(orig);
+clone.a.push(9);
+clone.b.c = 99;
+console.log(JSON.stringify(orig), JSON.stringify(clone), clone !== orig, clone.a !== orig.a);
+const cyc = {};
+cyc.self = cyc;
+const cc = structuredClone(cyc);
+console.log(cc.self === cc, cc !== cyc);
+const cm = structuredClone(new Map([["x", 1]]));
+cm.set("y", 2);
+console.log(cm.size, cm.get("x"));
+const cs = structuredClone(new Set([1, 2, 3]));
+console.log([...cs].join(","));
+const cd = structuredClone(new Date(1000));
+console.log(cd.getTime(), cd instanceof Date);
+console.log(Object.keys(structuredClone([1, , 3])).join(","));
