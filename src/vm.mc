@@ -597,6 +597,21 @@ bool js_same_value_zero(Value a, Value b) {
     return value_same_bits(a, b);
 }
 
+// SameValue (Object.is): like SameValueZero but +0 and -0 differ.
+bool js_same_value(Value a, Value b) {
+    if value_is_number(a) && value_is_number(b) {
+        f64 x = js_to_number(a);
+        f64 y = js_to_number(b);
+        if x != x && y != y { return true; }
+        if x == 0.0 && y == 0.0 { return (1.0 / x < 0.0) == (1.0 / y < 0.0); }
+        return x == y;
+    }
+    if value_is_string(a) && value_is_string(b) {
+        return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
+    }
+    return value_same_bits(a, b);
+}
+
 private bool is_nullish(Value v) {
     return value_is_null(v) || value_is_undefined(v);
 }

@@ -32,3 +32,20 @@ try { (void 0).x; } catch (e) { console.log(e.message); }
 try { null.foo; } catch (e) { console.log(e.message); }
 let a;
 try { a.b.c; } catch (e) { console.log(e.message); }
+
+// Object.is / Object.hasOwn
+console.log(Object.is(NaN, NaN), Object.is(-0, 0), Object.is(1, 1), Object.is("a", "a"));
+console.log(Object.hasOwn({ x: 1 }, "x"), Object.hasOwn({ x: 1 }, "y"), Object.hasOwn([1, 2], 0));
+console.log(Object.fromEntries(new Map([["m", 1], ["n", 2]])).n);
+
+// Array ES2023 copying methods (do not mutate the source)
+const src = [3, 1, 2];
+console.log(src.toSorted().join(","), src.join(","));
+console.log([1, 2, 3].toReversed().join(","), [1, 2, 3].with(1, 9).join(","));
+console.log([5, 3, 8, 1].toSorted((x, y) => x - y).join(","));
+console.log([1, 2, 2, 3].lastIndexOf(2), [1, 2, 3].lastIndexOf(9));
+
+// URI encoding
+console.log(encodeURIComponent("a b&c=d/e"), encodeURI("http://x.com/a b?q=1&r=2"));
+console.log(decodeURIComponent("a%20b%26c"), decodeURI("a%20b%2Fc%3Fd"));
+console.log(encodeURIComponent("café"), decodeURIComponent(encodeURIComponent("héllo wörld")));

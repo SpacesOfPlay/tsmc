@@ -947,6 +947,67 @@ const i32 IT_EVERY = 4;
 const i32 IT_FIND = 5;
 const i32 IT_FINDINDEX = 6;
 
+private Value nat_arr_lastindexof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    Value needle = arg_at(args, argc, 0);
+    i32 start = a.elen - 1;
+    if argc > 1 && !value_is_undefined(*(args + 1)) {
+        i32 s = to_int_arg(*(args + 1));
+        if s < 0 { s += a.elen; }
+        if s < start { start = s; }
+    }
+    for i32 i = start; i >= 0; i-- {
+        if !js_array_has(a, i) { continue; }   // skips holes, like indexOf
+        if js_strict_eq(js_array_get(a, i), needle) { return value_int(i); }
+    }
+    return value_int(-1);
+}
+
+// A dense copy (holes become undefined) for the ES2023 copying methods.
+private JsObject* arr_dense_copy(VM* vm, JsObject* a) {
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    for i32 i = 0; i < a.elen; i++ {
+        js_array_set(r, i, js_array_get(a, i));
+    }
+    return r;
+}
+
+private Value nat_arr_toreversed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&r.head));
+    for i32 i = 0; i < a.elen; i++ {
+        js_array_set(r, i, js_array_get(a, a.elen - 1 - i));
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&r.head);
+}
+
+private Value nat_arr_with(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    i32 idx = to_int_arg(arg_at(args, argc, 0));
+    if idx < 0 { idx += a.elen; }
+    if idx < 0 || idx >= a.elen {
+        vm_throw_error(vm, ERR_RANGE, "invalid index");
+        return value_undefined();
+    }
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&r.head));
+    for i32 i = 0; i < a.elen; i++ {
+        js_array_set(r, i, i == idx ? arg_at(args, argc, 1) : js_array_get(a, i));
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&r.head);
+}
+
 private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) {
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
@@ -1252,6 +1313,19 @@ private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i3
         *(a.elems + j + 1) = key;
     }
     return thisv;
+}
+
+private Value nat_arr_tosorted(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_array(vm, thisv);
+    if a == null { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* r = arr_dense_copy(vm, a);
+    Value rv = value_cell(&r.head);
+    gc_root(&vm.heap, rv);
+    Value sorted = nat_arr_sort(vmp, callee, rv, args, argc);
+    gc_root_reset(&vm.heap, rm);
+    return sorted;
 }
 
 // --- String -------------------------------------------------------------------
@@ -1898,9 +1972,50 @@ private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value
                 js_set_prop(o, atom, js_array_get(p, 1));
             }
         }
+    } else if value_is_object(src) || value_is_map(src) || value_is_generator(src) {
+        // any iterable of [key, value] entries (e.g. a Map)
+        Value it;
+        if vm_get_iterator(vm, src, &it) {
+            gc_root(&vm.heap, it);
+            while true {
+                Value e;
+                bool done;
+                if !vm_iter_next(vm, it, &e, &done) { break; }
+                if done { break; }
+                if value_is_array(e) {
+                    JsObject* p = value_as_object(e);
+                    Value ks = js_to_string_value(vm, js_array_get(p, 0));
+                    vm_push(vm, ks);
+                    u32 atom = bi_atom(vm, sview(ks));
+                    vm_pop(vm);
+                    js_set_prop(o, atom, js_array_get(p, 1));
+                }
+            }
+        }
     }
     gc_root_reset(&vm.heap, rm);
     return value_cell(&o.head);
+}
+
+private Value nat_object_is(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(js_same_value(arg_at(args, argc, 0), arg_at(args, argc, 1)));
+}
+
+private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_bool(false); }
+    JsObject* o = value_as_object(ov);
+    Value kv = arg_at(args, argc, 1);
+    if (o.obj_flags & OBJF_ARRAY) != 0 && value_is_int(kv) {
+        return value_bool(js_array_has(o, value_as_int(kv)));
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value ks = js_to_string_value(vm, kv);
+    gc_root(&vm.heap, ks);
+    u32 a = bi_atom(vm, sview(ks));
+    gc_root_reset(&vm.heap, rm);
+    return value_bool(props_entry(&o.props, a) != null);
 }
 
 // --- Number / Boolean ------------------------------------------------------------
@@ -1954,6 +2069,119 @@ private Value nat_global_isfinite(void* vmp, Value callee, Value thisv, Value* a
     f64 d = js_to_number(arg_at(args, argc, 0));
     f64 inf = 1.0e308 * 10.0;
     return value_bool(d == d && d != inf && d != -inf);
+}
+
+private bool uri_unreserved(u8 c) {
+    if c >= 'A' && c <= 'Z' { return true; }
+    if c >= 'a' && c <= 'z' { return true; }
+    if c >= '0' && c <= '9' { return true; }
+    return c == '-' || c == '_' || c == '.' || c == '!' || c == '~'
+        || c == '*' || c == '\'' || c == '(' || c == ')';
+}
+
+private bool uri_reserved(u8 c) {
+    return c == ';' || c == ',' || c == '/' || c == '?' || c == ':'
+        || c == '@' || c == '&' || c == '=' || c == '+' || c == '$' || c == '#';
+}
+
+// component=true is encodeURIComponent; false keeps reserved chars (encodeURI).
+private Value uri_encode(VM* vm, Value thisv, Value* args, i32 argc, bool component) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str s = sview(sv);
+    str_buf sb;
+    str_buf_init(&sb);
+    str hex = "0123456789ABCDEF";
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if uri_unreserved(c) || (!component && uri_reserved(c)) {
+            str one;
+            one.data = s.data + i;
+            one.len = 1;
+            str_buf_add(&sb, one);
+        } else {
+            u8[3] esc;
+            esc[0] = '%';
+            esc[1] = *(hex.data + (c >> 4));
+            esc[2] = *(hex.data + (c & 15));
+            str e;
+            e.data = &esc[0];
+            e.len = 3;
+            str_buf_add(&sb, e);
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private i32 hex_val(u8 c) {
+    if c >= '0' && c <= '9' { return c - '0'; }
+    if c >= 'A' && c <= 'F' { return c - 'A' + 10; }
+    if c >= 'a' && c <= 'f' { return c - 'a' + 10; }
+    return -1;
+}
+
+private Value uri_decode(VM* vm, Value thisv, Value* args, i32 argc, bool component) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str s = sview(sv);
+    str_buf sb;
+    str_buf_init(&sb);
+    i32 i = 0;
+    while i < s.len {
+        u8 c = *(s.data + i);
+        i32 hi = -1;
+        i32 lo = -1;
+        if c == '%' && i + 2 < s.len {
+            hi = hex_val(*(s.data + i + 1));
+            lo = hex_val(*(s.data + i + 2));
+        }
+        if hi >= 0 && lo >= 0 {
+            u8 b = cast(u8, (hi << 4) | lo);
+            // decodeURI leaves reserved-char escapes intact
+            if !component && uri_reserved(b) {
+                str keep;
+                keep.data = s.data + i;
+                keep.len = 3;
+                str_buf_add(&sb, keep);
+            } else {
+                u8[1] bb;
+                bb[0] = b;
+                str one;
+                one.data = &bb[0];
+                one.len = 1;
+                str_buf_add(&sb, one);
+            }
+            i += 3;
+        } else {
+            str one;
+            one.data = s.data + i;
+            one.len = 1;
+            str_buf_add(&sb, one);
+            i++;
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_encode_uri_comp(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return uri_encode(as_vm(vmp), thisv, args, argc, true);
+}
+private Value nat_encode_uri(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return uri_encode(as_vm(vmp), thisv, args, argc, false);
+}
+private Value nat_decode_uri_comp(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return uri_decode(as_vm(vmp), thisv, args, argc, true);
+}
+private Value nat_decode_uri(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return uri_decode(as_vm(vmp), thisv, args, argc, false);
 }
 
 private Value nat_parseint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -4565,6 +4793,8 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "defineProperty", &nat_object_defineproperty);
     def_static(vm, object_ctor, "defineProperties", &nat_object_defineproperties);
     def_static(vm, object_ctor, "getOwnPropertyDescriptor", &nat_object_getownpropdesc);
+    def_static(vm, object_ctor, "is", &nat_object_is);
+    def_static(vm, object_ctor, "hasOwn", &nat_object_hasown);
     def_static(vm, object_ctor, "freeze", &nat_object_freeze);
     def_static(vm, object_ctor, "isFrozen", &nat_object_isfrozen);
     def_static(vm, object_ctor, "seal", &nat_object_seal);
@@ -4608,6 +4838,10 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "fill", &nat_arr_fill);
     def_method(vm, vm.array_proto, "toString", &nat_arr_join);
     def_method(vm, vm.array_proto, "copyWithin", &nat_arr_copywithin);
+    def_method(vm, vm.array_proto, "lastIndexOf", &nat_arr_lastindexof);
+    def_method(vm, vm.array_proto, "toSorted", &nat_arr_tosorted);
+    def_method(vm, vm.array_proto, "toReversed", &nat_arr_toreversed);
+    def_method(vm, vm.array_proto, "with", &nat_arr_with);
     def_method(vm, vm.array_proto, "values", &nat_arr_values);
     def_method(vm, vm.array_proto, "keys", &nat_arr_keys);
     def_method(vm, vm.array_proto, "entries", &nat_arr_entries);
@@ -4756,6 +4990,10 @@ void builtins_install(VM* vm) {
     }
 
     // globals
+    ignore def_global_fn(vm, "encodeURIComponent", &nat_encode_uri_comp);
+    ignore def_global_fn(vm, "encodeURI", &nat_encode_uri);
+    ignore def_global_fn(vm, "decodeURIComponent", &nat_decode_uri_comp);
+    ignore def_global_fn(vm, "decodeURI", &nat_decode_uri);
     ignore def_global_fn(vm, "parseInt", &nat_parseint);
     ignore def_global_fn(vm, "parseFloat", &nat_parsefloat);
     ignore def_global_fn(vm, "isNaN", &nat_global_isnan);
