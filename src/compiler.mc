@@ -1079,6 +1079,54 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         return;
     }
+    if k == N_TAGGED_TEMPLATE {
+        Node* tag = n.a;
+        Node* tmpl = n.b;
+        // callee + `this`, mirroring N_CALL: a member tag keeps its receiver
+        if tag.kind == N_MEMBER && (tag.flags & NF_PRIVATE) == 0 && tag.a.kind != N_SUPER {
+            compile_expr(co, tag.a);
+            ch_op_u16(ch, OP_GETMETHOD, name_const(co, tag.name));
+        } else if tag.kind == N_INDEX {
+            compile_expr(co, tag.a);
+            compile_expr(co, tag.b);
+            ch_op(ch, OP_GETMETHOD_DYN);
+        } else {
+            compile_expr(co, tag);
+            ch_op(ch, OP_UNDEF);
+        }
+        // strings array (cooked quasis)
+        i32 nq = 0;
+        for i32 i = 0; i < tmpl.kids.len; i++ {
+            Node* e = *(tmpl.kids.items + i);
+            if e.kind == N_TEMPLATE_ELEM {
+                ch_op_u16(ch, OP_CONST, str_const(co, e.name));
+                nq++;
+            }
+        }
+        ch_op_u16(ch, OP_NEWARR, nq);
+        // attach .raw = [raw quasis], leaving the strings array on top
+        ch_op(ch, OP_DUP);
+        for i32 i = 0; i < tmpl.kids.len; i++ {
+            Node* e = *(tmpl.kids.items + i);
+            if e.kind == N_TEMPLATE_ELEM {
+                ch_op_u16(ch, OP_CONST, str_const(co, e.aux));
+            }
+        }
+        ch_op_u16(ch, OP_NEWARR, nq);
+        ch_op_u16(ch, OP_SETPROP, name_const(co, "raw"));
+        ch_op(ch, OP_POP);
+        // substitution expressions as the remaining arguments
+        i32 nsub = 0;
+        for i32 i = 0; i < tmpl.kids.len; i++ {
+            Node* e = *(tmpl.kids.items + i);
+            if e.kind != N_TEMPLATE_ELEM {
+                compile_expr(co, e);
+                nsub++;
+            }
+        }
+        ch_op_u16(ch, OP_CALL, 1 + nsub);
+        return;
+    }
     if k == N_BIN {
         if n.op == TOK_AMPAMP || n.op == TOK_PIPEPIPE || n.op == TOK_QUESTION_QUESTION {
             i32 jop = OP_JF_KEEP;

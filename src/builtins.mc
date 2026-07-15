@@ -1364,6 +1364,38 @@ private Value nat_string_fromcharcode(void* vmp, Value callee, Value thisv, Valu
     return r;
 }
 
+// String.raw(strings, ...subs): joins strings.raw[i] with subs between.
+private Value nat_string_raw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value strings = arg_at(args, argc, 0);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value raw;
+    if !value_is_object(strings)
+        || !vm_get_prop_value(vm, strings, bi_atom(vm, "raw"), &raw)
+        || !value_is_array(raw) {
+        gc_root_reset(&vm.heap, rm);
+        return new_str(vm, "");
+    }
+    gc_root(&vm.heap, raw);
+    JsObject* ra = value_as_object(raw);
+    str_buf sb;
+    str_buf_init(&sb);
+    for i32 i = 0; i < ra.elen; i++ {
+        Value seg = js_to_string_value(vm, js_array_get(ra, i));
+        gc_root(&vm.heap, seg);
+        str_buf_add(&sb, sview(seg));
+        if i + 1 < ra.elen && i + 1 < argc {
+            Value s = js_to_string_value(vm, *(args + i + 1));
+            gc_root(&vm.heap, s);
+            str_buf_add(&sb, sview(s));
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
 // Each argument is a Unicode code point (0..0x10FFFF).
 private Value nat_string_fromcodepoint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -4947,6 +4979,7 @@ void builtins_install(VM* vm) {
     props_set(&string_ctor.props, vm.atom_prototype, value_cell(&vm.string_proto.head));
     def_static(vm, string_ctor, "fromCharCode", &nat_string_fromcharcode);
     def_static(vm, string_ctor, "fromCodePoint", &nat_string_fromcodepoint);
+    def_static(vm, string_ctor, "raw", &nat_string_raw);
     def_method(vm, vm.string_proto, "charAt", &nat_str_charat);
     def_method(vm, vm.string_proto, "charCodeAt", &nat_str_charcodeat);
     def_method(vm, vm.string_proto, "codePointAt", &nat_str_codepointat);

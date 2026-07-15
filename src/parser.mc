@@ -632,6 +632,7 @@ private Node* parse_template(Parser* p) {
     i32 mark = p.scratch.len;
     Node* q = nnew(p, N_TEMPLATE_ELEM);
     q.name = p.cur.text;
+    q.aux = p.cur.aux;   // raw quasi
     vec_push(&p.scratch, q);
     if at(p, TOK_TEMPLATE_FULL) {
         advance(p);
@@ -650,6 +651,7 @@ private Node* parse_template(Parser* p) {
         if tk.kind == TOK_ERROR { break; }
         Node* e = nnew(p, N_TEMPLATE_ELEM);
         e.name = tk.text;
+        e.aux = tk.aux;   // raw quasi
         vec_push(&p.scratch, e);
         advance(p);
         if tk.kind == TOK_TEMPLATE_TAIL { break; }

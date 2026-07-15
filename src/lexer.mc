@@ -669,6 +669,7 @@ private void scan_template(Lexer* lx, Token* t, bool from_sub) {
     } else {
         t.text = lx_view(lx, a, b);
     }
+    t.aux = lx_view(lx, a, b);   // raw source, for a tagged template's .raw
 }
 
 // --- punctuators ----------------------------------------------------
