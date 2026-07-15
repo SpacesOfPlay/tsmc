@@ -19,6 +19,42 @@ import gc;
 import object;
 import vm;
 
+// Canonical file identity for module dedup: resolves symlinks and
+// on-disk case, so two spellings of the same file load as one module.
+when os(windows) {
+    extern "kernel32.dll" {
+        i64 CreateFileA(u8* name, i32 access, i32 share, void* sec,
+            i32 disposition, i32 flags, i64 template_file);
+        i32 GetFinalPathNameByHandleA(i64 handle, u8* buf, i32 cap, i32 flags);
+        i32 CloseHandle(i64 handle);
+    }
+    // Final path by handle: symlinks and junctions resolved, on-disk
+    // case. 0x02000000 is FILE_FLAG_BACKUP_SEMANTICS (allows opening
+    // directories); share mode 7 is read|write|delete.
+    private bool canon_into(u8* cpath, u8* buf, i32 cap) {
+        i64 h = CreateFileA(cpath, 0, 7, null, 3, 0x02000000, cast(i64, 0));
+        if h == cast(i64, 0) - 1 { return false; }
+        i32 n = GetFinalPathNameByHandleA(h, buf, cap, 0);
+        CloseHandle(h);
+        return n > 0 && n < cap;
+    }
+}
+when os(linux) {
+    extern "libc.so.6" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
+}
+when os(android) {
+    extern "libc.so" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
+}
+when os(macos) || os(ios) {
+    extern "libSystem.B.dylib" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
+}
+when !os(windows) {
+    // resolved buffer must hold PATH_MAX; callers pass 4096.
+    private bool canon_into(u8* cpath, u8* buf, i32 cap) {
+        return sys_realpath(cpath, buf) != null;
+    }
+}
+
 const i32 MOD_NEW = 0;
 const i32 MOD_LOADED = 1;
 const i32 MOD_EVALUATING = 2;
@@ -26,6 +62,7 @@ const i32 MOD_DONE = 3;
 
 struct Module {
     str path;             // resolved, owned
+    str canon;            // canonical identity key for dedup, owned
     u8* src_data;         // owned file bytes
     i32 src_len;
     Bump arena;
@@ -78,6 +115,11 @@ private str path_join(str dir, str spec) {
     str_buf_add(&sb, dir);
     str_buf_add(&sb, spec);
     str joined = str_buf_to_str(&sb);
+    // Leading separators to restore: one for an absolute path, two for
+    // a UNC root ("\\server\share").
+    i32 lead = 0;
+    while lead < 2 && lead < joined.len &&
+        (*(joined.data + lead) == '/' || *(joined.data + lead) == '\\') { lead++; }
     Vec<str> segs = vec_new<str>(8);
     i32 i = 0;
     while i < joined.len {
@@ -97,6 +139,7 @@ private str path_join(str dir, str spec) {
     }
     str_buf out;
     str_buf_init(&out);
+    for i32 k = 0; k < lead; k++ { str_buf_add(&out, "/"); }
     for i32 j = 0; j < segs.len; j++ {
         if j > 0 { str_buf_add(&out, "/"); }
         str_buf_add(&out, vec_get(&segs, j));
@@ -149,11 +192,31 @@ private str resolve_specifier(str importer, str spec) {
     return r;
 }
 
+// Canonical identity key (heap str) for module dedup. The lexical path
+// stays the one used for reads, resolution, and messages. Falls back to
+// a copy of the lexical path when the file cannot be canonicalized.
+private str canon_path(str path) {
+    u8* cpath = str_to_cstr(path);
+    u8* buf = alloc<u8>(4096);
+    if canon_into(cpath, buf, 4096) {
+        free(cpath);
+        return str_from_cstr(buf);
+    }
+    free(buf);
+    free(cpath);
+    u8* d = alloc<u8>(path.len > 0 ? path.len : 1);
+    if path.len > 0 { memcpy(d, path.data, path.len); }
+    str r;
+    r.data = d;
+    r.len = path.len;
+    return r;
+}
+
 // --- loading -----------------------------------------------------------------
 
-private i32 find_module(Loader* ld, str path) {
+private i32 find_module(Loader* ld, str canon) {
     for i32 i = 0; i < ld.mods.len; i++ {
-        if str_equal(vec_get(&ld.mods, i).path, path) { return i; }
+        if str_equal(vec_get(&ld.mods, i).canon, canon) { return i; }
     }
     return -1;
 }
@@ -161,13 +224,15 @@ private i32 find_module(Loader* ld, str path) {
 // Loads path (and its deps) into the loader; returns the module index
 // or -1 on failure.
 private i32 load_module(Loader* ld, str path) {
-    i32 existing = find_module(ld, path);
-    if existing >= 0 { return existing; }
+    str canon = canon_path(path);
+    i32 existing = find_module(ld, canon);
+    if existing >= 0 { free(canon.data); return existing; }
 
     FileData fd = file_read(path);
     if fd.data == null {
         eprint("tsmc: cannot read module '{}'\n", path);
         ld.failed = true;
+        free(canon.data);
         return -1;
     }
 
@@ -176,6 +241,7 @@ private i32 load_module(Loader* ld, str path) {
     if path.len > 0 { memcpy(pc, path.data, path.len); }
     mod.path.data = pc;
     mod.path.len = path.len;
+    mod.canon = canon;
     mod.src_data = fd.data;
     mod.src_len = fd.len;
     mod.state = MOD_NEW;
@@ -278,6 +344,7 @@ private i32 eval_module(Loader* ld, i32 idx) {
 
 private void module_free(Module* mod) {
     free(mod.path.data);
+    free(mod.canon.data);
     if mod.src_data != null { free(mod.src_data); }
     vec_free(&mod.dep_idx);
     bump_destroy(&mod.arena);
