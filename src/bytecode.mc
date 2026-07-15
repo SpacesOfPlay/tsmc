@@ -29,6 +29,7 @@ enum Op {
 
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
     OP_NEG, OP_TONUM,
+    OP_INC, OP_DEC,   // ++/-- step, type-appropriate (Number or BigInt)
     OP_NOT, OP_BITNOT, OP_TYPEOF,
     OP_EQ, OP_NEQ, OP_SEQ, OP_SNEQ,
     OP_LT, OP_GT, OP_LE, OP_GE,

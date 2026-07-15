@@ -14,6 +14,7 @@ import gc;
 import atom;
 import object;
 import ustr;
+import bigint;
 import vm;
 import math;
 
@@ -2054,7 +2055,9 @@ private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* arg
 
 private Value nat_number_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     if argc == 0 { return value_int(0); }
-    return js_number_value(js_to_number(*(args)));
+    Value x = *(args);
+    if value_is_bigint(x) { return js_number_value(bn_to_f64(bigint_view(value_as_bigint(x)))); }
+    return js_number_value(js_to_number(x));
 }
 
 private Value nat_boolean_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -3536,6 +3539,59 @@ private Value nat_error_tostring(void* vmp, Value callee, Value thisv, Value* ar
 }
 
 // --- Symbol -----------------------------------------------------------------------
+
+// BigInt(x): from a BigInt (passthrough), integer Number, boolean, or
+// decimal string.
+private Value nat_bigint_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value x = arg_at(args, argc, 0);
+    if value_is_bigint(x) { return x; }
+    bool ok = true;
+    BigNum bn;
+    if value_is_bool(x) {
+        bn = bn_from_i64(value_is_true(x) ? 1 : 0);
+    } else if value_is_number(x) {
+        f64 d = js_to_number(x);
+        f64 inf = 1.0e308 * 10.0;
+        if d != d || d == inf || d == -inf || d != floor(d) {
+            vm_throw_error(vm, ERR_RANGE, "The number is not a safe integer");
+            return value_undefined();
+        }
+        bn = bn_from_i64(cast(i64, d));
+    } else if value_is_string(x) {
+        str s = sview(x);
+        // an empty (or all-blank) string is 0n
+        bn = bn_from_str(s, &ok);
+        if !ok {
+            i32 a = 0;
+            while a < s.len && (*(s.data + a) == ' ' || *(s.data + a) == '\t') { a++; }
+            if a >= s.len { bn = bn_from_i64(0); ok = true; }
+        }
+        if !ok {
+            vm_throw_error(vm, ERR_SYNTAX, "Cannot convert string to a BigInt");
+            return value_undefined();
+        }
+    } else {
+        vm_throw_error(vm, ERR_TYPE, "Cannot convert value to a BigInt");
+        return value_undefined();
+    }
+    GcBigInt* g = js_new_bigint(&vm.heap, bn);
+    bn_free(&bn);
+    return value_cell(&g.head);
+}
+
+private Value nat_bigint_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_bigint(thisv) { return new_str(vm, "0"); }
+    string s = bn_to_str(bigint_view(value_as_bigint(thisv)));
+    Value r = new_str(vm, s);
+    free(s);
+    return r;
+}
+
+private Value nat_bigint_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return thisv;
+}
 
 private Value nat_symbol_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -5205,6 +5261,15 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.symbol_proto, "valueOf", &nat_symbol_valueof);
     def_accessor(vm, vm.symbol_proto, "description", &nat_symbol_description);
     link_ctor(vm, vm.symbol_proto, symbol_ctor);
+
+    // BigInt
+    JsNative* bigint_ctor = def_global_fn(vm, "BigInt", &nat_bigint_ctor);
+    vm.bigint_proto = js_new_object(&vm.heap, vm.object_proto);
+    props_set(&bigint_ctor.props, vm.atom_prototype, value_cell(&vm.bigint_proto.head));
+    def_method(vm, vm.bigint_proto, "toString", &nat_bigint_tostring);
+    def_method(vm, vm.bigint_proto, "valueOf", &nat_bigint_valueof);
+    def_method(vm, vm.bigint_proto, "toLocaleString", &nat_bigint_tostring);
+    link_ctor(vm, vm.bigint_proto, bigint_ctor);
 
     // Array/String iterators via Symbol.iterator
     u32 iter_id = vm_sym_iterator_id(vm);

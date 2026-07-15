@@ -748,7 +748,6 @@ private Node* parse_primary(Parser* p) {
         return n;
     }
     if k == TOK_BIGINT {
-        perror(p, "bigint literals are not supported yet");
         Node* n = nnew(p, N_BIGINT);
         n.name = p.cur.text;
         advance(p);

@@ -13,6 +13,7 @@ import gc;
 import atom;
 import object;
 import ustr;
+import bigint;
 import bytecode;
 import ast;
 import bump;
@@ -31,7 +32,7 @@ type RegexProgPtr = RegexProg*;
 const i32 VM_STACK_MAX = 262144;
 const i32 VM_FRAMES_MAX = 8000;
 const i32 VM_HANDLERS_MAX = 4096;
-const i32 VM_EXEC_DEPTH_MAX = 180;
+const i32 VM_EXEC_DEPTH_MAX = 120;
 
 struct Frame {
     JsFunction* fun;    // null for the script frame
@@ -101,6 +102,7 @@ struct VM {
     JsObject* set_proto;
     JsObject* date_proto;
     JsObject* symbol_proto;
+    JsObject* bigint_proto;
     Vec<RegexProgPtr> regexps;
     u32 atom_rx;
     u32 atom_source;
@@ -180,6 +182,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
     if vm.symbol_proto != null { gc_mark_cell(h, &vm.symbol_proto.head); }
+    if vm.bigint_proto != null { gc_mark_cell(h, &vm.bigint_proto.head); }
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
     if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
@@ -229,6 +232,7 @@ bool js_truthy(Value v) {
     if value_is_bool(v) { return value_is_true(v); }
     if value_is_undefined(v) || value_is_null(v) || value_is_hole(v) { return false; }
     if value_is_string(v) { return value_as_string(v).len > 0; }
+    if value_is_bigint(v) { return value_as_bigint(v).nlimbs != 0; }
     return true;
 }
 
@@ -550,6 +554,13 @@ Value js_to_string_value(VM* vm, Value v) {
         str_buf_free(&sb);
         return value_cell(&g.head);
     }
+    if value_is_bigint(v) {
+        BigNum b = bigint_view(value_as_bigint(v));
+        string s = bn_to_str(b);
+        GcString* g = gc_new_string(&vm.heap, s);
+        free(s);
+        return value_cell(&g.head);
+    }
     // object-like: ToPrimitive with the string hint (toString/valueOf),
     // then ToString the resulting primitive
     Value prim;
@@ -579,6 +590,9 @@ bool js_strict_eq(Value a, Value b) {
     }
     if value_is_string(a) && value_is_string(b) {
         return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
+    }
+    if value_is_bigint(a) && value_is_bigint(b) {
+        return bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b))) == 0;
     }
     return value_same_bits(a, b);
 }
@@ -616,6 +630,16 @@ private bool is_nullish(Value v) {
     return value_is_null(v) || value_is_undefined(v);
 }
 
+// A BigInt equals a string iff the string parses to the same integer.
+private bool bigint_eq_str(GcBigInt* g, str s) {
+    bool ok;
+    BigNum sb = bn_from_str(s, &ok);
+    if !ok { return false; }
+    bool eq = bn_cmp(bigint_view(g), sb) == 0;
+    bn_free(&sb);
+    return eq;
+}
+
 bool js_loose_eq(Value a, Value b) {
     if is_nullish(a) || is_nullish(b) {
         return is_nullish(a) && is_nullish(b);
@@ -626,6 +650,14 @@ bool js_loose_eq(Value a, Value b) {
     if value_is_bool(b) { return js_loose_eq(a, value_int(value_is_true(b) ? 1 : 0)); }
     if value_is_number(a) && value_is_string(b) { return js_to_number(a) == js_to_number(b); }
     if value_is_string(a) && value_is_number(b) { return js_to_number(a) == js_to_number(b); }
+    // BigInt: equal by mathematical value across BigInt/Number/String
+    if value_is_bigint(a) && value_is_bigint(b) {
+        return bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b))) == 0;
+    }
+    if value_is_bigint(a) && value_is_number(b) { return bn_to_f64(bigint_view(value_as_bigint(a))) == js_to_number(b); }
+    if value_is_number(a) && value_is_bigint(b) { return js_to_number(a) == bn_to_f64(bigint_view(value_as_bigint(b))); }
+    if value_is_bigint(a) && value_is_string(b) { return bigint_eq_str(value_as_bigint(a), gc_string_view(value_as_string(b))); }
+    if value_is_string(a) && value_is_bigint(b) { return bigint_eq_str(value_as_bigint(b), gc_string_view(value_as_string(a))); }
     // object vs primitive ToPrimitive deferred; objects compare by identity
     return value_same_bits(a, b);
 }
@@ -756,6 +788,10 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     }
     if value_is_symbol(objv) {
         if vm.symbol_proto != null { ignore js_get_prop(vm.symbol_proto, a, out); }
+        return true;
+    }
+    if value_is_bigint(objv) {
+        if vm.bigint_proto != null { ignore js_get_prop(vm.bigint_proto, a, out); }
         return true;
     }
     if value_is_generator(objv) {
@@ -899,7 +935,7 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
 // A primitive value is anything that is not an object-like reference.
 private bool value_is_primitive(Value v) {
     if !value_is_cell(v) { return true; }
-    return value_is_string(v) || value_is_symbol(v);
+    return value_is_string(v) || value_is_symbol(v) || value_is_bigint(v);
 }
 
 // ToPrimitive (ES 7.1.1): invoke valueOf/toString (ordered by hint)
@@ -971,6 +1007,13 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
     if value_is_string(v) {
         if nested { inspect_quoted(sb, gc_string_view(value_as_string(v))); }
         else { str_buf_add(sb, gc_string_view(value_as_string(v))); }
+        return;
+    }
+    if value_is_bigint(v) {
+        string s = bn_to_str(bigint_view(value_as_bigint(v)));
+        str_buf_add(sb, s);
+        str_buf_add(sb, "n");
+        free(s);
         return;
     }
     if value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0 {
@@ -1102,7 +1145,7 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
 // objects/arrays via a Node-like inspect.
 Value js_console_string(VM* vm, Value v) {
     if value_is_object(v) || value_is_array(v) || value_is_map(v)
-        || value_is_function(v) || value_is_native(v)
+        || value_is_function(v) || value_is_native(v) || value_is_bigint(v)
         || (value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0) {
         str_buf sb;
         str_buf_init(&sb);
@@ -1201,6 +1244,7 @@ void vm_init(VM* vm) {
     vm.set_proto = null;
     vm.date_proto = null;
     vm.symbol_proto = null;
+    vm.bigint_proto = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");
@@ -1289,6 +1333,62 @@ private bool coerce_top2_prim(VM* vm) {
     Value pb;
     if !vm_to_primitive(vm, vpeek(vm, 0), false, &pb) { return false; }
     *(vm.stack + vm.sp - 1) = pb;
+    return true;
+}
+
+// Arithmetic on two BigInts; throws RangeError on /0 or negative **.
+private Value bigint_arith(VM* vm, Value av, Value bv, i32 op) {
+    BigNum x = bigint_view(value_as_bigint(av));
+    BigNum y = bigint_view(value_as_bigint(bv));
+    BigNum r;
+    bool ok = true;
+    if op == OP_ADD { r = bn_add(x, y); }
+    else if op == OP_SUB { r = bn_sub(x, y); }
+    else if op == OP_MUL { r = bn_mul(x, y); }
+    else if op == OP_DIV { BigNum rem; r = bn_divmod(x, y, &rem, &ok); bn_free(&rem); }
+    else if op == OP_MOD { BigNum q = bn_divmod(x, y, &r, &ok); bn_free(&q); }
+    else if op == OP_POW { r = bn_pow(x, y, &ok); }
+    else { ok = false; r = bn_from_i64(0); }
+    if !ok {
+        bn_free(&r);
+        vm_throw_error(vm, ERR_RANGE,
+            op == OP_POW ? "Exponent must be non-negative" : "Division by zero");
+        return value_undefined();
+    }
+    GcBigInt* g = js_new_bigint(&vm.heap, r);
+    bn_free(&r);
+    return value_cell(&g.head);
+}
+
+private Value bigint_negate(VM* vm, Value v) {
+    BigNum r = bn_neg(bigint_view(value_as_bigint(v)));
+    GcBigInt* g = js_new_bigint(&vm.heap, r);
+    bn_free(&r);
+    return value_cell(&g.head);
+}
+
+private Value bigint_step(VM* vm, Value v, bool inc) {
+    BigNum one = bn_from_i64(inc ? 1 : -1);
+    BigNum r = bn_add(bigint_view(value_as_bigint(v)), one);
+    bn_free(&one);
+    GcBigInt* g = js_new_bigint(&vm.heap, r);
+    bn_free(&r);
+    return value_cell(&g.head);
+}
+
+// Handles a BigInt operand in a binary arithmetic op: sets *out and
+// returns true if it consumed the operands (both-BigInt result or a
+// mixed-type throw). Returns false to fall through to numeric handling.
+private bool try_bigint_op(VM* vm, Value a, Value b, i32 op, Value* out) {
+    bool ab = value_is_bigint(a);
+    bool bb = value_is_bigint(b);
+    if !ab && !bb { return false; }
+    if ab && bb {
+        *out = bigint_arith(vm, a, b, op);
+        return true;
+    }
+    vm_throw_error(vm, ERR_TYPE, "Cannot mix BigInt and other types, use explicit conversions");
+    *out = value_undefined();
     return true;
 }
 
@@ -1477,6 +1577,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     if vb.len > 0 { memcpy(dst + va.len, vb.data, vb.len); }
                     vm.sp -= 4;
                     vpush(vm, value_cell(&g.head));
+                } else if value_is_bigint(a) || value_is_bigint(b) {
+                    Value r;
+                    ignore try_bigint_op(vm, a, b, OP_ADD, &r);
+                    vm.sp -= 2;
+                    if !vm.has_pending { vpush(vm, r); }
                 } else {
                     f64 r = js_to_number(a) + js_to_number(b);
                     vm.sp -= 2;
@@ -1497,6 +1602,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_bigint(a) || value_is_bigint(b) {
+                    Value r;
+                    ignore try_bigint_op(vm, a, b, OP_SUB, &r);
+                    vm.sp -= 2;
+                    if !vm.has_pending { vpush(vm, r); }
                 } else {
                     f64 r = js_to_number(a) - js_to_number(b);
                     vm.sp -= 2;
@@ -1517,6 +1627,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_bigint(a) || value_is_bigint(b) {
+                    Value r;
+                    ignore try_bigint_op(vm, a, b, OP_MUL, &r);
+                    vm.sp -= 2;
+                    if !vm.has_pending { vpush(vm, r); }
                 } else {
                     f64 r = js_to_number(a) * js_to_number(b);
                     vm.sp -= 2;
@@ -1529,6 +1644,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if value_is_bigint(a) || value_is_bigint(b) {
+                    Value r;
+                    ignore try_bigint_op(vm, a, b, op, &r);
+                    vm.sp -= 2;
+                    if !vm.has_pending { vpush(vm, r); }
+                    break case;
+                }
                 f64 x = js_to_number(a);
                 f64 y = js_to_number(b);
                 f64 r = 0.0;
@@ -1550,14 +1672,36 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, num_norm(r));
             }
             case OP_NEG: {
-                f64 r = -js_to_number(vpeek(vm, 0));
+                Value v = vpeek(vm, 0);
+                if value_is_bigint(v) {
+                    vm.sp--;
+                    vpush(vm, bigint_negate(vm, v));
+                    break case;
+                }
+                f64 r = -js_to_number(v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
             case OP_TONUM: {
-                f64 r = js_to_number(vpeek(vm, 0));
+                Value v = vpeek(vm, 0);
+                if value_is_bigint(v) { break case; }   // ToNumeric keeps BigInt
+                f64 r = js_to_number(v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
+            }
+            case OP_INC, OP_DEC: {
+                Value v = vpeek(vm, 0);
+                vm.sp--;
+                if value_is_bigint(v) {
+                    vpush(vm, bigint_step(vm, v, op == OP_INC));
+                } else if value_is_int(v) {
+                    i64 s = cast(i64, value_as_int(v)) + (op == OP_INC ? 1 : -1);
+                    if s >= -2147483648 && s <= 2147483647 { vpush(vm, value_int(cast(i32, s))); }
+                    else { vpush(vm, value_number(cast(f64, s))); }
+                } else {
+                    f64 r = js_to_number(v) + (op == OP_INC ? 1.0 : -1.0);
+                    vpush(vm, num_norm(r));
+                }
             }
             case OP_NOT: {
                 bool r = !js_truthy(vpeek(vm, 0));
@@ -1565,6 +1709,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_BITNOT: {
+                if value_is_bigint(vpeek(vm, 0)) {
+                    vm_throw_error(vm, ERR_TYPE, "BigInt bitwise operators are not supported yet");
+                    break case;
+                }
                 i32 r = ~f64_to_i32(js_to_number(vpeek(vm, 0)));
                 vm.sp--;
                 vpush(vm, value_int(r));
@@ -1577,6 +1725,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 else if value_is_bool(v) { s = "boolean"; }
                 else if value_is_string(v) { s = "string"; }
                 else if value_is_symbol(v) { s = "symbol"; }
+                else if value_is_bigint(v) { s = "bigint"; }
                 else if value_is_function(v) || value_is_native(v) { s = "function"; }
                 GcString* g = gc_new_string(&vm.heap, s);
                 vm.sp--;
@@ -1633,6 +1782,22 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     if op == OP_GT { r = c > 0; }
                     if op == OP_LE { r = c <= 0; }
                     if op == OP_GE { r = c >= 0; }
+                } else if value_is_bigint(a) || value_is_bigint(b) {
+                    i32 c = 0;
+                    bool unordered = false;
+                    if value_is_bigint(a) && value_is_bigint(b) {
+                        c = bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b)));
+                    } else {
+                        f64 x = value_is_bigint(a) ? bn_to_f64(bigint_view(value_as_bigint(a))) : js_to_number(a);
+                        f64 y = value_is_bigint(b) ? bn_to_f64(bigint_view(value_as_bigint(b))) : js_to_number(b);
+                        if x != x || y != y { unordered = true; }
+                        else if x < y { c = -1; } else if x > y { c = 1; }
+                    }
+                    if unordered { r = false; }
+                    else if op == OP_LT { r = c < 0; }
+                    else if op == OP_GT { r = c > 0; }
+                    else if op == OP_LE { r = c <= 0; }
+                    else { r = c >= 0; }
                 } else {
                     f64 x = js_to_number(a);
                     f64 y = js_to_number(b);
@@ -1645,6 +1810,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+                if value_is_bigint(vpeek(vm, 0)) || value_is_bigint(vpeek(vm, 1)) {
+                    vm_throw_error(vm, ERR_TYPE, "BigInt bitwise operators are not supported yet");
+                    break case;
+                }
                 i32 x = f64_to_i32(js_to_number(vpeek(vm, 1)));
                 i32 y = f64_to_i32(js_to_number(vpeek(vm, 0)));
                 i32 r = 0;
@@ -1657,6 +1826,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_int(r));
             }
             case OP_USHR: {
+                if value_is_bigint(vpeek(vm, 0)) || value_is_bigint(vpeek(vm, 1)) {
+                    vm_throw_error(vm, ERR_TYPE, "BigInts have no unsigned right shift, use >> instead");
+                    break case;
+                }
                 u32 x = f64_to_i32(js_to_number(vpeek(vm, 1)));
                 u32 y = f64_to_i32(js_to_number(vpeek(vm, 0)));
                 u32 r = x >> (y & 31);

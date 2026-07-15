@@ -54,7 +54,7 @@ Landed, each with a measured win or a fixed hazard:
   array, not the C stack, so `VM_FRAMES_MAX` rose to 8000 — `sum(2000)`
   now succeeds where 256 used to throw. Native re-entry
   (`vm_call_value` → `vm_execute`) grows the real C stack, so a
-  separate `exec_depth` cap (180) trips first there. Both runaway
+  separate `exec_depth` cap (120) trips first there. Both runaway
   cases raise `RangeError`; neither segfaults.
 
 ## Tests

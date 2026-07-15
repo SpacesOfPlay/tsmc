@@ -4,13 +4,14 @@ Deferred ES features that the conformance sweep (M11) surfaced. Each
 lands one at a time: plan section below, then implementation, tests, and
 a green suite before the next. Ordered easiest-first.
 
-1. **Tagged templates** — parser already builds the node; wire raw
-   strings and compile the call.
-2. **Private class fields** (`#x`) — parser + lowering + per-instance
-   storage.
-3. **Regex named groups** (`(?<n>…)`, `$<n>`, `.groups`) — regex engine.
-4. **BigInt** — a new primitive type; needs a `DESIGN_bigint.md` first
-   (value representation is cross-cutting).
+1. **Tagged templates** — DONE.
+2. **Private class fields** (`#x`) — DONE.
+3. **Regex named groups** (`(?<n>…)`, `$<n>`, `.groups`) — DONE.
+4. **BigInt** — DONE (see `DESIGN_bigint.md`). Arbitrary-precision
+   integer primitive: literals, `+ - * / % **`, comparison/equality
+   across BigInt/Number, `typeof`, ToBoolean/ToString, `Number()`,
+   `BigInt()`, `.toString()`. Bitwise operators, `asIntN`/`asUintN`,
+   and non-decimal `toString` radices remain deferred.
 
 ---
 

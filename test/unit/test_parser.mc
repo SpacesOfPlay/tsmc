@@ -247,7 +247,7 @@ i32 main() {
     check_parse_error("export = foo;", "export assign rejected");
     check_parse_error("@dec class A {}", "decorators rejected");
     check_parse_error("let 5 = x;", "bad binding");
-    check_parse_error("123n;", "bigint rejected");
+    check_parse_error("a ? b;", "ternary missing colon");
     check_parse_error("let x = ;", "missing initializer expr");
 
     return check_done("test_parser");

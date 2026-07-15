@@ -12,6 +12,7 @@ import map;
 import value;
 import gc;
 import atom;
+import bigint;
 
 // continues GcKind: 0..1 are built into gc.mc
 const i32 GC_OBJECT   = 2;
@@ -22,6 +23,7 @@ const i32 GC_ACCESSOR = 6;
 const i32 GC_SYMBOL   = 7;
 const i32 GC_GENERATOR = 8;
 const i32 GC_MAP      = 9;
+const i32 GC_BIGINT   = 10;
 
 const i32 GEN_START = 0;
 const i32 GEN_SUSPENDED = 1;
@@ -229,6 +231,33 @@ struct JsMap {
     bool is_set;
 }
 
+// Arbitrary-precision integer: base-1e9 limbs stored inline after the
+// cell (like GcString). Holds no GC references.
+struct GcBigInt {
+    GcCell head;
+    bool neg;
+    i32 nlimbs;
+}
+
+GcBigInt* js_new_bigint(GcHeap* h, BigNum a) {
+    GcCell* c = gc_alloc(h, GC_BIGINT, sizeof(GcBigInt) + cast(i64, a.n) * 4);
+    GcBigInt* g = cast(GcBigInt*, c);
+    g.neg = a.neg;
+    g.nlimbs = a.n;
+    u32* dst = cast(u32*, cast(u8*, g) + sizeof(GcBigInt));
+    for i32 i = 0; i < a.n; i++ { *(dst + i) = *(a.limbs + i); }
+    return g;
+}
+
+// A borrowing BigNum over the inline limbs — never bn_free it.
+BigNum bigint_view(GcBigInt* g) {
+    BigNum r;
+    r.neg = g.neg;
+    r.n = g.nlimbs;
+    r.limbs = cast(u32*, cast(u8*, g) + sizeof(GcBigInt));
+    return r;
+}
+
 // Accessor property payload; lives as the property's stored value.
 struct JsAccessor {
     GcCell head;
@@ -327,6 +356,7 @@ void js_trace(GcHeap* h, GcCell* c) {
         }
         return;
     }
+    if c.kind == GC_BIGINT { return; }   // inline limbs, no references
     eprint("gc: unknown runtime cell kind {}\n", c.kind);
     exit(70);
 }
@@ -477,6 +507,8 @@ bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
 bool value_is_symbol(Value v)   { return value_is_kind(v, GC_SYMBOL); }
 bool value_is_generator(Value v){ return value_is_kind(v, GC_GENERATOR); }
 bool value_is_map(Value v)      { return value_is_kind(v, GC_MAP); }
+bool value_is_bigint(Value v)   { return value_is_kind(v, GC_BIGINT); }
+GcBigInt* value_as_bigint(Value v) { return cast(GcBigInt*, value_as_cell(v)); }
 
 JsSymbol* value_as_symbol(Value v)       { return cast(JsSymbol*, value_as_cell(v)); }
 JsGenerator* value_as_generator(Value v) { return cast(JsGenerator*, value_as_cell(v)); }

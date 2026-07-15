@@ -19,6 +19,7 @@ import atom;
 import bytecode;
 import bump;
 import object;
+import bigint;
 
 struct CBind {
     str name;
@@ -794,15 +795,13 @@ private void compile_assign(Compiler* co, Node* n) {
 private void compile_update(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     Node* t = n.a;
-    i32 op = n.op == TOK_PLUSPLUS ? OP_ADD : OP_SUB;
+    i32 step = n.op == TOK_PLUSPLUS ? OP_INC : OP_DEC;
     bool prefix = (n.flags & NF_PREFIX) != 0;
-    i32 one = ch_add_const(ch, value_int(1));
     if t.kind == N_IDENT {
         emit_load_ident(co, t);
         ch_op(ch, OP_TONUM);
         if !prefix { ch_op(ch, OP_DUP); }
-        ch_op_u16(ch, OP_CONST, one);
-        ch_op(ch, op);
+        ch_op(ch, step);
         emit_store_ident(co, t);
         if !prefix { ch_op(ch, OP_POP); }
         return;
@@ -823,8 +822,7 @@ private void compile_update(Compiler* co, Node* n) {
         }
         ch_op(ch, OP_TONUM);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
-        ch_op_u16(ch, OP_CONST, one);
-        ch_op(ch, op);
+        ch_op(ch, step);
         if t.kind == N_MEMBER {
             ch_op_u16(ch, OP_SETPROP, mkc);
         } else {
@@ -980,6 +978,17 @@ private void compile_expr(Compiler* co, Node* n) {
     i32 k = n.kind;
     if k == N_NUMBER {
         ch_op_u16(ch, OP_CONST, ch_add_const(ch, num_value(n.num)));
+        return;
+    }
+    if k == N_BIGINT {
+        // literal text includes the trailing 'n'
+        str t = n.name;
+        if t.len > 0 && *(t.data + t.len - 1) == 'n' { t.len--; }
+        bool ok;
+        BigNum bn = bn_from_str(t, &ok);
+        GcBigInt* g = js_new_bigint(co.heap, bn);
+        bn_free(&bn);
+        ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_cell(&g.head)));
         return;
     }
     if k == N_STRING {
