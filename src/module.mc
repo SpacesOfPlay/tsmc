@@ -59,9 +59,7 @@ private str dir_of(str path) {
     return d;
 }
 
-// All path helpers work in raw byte buffers (alloc/free), sidestepping
-// owned-string ownership tracking. Returned strs carry a heap .data
-// the caller frees; {null, 0} means none.
+// Path helpers return heap strs the caller frees; {null, 0} means none.
 
 private str raw_from(str_buf* sb) {
     str v = str_buf_to_str(sb);
@@ -134,17 +132,19 @@ private str try_candidate(str joined, str suffix) {
 }
 
 // Resolves a relative specifier; returns a heap str (.data freed by
-// the caller) or {null, 0} if no file matches.
+// the caller) or {null, 0} if no file matches. The empty suffix is the
+// exact-path try; the rest add an inferred extension or /index.
 private str resolve_specifier(str importer, str spec) {
     str dir = dir_of(importer);
     str joined = path_join(dir, spec);
-    str r = try_candidate(joined, "");
-    if r.data == null { r = try_candidate(joined, ".ts"); }
-    if r.data == null { r = try_candidate(joined, ".js"); }
-    if r.data == null { r = try_candidate(joined, ".mjs"); }
-    if r.data == null { r = try_candidate(joined, ".mts"); }
-    if r.data == null { r = try_candidate(joined, "/index.ts"); }
-    if r.data == null { r = try_candidate(joined, "/index.js"); }
+    str[8] tries = { "", ".ts", ".js", ".mjs", ".mts",
+        "/index.ts", "/index.js", "/index.mts" };
+    str r;
+    r.data = null;
+    r.len = 0;
+    for i32 e = 0; e < 8; e++ {
+        if r.data == null { r = try_candidate(joined, tries[e]); }
+    }
     free(joined.data);
     return r;
 }
