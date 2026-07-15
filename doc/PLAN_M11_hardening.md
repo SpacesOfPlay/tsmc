@@ -125,7 +125,18 @@ surfaced was fixed to match Node:
   bug: `return`ing a struct-typed ternary picks the wrong branch —
   `doc/BUG_*` in the compiler repo; worked around by binding to a local.)
 
-Known deferred gaps: no BigInt; `Object.keys` on a function doesn't list
-static fields (function own-prop enumeration); class getters/setters are
-still enumerable; string comparison uses byte order (differs from UTF-16
-only for astral vs. U+E000–U+FFFF); regex indices remain byte-based.
+- **More builtins.** Date UTC accessors + `Date.UTC` (no timezone, so
+  UTC aliases the plain accessors); `Symbol.prototype` toString/valueOf/
+  description; `Number("0b…"/"0o…")`; **static class inheritance** — a
+  derived constructor's `[[Prototype]]` is the parent constructor
+  (`JsFunction.fproto`, walked in property lookup and `getPrototypeOf`),
+  so inherited static methods/fields resolve; Latin-1 case mapping in
+  `toUpperCase`/`toLowerCase` (ß→SS, ÿ↔Ÿ), replacing the ASCII-only map.
+
+Known deferred gaps: no BigInt; private class fields (`#x`), tagged
+templates, and regex named groups are unimplemented; `super` in a static
+method and `__proto__` (accessor) are unsupported; `Object.keys` on a
+function omits static fields; class getters/setters stay enumerable;
+case mapping beyond Latin-1 (Greek, Cyrillic) is unmapped; string
+comparison uses byte order (differs from UTF-16 only for astral vs.
+U+E000–U+FFFF); regex indices remain byte-based.

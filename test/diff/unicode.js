@@ -45,3 +45,9 @@ console.log(new Map([["k", 1]]).get("k"));
 // concatenation and templates preserve unit length
 console.log(("ca" + "fé").length, (`${"日"}本語`).length);
 console.log("é".repeat(3), "é".repeat(3).length);
+
+// Latin-1 case mapping
+console.log("café".toUpperCase(), "CAFÉ".toLowerCase());
+console.log("àéîõü".toUpperCase(), "ÀÉÎÕÜ".toLowerCase());
+console.log("naïve RÉSUMÉ".toLowerCase(), "hello wörld".toUpperCase());
+console.log("straße".toUpperCase(), "ÿ".toUpperCase(), "Ÿ".toLowerCase());

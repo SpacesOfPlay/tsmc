@@ -1465,6 +1465,14 @@ private void compile_class_expr(Compiler* co, Node* c) {
     ch_op_u16(ch, OP_SETLOCAL, t_ctor);
     ch_op(ch, OP_POP);
 
+    // static inheritance: derived ctor's [[Prototype]] is the parent ctor
+    if derived {
+        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+        emit_load_name(co, "%super", c);
+        ch_op(ch, OP_SETPROTO);
+        ch_op(ch, OP_POP);
+    }
+
     // C.prototype: fresh object chained to the parent's prototype
     ch_op(ch, OP_NEWOBJ);
     if derived {

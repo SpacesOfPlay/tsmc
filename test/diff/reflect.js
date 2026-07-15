@@ -19,3 +19,15 @@ console.log(Animal.name, Dog.name, new Dog().constructor === Dog);
 
 const named = class Widget {};
 console.log(named.name);
+
+// static inheritance: derived ctor's [[Prototype]] is the parent ctor
+class Base { static make() { return "base"; } static kind = "B"; }
+class Derived extends Base {}
+class Deeper extends Derived {}
+console.log(Derived.make(), Deeper.make(), Derived.kind, Deeper.kind);
+console.log(Object.getPrototypeOf(Derived) === Base, Object.getPrototypeOf(Deeper) === Derived);
+
+// Symbol
+const sym = Symbol("tag");
+console.log(sym.toString(), sym.description, typeof sym);
+console.log(Symbol().toString(), Symbol().description, String(Symbol("z")));

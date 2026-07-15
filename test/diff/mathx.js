@@ -9,6 +9,7 @@ console.log(Math.max(-Infinity, 5), Math.min(Infinity, 5));
 console.log(Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, Number.EPSILON > 0);
 console.log((123.456).toFixed(2), (0).toFixed(2), (1.005).toFixed(2), (-1.5).toFixed(0));
 console.log(parseInt("FF", 16), parseInt("777", 8), parseInt("101", 2));
+console.log(Number("0b101"), Number("0o17"), Number("0xff"), Number("0B11"), Number("0O10"));
 console.log((255).toString(16), (255).toString(2), (8).toString(8), (35).toString(36));
 console.log(Number.isInteger(5.0), Number.isInteger(5.5), Number.isSafeInteger(2 ** 53));
 console.log(Math.floor(-0.5), Math.ceil(-0.5), 7 % 3, -7 % 3, 7 % -3);

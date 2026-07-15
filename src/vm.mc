@@ -100,6 +100,7 @@ struct VM {
     JsObject* map_proto;
     JsObject* set_proto;
     JsObject* date_proto;
+    JsObject* symbol_proto;
     Vec<RegexProgPtr> regexps;
     u32 atom_rx;
     u32 atom_source;
@@ -178,6 +179,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
+    if vm.symbol_proto != null { gc_mark_cell(h, &vm.symbol_proto.head); }
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
     if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
@@ -281,6 +283,23 @@ private f64 vm_str_to_num(str s) {
             v = v * 16.0 + d;
         }
         return sign * v;
+    }
+    // binary (0b) and octal (0o)
+    if b - a > 2 && *(s.data + a) == '0' {
+        u8 pre = *(s.data + a + 1);
+        f64 base = 0.0;
+        i32 maxd = 0;
+        if pre == 'b' || pre == 'B' { base = 2.0; maxd = 1; }
+        else if pre == 'o' || pre == 'O' { base = 8.0; maxd = 7; }
+        if base != 0.0 {
+            f64 v = 0.0;
+            for i32 i = a + 2; i < b; i++ {
+                i32 d = *(s.data + i) - '0';
+                if d < 0 || d > maxd { return 0.0 / 0.0; }
+                v = v * base + cast(f64, d);
+            }
+            return sign * v;
+        }
     }
     // decimal
     u64 mant = 0;
@@ -686,6 +705,13 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = value_int(arity);
             return true;
         }
+        // static inheritance: walk the derived-ctor [[Prototype]] chain
+        if value_is_function(objv) {
+            Value fp = value_as_function(objv).fproto;
+            if value_is_function(fp) || value_is_native(fp) {
+                return get_prop_atom(vm, fp, a, out);
+            }
+        }
         if vm.function_proto != null { ignore js_get_prop(vm.function_proto, a, out); }
         return true;
     }
@@ -711,6 +737,10 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     }
     if value_is_bool(objv) {
         if vm.boolean_proto != null { ignore js_get_prop(vm.boolean_proto, a, out); }
+        return true;
+    }
+    if value_is_symbol(objv) {
+        if vm.symbol_proto != null { ignore js_get_prop(vm.symbol_proto, a, out); }
         return true;
     }
     if value_is_generator(objv) {
@@ -1155,6 +1185,7 @@ void vm_init(VM* vm) {
     vm.map_proto = null;
     vm.set_proto = null;
     vm.date_proto = null;
+    vm.symbol_proto = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");
@@ -1985,6 +2016,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* p = null;
                     if value_is_object(protov) { p = value_as_object(protov); }
                     value_as_object(objv).proto = p;
+                } else if value_is_function(objv) {
+                    // static inheritance: a derived ctor's [[Prototype]]
+                    value_as_function(objv).fproto = protov;
                 }
             }
             case OP_DEFGETTER, OP_DEFSETTER: {

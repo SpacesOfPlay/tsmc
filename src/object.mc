@@ -194,6 +194,7 @@ struct JsFunction {
     Value* upvals;         // boxes, one per template upvalue
     i32 n_upvals;
     PropList props;
+    Value fproto;          // [[Prototype]]: parent ctor for derived classes
 }
 
 // ctx is the owning VM; typed as void* to keep layering one-way.
@@ -280,6 +281,7 @@ void js_trace(GcHeap* h, GcCell* c) {
             gc_mark_value(h, *(f.upvals + i));
         }
         mark_props(h, &f.props);
+        gc_mark_value(h, f.fproto);
         return;
     }
     if c.kind == GC_NATIVE {
@@ -388,6 +390,7 @@ JsFunction* js_new_function(GcHeap* h, FnTemplate* t, i32 n_upvals) {
         }
     }
     props_init(&f.props);
+    f.fproto = value_undefined();
     return f;
 }
 

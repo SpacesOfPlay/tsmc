@@ -249,10 +249,18 @@ private Value nat_object_create(void* vmp, Value callee, Value thisv, Value* arg
 }
 
 private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
     if value_is_object(ov) {
         JsObject* p = value_as_object(ov).proto;
         if p != null { return value_cell(&p.head); }
+    } else if value_is_function(ov) {
+        // derived-class ctor -> parent ctor; else Function.prototype
+        Value fp = value_as_function(ov).fproto;
+        if value_is_function(fp) || value_is_native(fp) { return fp; }
+        if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
+    } else if value_is_native(ov) {
+        if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
     }
     return value_null();
 }
@@ -1507,23 +1515,43 @@ private Value nat_str_substring(void* vmp, Value callee, Value thisv, Value* arg
     return r;
 }
 
+// Case-maps one code point: ASCII plus the Latin-1 letters. Beyond
+// Latin-1 (Greek, Cyrillic, ...) is left unmapped — a documented gap.
+private i32 case_map_cp(i32 cp, bool upper) {
+    if upper {
+        if cp >= 'a' && cp <= 'z' { return cp - 32; }
+        if cp >= 0xE0 && cp <= 0xFE && cp != 0xF7 { return cp - 0x20; }
+        if cp == 0xFF { return 0x178; }   // ÿ -> Ÿ
+        if cp == 0xB5 { return 0x39C; }   // µ -> Μ (Greek Mu)
+        return cp;
+    }
+    if cp >= 'A' && cp <= 'Z' { return cp + 32; }
+    if cp >= 0xC0 && cp <= 0xDE && cp != 0xD7 { return cp + 0x20; }
+    if cp == 0x178 { return 0xFF; }       // Ÿ -> ÿ
+    return cp;
+}
+
 private Value str_case_map(VM* vm, Value thisv, bool upper) {
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     str s = sview(sv2);
-    u8* buf = alloc<u8>(s.len + 1);
-    for i32 i = 0; i < s.len; i++ {
-        u8 c = *(s.data + i);
-        if upper && c >= 'a' && c <= 'z' { c = cast(u8, c - 32); }
-        if !upper && c >= 'A' && c <= 'Z' { c = cast(u8, c + 32); }
-        *(buf + i) = c;
+    str_buf sb;
+    str_buf_init(&sb);
+    i32 off = 0;
+    while off < s.len {
+        i32 n;
+        i32 cp = utf8_decode(s, off, &n);
+        off += n;
+        if upper && cp == 0xDF {          // ß -> SS
+            wtf8_put_cp(&sb, 'S');
+            wtf8_put_cp(&sb, 'S');
+        } else {
+            wtf8_put_cp(&sb, case_map_cp(cp, upper));
+        }
     }
-    str out;
-    out.data = buf;
-    out.len = s.len;
-    Value r = new_str(vm, out);
-    free(buf);
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -3162,6 +3190,30 @@ private Value nat_symbol_ctor(void* vmp, Value callee, Value thisv, Value* args,
     return vm_new_symbol(vm, desc);
 }
 
+private Value nat_symbol_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_symbol(thisv) { return new_str(vm, "Symbol()"); }
+    JsSymbol* sy = value_as_symbol(thisv);
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "Symbol(");
+    if value_is_string(sy.desc) { str_buf_add(&sb, sview(sy.desc)); }
+    str_buf_add(&sb, ")");
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+private Value nat_symbol_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return thisv;
+}
+
+// Symbol.prototype.description getter: the symbol's description or undefined.
+private Value nat_symbol_description(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    if !value_is_symbol(thisv) { return value_undefined(); }
+    return value_as_symbol(thisv).desc;
+}
+
 // --- array / string iterators ------------------------------------------------------
 
 private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -3902,6 +3954,12 @@ private f64 date_compose(i64 y, i32 mo, i32 day, i32 hr, i32 mi, i32 se, i32 mms
         + cast(f64, mi) * 60000.0 + cast(f64, se) * 1000.0 + cast(f64, mms);
 }
 
+// years 0..99 map to 1900..1999 (legacy Date behavior)
+private i64 date_year_expand(i64 y) {
+    if y >= 0 && y <= 99 { return y + 1900; }
+    return y;
+}
+
 private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* d;
@@ -3915,7 +3973,7 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
     } else if argc == 1 {
         t = js_to_number(*(args));
     } else {
-        i64 y = cast(i64, js_to_number(*(args)));
+        i64 y = date_year_expand(cast(i64, js_to_number(*(args))));
         i32 mo = to_int_arg(arg_at(args, argc, 1));
         i32 day = argc > 2 ? to_int_arg(*(args + 2)) : 1;
         i32 hr = argc > 3 ? to_int_arg(*(args + 3)) : 0;
@@ -3932,6 +3990,19 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
 private Value nat_date_now(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     return js_number_value(vm_now_millis(vm));
+}
+
+// Date.UTC(year, month=0, day=1, h=0, m=0, s=0, ms=0) -> timestamp.
+private Value nat_date_utc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    if argc == 0 { return value_number(0.0 / 0.0); }
+    i64 y = date_year_expand(cast(i64, js_to_number(*(args))));
+    i32 mo = argc > 1 ? to_int_arg(*(args + 1)) : 0;
+    i32 day = argc > 2 ? to_int_arg(*(args + 2)) : 1;
+    i32 hr = argc > 3 ? to_int_arg(*(args + 3)) : 0;
+    i32 mi = argc > 4 ? to_int_arg(*(args + 4)) : 0;
+    i32 se = argc > 5 ? to_int_arg(*(args + 5)) : 0;
+    i32 mms = argc > 6 ? to_int_arg(*(args + 6)) : 0;
+    return js_number_value(date_compose(y, mo, day, hr, mi, se, mms));
 }
 
 private Value nat_date_gettime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -4693,6 +4764,12 @@ void builtins_install(VM* vm) {
     // Symbol
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
+    vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
+    props_set(&symbol_ctor.props, vm.atom_prototype, value_cell(&vm.symbol_proto.head));
+    def_method(vm, vm.symbol_proto, "toString", &nat_symbol_tostring);
+    def_method(vm, vm.symbol_proto, "valueOf", &nat_symbol_valueof);
+    def_accessor(vm, vm.symbol_proto, "description", &nat_symbol_description);
+    link_ctor(vm, vm.symbol_proto, symbol_ctor);
 
     // Array/String iterators via Symbol.iterator
     u32 iter_id = vm_sym_iterator_id(vm);
@@ -4759,6 +4836,7 @@ void builtins_install(VM* vm) {
     JsNative* date_ctor = def_global_fn(vm, "Date", &nat_date_ctor);
     props_set(&date_ctor.props, vm.atom_prototype, value_cell(&vm.date_proto.head));
     def_static(vm, date_ctor, "now", &nat_date_now);
+    def_static(vm, date_ctor, "UTC", &nat_date_utc);
     def_method(vm, vm.date_proto, "getTime", &nat_date_gettime);
     def_method(vm, vm.date_proto, "valueOf", &nat_date_gettime);
     def_method(vm, vm.date_proto, "getFullYear", &nat_date_getfullyear);
@@ -4769,6 +4847,15 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.date_proto, "getMinutes", &nat_date_getminutes);
     def_method(vm, vm.date_proto, "getSeconds", &nat_date_getseconds);
     def_method(vm, vm.date_proto, "getMilliseconds", &nat_date_getms);
+    // no timezone support: the UTC accessors alias the plain ones
+    def_method(vm, vm.date_proto, "getUTCFullYear", &nat_date_getfullyear);
+    def_method(vm, vm.date_proto, "getUTCMonth", &nat_date_getmonth);
+    def_method(vm, vm.date_proto, "getUTCDate", &nat_date_getdate);
+    def_method(vm, vm.date_proto, "getUTCDay", &nat_date_getday);
+    def_method(vm, vm.date_proto, "getUTCHours", &nat_date_gethours);
+    def_method(vm, vm.date_proto, "getUTCMinutes", &nat_date_getminutes);
+    def_method(vm, vm.date_proto, "getUTCSeconds", &nat_date_getseconds);
+    def_method(vm, vm.date_proto, "getUTCMilliseconds", &nat_date_getms);
     def_method(vm, vm.date_proto, "toISOString", &nat_date_toiso);
     def_method(vm, vm.date_proto, "toJSON", &nat_date_toiso);
 
