@@ -243,8 +243,23 @@ private i32 num_key_const(Compiler* co, f64 num) {
     return ci;
 }
 
+// Private names are stored under "%#name": the '%' hides them from
+// enumeration, the '#' keeps them clear of the engine's %-internals.
+private i32 private_key_const(Compiler* co, str name) {
+    string s = format("%#{}", name);
+    str view = s;
+    u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
+    memcpy(copy, view.data, view.len);
+    free(s);
+    str m;
+    m.data = copy;
+    m.len = view.len;
+    return name_const(co, m);
+}
+
 private i32 prop_key_const(Compiler* co, Node* key) {
     if key.kind == N_NUMBER { return num_key_const(co, key.num); }
+    if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key.name); }
     return name_const(co, key.name);
 }
 
@@ -697,13 +712,17 @@ private void compile_assign(Compiler* co, Node* n) {
             return;
         }
         if t.kind == N_MEMBER {
-            if (t.flags & (NF_OPT_CHAIN | NF_PRIVATE)) != 0 {
+            if (t.flags & NF_OPT_CHAIN) != 0 {
                 cerror(co, t, "invalid assignment target");
                 return;
             }
             compile_expr(co, t.a);
             compile_expr(co, n.b);
-            ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+            if (t.flags & NF_PRIVATE) != 0 {
+                ch_op_u16(ch, OP_SETPROP, private_key_const(co, t.name));
+            } else {
+                ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+            }
             return;
         }
         if t.kind == N_INDEX {
@@ -750,12 +769,13 @@ private void compile_assign(Compiler* co, Node* n) {
         return;
     }
     if t.kind == N_MEMBER {
+        i32 kc = (t.flags & NF_PRIVATE) != 0 ? private_key_const(co, t.name) : name_const(co, t.name);
         compile_expr(co, t.a);
         ch_op(ch, OP_DUP);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, t.name));
+        ch_op_u16(ch, OP_GETPROP, kc);
         compile_expr(co, n.b);
         ch_op(ch, op);
-        ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+        ch_op_u16(ch, OP_SETPROP, kc);
         return;
     }
     if t.kind == N_INDEX {
@@ -789,10 +809,12 @@ private void compile_update(Compiler* co, Node* n) {
     }
     if t.kind == N_MEMBER || t.kind == N_INDEX {
         i32 tmp = alloc_slot(co.cur);
+        i32 mkc = 0;
         if t.kind == N_MEMBER {
+            mkc = (t.flags & NF_PRIVATE) != 0 ? private_key_const(co, t.name) : name_const(co, t.name);
             compile_expr(co, t.a);
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, t.name));
+            ch_op_u16(ch, OP_GETPROP, mkc);
         } else {
             compile_expr(co, t.a);
             compile_expr(co, t.b);
@@ -804,7 +826,7 @@ private void compile_update(Compiler* co, Node* n) {
         ch_op_u16(ch, OP_CONST, one);
         ch_op(ch, op);
         if t.kind == N_MEMBER {
-            ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+            ch_op_u16(ch, OP_SETPROP, mkc);
         } else {
             ch_op(ch, OP_SETINDEX);
         }
@@ -834,12 +856,14 @@ private bool chain_has_opt(Node* n) {
 private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
     Chunk* ch = &co.cur.ch;
     i32 k = n.kind;
-    if k == N_MEMBER && (n.flags & NF_PRIVATE) == 0 && n.a.kind != N_SUPER {
+    if k == N_MEMBER && n.a.kind != N_SUPER {
         emit_chain(co, n.a, nils);
         if (n.flags & NF_OPT_CHAIN) != 0 {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
-        ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+        i32 mk = (n.flags & NF_PRIVATE) != 0
+            ? private_key_const(co, n.name) : name_const(co, n.name);
+        ch_op_u16(ch, OP_GETPROP, mk);
         return;
     }
     if k == N_INDEX {
@@ -853,13 +877,14 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
     }
     if k == N_CALL {
         Node* callee = n.a;
-        if callee.kind == N_MEMBER && (callee.flags & NF_PRIVATE) == 0
-            && callee.a.kind != N_SUPER {
+        if callee.kind == N_MEMBER && callee.a.kind != N_SUPER {
             emit_chain(co, callee.a, nils);
             if (callee.flags & NF_OPT_CHAIN) != 0 {
                 vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
             }
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+            i32 mk = (callee.flags & NF_PRIVATE) != 0
+                ? private_key_const(co, callee.name) : name_const(co, callee.name);
+            ch_op_u16(ch, OP_GETMETHOD, mk);
         } else if callee.kind == N_INDEX {
             emit_chain(co, callee.a, nils);
             if (callee.flags & NF_OPT_CHAIN) != 0 {
@@ -933,9 +958,11 @@ private void compile_call(Compiler* co, Node* n) {
         compile_opt_chain(co, n);
         return;
     }
-    if callee.kind == N_MEMBER && (callee.flags & NF_PRIVATE) == 0 {
+    if callee.kind == N_MEMBER {
         compile_expr(co, callee.a);
-        ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+        i32 mk = (callee.flags & NF_PRIVATE) != 0
+            ? private_key_const(co, callee.name) : name_const(co, callee.name);
+        ch_op_u16(ch, OP_GETMETHOD, mk);
     } else if callee.kind == N_INDEX {
         compile_expr(co, callee.a);
         compile_expr(co, callee.b);
@@ -1217,8 +1244,8 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         if (n.flags & NF_PRIVATE) != 0 {
-            cerror(co, n, "private class members are not supported yet");
-            ch_op(ch, OP_UNDEF);
+            compile_expr(co, n.a);
+            ch_op_u16(ch, OP_GETPROP, private_key_const(co, n.name));
             return;
         }
         if chain_has_opt(n) {
@@ -1482,10 +1509,6 @@ private void compile_class_expr(Compiler* co, Node* c) {
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind != N_CLASS_MEMBER { continue; }
-        if m.a != null && m.a.kind == N_PRIVATE_IDENT {
-            cerror(co, m, "private class members are not supported yet");
-            continue;
-        }
         if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
             && (m.flags & (NF_GETTER | NF_SETTER)) == 0
             && m.a != null && m.a.kind == N_IDENT && str_equal(m.a.name, "constructor") {
@@ -1543,7 +1566,6 @@ private void compile_class_expr(Compiler* co, Node* c) {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK { continue; }
         if m.kind != N_CLASS_MEMBER || m == ctor_member { continue; }
-        if m.a != null && m.a.kind == N_PRIVATE_IDENT { continue; }
         bool is_static = (m.flags & NF_STATIC) != 0;
         bool is_method = m.b != null && m.b.kind == N_FUNCTION;
         bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;

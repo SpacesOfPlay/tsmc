@@ -48,3 +48,37 @@ the **cooked** quasi in `Token.text`; the **raw** source is
 - The strings object is built fresh per evaluation (no per-call-site
   caching) and is not frozen. Both are observable only by identity
   (`` t`x` === t`x` ``) or mutation of `strings`, which real tags don't do.
+
+---
+
+## 2. Private class fields (`#x`) — DONE
+
+`class C { #x = 5; #m() {…}; get() { return this.#x; } }`. The lexer and
+parser already produce private names (`TOK_PRIVATE_NAME`,
+`N_PRIVATE_IDENT`, `N_MEMBER` with `NF_PRIVATE`); the private text drops
+the `#` (so `#x` → `"x"`). Only the compiler rejects them
+("private class members are not supported yet").
+
+### Approach — mangled non-enumerable key
+
+Store each private name under the atom `"%#" + name` (e.g. `#x` →
+`"%#x"`). The `%` prefix makes it non-enumerable through the existing
+`vm_enumerable_key` rule (so it never shows in keys/`for-in`/JSON), and
+the `#` keeps it clear of the engine's other `%`-internal props. All
+private access routes through one mangling helper, with `prop_key_const`
+learning `N_PRIVATE_IDENT`:
+
+- **Field** `#x = init` — already classified as an instance field;
+  `emit_field_inits` writes `this["%#x"] = init` via `prop_key_const`.
+- **Method** `#m() {}` — installed on the prototype under `"%#m"` (kept
+  reachable through the proto chain for `this.#m()`).
+- **Read/write** `this.#x` — the `N_MEMBER`/assignment paths emit
+  `OP_GETPROP`/`OP_SETPROP` on `"%#x"`.
+
+### Not doing (documented)
+
+Not spec-strict privacy: the key is a mangled string, so there is no
+per-class brand — two classes' `#x` share a key, `#x in obj` is a plain
+own-key test, and accessing a private field on a foreign instance reads
+`undefined` instead of throwing. Real single-class encapsulation works;
+these are rare cross-class edges.
