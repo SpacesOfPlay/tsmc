@@ -4501,6 +4501,28 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
     }
     js_set_prop(arr, vm_atom_index(vm), value_int(*(caps + 0)));
     js_set_prop(arr, bi_atom(vm, "input"), subjectv);
+    // result.groups: undefined unless the pattern has named groups
+    if regex_has_named(prog) {
+        JsObject* groups = js_new_object(&vm.heap, null);
+        js_set_prop(arr, bi_atom(vm, "groups"), value_cell(&groups.head));
+        for i32 g = 1; g <= ng; g++ {
+            str nm = regex_group_name(prog, g);
+            if nm.len > 0 {
+                i32 gs = *(caps + 2 * g);
+                i32 ge = *(caps + 2 * g + 1);
+                Value v = value_undefined();
+                if gs >= 0 {
+                    str sub;
+                    sub.data = s.data + gs;
+                    sub.len = ge - gs;
+                    v = new_str(vm, sub);
+                }
+                js_set_prop(groups, bi_atom(vm, nm), v);
+            }
+        }
+    } else {
+        js_set_prop(arr, bi_atom(vm, "groups"), value_undefined());
+    }
     if regex_is_global(prog) || regex_is_sticky(prog) {
         js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(*(caps + 1)));
     }
@@ -4667,14 +4689,37 @@ private Value nat_str_search(void* vmp, Value callee, Value thisv, Value* args, 
     return value_int(result);
 }
 
-// Substitutes $1..$9, $&, $$ in a replacement template.
-private void append_replacement(VM* vm, str_buf* sb, str tmpl, str subject, i32* caps, i32 ng) {
+// Substitutes $1..$99, $&, $$, and $<name> in a replacement template.
+private void append_replacement(VM* vm, str_buf* sb, str tmpl, str subject, i32* caps, i32 ng, RegexProg* prog) {
     i32 i = 0;
     while i < tmpl.len {
         u8 c = *(tmpl.data + i);
         if c == '$' && i + 1 < tmpl.len {
             u8 n = *(tmpl.data + i + 1);
             if n == '$' { str_buf_add(sb, "$"); i += 2; continue; }
+            if n == '<' && prog != null && regex_has_named(prog) {
+                // $<name>
+                i32 j = i + 2;
+                while j < tmpl.len && *(tmpl.data + j) != '>' { j++; }
+                if j < tmpl.len {
+                    str name;
+                    name.data = tmpl.data + i + 2;
+                    name.len = j - (i + 2);
+                    i32 g = regex_group_index(prog, name);
+                    if g >= 1 {
+                        i32 gs = *(caps + 2 * g);
+                        i32 ge = *(caps + 2 * g + 1);
+                        if gs >= 0 {
+                            str sub;
+                            sub.data = subject.data + gs;
+                            sub.len = ge - gs;
+                            str_buf_add(sb, sub);
+                        }
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
             if n == '&' {
                 str m;
                 m.data = subject.data + *(caps + 0);
@@ -4744,7 +4789,9 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
         pre.len = ms - pos;
         str_buf_add(&sb, pre);
         if fn_repl {
-            i32 nargs = ng + 3;
+            // (match, ...groups, offset, string [, namedGroups])
+            bool named = regex_has_named(prog);
+            i32 nargs = ng + 3 + (named ? 1 : 0);
             Value* ca = alloc<Value>(nargs);
             for i32 g = 0; g <= ng; g++ {
                 i32 gs = *(caps + 2 * g);
@@ -4760,6 +4807,26 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
             }
             *(ca + ng + 1) = value_int(ms);
             *(ca + ng + 2) = sv2;
+            if named {
+                JsObject* groups = js_new_object(&vm.heap, null);
+                Value gv = value_cell(&groups.head);
+                gc_root(&vm.heap, gv);
+                for i32 g = 1; g <= ng; g++ {
+                    str nm = regex_group_name(prog, g);
+                    if nm.len > 0 {
+                        i32 gs = *(caps + 2 * g);
+                        Value gval = value_undefined();
+                        if gs >= 0 {
+                            str sub;
+                            sub.data = s.data + gs;
+                            sub.len = *(caps + 2 * g + 1) - gs;
+                            gval = new_str(vm, sub);
+                        }
+                        js_set_prop(groups, bi_atom(vm, nm), gval);
+                    }
+                }
+                *(ca + ng + 3) = gv;
+            }
             Value fr = vm_call_value(vm, repl, value_undefined(), ca, nargs);
             free(ca);
             if vm.has_pending { break; }
@@ -4768,7 +4835,7 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
             gc_root(&vm.heap, frs);
             str_buf_add(&sb, sview(frs));
         } else {
-            append_replacement(vm, &sb, sview(rtmpl), s, caps, ng);
+            append_replacement(vm, &sb, sview(rtmpl), s, caps, ng, prog);
         }
         if me > pos {
             pos = me;

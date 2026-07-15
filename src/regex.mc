@@ -71,6 +71,8 @@ struct RegexProg {
     bool* class_neg;
     i32 n_classes;
     i32 n_groups;            // capturing groups (excludes whole match)
+    str* group_names;        // index 1..n_groups -> name (empty if unnamed)
+    bool has_named;
     bool ignore_case;
     bool multiline;
     bool dotall;
@@ -80,12 +82,18 @@ struct RegexProg {
 
 // --- parser ---------------------------------------------------------------
 
+struct RxGroupName {
+    i32 idx;
+    str name;
+}
+
 struct RxParser {
     str src;
     i32 pos;
     i32 group_count;
     bool failed;
     Vec<RxClass> classes;   // owns range arrays until moved into prog
+    Vec<RxGroupName> gnames;
 }
 
 private u8 px_at(RxParser* p, i32 i) {
@@ -302,6 +310,22 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             if m == ':' { p.pos++; kind = RN_NCGROUP; }
             else if m == '=' { p.pos++; kind = RN_LOOK; neg_look = false; }
             else if m == '!' { p.pos++; kind = RN_LOOK; neg_look = true; }
+            else if m == '<' && px_at(p, p.pos + 1) != '=' && px_at(p, p.pos + 1) != '!' {
+                // named capturing group (?<name>...)
+                p.pos++;   // consume '<'
+                i32 nstart = p.pos;
+                while px_cur(p) != '>' && px_cur(p) != 0 { p.pos++; }
+                str nm;
+                nm.data = p.src.data + nstart;
+                nm.len = p.pos - nstart;
+                if px_cur(p) == '>' { p.pos++; } else { p.failed = true; }
+                p.group_count++;
+                gidx = p.group_count;
+                RxGroupName gn;
+                gn.idx = gidx;
+                gn.name = nm;
+                vec_push(&p.gnames, gn);
+            }
             else { p.failed = true; kind = RN_NCGROUP; }
         } else {
             p.group_count++;
@@ -565,6 +589,7 @@ RegexProg* regex_compile(str pattern, str flags) {
     p.group_count = 0;
     p.failed = false;
     vec_init<RxClass>(&p.classes, 4);
+    vec_init<RxGroupName>(&p.gnames, 2);
     Vec<RxNodePtr> stack = vec_new<RxNodePtr>(8);
     RxNode* root = parse_alt(&p, &stack);
     vec_free(&stack);
@@ -574,6 +599,7 @@ RegexProg* regex_compile(str pattern, str flags) {
             free(vec_get(&p.classes, i).ranges);
         }
         vec_free(&p.classes);
+        vec_free(&p.gnames);
         return null;
     }
 
@@ -592,6 +618,30 @@ RegexProg* regex_compile(str pattern, str flags) {
     }
     vec_free(&code);
     prog.n_groups = p.group_count;
+
+    // group names: index 1..n_groups -> name (empty if unnamed)
+    i32 gn_size = p.group_count + 1;
+    prog.group_names = alloc<str>(gn_size);
+    for i32 i = 0; i < gn_size; i++ {
+        str empty;
+        empty.data = null;
+        empty.len = 0;
+        *(prog.group_names + i) = empty;
+    }
+    prog.has_named = p.gnames.len > 0;
+    for i32 i = 0; i < p.gnames.len; i++ {
+        RxGroupName gn = vec_get(&p.gnames, i);
+        if gn.idx >= 1 && gn.idx <= p.group_count && gn.name.len > 0 {
+            // own a copy: the parser's views point into the pattern source
+            u8* buf = alloc<u8>(gn.name.len);
+            memcpy(buf, gn.name.data, gn.name.len);
+            str owned;
+            owned.data = buf;
+            owned.len = gn.name.len;
+            *(prog.group_names + gn.idx) = owned;
+        }
+    }
+    vec_free(&p.gnames);
 
     // pack classes
     prog.n_classes = p.classes.len;
@@ -638,12 +688,33 @@ void regex_free(RegexProg* prog) {
     free(prog.class_off);
     free(prog.class_len);
     free(prog.class_neg);
+    if prog.group_names != null {
+        for i32 i = 0; i <= prog.n_groups; i++ {
+            str nm = *(prog.group_names + i);
+            if nm.data != null { free(nm.data); }
+        }
+        free(prog.group_names);
+    }
     free(prog);
 }
 
 i32 regex_ngroups(RegexProg* prog) { return prog.n_groups; }
 bool regex_is_global(RegexProg* prog) { return prog.global; }
 bool regex_is_sticky(RegexProg* prog) { return prog.sticky; }
+bool regex_has_named(RegexProg* prog) { return prog.has_named; }
+str regex_group_name(RegexProg* prog, i32 gidx) {
+    if gidx < 0 || gidx > prog.n_groups { str e; e.data = null; e.len = 0; return e; }
+    return *(prog.group_names + gidx);
+}
+// Group index for a name, or -1 if none.
+i32 regex_group_index(RegexProg* prog, str name) {
+    if !prog.has_named { return -1; }
+    for i32 g = 1; g <= prog.n_groups; g++ {
+        str nm = *(prog.group_names + g);
+        if nm.len == name.len && nm.len > 0 && str_equal(nm, name) { return g; }
+    }
+    return -1;
+}
 
 // --- matcher --------------------------------------------------------------
 

@@ -17,3 +17,15 @@ console.log(/(\w)\1/.test("hello"), "hello".match(/(\w)\1/)[0]);
 console.log("2023/12/25".replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$2-$1"));
 console.log([..."a1b2c3".matchAll ? "yes" : "no"].join(""));
 console.log("one two three".replace(/(\w+)\s(\w+)/, "$2 $1"));
+
+// named capture groups
+const dm = "2021-05-15".match(/(?<y>\d+)-(?<mo>\d+)-(?<d>\d+)/);
+console.log(dm.groups.y, dm.groups.mo, dm.groups.d, dm[1], dm[0]);
+console.log(Object.keys(dm.groups).join(","));
+console.log("nogroups".match(/\w+/).groups);
+console.log("x".match(/(?<opt>y)?x/).groups.opt);
+console.log([..."a1b2".matchAll(/(?<l>[a-z])(?<n>\d)/g)].map((m) => m.groups.l + m.groups.n).join(" "));
+console.log("2021-05-15".replace(/(?<y>\d+)-(?<m>\d+)-(?<d>\d+)/, "$<d>/$<m>/$<y>"));
+console.log("John Smith".replace(/(?<first>\w+)\s(?<last>\w+)/, "$<last>, $<first>"));
+console.log("a1b2".replace(/(?<l>[a-z])(?<n>\d)/g, "$<n>$<l>"));
+console.log("2021-05".replace(/(?<y>\d+)-(?<m>\d+)/, (m, y, mo, off, s, g) => g.y + "/" + g.m));

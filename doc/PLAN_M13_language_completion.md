@@ -82,3 +82,37 @@ per-class brand — two classes' `#x` share a key, `#x in obj` is a plain
 own-key test, and accessing a private field on a foreign instance reads
 `undefined` instead of throwing. Real single-class encapsulation works;
 these are rare cross-class edges.
+
+---
+
+## 3. Regex named groups (`(?<n>…)`, `$<n>`, `.groups`) — DONE
+
+`/(?<y>\d+)-(?<m>\d+)/` captures numbered groups as today, plus a
+`groups` object (`{ y, m }`) on the match, `$<name>` in string
+replacements, and a trailing `groups` argument to a replacer function.
+
+Current state: the engine parses numbered/non-capturing/lookahead groups
+(`RN_GROUP`, `RN_NCGROUP`, `RN_LOOK`) but `(?<…` falls through to an
+error. Match results and `replace` handle numbered groups only.
+
+### Approach
+
+- **Engine** (`regex.mc`): in `parse_atom`, recognize `(?<name>` (but
+  not `(?<=`/`(?<!`, which stay unsupported lookbehind). It is an
+  ordinary capturing group — assign the next group index — plus record
+  `name → index`. Store a `str* group_names` (size `n_groups+1`,
+  index → name or empty) on `RegexProg`; expose `regex_has_named` and
+  `regex_group_name(prog, gidx)`.
+- **Match result** (`regexp_exec_impl`): always set `result.groups` —
+  `undefined` when there are no named groups, else a null-prototype
+  object mapping each name to its capture (or `undefined` if the group
+  didn't participate). Numbered access (`m[1]`) is unchanged.
+- **String replacement**: `$<name>` resolves to the named group's
+  capture alongside the existing `$1`/`$&`/`` $` ``/`$'` handling.
+- **Replacer function**: when the pattern has named groups, pass the
+  `groups` object as the final argument after `offset`, `string`.
+
+### Not doing
+
+Lookbehind (`(?<=…)`, `(?<!…)`) stays unsupported — a separate engine
+feature.
