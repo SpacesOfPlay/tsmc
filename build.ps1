@@ -6,7 +6,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("build", "test", "clean", "help")]
+    [ValidateSet("build", "test", "bench", "clean", "help")]
     [string]$Command = "help"
 )
 
@@ -104,18 +104,34 @@ function Run-Tests {
     else { Fail "$fail test(s) failed"; exit 1 }
 }
 
+function Run-Bench {
+    Build-Tsmc
+    Step "benchmarks"
+    $benches = @(Get-ChildItem (Join-Path $ProjectDir "bench\*.ts") -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($benches.Count -eq 0) { Write-Host "  (none)"; return }
+    foreach ($f in $benches) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $out = (& $OutExe $f.FullName 2>&1) -join " "
+        $sw.Stop()
+        $ms = "{0,7:N0}" -f $sw.Elapsed.TotalMilliseconds
+        Write-Host ("  {0} ms  {1}  -> {2}" -f $ms, $f.BaseName.PadRight(12), $out)
+    }
+}
+
 switch ($Command) {
     "build" { Build-Tsmc }
     "test"  { Run-Tests }
+    "bench" { Run-Bench }
     "clean" {
         Step "clean"
         if (Test-Path $BuildDir) { Remove-Item -Recurse -Force $BuildDir }
         Pass "removed build/"
     }
     "help" {
-        Write-Host "usage: ./build.ps1 <build|test|clean>"
+        Write-Host "usage: ./build.ps1 <build|test|bench|clean>"
         Write-Host "  build   compile build/tsmc.exe"
         Write-Host "  test    build, then run unit + cli + golden run tests"
+        Write-Host "  bench   build, then time bench/*.ts"
         Write-Host "  clean   remove build/"
     }
 }

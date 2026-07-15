@@ -37,24 +37,49 @@ struct Prop {
     Value val;
 }
 
+// Insertion-ordered {key, value} entries. Small tables scan linearly
+// (cache-friendly); once a table grows past PROPS_INDEX_MIN a hash
+// index (key -> item position) makes lookups O(1) for dictionary-
+// pattern objects. Enumeration always walks `items` in order.
+const i32 PROPS_INDEX_MIN = 16;
+
 struct PropList {
     Prop* items;
     i32 len;
     i32 cap;
+    IntMap<i32>* idx;   // null below the threshold
 }
 
 void props_init(PropList* p) {
     p.items = null;
     p.len = 0;
     p.cap = 0;
+    p.idx = null;
 }
 
 void props_free(PropList* p) {
     if p.items != null { free(p.items); }
+    if p.idx != null {
+        intmap_free<i32>(p.idx);
+        free(p.idx);
+    }
     props_init(p);
 }
 
+private void props_build_index(PropList* p) {
+    p.idx = new(IntMap<i32>);
+    intmap_init<i32>(p.idx);
+    for i32 i = 0; i < p.len; i++ {
+        intmap_set<i32>(p.idx, (p.items + i).key, i);
+    }
+}
+
 Value* props_get(PropList* p, u32 key) {
+    if p.idx != null {
+        i32* pos = intmap_get<i32>(p.idx, key);
+        if pos != null { return &(p.items + *pos).val; }
+        return null;
+    }
     for i32 i = 0; i < p.len; i++ {
         Prop* pr = p.items + i;
         if pr.key == key { return &pr.val; }
@@ -79,10 +104,16 @@ void props_set(PropList* p, u32 key, Value v) {
         p.items = ni;
         p.cap = ncap;
     }
-    Prop* pr = p.items + p.len;
+    i32 pos = p.len;
+    Prop* pr = p.items + pos;
     pr.key = key;
     pr.val = v;
     p.len++;
+    if p.idx != null {
+        intmap_set<i32>(p.idx, key, pos);
+    } else if p.len >= PROPS_INDEX_MIN {
+        props_build_index(p);
+    }
 }
 
 bool props_remove(PropList* p, u32 key) {
@@ -92,6 +123,13 @@ bool props_remove(PropList* p, u32 key) {
                 *(p.items + j) = *(p.items + j + 1);
             }
             p.len--;
+            // positions shifted; rebuild the index
+            if p.idx != null {
+                intmap_free<i32>(p.idx);
+                free(p.idx);
+                p.idx = null;
+                if p.len >= PROPS_INDEX_MIN { props_build_index(p); }
+            }
             return true;
         }
     }

@@ -126,18 +126,37 @@ run_tests() {
     fi
 }
 
+run_bench() {
+    build_tsmc
+    step "benchmarks"
+    n=0
+    for f in "$PROJECT_DIR"/bench/*.ts; do
+        [ -e "$f" ] || continue
+        n=$((n + 1))
+        name="$(basename "$f" .ts)"
+        start=$(date +%s%N)
+        out="$("$OUT_EXE" "$f" 2>&1)"
+        end=$(date +%s%N)
+        ms=$(( (end - start) / 1000000 ))
+        printf '  %6d ms  %-12s -> %s\n' "$ms" "$name" "$out"
+    done
+    [ "$n" -eq 0 ] && echo "  (none)"
+}
+
 case "${1:-help}" in
     build) build_tsmc ;;
     test)  run_tests ;;
+    bench) run_bench ;;
     clean)
         step "clean"
         rm -rf "$BUILD_DIR"
         pass "removed build/"
         ;;
     *)
-        echo "usage: ./build.sh <build|test|clean>"
+        echo "usage: ./build.sh <build|test|bench|clean>"
         echo "  build   compile build/tsmc"
         echo "  test    build, then run unit + cli + golden run tests"
+        echo "  bench   build, then time bench/*.ts"
         echo "  clean   remove build/"
         ;;
 esac

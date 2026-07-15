@@ -24,9 +24,13 @@ import regex;
 
 type RegexProgPtr = RegexProg*;
 
-const i32 VM_STACK_MAX = 16384;
-const i32 VM_FRAMES_MAX = 256;
-const i32 VM_HANDLERS_MAX = 256;
+// Direct JS recursion grows the frames array, not the C stack, so it
+// can go deep. Native re-entry (a native calling back into JS) grows
+// the real C stack per level, so it is capped much lower.
+const i32 VM_STACK_MAX = 262144;
+const i32 VM_FRAMES_MAX = 8000;
+const i32 VM_HANDLERS_MAX = 4096;
+const i32 VM_EXEC_DEPTH_MAX = 180;
 
 struct Frame {
     JsFunction* fun;    // null for the script frame
@@ -115,6 +119,7 @@ struct VM {
     u32 atom_value;
     u32 atom_done;
     u32 atom_next;
+    i32 exec_depth;   // nested vm_execute invocations (C-stack guard)
 }
 
 const i32 ERR_ERROR = 0;
@@ -801,6 +806,7 @@ void vm_init(VM* vm) {
     vm.atom_value = atom_intern(&vm.atoms, "value");
     vm.atom_done = atom_intern(&vm.atoms, "done");
     vm.atom_next = atom_intern(&vm.atoms, "next");
+    vm.exec_depth = 0;
     vm_install_globals(vm);
     // Symbol.iterator: allocated first so its id is stable and shared
     Value itsym = vm_new_symbol(vm, value_undefined());
@@ -1042,14 +1048,46 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW: {
+            case OP_SUB: {
+                Value b = vpeek(vm, 0);
+                Value a = vpeek(vm, 1);
+                if value_is_int(a) && value_is_int(b) {
+                    i64 s = cast(i64, value_as_int(a)) - value_as_int(b);
+                    vm.sp -= 2;
+                    if s >= -2147483648 && s <= 2147483647 {
+                        vpush(vm, value_int(cast(i32, s)));
+                    } else {
+                        vpush(vm, value_number(cast(f64, s)));
+                    }
+                } else {
+                    f64 r = js_to_number(a) - js_to_number(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
+                }
+            }
+            case OP_MUL: {
+                Value b = vpeek(vm, 0);
+                Value a = vpeek(vm, 1);
+                if value_is_int(a) && value_is_int(b) {
+                    i64 s = cast(i64, value_as_int(a)) * value_as_int(b);
+                    vm.sp -= 2;
+                    if s >= -2147483648 && s <= 2147483647 {
+                        vpush(vm, value_int(cast(i32, s)));
+                    } else {
+                        vpush(vm, value_number(cast(f64, s)));
+                    }
+                } else {
+                    f64 r = js_to_number(a) * js_to_number(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
+                }
+            }
+            case OP_DIV, OP_MOD, OP_POW: {
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 f64 x = js_to_number(a);
                 f64 y = js_to_number(b);
                 f64 r = 0.0;
-                if op == OP_SUB { r = x - y; }
-                if op == OP_MUL { r = x * y; }
                 if op == OP_DIV { r = x / y; }
                 if op == OP_POW { r = pow(x, y); }
                 if op == OP_MOD {
@@ -1116,7 +1154,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 bool r = false;
-                if value_is_string(a) && value_is_string(b) {
+                if value_is_int(a) && value_is_int(b) {
+                    i32 x = value_as_int(a);
+                    i32 y = value_as_int(b);
+                    if op == OP_LT { r = x < y; }
+                    if op == OP_GT { r = x > y; }
+                    if op == OP_LE { r = x <= y; }
+                    if op == OP_GE { r = x >= y; }
+                } else if value_is_string(a) && value_is_string(b) {
                     i32 c = js_str_cmp(gc_string_view(value_as_string(a)),
                         gc_string_view(value_as_string(b)));
                     if op == OP_LT { r = c < 0; }
@@ -1983,7 +2028,8 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     if g.state == GEN_DONE {
         return value_undefined();
     }
-    if vm.fp >= VM_FRAMES_MAX || vm.sp + g.saved_len + 8 >= VM_STACK_MAX {
+    if vm.fp >= VM_FRAMES_MAX || vm.sp + g.saved_len + 8 >= VM_STACK_MAX
+        || vm.exec_depth >= VM_EXEC_DEPTH_MAX {
         vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
         return value_undefined();
     }
@@ -2018,7 +2064,9 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     if is_throw {
         vm_throw(vm, input);
     }
+    vm.exec_depth++;
     i32 st = vm_execute(vm, vm.fp);
+    vm.exec_depth--;
     if st != 0 {
         g.state = GEN_DONE;
         vm.sp = entry_sp;
@@ -2332,7 +2380,16 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.is_ctor = false;
     nf.gen = null;
     vm.fp++;
+    // this re-entry runs on the native C stack; guard its depth
+    if vm.exec_depth >= VM_EXEC_DEPTH_MAX {
+        vm.fp--;
+        vm.sp = entry_sp;
+        vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
+        return value_undefined();
+    }
+    vm.exec_depth++;
     i32 st = vm_execute(vm, vm.fp);
+    vm.exec_depth--;
     if st != 0 {
         vm.sp = entry_sp;
         return value_undefined();
