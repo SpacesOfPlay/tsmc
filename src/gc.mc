@@ -27,6 +27,11 @@ type CellPtr = GcCell*;
 type GcTraceFn = fn(GcHeap*, GcCell*): void;
 type GcFinalizeFn = fn(GcCell*): void;
 type GcMarkRootsFn = fn(GcHeap*, void*): void;
+// Ephemeron support: mark the values of weak entries whose key is live,
+// returning true if it marked anything new (looped to a fixpoint). The
+// sweep hook drops entries with dead keys, run while marks are still set.
+type GcWeakMarkFn = fn(GcHeap*, void*): bool;
+type GcWeakSweepFn = fn(GcHeap*, void*): void;
 
 const i64 GC_MIN_THRESHOLD = 262144;
 
@@ -42,6 +47,8 @@ struct GcHeap {
     GcTraceFn tracer;         // child marking for runtime kinds
     GcFinalizeFn finalizer;   // frees a cell's non-GC allocations
     GcMarkRootsFn mark_roots; // extra roots (VM stack, globals, …)
+    GcWeakMarkFn weak_mark;   // ephemeron marking (WeakMap/WeakSet)
+    GcWeakSweepFn weak_sweep; // drops dead-keyed weak entries
     void* mark_ctx;
 }
 
@@ -57,6 +64,8 @@ void gc_init(GcHeap* h) {
     h.tracer = null;
     h.finalizer = null;
     h.mark_roots = null;
+    h.weak_mark = null;
+    h.weak_sweep = null;
     h.mark_ctx = null;
 }
 
@@ -134,6 +143,19 @@ void gc_collect(GcHeap* h) {
         CellPtr c = vec_pop(&h.mark_stack);
         gc_trace(h, c);
     }
+
+    // Ephemerons: repeatedly mark values reachable only through a live
+    // weak-map key, tracing each new wave, until nothing new is marked.
+    if h.weak_mark != null {
+        while h.weak_mark(h, h.mark_ctx) {
+            while h.mark_stack.len > 0 {
+                CellPtr c = vec_pop(&h.mark_stack);
+                gc_trace(h, c);
+            }
+        }
+    }
+    // Drop weak entries whose key did not survive (marks still valid).
+    if h.weak_sweep != null { h.weak_sweep(h, h.mark_ctx); }
 
     GcCell** link = &h.all;
     i64 live_bytes = 0;

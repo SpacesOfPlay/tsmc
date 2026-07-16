@@ -11,7 +11,7 @@ percentage. Gaps found by probing common idioms against Node:
   and `for await…of` (§3).
 - **JSON.parse reviver** — DONE (§4).
 - **Regex** — lookbehind and the `/u` flag are unsupported.
-- **WeakMap / WeakSet** — absent (needs weak-ref GC support).
+- **WeakMap / WeakSet** — DONE (§5).
 - Lower ROI / bigger surface: `Intl`, Node globals (`process`, `fs`,
   `Buffer`), `TextEncoder`/`TextDecoder`, `Object.groupBy`.
 
@@ -130,3 +130,30 @@ InternalizeJSONProperty: after parsing, the result is walked under a
 deletes the property (an array element becomes a hole); the root is
 visited last with key `""`. Verified against Node for value transforms,
 Date revival, deletion, visit order, and the `this`-is-holder binding.
+
+---
+
+## 5. WeakMap / WeakSet — DONE
+
+Absent; they need genuine weak-reference GC support (not just a Map with
+a flag).
+
+### Approach
+
+- `JsMap` gains a `weak` flag; a weak map's `js_trace` marks its prototype
+  but **not** its keys/values.
+- The collector gained an ephemeron phase (two hooks on `GcHeap`):
+  after the normal mark drains, `vm_weak_mark` marks the value of every
+  weak entry whose key is already live and loops to a fixpoint (a value
+  may be another map's key — verified with a key-chain), tracing each
+  wave; then `vm_weak_sweep` drops entries whose key did not survive,
+  before the sweep clears marks.
+- `WeakMap`/`WeakSet` constructors build a weak `JsMap` and validate that
+  keys are references (objects/functions/arrays — primitives throw
+  `TypeError`). `get`/`has`/`delete` reuse the Map natives; `set`/`add`
+  add the key check. No `size`, iteration, `forEach`, or `clear`, matching
+  the spec.
+
+Functional behavior is identical to Node; the ephemeron marking (values
+kept alive only by a live key, including chains) is exercised under
+`--gc-stress`. Diff test `test/diff/weak.js`.

@@ -4570,6 +4570,78 @@ private Value nat_map_delete(void* vmp, Value callee, Value thisv, Value* args, 
     return value_bool(true);
 }
 
+// WeakMap/WeakSet: keys are held weakly and must be references (objects,
+// functions, arrays). No iteration or size — keys are not observable.
+private Value make_weak(VM* vm, Value iterable, bool is_set) {
+    JsObject* proto = is_set ? vm_weakset_proto(vm) : vm_weakmap_proto(vm);
+    JsMap* mp = js_new_map(&vm.heap, proto, is_set);
+    mp.weak = true;
+    if bi_nullish(iterable) { return value_cell(&mp.head); }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&mp.head));
+    Value it;
+    if vm_get_iterator(vm, iterable, &it) {
+        gc_root(&vm.heap, it);
+        while true {
+            Value e;
+            bool done;
+            if !vm_iter_next(vm, it, &e, &done) { break; }
+            if done { break; }
+            gc_root(&vm.heap, e);
+            if is_set {
+                if !value_is_reference(e) {
+                    vm_throw_error(vm, ERR_TYPE, "Invalid value used in weak set");
+                    break;
+                }
+                map_put(mp, e, value_undefined());
+            } else if value_is_array(e) {
+                JsObject* pair = value_as_object(e);
+                Value k = js_array_get(pair, 0);
+                if !value_is_reference(k) {
+                    vm_throw_error(vm, ERR_TYPE, "Invalid value used as weak map key");
+                    break;
+                }
+                map_put(mp, k, js_array_get(pair, 1));
+            }
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    if vm.has_pending { return value_undefined(); }
+    return value_cell(&mp.head);
+}
+
+private Value nat_weakmap_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_weak(as_vm(vmp), arg_at(args, argc, 0), false);
+}
+private Value nat_weakset_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return make_weak(as_vm(vmp), arg_at(args, argc, 0), true);
+}
+
+private Value nat_weakmap_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    Value k = arg_at(args, argc, 0);
+    if !value_is_reference(k) {
+        vm_throw_error(vm, ERR_TYPE, "Invalid value used as weak map key");
+        return value_undefined();
+    }
+    map_put(mp, k, arg_at(args, argc, 1));
+    return thisv;
+}
+private Value nat_weakset_add(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    Value k = arg_at(args, argc, 0);
+    if !value_is_reference(k) {
+        vm_throw_error(vm, ERR_TYPE, "Invalid value used in weak set");
+        return value_undefined();
+    }
+    map_put(mp, k, value_undefined());
+    return thisv;
+}
+
 private Value nat_map_clear(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
@@ -5973,6 +6045,24 @@ void builtins_install(VM* vm) {
     def_accessor(vm, vm.set_proto, "size", &nat_map_size);
     JsNative* set_it = js_new_native(&vm.heap, &nat_map_values, "[Symbol.iterator]");
     js_set_prop(vm.set_proto, iter_id, value_cell(&set_it.head));
+
+    // WeakMap / WeakSet (keys held weakly; get/has/delete reuse Map's)
+    vm.weakmap_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* weakmap_ctor = def_global_fn(vm, "WeakMap", &nat_weakmap_ctor);
+    props_set_desc(&weakmap_ctor.props, vm.atom_prototype, value_cell(&vm.weakmap_proto.head), 0);
+    def_method(vm, vm.weakmap_proto, "set", &nat_weakmap_set);
+    def_method(vm, vm.weakmap_proto, "get", &nat_map_get);
+    def_method(vm, vm.weakmap_proto, "has", &nat_map_has);
+    def_method(vm, vm.weakmap_proto, "delete", &nat_map_delete);
+    link_ctor(vm, vm.weakmap_proto, weakmap_ctor);
+
+    vm.weakset_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* weakset_ctor = def_global_fn(vm, "WeakSet", &nat_weakset_ctor);
+    props_set_desc(&weakset_ctor.props, vm.atom_prototype, value_cell(&vm.weakset_proto.head), 0);
+    def_method(vm, vm.weakset_proto, "add", &nat_weakset_add);
+    def_method(vm, vm.weakset_proto, "has", &nat_map_has);
+    def_method(vm, vm.weakset_proto, "delete", &nat_map_delete);
+    link_ctor(vm, vm.weakset_proto, weakset_ctor);
 
     // Date
     vm.date_proto = js_new_object(&vm.heap, vm.object_proto);

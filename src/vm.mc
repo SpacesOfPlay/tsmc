@@ -101,6 +101,8 @@ struct VM {
     JsObject* regexp_proto;
     JsObject* map_proto;
     JsObject* set_proto;
+    JsObject* weakmap_proto;
+    JsObject* weakset_proto;
     JsObject* date_proto;
     JsObject* symbol_proto;
     JsObject* bigint_proto;
@@ -154,6 +156,58 @@ private void mark_template(GcHeap* h, FnTemplate* t) {
     }
 }
 
+// Ephemeron pass: for every live WeakMap/WeakSet, mark the value of each
+// entry whose key survived. Returns true if it marked anything new, so
+// the collector loops it (a value may itself be another map's key).
+private bool vm_weak_mark(GcHeap* h, void* ctx) {
+    bool any = false;
+    GcCell* c = h.all;
+    while c != null {
+        if c.mark != 0 && c.kind == GC_MAP {
+            JsMap* m = cast(JsMap*, c);
+            if m.weak {
+                for i32 i = 0; i < m.len; i++ {
+                    if *(m.live + i) {
+                        Value k = *(m.keys + i);
+                        if value_is_cell(k) && value_as_cell(k).mark != 0 {
+                            Value v = *(m.vals + i);
+                            if value_is_cell(v) && value_as_cell(v).mark == 0 {
+                                gc_mark_value(h, v);
+                                any = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        c = c.next;
+    }
+    return any;
+}
+
+// Drops entries whose key did not survive marking, from every live weak
+// collection. Runs before the sweep, while marks are still valid.
+private void vm_weak_sweep(GcHeap* h, void* ctx) {
+    GcCell* c = h.all;
+    while c != null {
+        if c.mark != 0 && c.kind == GC_MAP {
+            JsMap* m = cast(JsMap*, c);
+            if m.weak {
+                for i32 i = 0; i < m.len; i++ {
+                    if *(m.live + i) {
+                        Value k = *(m.keys + i);
+                        if !value_is_cell(k) || value_as_cell(k).mark == 0 {
+                            *(m.live + i) = false;
+                            m.count--;
+                        }
+                    }
+                }
+            }
+        }
+        c = c.next;
+    }
+}
+
 private void vm_mark_roots(GcHeap* h, void* ctx) {
     VM* vm = cast(VM*, ctx);
     for i32 i = 0; i < vm.sp; i++ {
@@ -184,6 +238,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
+    if vm.weakmap_proto != null { gc_mark_cell(h, &vm.weakmap_proto.head); }
+    if vm.weakset_proto != null { gc_mark_cell(h, &vm.weakset_proto.head); }
     if vm.symbol_proto != null { gc_mark_cell(h, &vm.symbol_proto.head); }
     if vm.bigint_proto != null { gc_mark_cell(h, &vm.bigint_proto.head); }
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
@@ -1315,6 +1371,8 @@ void vm_init(VM* vm) {
     vm.heap.tracer = &js_trace;
     vm.heap.finalizer = &js_finalize;
     vm.heap.mark_roots = &vm_mark_roots;
+    vm.heap.weak_mark = &vm_weak_mark;
+    vm.heap.weak_sweep = &vm_weak_sweep;
     vm.heap.mark_ctx = cast(void*, vm);
     atoms_init(&vm.atoms);
     vm.stack = alloc<Value>(VM_STACK_MAX);
@@ -1346,6 +1404,8 @@ void vm_init(VM* vm) {
     vm.regexp_proto = null;
     vm.map_proto = null;
     vm.set_proto = null;
+    vm.weakmap_proto = null;
+    vm.weakset_proto = null;
     vm.date_proto = null;
     vm.symbol_proto = null;
     vm.bigint_proto = null;
@@ -3330,6 +3390,8 @@ i32 vm_run_module_fn(VM* vm, FnTemplate* t, Value* args, i32 nargs) {
 JsObject* vm_regexp_proto(VM* vm) { return vm.regexp_proto; }
 JsObject* vm_map_proto(VM* vm) { return vm.map_proto; }
 JsObject* vm_set_proto(VM* vm) { return vm.set_proto; }
+JsObject* vm_weakmap_proto(VM* vm) { return vm.weakmap_proto; }
+JsObject* vm_weakset_proto(VM* vm) { return vm.weakset_proto; }
 JsObject* vm_date_proto(VM* vm) { return vm.date_proto; }
 
 // Milliseconds since the Unix epoch (UTC). Platform-specific.

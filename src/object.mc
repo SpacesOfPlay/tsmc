@@ -229,6 +229,7 @@ struct JsMap {
     i32 cap;
     i32 count;    // live entries
     bool is_set;
+    bool weak;    // WeakMap/WeakSet: keys held weakly, not traced
 }
 
 // Arbitrary-precision integer: base-1e9 limbs stored inline after the
@@ -348,6 +349,9 @@ void js_trace(GcHeap* h, GcCell* c) {
     if c.kind == GC_MAP {
         JsMap* mp = cast(JsMap*, c);
         if mp.proto != null { gc_mark_cell(h, &mp.proto.head); }
+        // Weak maps hold keys/values weakly; the ephemeron pass marks
+        // values whose key is otherwise live (see vm_weak_mark).
+        if mp.weak { return; }
         for i32 i = 0; i < mp.len; i++ {
             if *(mp.live + i) {
                 gc_mark_value(h, *(mp.keys + i));
@@ -467,6 +471,7 @@ JsMap* js_new_map(GcHeap* h, JsObject* proto, bool is_set) {
     JsMap* mp = cast(JsMap*, gc_alloc(h, GC_MAP, sizeof(JsMap)));
     mp.proto = proto;
     mp.is_set = is_set;
+    mp.weak = false;
     return mp;
 }
 
