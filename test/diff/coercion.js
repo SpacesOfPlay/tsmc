@@ -23,3 +23,10 @@ console.log(new String("hi").length, new String("ab").toUpperCase(), new String(
 console.log(`${new Number(7)}-${new Boolean(true)}`, new Number(255).toString(16));
 console.log(new Number(5) == 5, new Number(5) === 5, new String("a") == "a");
 console.log(typeof new Number(1), new Number(3).toFixed(2), (9).valueOf());
+// implicit Symbol coercion is a TypeError; explicit String()/toString() is not
+function symThrows(f) { try { f(); return false; } catch (e) { return e instanceof TypeError; } }
+console.log(symThrows(() => "" + Symbol()), symThrows(() => Symbol() + 1), symThrows(() => `${Symbol()}`));
+console.log(symThrows(() => Number(Symbol())), symThrows(() => +Symbol()), symThrows(() => Symbol() < 1));
+console.log(symThrows(() => Symbol() & 1), symThrows(() => [Symbol()].join(",")), symThrows(() => new String(Symbol())));
+console.log(String(Symbol("x")), Symbol("y").toString(), typeof Symbol());
+console.log(Symbol() == 1, (function(){ var s = Symbol(); return s == s; })());

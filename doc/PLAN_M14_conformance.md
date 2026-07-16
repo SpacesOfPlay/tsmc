@@ -81,3 +81,27 @@ Cleared 10 more addition-area failures (22 → 12).
   the wrapper object). Separate exotic-object behavior.
 - **`JSON.stringify` of wrappers** — `JSON.stringify(new Number(5))`
   should serialize `5`, not `{}`. Lives in the JSON serializer.
+
+---
+
+## 3. Symbol coercion throws — DONE
+
+Implicit `ToString`/`ToNumber` of a Symbol must throw a `TypeError`
+(`"" + Symbol()`, `` `${sym}` ``, `Symbol() + 1`, `+sym`, `sym < 1`,
+bitwise, `[sym].join()`), while the explicit conversions stay legal
+(`String(sym)` and `sym.toString()` → `"Symbol(desc)"`, `console.log`).
+Previously ToString gave `"Symbol()"` and ToNumber gave `NaN`.
+
+### Approach
+
+- `vm_symbol_desc` produces the descriptive string; `js_to_string_value`
+  now throws on a Symbol, and the explicit callers (`String` ctor,
+  `js_console_string`/`inspect`) use `vm_symbol_desc` instead.
+- New `vm_to_number` throws on a Symbol and otherwise defers to
+  `js_to_number`; it replaces `js_to_number` in the arithmetic, unary,
+  relational, and bitwise opcodes (the `value_is_number`-guarded fast
+  paths and the equality helpers are untouched, so `sym === sym` and
+  `sym == 1` keep identity semantics). `Number`/`String` constructors
+  check `has_pending` after coercing.
+- Property keys are unaffected: `key_to_atom` maps Symbols to their
+  reserved id before any string coercion.

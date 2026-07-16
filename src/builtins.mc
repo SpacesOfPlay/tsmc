@@ -1358,7 +1358,20 @@ private f64 num_this(VM* vm, Value thisv) {
 
 private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    Value p = argc == 0 ? new_str(vm, "") : js_to_string_value(vm, *(args));
+    Value p;
+    if argc == 0 {
+        p = new_str(vm, "");
+    } else if value_is_symbol(*(args)) {
+        // String(sym) is the descriptive string; new String(sym) throws.
+        if value_is_object(thisv) {
+            vm_throw_error(vm, ERR_TYPE, "Cannot convert a Symbol value to a string");
+            return value_undefined();
+        }
+        return vm_symbol_desc(vm, *(args));
+    } else {
+        p = js_to_string_value(vm, *(args));
+    }
+    if vm.has_pending { return value_undefined(); }
     // new String(x): box the primitive on the fresh instance.
     if value_is_object(thisv) {
         JsObject* o = value_as_object(thisv);
@@ -2098,8 +2111,9 @@ private Value nat_number_ctor(void* vmp, Value callee, Value thisv, Value* args,
     } else {
         Value x = *(args);
         if value_is_bigint(x) { p = js_number_value(bn_to_f64(bigint_view(value_as_bigint(x)))); }
-        else { p = js_number_value(js_to_number(x)); }
+        else { p = js_number_value(vm_to_number(vm, x)); }
     }
+    if vm.has_pending { return value_undefined(); }
     if value_is_object(thisv) { set_wrapped_prim(vm, value_as_object(thisv), p); return thisv; }
     return p;
 }
