@@ -209,3 +209,29 @@ invisible to `getOwnPropertyDescriptor`/`getOwnPropertyNames`/`hasOwn`
 - **Lazy `prototype` in `getOwnPropertyNames`** — a plain function whose
   `.prototype` hasn't been accessed won't list it (still lazily
   materialized); classes and accessed functions are fine.
+
+---
+
+## 8. Function global constructor — DONE
+
+`Function` was undefined as a global. Beyond the obvious
+`Function`/`Function.prototype`/`f.constructor === Function` references,
+this blocked the whole `verifyProperty` suite: test262's
+`propertyHelper.js` binds `Function.prototype.call` at load time, so
+every test including it (most of `built-ins/*`) failed before running.
+
+### Approach
+
+- The function prototype object and its `call`/`apply`/`bind` already
+  existed. Added the missing global constructor with `prototype =
+  function_proto` (frozen) and the `constructor` back-link. Calling it
+  throws — dynamic code compilation is unsupported — but references now
+  resolve. The runner already content-skips tests that *call* `Function`.
+
+### Not doing (documented)
+
+- **`Function.prototype` is not itself callable** — `typeof
+  Function.prototype` is `"object"`, not `"function"`. Making it a
+  callable no-op is a separate change.
+- **`new Function(src)`** — dynamic code; out of scope for a
+  type-strip-and-run interpreter.
