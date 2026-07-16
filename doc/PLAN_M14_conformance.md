@@ -129,10 +129,17 @@ broadly.
 
 - **Non-ASCII identifier letters** (`café`, `π` written literally) — the
   `is_id_start`/`is_id_part` tables are ASCII-only; unchanged.
-- **Escaped reserved words in binding position** — spec makes
-  `\u{69}f` / `({ break }) => {}` a SyntaxError. Our parser already
-  wrongly accepts a *plain* reserved word as an object-pattern / arrow
-  shorthand binding (e.g. `({ break }) => {}` parses), so those negative
-  tests fail regardless of escapes. This is a pre-existing parser
-  lenience unmasked by #4, tracked as its own item (reject ReservedWord
-  as BindingIdentifier in patterns and arrow params).
+
+### Escaped/plain reserved words in shorthand binding — DONE (with #4)
+
+#4 unmasked a pre-existing lenience: the parser accepted a *plain*
+reserved word as an object shorthand binding (`({ break }) => {}`,
+`var { default } = {}`, `function f({ if }) {}`) where spec requires a
+SyntaxError. Both shorthand parsers (`parse_object` and the
+`parse_binding` object pattern) now reject a `ReservedWord` key in
+shorthand position via `is_reserved_word` (yield/await stay contextual);
+`{ break: x }` with an explicit value is still fine. This recovers the
+~256 escaped negative-parse tests (118/120 sampled now SyntaxError) and
+fixes the equivalent plain-keyword cases. On the full tree the escape
+work is net-positive (361 positive escaped tests vs 256 negatives, now
+both correct); the `--limit 1500` window had over-sampled the negatives.
