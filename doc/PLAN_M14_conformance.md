@@ -105,3 +105,34 @@ Previously ToString gave `"Symbol()"` and ToNumber gave `NaN`.
   check `has_pending` after coercing.
 - Property keys are unaffected: `key_to_atom` maps Symbols to their
   reserved id before any string coercion.
+
+---
+
+## 4. Unicode escapes in identifiers — DONE
+
+`def\u{61}ult`, `ca\u{66}e`, `\u{66}oo` — `\uXXXX` and `\u{…}` escapes in
+identifier / property-name position. The lexer rejected the backslash
+with "unexpected character", failing every test262 `*-escaped-*` test
+broadly.
+
+### Approach
+
+- `scan_ident_escape` validates a `\uXXXX` / `\u{…}` escape and advances;
+  `scan_ident` allows escapes in start and part positions, keeping the
+  common escape-free case on the borrowed source view and decoding an
+  escaped name into an owned buffer (`decode_ident`). The dispatch also
+  enters `scan_ident` when a token starts with `\u`. Keyword lookup runs
+  on the decoded name (so `def\u{61}ult` is a valid `default` property
+  key).
+
+### Not doing / follow-up
+
+- **Non-ASCII identifier letters** (`café`, `π` written literally) — the
+  `is_id_start`/`is_id_part` tables are ASCII-only; unchanged.
+- **Escaped reserved words in binding position** — spec makes
+  `\u{69}f` / `({ break }) => {}` a SyntaxError. Our parser already
+  wrongly accepts a *plain* reserved word as an object-pattern / arrow
+  shorthand binding (e.g. `({ break }) => {}` parses), so those negative
+  tests fail regardless of escapes. This is a pre-existing parser
+  lenience unmasked by #4, tracked as its own item (reject ReservedWord
+  as BindingIdentifier in patterns and arrow params).

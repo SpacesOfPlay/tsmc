@@ -51,3 +51,14 @@ console.log("café".toUpperCase(), "CAFÉ".toLowerCase());
 console.log("àéîõü".toUpperCase(), "ÀÉÎÕÜ".toLowerCase());
 console.log("naïve RÉSUMÉ".toLowerCase(), "hello wörld".toUpperCase());
 console.log("straße".toUpperCase(), "ÿ".toUpperCase(), "Ÿ".toLowerCase());
+
+// Unicode escapes in identifiers and property names (ES 12.6)
+var obj = { def\u{61}ult: 1, abc: 2 };
+console.log(obj.default, obj.abc);
+var ca\u{66}e = 42;
+console.log(cafe, cafe);
+var xy = 7;
+console.log(xy);
+console.log({ \u{66}oo: "bar" }.foo);
+class Cls { method() { return 9; } }
+console.log(new Cls().method());

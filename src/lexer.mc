@@ -350,11 +350,108 @@ private str decode_text(Lexer* lx, i32 a, i32 b, bool is_template) {
 
 // --- identifiers and keywords ---------------------------------------
 
+// Validates a \uXXXX or \u{...} escape at lx.pos (on the '\') and
+// advances past it, returning the code point; -1 (position restored) if
+// it is not a well-formed Unicode escape.
+private i32 scan_ident_escape(Lexer* lx) {
+    i32 start = lx.pos;
+    if lx_at(lx, lx.pos) != '\\' || lx_at(lx, lx.pos + 1) != 'u' { return -1; }
+    lx.pos += 2;
+    if lx_cur(lx) == '{' {
+        lx.pos++;
+        i32 v = 0;
+        i32 nd = 0;
+        while lx.pos < lx.src.len && lx_cur(lx) != '}' {
+            u8 h = lx_cur(lx);
+            if !is_hex(h) { lx.pos = start; return -1; }
+            v = v * 16 + hex_val(h);
+            if v > 0x10FFFF { lx.pos = start; return -1; }
+            nd++;
+            lx.pos++;
+        }
+        if nd == 0 || lx.pos >= lx.src.len { lx.pos = start; return -1; }
+        lx.pos++;                                       // past '}'
+        return v;
+    }
+    i32 v = 0;
+    for i32 k = 0; k < 4; k++ {
+        u8 h = lx_at(lx, lx.pos + k);
+        if !is_hex(h) { lx.pos = start; return -1; }
+        v = v * 16 + hex_val(h);
+    }
+    lx.pos += 4;
+    return v;
+}
+
+// Decodes an identifier span containing \u escapes (already validated by
+// the scan) into an owned UTF-8 buffer.
+private str decode_ident(Lexer* lx, i32 a, i32 b) {
+    u8* buf = alloc<u8>(b - a + 1);
+    i32 out = 0;
+    i32 i = a;
+    while i < b {
+        u8 c = *(lx.src.data + i);
+        if c != '\\' {
+            *(buf + out) = c;
+            out++;
+            i++;
+            continue;
+        }
+        i += 2;                                         // past '\u'
+        u32 cp = 0;
+        if *(lx.src.data + i) == '{' {
+            i++;
+            while *(lx.src.data + i) != '}' {
+                cp = cp * 16 + cast(u32, hex_val(*(lx.src.data + i)));
+                i++;
+            }
+            i++;                                        // past '}'
+        } else {
+            for i32 k = 0; k < 4; k++ {
+                cp = cp * 16 + cast(u32, hex_val(*(lx.src.data + i)));
+                i++;
+            }
+        }
+        out += utf8_encode(buf + out, cp);
+    }
+    str s;
+    s.data = buf;
+    s.len = out;
+    vec_push(&lx.owned, s);
+    return s;
+}
+
+// IdentifierName, allowing \uXXXX / \u{...} escapes (ES 12.6). The common
+// escape-free case keeps a borrowed source view; an escaped name decodes
+// into an owned buffer. Keyword classification runs on the decoded name.
 private void scan_ident(Lexer* lx, Token* t) {
     i32 a = lx.pos;
-    lx.pos++;
-    while lx.pos < lx.src.len && is_id_part(lx_cur(lx)) { lx.pos++; }
-    t.text = lx_view(lx, a, lx.pos);
+    bool esc = false;
+    if lx_cur(lx) == '\\' {
+        if scan_ident_escape(lx) < 0 {
+            lex_error(lx, a, lx.pos + 1, "invalid Unicode escape in identifier");
+            t.kind = TOK_ERROR;
+            lx.pos++;
+            t.text = lx_view(lx, a, lx.pos);
+            return;
+        }
+        esc = true;
+    } else {
+        lx.pos++;
+    }
+    while lx.pos < lx.src.len {
+        u8 c = lx_cur(lx);
+        if c == '\\' {
+            if scan_ident_escape(lx) < 0 { break; }
+            esc = true;
+        } else if is_id_part(c) {
+            lx.pos++;
+        } else {
+            break;
+        }
+    }
+    if esc { t.text = decode_ident(lx, a, lx.pos); }
+    else { t.text = lx_view(lx, a, lx.pos); }
     i32* k = strmap_get<i32>(&lx.keywords, t.text);
     if k != null {
         t.kind = *k;
@@ -830,7 +927,7 @@ Token lexer_next(Lexer* lx) {
         return t;
     }
     u8 c = lx_cur(lx);
-    if is_id_start(c) {
+    if is_id_start(c) || (c == '\\' && lx_at(lx, lx.pos + 1) == 'u') {
         scan_ident(lx, &t);
     } else if is_digit(c) {
         scan_number(lx, &t);
