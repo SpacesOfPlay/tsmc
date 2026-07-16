@@ -1909,6 +1909,71 @@ private void compile_for_in(Compiler* co, Node* n) {
 }
 
 // for-of via the iterator protocol.
+// `for await (x of e)`: desugars to a loop that awaits both iter.next()
+// and each yielded value, so it works over async generators, sync
+// iterables of promises, and plain sync iterables alike. The object's
+// (sync) iterator is used — our generators return {value, done} directly,
+// and awaiting a non-promise passes it through.
+private void compile_for_await_of(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+
+    fs.depth++;
+    i32 saved_binds = fs.binds.len;
+    i32 saved_slots = fs.cur_slots;
+
+    compile_expr(co, n.b);
+    ch_op(ch, OP_GET_ITER);
+    i32 t_iter = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_iter);
+    ch_op(ch, OP_POP);
+
+    i32 bind_start = fs.binds.len;
+    Node* pattern = null;
+    if n.a.kind == N_VAR {
+        pattern = (*(n.a.kids.items)).a;
+        declare_pattern(co, pattern, 2);
+    }
+    i32 bind_end = fs.binds.len;
+
+    LoopCtx lc = make_loop_ctx(co, true);
+    i32 lcond = ch_pos(ch);
+    // result = await iter.next()
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
+    ch_op_u16(ch, OP_CALL, 0);
+    ch_op(ch, OP_YIELD);
+    // if result.done: break (leaving result on the stack for the pop)
+    ch_op(ch, OP_DUP);
+    ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+    i32 jend = ch_jump(ch, OP_JUMPT);
+    // value = await result.value
+    ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+    ch_op(ch, OP_YIELD);
+
+    for i32 i = bind_start; i < bind_end; i++ {
+        CBind b = vec_get(&fs.binds, i);
+        if b.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot); }
+    }
+    if pattern != null { compile_destructure(co, pattern, true); }
+    else { compile_destructure(co, n.a, false); }
+
+    vec_push(&fs.loops, lc);
+    compile_stmt(co, n.c);
+    ignore vec_pop(&fs.loops);
+
+    i32 lcont = ch_pos(ch);
+    patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
+    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_patch(ch, jend);
+    ch_op(ch, OP_POP);             // drop the result object under done
+    patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
+
+    fs.binds.len = saved_binds;
+    fs.cur_slots = saved_slots;
+    fs.depth--;
+}
+
 private void compile_for_of(Compiler* co, Node* n) {
     FScope* fs = co.cur;
     Chunk* ch = &fs.ch;
@@ -2076,7 +2141,11 @@ private void compile_stmt(Compiler* co, Node* n) {
     }
     if k == N_FOR_OF {
         if (n.flags & NF_AWAIT) != 0 {
-            cerror(co, n, "for await is not supported yet");
+            if !fs.is_async {
+                cerror(co, n, "for await is only valid in async functions");
+                return;
+            }
+            compile_for_await_of(co, n);
             return;
         }
         compile_for_of(co, n);

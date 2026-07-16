@@ -7,8 +7,8 @@ percentage. Gaps found by probing common idioms against Node:
   no `toLocale*`. #1 below. **DONE.**
 - **Error stack traces** — `error.stack` is `undefined`; `{cause}` option
   unsupported. Critical for debugging.
-- **Async completeness** — `Promise.allSettled`, `Promise.any`, and
-  `for await…of` missing (the rest of async is solid).
+- **Async completeness** — DONE. `Promise.allSettled`, `Promise.any`,
+  and `for await…of` (§3).
 - **JSON.parse reviver** — the reviver callback is ignored.
 - **Regex** — lookbehind and the `/u` flag are unsupported.
 - **WeakMap / WeakSet** — absent (needs weak-ref GC support).
@@ -89,3 +89,32 @@ Invalid Date. Golden test: `test/run/dates.ts`.
   eager string, not V8's lazy structured trace.
 - **Exact column parity** — line numbers match; columns are best-effort
   at statement/call granularity.
+
+---
+
+## 3. Async completeness — DONE
+
+`Promise.allSettled`, `Promise.any`, and `for await…of` were missing; the
+rest of async (async/await, `Promise.all`/`race`, microtasks, timers) was
+already solid.
+
+- **allSettled / any** follow `Promise.all`'s shape via a `promise_combine`
+  helper (shared state counted down by per-element natives). `allSettled`
+  never rejects and records `{ status, value|reason }`; `any` fulfills on
+  the first success and rejects with an `AggregateError` (name + `.errors`)
+  only when all inputs reject. Array input only, like `all`/`race`.
+- **for await…of** compiles to a loop that awaits both `iter.next()` and
+  each yielded value, over the object's sync iterator. Our async
+  generators return `{ value, done }` directly and awaiting a non-promise
+  passes it through, so async generators, arrays of promises, and plain
+  sync iterables all work with one desugaring; `break`/`continue`/
+  destructuring included.
+
+### Not doing (documented)
+
+- **`AggregateError` global** — `Promise.any` builds an error with the
+  right shape (`name`, `.errors`), but there is no `AggregateError`
+  constructor, so `instanceof AggregateError` is false (`instanceof Error`
+  is true).
+- **`Symbol.asyncIterator`** — not added; `for await` uses the sync
+  iterator, which covers our generators and iterables of promises.

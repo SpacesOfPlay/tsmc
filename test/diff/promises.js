@@ -27,6 +27,18 @@ async function main() {
   } catch (e) {
     console.log("any empty:", e.name, JSON.stringify(e.errors));
   }
+
+  // for await: async generator, array of promises, break/continue
+  async function* ag() { yield 1; yield 2; yield 3; }
+  let s = 0;
+  for await (const x of ag()) s += x;
+  console.log("for-await gen:", s);
+  const collected = [];
+  for await (const v of [Promise.resolve("p"), "q", Promise.resolve("r")]) collected.push(v);
+  console.log("for-await promises:", collected.join(","));
+  const kept = [];
+  for await (const z of ag()) { if (z === 2) continue; if (z > 2) break; kept.push(z); }
+  console.log("for-await break/continue:", kept.join(","));
 }
 
 main().then(() => console.log("done"));
