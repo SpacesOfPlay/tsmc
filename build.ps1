@@ -6,8 +6,11 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("build", "test", "bench", "diff", "clean", "help")]
-    [string]$Command = "help"
+    [ValidateSet("build", "test", "bench", "diff", "t262", "clean", "help")]
+    [string]$Command = "help",
+
+    [Parameter(ValueFromRemainingArguments=$true)]
+    [string[]]$Rest = @()
 )
 
 $ProjectDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -142,17 +145,35 @@ switch ($Command) {
     "test"  { Run-Tests }
     "bench" { Run-Bench }
     "diff"  { Run-Diff }
+    "t262"  {
+        Build-Tsmc
+        # The runner is one portable bash script (dir-walk + process spawn).
+        # On Windows use Git Bash — derived from git's own location so we
+        # don't pick up the WSL 'bash' launcher in System32.
+        $bash = $null
+        $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+        if ($git) {
+            $gitRoot = Split-Path (Split-Path $git)
+            foreach ($c in @("bin\bash.exe", "usr\bin\bash.exe")) {
+                $p = Join-Path $gitRoot $c
+                if (Test-Path $p) { $bash = $p; break }
+            }
+        }
+        if (-not $bash) { Fail "Git Bash not found (install Git for Windows) — needed for the test262 runner"; exit 1 }
+        & $bash (Join-Path $ProjectDir "tools/test262.sh") @Rest
+    }
     "clean" {
         Step "clean"
         if (Test-Path $BuildDir) { Remove-Item -Recurse -Force $BuildDir }
         Pass "removed build/"
     }
     "help" {
-        Write-Host "usage: ./build.ps1 <build|test|bench|diff|clean>"
+        Write-Host "usage: ./build.ps1 <build|test|bench|diff|t262|clean>"
         Write-Host "  build   compile build/tsmc.exe"
         Write-Host "  test    build, then run unit + cli + golden run tests"
         Write-Host "  bench   build, then time bench/*.ts"
         Write-Host "  diff    build, then diff test/diff/*.js vs node"
+        Write-Host "  t262    build, then run test262 (fetched to vendor/ on first use)"
         Write-Host "  clean   remove build/"
     }
 }

@@ -31,17 +31,48 @@ library in `lib/` next to the binary.
 ./build.ps1 build      # Windows      -> build/tsmc.exe
 ./build.sh build       # Linux/macOS  -> build/tsmc
 ./build.ps1 test       # build + run the full test suite
+./build.ps1 diff       # differential test vs a reference node
+./build.ps1 bench      # time bench/*.ts
+./build.ps1 t262       # ECMAScript conformance (test262) — see below
 ./build.ps1 clean      # remove build/
 ```
+
+## Conformance (test262)
+
+tsmc strips types and runs the resulting ECMAScript, so conformance is
+measured against the official ECMAScript suite,
+[tc39/test262](https://github.com/tc39/test262) — not the TypeScript
+type-checker tests, which don't apply to a type-stripping runtime.
+
+The suite is **not vendored**. On first use it is fetched at a pinned
+commit into `vendor/test262/` (gitignored), so any clone reproduces the
+same tests:
+
+```
+./build.ps1 t262                                 # default: test/language
+./build.sh  t262 test/built-ins/Array
+./build.sh  t262 test/language --limit 500       # sample the first N
+```
+
+On Windows the runner is a portable bash script (`tools/test262.sh`)
+run through Git Bash. It assembles each test with its harness includes,
+runs the strict and sloppy variants, and honours the `negative`
+frontmatter. Tests that need a feature the interpreter doesn't implement
+(TypedArrays, Proxy/Reflect, Intl, `eval`, …) are **skipped**, not
+failed — the honest metric is the pass rate over the tests that ran.
+Failing test paths are written to `build/test262-fails.txt`. Pin a
+different revision with the `T262_COMMIT` environment variable.
 
 ## Layout
 
 ```
-src/    interpreter source (modern minc)
-doc/    design documents and milestone plans
-test/   unit tests (minc) and golden run tests (.ts + .expected)
-minc/   local minc deploy: compiler + lib/ + docs (gitignored)
-build/  build artifacts (gitignored)
+src/     interpreter source (modern minc)
+doc/     design documents and milestone plans
+test/    unit tests (minc), golden run tests, and differential (.js) tests
+tools/   test262 conformance runner
+minc/    local minc deploy: compiler + lib/ + docs (gitignored)
+build/   build artifacts (gitignored)
+vendor/  fetched test262 checkout (gitignored)
 ```
 
 ## License

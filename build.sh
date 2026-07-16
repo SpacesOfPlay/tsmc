@@ -174,17 +174,19 @@ case "${1:-help}" in
     test)  run_tests ;;
     bench) run_bench ;;
     diff)  run_diff ;;
+    t262)  build_tsmc; shift; "$PROJECT_DIR/tools/test262.sh" "$@" ;;
     clean)
         step "clean"
         rm -rf "$BUILD_DIR"
         pass "removed build/"
         ;;
     *)
-        echo "usage: ./build.sh <build|test|bench|diff|clean>"
+        echo "usage: ./build.sh <build|test|bench|diff|t262|clean>"
         echo "  build   compile build/tsmc"
         echo "  test    build, then run unit + cli + golden run tests"
         echo "  bench   build, then time bench/*.ts"
         echo "  diff    build, then diff test/diff/*.js vs node"
+        echo "  t262    build, then run test262 (fetched to vendor/ on first use)"
         echo "  clean   remove build/"
         ;;
 esac
