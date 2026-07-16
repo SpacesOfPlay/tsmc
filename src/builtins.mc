@@ -4523,6 +4523,119 @@ private i64 date_year_expand(i64 y) {
     return y;
 }
 
+private str wday_abbr(i32 w) {
+    if w == 0 { return "Sun"; }
+    if w == 1 { return "Mon"; }
+    if w == 2 { return "Tue"; }
+    if w == 3 { return "Wed"; }
+    if w == 4 { return "Thu"; }
+    if w == 5 { return "Fri"; }
+    return "Sat";
+}
+
+private str month_abbr(i32 m) {
+    if m == 0 { return "Jan"; }
+    if m == 1 { return "Feb"; }
+    if m == 2 { return "Mar"; }
+    if m == 3 { return "Apr"; }
+    if m == 4 { return "May"; }
+    if m == 5 { return "Jun"; }
+    if m == 6 { return "Jul"; }
+    if m == 7 { return "Aug"; }
+    if m == 8 { return "Sep"; }
+    if m == 9 { return "Oct"; }
+    if m == 10 { return "Nov"; }
+    return "Dec";
+}
+
+// Reads exactly `count` decimal digits at *i into *out; false if fewer.
+private bool ds_digits(str s, i32* i, i32 count, i32* out) {
+    i32 v = 0;
+    for i32 k = 0; k < count; k++ {
+        if *i >= s.len { return false; }
+        u8 c = *(s.data + *i);
+        if c < '0' || c > '9' { return false; }
+        v = v * 10 + cast(i32, c - '0');
+        *i = *i + 1;
+    }
+    *out = v;
+    return true;
+}
+
+// Parses ISO 8601: YYYY[-MM[-DD]][(T| )HH:mm[:ss[.sss]]][Z|±hh[:]mm].
+// A date-only string and one with a trailing Z are UTC; a time without an
+// offset is also treated as UTC (the interpreter has no local zone).
+// Returns NaN when the whole string is not consumed or a field is invalid.
+private f64 date_parse_iso(str s) {
+    f64 nan = 0.0 / 0.0;
+    i32 i = 0;
+    i32 end = s.len;
+    while i < end && *(s.data + i) == ' ' { i++; }
+    while end > i && *(s.data + end - 1) == ' ' { end--; }
+    i32 year = 0;
+    if !ds_digits(s, &i, 4, &year) { return nan; }
+    i32 month = 1;
+    i32 day = 1;
+    i32 hour = 0;
+    i32 min = 0;
+    i32 sec = 0;
+    i32 ms = 0;
+    i32 off_min = 0;
+    if i < end && *(s.data + i) == '-' {
+        i++;
+        if !ds_digits(s, &i, 2, &month) { return nan; }
+        if i < end && *(s.data + i) == '-' {
+            i++;
+            if !ds_digits(s, &i, 2, &day) { return nan; }
+        }
+    }
+    if i < end && (*(s.data + i) == 'T' || *(s.data + i) == ' ') {
+        i++;
+        if !ds_digits(s, &i, 2, &hour) { return nan; }
+        if i >= end || *(s.data + i) != ':' { return nan; }
+        i++;
+        if !ds_digits(s, &i, 2, &min) { return nan; }
+        if i < end && *(s.data + i) == ':' {
+            i++;
+            if !ds_digits(s, &i, 2, &sec) { return nan; }
+            if i < end && *(s.data + i) == '.' {
+                i++;
+                i32 frac = 0;
+                i32 fc = 0;
+                while i < end && fc < 3 && *(s.data + i) >= '0' && *(s.data + i) <= '9' {
+                    frac = frac * 10 + cast(i32, *(s.data + i) - '0');
+                    fc++;
+                    i++;
+                }
+                while fc < 3 { frac = frac * 10; fc++; }
+                while i < end && *(s.data + i) >= '0' && *(s.data + i) <= '9' { i++; }
+                ms = frac;
+            }
+        }
+        if i < end {
+            u8 c = *(s.data + i);
+            if c == 'Z' {
+                i++;
+            } else if c == '+' || c == '-' {
+                bool neg = c == '-';
+                i++;
+                i32 oh = 0;
+                i32 om = 0;
+                if !ds_digits(s, &i, 2, &oh) { return nan; }
+                if i < end && *(s.data + i) == ':' { i++; }
+                if !ds_digits(s, &i, 2, &om) { return nan; }
+                off_min = oh * 60 + om;
+                if neg { off_min = -off_min; }
+            }
+        }
+    }
+    if i != end { return nan; }
+    if month < 1 || month > 12 || day < 1 || day > 31 { return nan; }
+    if hour > 24 || min > 59 || sec > 59 { return nan; }
+    f64 t = date_compose(cast(i64, year), month - 1, day, hour, min, sec, ms);
+    return t - cast(f64, off_min) * 60000.0;   // local field time -> UTC
+}
+
 private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* d;
@@ -4534,7 +4647,9 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
     if argc == 0 {
         t = vm_now_millis(vm);
     } else if argc == 1 {
-        t = js_to_number(*(args));
+        // new Date(string) parses; new Date(number|Date) is a time value
+        if value_is_string(*(args)) { t = date_parse_iso(sview(*(args))); }
+        else { t = js_to_number(*(args)); }
     } else {
         i64 y = date_year_expand(cast(i64, js_to_number(*(args))));
         i32 mo = to_int_arg(arg_at(args, argc, 1));
@@ -4637,6 +4752,125 @@ private Value nat_date_toiso(void* vmp, Value callee, Value thisv, Value* args, 
     Value r = new_str(vm, str_buf_to_str(&sb));
     str_buf_free(&sb);
     return r;
+}
+
+private Value nat_date_parse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value a0 = arg_at(args, argc, 0);
+    if !value_is_string(a0) { return value_number(0.0 / 0.0); }
+    return value_number(date_parse_iso(sview(a0)));
+}
+
+// Appends a 4+-digit year (zero-padded to 4 like the ISO/toString forms).
+private void date_fmt_year(str_buf* sb, i64 y) {
+    if y < 0 { str_buf_add(sb, "-"); y = -y; }
+    if y < 1000 { str_buf_add(sb, "0"); }
+    if y < 100 { str_buf_add(sb, "0"); }
+    if y < 10 { str_buf_add(sb, "0"); }
+    string ys = format("{}", y);
+    str_buf_add(sb, ys);
+    free(ys);
+}
+
+// "Thu Jan 01 1970"
+private void date_fmt_datepart(str_buf* sb, DateParts d) {
+    str_buf_add(sb, wday_abbr(d.wday));
+    str_buf_add(sb, " ");
+    str_buf_add(sb, month_abbr(d.month));
+    str_buf_add(sb, " ");
+    pad2(sb, d.day);
+    str_buf_add(sb, " ");
+    date_fmt_year(sb, d.year);
+}
+
+// "00:00:00 GMT+0000 (Coordinated Universal Time)"
+private void date_fmt_timepart(str_buf* sb, DateParts d) {
+    pad2(sb, d.hour);
+    str_buf_add(sb, ":");
+    pad2(sb, d.min);
+    str_buf_add(sb, ":");
+    pad2(sb, d.sec);
+    str_buf_add(sb, " GMT+0000 (Coordinated Universal Time)");
+}
+
+// Shared entry for the toString family. mode: 0 full, 1 date, 2 time,
+// 3 UTC (RFC 7231), 4 locale-date, 5 locale-time, 6 locale full.
+private Value date_string(VM* vm, Value thisv, i32 mode) {
+    f64 t = date_ms(vm, thisv);
+    if t != t { return new_str(vm, "Invalid Date"); }
+    DateParts d = date_decompose(t);
+    str_buf sb;
+    str_buf_init(&sb);
+    if mode == 0 {
+        date_fmt_datepart(&sb, d);
+        str_buf_add(&sb, " ");
+        date_fmt_timepart(&sb, d);
+    } else if mode == 1 {
+        date_fmt_datepart(&sb, d);
+    } else if mode == 2 {
+        date_fmt_timepart(&sb, d);
+    } else if mode == 3 {
+        str_buf_add(&sb, wday_abbr(d.wday));
+        str_buf_add(&sb, ", ");
+        pad2(&sb, d.day);
+        str_buf_add(&sb, " ");
+        str_buf_add(&sb, month_abbr(d.month));
+        str_buf_add(&sb, " ");
+        date_fmt_year(&sb, d.year);
+        str_buf_add(&sb, " ");
+        pad2(&sb, d.hour);
+        str_buf_add(&sb, ":");
+        pad2(&sb, d.min);
+        str_buf_add(&sb, ":");
+        pad2(&sb, d.sec);
+        str_buf_add(&sb, " GMT");
+    } else {
+        // locale forms: en-US numeric, e.g. "1/1/1970", "12:00:00 AM"
+        bool want_date = mode == 4 || mode == 6;
+        bool want_time = mode == 5 || mode == 6;
+        if want_date {
+            string ds = format("{}/{}/{}", d.month + 1, d.day, d.year);
+            str_buf_add(&sb, ds);
+            free(ds);
+        }
+        if want_date && want_time { str_buf_add(&sb, ", "); }
+        if want_time {
+            i32 h12 = d.hour % 12;
+            if h12 == 0 { h12 = 12; }
+            string hs = format("{}", h12);
+            str_buf_add(&sb, hs);
+            free(hs);
+            str_buf_add(&sb, ":");
+            pad2(&sb, d.min);
+            str_buf_add(&sb, ":");
+            pad2(&sb, d.sec);
+            str_buf_add(&sb, d.hour < 12 ? " AM" : " PM");
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
+}
+
+private Value nat_date_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 0);
+}
+private Value nat_date_todatestring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 1);
+}
+private Value nat_date_totimestring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 2);
+}
+private Value nat_date_toutcstring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 3);
+}
+private Value nat_date_tolocaledate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 4);
+}
+private Value nat_date_tolocaletime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 5);
+}
+private Value nat_date_tolocalestring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_string(as_vm(vmp), thisv, 6);
 }
 
 // Date.prototype[Symbol.toPrimitive]: a "number" hint takes valueOf (the
@@ -5526,6 +5760,7 @@ void builtins_install(VM* vm) {
     props_set_desc(&date_ctor.props, vm.atom_prototype, value_cell(&vm.date_proto.head), 0);
     def_static(vm, date_ctor, "now", &nat_date_now);
     def_static(vm, date_ctor, "UTC", &nat_date_utc);
+    def_static(vm, date_ctor, "parse", &nat_date_parse);
     def_method(vm, vm.date_proto, "getTime", &nat_date_gettime);
     def_method(vm, vm.date_proto, "valueOf", &nat_date_gettime);
     def_method(vm, vm.date_proto, "getFullYear", &nat_date_getfullyear);
@@ -5547,6 +5782,14 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.date_proto, "getUTCMilliseconds", &nat_date_getms);
     def_method(vm, vm.date_proto, "toISOString", &nat_date_toiso);
     def_method(vm, vm.date_proto, "toJSON", &nat_date_toiso);
+    def_method(vm, vm.date_proto, "toString", &nat_date_tostring);
+    def_method(vm, vm.date_proto, "toDateString", &nat_date_todatestring);
+    def_method(vm, vm.date_proto, "toTimeString", &nat_date_totimestring);
+    def_method(vm, vm.date_proto, "toUTCString", &nat_date_toutcstring);
+    def_method(vm, vm.date_proto, "toGMTString", &nat_date_toutcstring);
+    def_method(vm, vm.date_proto, "toLocaleDateString", &nat_date_tolocaledate);
+    def_method(vm, vm.date_proto, "toLocaleTimeString", &nat_date_tolocaletime);
+    def_method(vm, vm.date_proto, "toLocaleString", &nat_date_tolocalestring);
     JsNative* date_tp = js_new_native(&vm.heap, &nat_date_toprimitive, "[Symbol.toPrimitive]");
     props_set_desc(&vm.date_proto.props, vm_sym_to_primitive_id(vm),
         value_cell(&date_tp.head), METHOD_ATTRS);
