@@ -1432,6 +1432,16 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
 
     FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
         fs.is_gen, fs.is_async);
+    // Function.length: count leading params up to the first with a
+    // default value or the rest parameter.
+    i32 arity = 0;
+    for i32 i = 0; i < f.kids.len; i++ {
+        Node* prm = *(f.kids.items + i);
+        if (prm.flags & NF_REST) != 0 { break; }
+        if prm.b != null { break; }
+        arity++;
+    }
+    t.arity = arity;
     co.cur = fs.parent;
     fscope_free(&fs);
     return t;

@@ -47,3 +47,16 @@ class K { static st() {} im() {} }
 console.log(Object.keys(K).length, Object.getOwnPropertyDescriptor(K, "prototype").enumerable);
 // internal wrapper slot never leaks
 console.log(Object.getOwnPropertyNames(new Number(5)).length, Object.keys(new Boolean(true)).length);
+
+// function length (default/rest-aware) and name as own properties
+function f3(a, b, c) {}
+function fdef(a, b = 1, c) {}
+function frest(a, ...r) {}
+console.log(f3.length, fdef.length, frest.length, ((x, y) => x).length);
+console.log(f3.name, (function named() {}).name, (() => {}).name === "");
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(f3, "length")));
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(f3, "name")));
+console.log(f3.hasOwnProperty("length"), Object.hasOwn(f3, "name"), Object.keys(f3).length);
+console.log(Object.getOwnPropertyNames(f3).includes("length"), Object.getOwnPropertyNames(f3).includes("name"));
+class Kl { m(a, b) {} static st(a, b, c) {} }
+console.log(Kl.prototype.m.length, Kl.st.length, Kl.name);

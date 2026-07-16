@@ -176,3 +176,36 @@ worked.
   classes don't materialize `length`/`name`, so
   `getOwnPropertyNames(f)` omits them (Node lists both). Separate from
   reflection-over-callables; the props simply don't exist yet.
+
+---
+
+## 7. Function length / name own properties — DONE
+
+`f.length` and `f.name` read correctly but were synthesized virtually —
+invisible to `getOwnPropertyDescriptor`/`getOwnPropertyNames`/`hasOwn`
+(Node lists them). `length` also ignored default and rest parameters
+(`function (a, b = 1, c)` reported 3, not 1).
+
+### Approach
+
+- `FnTemplate` gains `arity` — leading parameters before the first
+  default value or rest — computed in `compile_callable`; the `.length`
+  read path uses it. `chunk_finish` defaults `arity` to the required
+  count for the non-user-function templates.
+- The reflection builtins synthesize `length`/`name` as own properties of
+  any callable via `fn_own_synth` (value from the existing read path,
+  descriptor `{ writable: false, enumerable: false, configurable: true }`):
+  `getOwnPropertyDescriptor`, `getOwnPropertyNames` (listed first),
+  `hasOwn`, and `hasOwnProperty`. Kept as read-synthesis rather than
+  materialized props to avoid a per-closure allocation on the hot path.
+
+### Not doing (documented)
+
+- **Native function `length`** — per-native argument counts aren't
+  tracked, so a native's `length` reads 0. Would need per-builtin
+  annotations.
+- **Legacy `arguments`/`caller`** own props on functions — deprecated,
+  not modelled.
+- **Lazy `prototype` in `getOwnPropertyNames`** — a plain function whose
+  `.prototype` hasn't been accessed won't list it (still lazily
+  materialized); classes and accessed functions are fine.

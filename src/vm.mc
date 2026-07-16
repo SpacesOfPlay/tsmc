@@ -768,10 +768,7 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             i32 arity = 0;
             if value_is_function(objv) {
                 FnTemplate* ft = value_as_function(objv).tmpl;
-                if ft != null {
-                    arity = ft.n_params;
-                    if ft.has_rest && arity > 0 { arity--; }
-                }
+                if ft != null { arity = ft.arity; }
             }
             *out = value_int(arity);
             return true;

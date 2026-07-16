@@ -289,6 +289,13 @@ private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value
                 n++;
             }
         }
+        // functions list their synthesized length/name first
+        if value_is_callable(ov) {
+            js_array_set(arr, n, new_str(vm, "length"));
+            n++;
+            js_array_set(arr, n, new_str(vm, "name"));
+            n++;
+        }
         // all own string keys, enumerable or not, minus symbols and the
         // engine's %-internal slots
         for i32 i = 0; i < props.len; i++ {
@@ -436,6 +443,15 @@ private u32 reflect_key(VM* vm, Value kv, str* sk) {
     return a;
 }
 
+// A function's `length` and `name` are own properties synthesized from
+// its template rather than stored. Returns true (with the value) for
+// those keys on a callable, so reflection reports them like real props.
+private bool fn_own_synth(VM* vm, Value ov, u32 key, Value* out) {
+    if !value_is_callable(ov) { return false; }
+    if key != vm.atom_length && key != vm.atom_name { return false; }
+    return vm_get_prop_value(vm, ov, key, out);
+}
+
 private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
@@ -471,6 +487,19 @@ private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Va
 
     Prop* pe = props_entry(props, key);
     if pe == null {
+        // functions expose synthesized length/name
+        Value fv;
+        if fn_own_synth(vm, ov, key, &fv) {
+            gc_root(&vm.heap, fv);
+            JsObject* fd = js_new_object(&vm.heap, vm.object_proto);
+            gc_root(&vm.heap, value_cell(&fd.head));
+            js_set_prop(fd, bi_atom(vm, "value"), fv);
+            js_set_prop(fd, bi_atom(vm, "writable"), value_bool(false));
+            js_set_prop(fd, bi_atom(vm, "enumerable"), value_bool(false));
+            js_set_prop(fd, bi_atom(vm, "configurable"), value_bool(true));
+            gc_root_reset(&vm.heap, rm);
+            return value_cell(&fd.head);
+        }
         gc_root_reset(&vm.heap, rm);
         return value_undefined();
     }
@@ -569,7 +598,9 @@ private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32
     str sk;
     u32 a = reflect_key(vm, kv, &sk);
     if vm.has_pending { return value_bool(false); }
-    return value_bool(props_get(props, a) != null);
+    if props_get(props, a) != null { return value_bool(true); }
+    Value fv;
+    return value_bool(fn_own_synth(vm, thisv, a, &fv));
 }
 
 private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2118,7 +2149,9 @@ private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* arg
     str sk;
     u32 a = reflect_key(vm, kv, &sk);
     if vm.has_pending { return value_bool(false); }
-    return value_bool(props_entry(props, a) != null);
+    if props_entry(props, a) != null { return value_bool(true); }
+    Value fv;
+    return value_bool(fn_own_synth(vm, ov, a, &fv));
 }
 
 // --- Number / Boolean ------------------------------------------------------------

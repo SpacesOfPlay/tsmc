@@ -92,6 +92,8 @@ struct TmplUpval {
 struct FnTemplate {
     str name;            // owned copy
     i32 n_params;
+    i32 arity;           // Function.length: params before the first
+                         // default value or rest parameter
     i32 n_slots;
     bool has_rest;       // last param collects surplus arguments
     bool is_gen;         // calls build a generator object
@@ -192,6 +194,10 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
         t.name.len = name.len;
     }
     t.n_params = n_params;
+    // default: every parameter is required (compile_callable overrides
+    // this with the default/rest-aware count).
+    if has_rest && n_params > 0 { t.arity = n_params - 1; }
+    else { t.arity = n_params; }
     t.n_slots = n_slots;
     t.code_len = ch.code.len;
     t.code = alloc<u8>(ch.code.len + 1);
