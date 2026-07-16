@@ -102,6 +102,21 @@ function Run-Tests {
     }
     if ($runTests.Count -eq 0) { Write-Host "  (none yet)" }
 
+    # GC stress: re-run every golden and differential script with
+    # collect-on-every-allocation, catching use-after-free / missing roots.
+    # We only assert a clean exit (0), not output — slow but thorough.
+    Step "gc stress"
+    $stressScripts = @($runTests) +
+        @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue | Sort-Object Name)
+    $stressFail = 0
+    foreach ($f in $stressScripts) {
+        & $OutExe "--gc-stress" $f.FullName > $null 2> $null
+        if ($LASTEXITCODE -ne 0) { Fail "$($f.BaseName) (--gc-stress exit $LASTEXITCODE)"; $stressFail++ }
+    }
+    if ($stressScripts.Count -eq 0) { Write-Host "  (none)" }
+    elseif ($stressFail -eq 0) { Pass "$($stressScripts.Count) scripts clean under --gc-stress"; $pass++ }
+    else { $fail += $stressFail }
+
     Write-Host ""
     if ($fail -eq 0) { Pass "all $pass tests passed"; exit 0 }
     else { Fail "$fail test(s) failed"; exit 1 }

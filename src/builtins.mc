@@ -5168,9 +5168,12 @@ private void link_ctor(VM* vm, JsObject* proto, JsNative* ctor) {
 // Installs a getter-only accessor property (non-enumerable, configurable).
 private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
     JsNative* g = js_new_native(&vm.heap, getter, name);
+    // keep the getter alive across the accessor allocation, which can GC
+    vm_push(vm, value_cell(&g.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
     ac.get = value_cell(&g.head);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
+    vm_pop(vm);
 }
 
 void builtins_install(VM* vm) {

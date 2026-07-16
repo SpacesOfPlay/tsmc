@@ -125,6 +125,27 @@ run_tests() {
     done
     [ "$n_run" -eq 0 ] && echo "  (none yet)"
 
+    # GC stress: re-run every golden and differential script with
+    # collect-on-every-allocation, catching use-after-free / missing roots.
+    # Only a clean exit (0) is asserted, not output — slow but thorough.
+    step "gc stress"
+    n_stress=0
+    n_stress_fail=0
+    for f in "$PROJECT_DIR"/test/run/*.ts "$PROJECT_DIR"/test/diff/*.js; do
+        [ -e "$f" ] || continue
+        n_stress=$((n_stress + 1))
+        if ! "$OUT_EXE" --gc-stress "$f" > /dev/null 2>&1; then
+            fail "$(basename "$f") (--gc-stress nonzero exit)"; n_stress_fail=$((n_stress_fail + 1))
+        fi
+    done
+    if [ "$n_stress" -eq 0 ]; then
+        echo "  (none)"
+    elif [ "$n_stress_fail" -eq 0 ]; then
+        pass "$n_stress scripts clean under --gc-stress"; n_pass=$((n_pass + 1))
+    else
+        n_fail=$((n_fail + n_stress_fail))
+    fi
+
     echo ""
     if [ "$n_fail" -eq 0 ]; then
         pass "all $n_pass tests passed"

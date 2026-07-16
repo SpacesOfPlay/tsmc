@@ -30,7 +30,7 @@ library in `lib/` next to the binary.
 ```
 ./build.ps1 build      # Windows      -> build/tsmc.exe
 ./build.sh build       # Linux/macOS  -> build/tsmc
-./build.ps1 test       # build + run the full test suite
+./build.ps1 test       # build + run the full test suite (incl. GC stress)
 ./build.ps1 diff       # differential test vs a reference node
 ./build.ps1 bench      # time bench/*.ts
 ./build.ps1 t262       # ECMAScript conformance (test262) — see below

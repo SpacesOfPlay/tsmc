@@ -988,7 +988,9 @@ private void compile_expr(Compiler* co, Node* n) {
         BigNum bn = bn_from_str(t, &ok);
         GcBigInt* g = js_new_bigint(co.heap, bn);
         bn_free(&bn);
-        ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_cell(&g.head)));
+        Value bv = value_cell(&g.head);
+        gc_root(co.heap, bv);   // stays rooted until the VM owns the template
+        ch_op_u16(ch, OP_CONST, ch_add_const(ch, bv));
         return;
     }
     if k == N_STRING {
