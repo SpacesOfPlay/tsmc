@@ -9,7 +9,7 @@ percentage. Gaps found by probing common idioms against Node:
   unsupported. Critical for debugging.
 - **Async completeness** — DONE. `Promise.allSettled`, `Promise.any`,
   and `for await…of` (§3).
-- **JSON.parse reviver** — the reviver callback is ignored.
+- **JSON.parse reviver** — DONE (§4).
 - **Regex** — lookbehind and the `/u` flag are unsupported.
 - **WeakMap / WeakSet** — absent (needs weak-ref GC support).
 - Lower ROI / bigger surface: `Intl`, Node globals (`process`, `fs`,
@@ -118,3 +118,15 @@ already solid.
   is true).
 - **`Symbol.asyncIterator`** — not added; `for await` uses the sync
   iterator, which covers our generators and iterables of promises.
+
+---
+
+## 4. JSON.parse reviver — DONE
+
+`JSON.parse(text, reviver)` ignored the reviver. It now implements
+InternalizeJSONProperty: after parsing, the result is walked under a
+`{ "": result }` holder, reviving children bottom-up and calling
+`reviver.call(holder, key, value)` at each node. Returning `undefined`
+deletes the property (an array element becomes a hole); the root is
+visited last with key `""`. Verified against Node for value transforms,
+Date revival, deletion, visit order, and the `this`-is-holder binding.

@@ -3500,6 +3500,48 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
     return js_number_value(d2);
 }
 
+// ES InternalizeJSONProperty: revive children bottom-up, then call
+// reviver.call(holder, key, val). `val` is already fetched from holder.
+private Value json_revive(VM* vm, Value holder, Value keyv, Value val, Value reviver) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, holder);
+    gc_root(&vm.heap, keyv);
+    gc_root(&vm.heap, val);
+    if value_is_array(val) {
+        JsObject* arr = value_as_object(val);
+        for i32 i = 0; i < arr.elen; i++ {
+            string is = format("{}", i);
+            Value ikey = new_str(vm, is);
+            free(is);
+            vm_push(vm, ikey);
+            Value nv = json_revive(vm, val, ikey, js_array_get(arr, i), reviver);
+            if value_is_undefined(nv) { js_array_set(arr, i, value_hole()); }
+            else { js_array_set(arr, i, nv); }
+            vm_pop(vm);
+        }
+    } else if value_is_object(val) {
+        JsObject* keys = vm_own_keys(vm, val);
+        vm_push(vm, value_cell(&keys.head));
+        i32 n = keys.elen;
+        for i32 i = 0; i < n; i++ {
+            Value kv = js_array_get(keys, i);
+            vm_push(vm, kv);
+            u32 ka = atom_intern(&vm.atoms, sview(kv));
+            Value child;
+            ignore vm_get_prop_value(vm, val, ka, &child);
+            Value nv = json_revive(vm, val, kv, child, reviver);
+            if value_is_undefined(nv) { ignore js_delete_prop(value_as_object(val), ka); }
+            else { js_set_prop(value_as_object(val), ka, nv); }
+            vm_pop(vm);
+        }
+        vm_pop(vm);
+    }
+    Value[2] ca = { keyv, val };
+    Value result = vm_call_value(vm, reviver, holder, &ca[0], 2);
+    gc_root_reset(&vm.heap, rm);
+    return result;
+}
+
 private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 rm = gc_root_mark(&vm.heap);
@@ -3516,6 +3558,15 @@ private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, 
         gc_root_reset(&vm.heap, rm);
         vm_throw_error(vm, ERR_SYNTAX, "invalid JSON");
         return value_undefined();
+    }
+    // optional reviver: walk the result under a { "": r } holder
+    Value reviver = arg_at(args, argc, 1);
+    if value_is_callable(reviver) {
+        JsObject* root = js_new_object(&vm.heap, vm.object_proto);
+        vm_push(vm, value_cell(&root.head));
+        js_set_prop(root, bi_atom(vm, ""), r);
+        r = json_revive(vm, value_cell(&root.head), new_str(vm, ""), r, reviver);
+        vm_pop(vm);
     }
     gc_root_reset(&vm.heap, rm);
     return r;

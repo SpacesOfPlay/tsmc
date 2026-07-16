@@ -21,3 +21,13 @@ console.log(JSON.stringify({ a: 1, b: 2, c: 3 }, (k, v) => (k === "b" ? undefine
 console.log(JSON.stringify({ x: { toJSON() { return "custom"; } }, y: 2 }));
 console.log(JSON.stringify({ n: 5, arr: [1, 2], skip: 9 }, ["n", "arr"], 2));
 console.log(JSON.stringify({ nested: { a: 1, b: 2 } }, ["nested", "a"]));
+
+// JSON.parse reviver: transform, revive, delete, order, holder
+console.log(JSON.parse('{"a":1,"b":2}', (k, v) => typeof v === "number" ? v * 10 : v).b);
+console.log(JSON.parse('{"d":"2020-06-15T10:30:00.000Z"}', (k, v) => k === "d" ? new Date(v).getTime() : v).d);
+console.log(JSON.stringify(JSON.parse('{"keep":1,"drop":2}', (k, v) => k === "drop" ? undefined : v)));
+console.log(JSON.stringify(JSON.parse('[10,20,30]', (k, v) => v === 20 ? undefined : v)));
+const ord = [];
+JSON.parse('{"p":[1],"q":{"r":2}}', (k, v) => { ord.push(k); return v; });
+console.log(ord.join(","));
+console.log(JSON.parse('99', (k, v) => k === "" ? v + 1 : v));
