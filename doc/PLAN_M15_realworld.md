@@ -56,3 +56,36 @@ Invalid Date. Golden test: `test/run/dates.ts`.
   interchange format) is covered.
 - **Real `Intl` / locale data** — `toLocale*` is a fixed en-US format,
   not locale- or options-aware.
+
+---
+
+## 2. Error stack traces — DONE
+
+`error.stack` was `undefined` and the `{ cause }` option was ignored.
+
+### Approach
+
+- **Position table**: `FnTemplate` gains a compact `PosEntry {code_off,
+  line, col}` table (built in the `Chunk`, copied on `chunk_finish`) plus
+  the source name. The compiler threads the module source + filename and
+  records an entry at each statement and before each call/new/throw
+  (line:col computed at compile time via `diag_line_col`, so the runtime
+  needs no source).
+- **Capture**: before invoking a native the VM stores the caller's `ip`
+  in its frame, so at `new Error()` every live frame has a current `ip`.
+  `vm_capture_stack` walks `vm.frames` top-down, maps each frame's call
+  `ip` through its template's position table, and formats
+  `    at <name> (<file>:<line>:<col>)`.
+- **Wiring**: `error_ctor_impl` and `vm_make_error` (VM-thrown errors)
+  set `.stack` = `"<Name>: <message>" + frames`. The `{ cause }` option
+  is copied onto the error. Uncaught errors print the full stack.
+- Each frame carries a `cur_ip` updated at every call site (not `ret_ip`,
+  which holds the *caller's* resume point); the innermost frame's site is
+  set when it constructs the error.
+
+### Not doing (documented)
+
+- **`Error.captureStackTrace` / stack getter laziness** — `.stack` is an
+  eager string, not V8's lazy structured trace.
+- **Exact column parity** — line numbers match; columns are best-effort
+  at statement/call granularity.

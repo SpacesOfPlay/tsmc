@@ -107,15 +107,27 @@ struct FnTemplate {
     i32 n_upvals;
     FnTemplate** subs;
     i32 n_subs;
+    PosEntry* pos;       // code_off -> source line/col, for stack traces
+    i32 n_pos;
+    str src_name;        // source filename (borrowed; owned by the module)
 }
 
 type TmplPtr = FnTemplate*;
+
+// Maps a bytecode offset to a 1-based source line/column, for stack
+// traces. Entries are recorded in increasing code_off order.
+struct PosEntry {
+    i32 code_off;
+    i32 line;
+    i32 col;
+}
 
 struct Chunk {
     Vec<u8> code;
     Vec<Value> consts;
     Vec<TmplUpval> upvals;
     Vec<TmplPtr> subs;
+    Vec<PosEntry> pos;
 }
 
 void chunk_init(Chunk* ch) {
@@ -123,6 +135,24 @@ void chunk_init(Chunk* ch) {
     vec_init<Value>(&ch.consts, 8);
     vec_init<TmplUpval>(&ch.upvals, 4);
     vec_init<TmplPtr>(&ch.subs, 4);
+    vec_init<PosEntry>(&ch.pos, 16);
+}
+
+// Records the source position active at the current code offset. When the
+// offset already has an entry, the later position wins.
+void ch_record_pos(Chunk* ch, i32 line, i32 col) {
+    i32 off = ch.code.len;
+    if ch.pos.len > 0 && vec_get(&ch.pos, ch.pos.len - 1).code_off == off {
+        PosEntry* last = ch.pos.data + (ch.pos.len - 1);
+        last.line = line;
+        last.col = col;
+        return;
+    }
+    PosEntry e;
+    e.code_off = off;
+    e.line = line;
+    e.col = col;
+    vec_push(&ch.pos, e);
 }
 
 void ch_op(Chunk* ch, i32 op) {
@@ -224,11 +254,42 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
             *(t.subs + i) = vec_get(&ch.subs, i);
         }
     }
+    t.n_pos = ch.pos.len;
+    if t.n_pos > 0 {
+        t.pos = alloc<PosEntry>(t.n_pos);
+        for i32 i = 0; i < t.n_pos; i++ {
+            *(t.pos + i) = vec_get(&ch.pos, i);
+        }
+    }
     vec_free(&ch.code);
     vec_free(&ch.consts);
     vec_free(&ch.upvals);
     vec_free(&ch.subs);
+    vec_free(&ch.pos);
     return t;
+}
+
+// The 1-based line/col for a bytecode offset (the last entry at or before
+// it); 0/0 if the template carries no position table.
+void tmpl_pos(FnTemplate* t, i32 code_off, i32* line, i32* col) {
+    *line = 0;
+    *col = 0;
+    i32 lo = 0;
+    i32 hi = t.n_pos - 1;
+    i32 best = -1;
+    while lo <= hi {
+        i32 mid = (lo + hi) / 2;
+        if (t.pos + mid).code_off <= code_off {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best >= 0 {
+        *line = (t.pos + best).line;
+        *col = (t.pos + best).col;
+    }
 }
 
 void template_free(FnTemplate* t) {
@@ -240,5 +301,6 @@ void template_free(FnTemplate* t) {
     if t.consts != null { free(t.consts); }
     if t.upvals != null { free(t.upvals); }
     if t.subs != null { free(t.subs); }
+    if t.pos != null { free(t.pos); }
     free(t);
 }

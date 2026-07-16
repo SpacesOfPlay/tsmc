@@ -3639,10 +3639,28 @@ private Value error_ctor_impl(VM* vm, Value thisv, Value* args, i32 argc, i32 ki
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&target.head));
     Value mv = arg_at(args, argc, 0);
+    str msg = "";
+    bool has_msg = false;
     if !value_is_undefined(mv) {
         Value ms = js_to_string_value(vm, mv);
+        gc_root(&vm.heap, ms);
         js_set_prop(target, vm.atom_message, ms);
+        msg = sview(ms);
+        has_msg = true;
     }
+    // options.cause -> error.cause (own property of the options object)
+    Value optv = arg_at(args, argc, 1);
+    if value_is_object(optv) {
+        Prop* ce = props_entry(&value_as_object(optv).props, bi_atom(vm, "cause"));
+        if ce != null { js_set_prop(target, bi_atom(vm, "cause"), ce.val); }
+    }
+    // .stack, using the error's resolved name
+    Value namev = value_undefined();
+    ignore vm_get_prop_value(vm, value_cell(&target.head), vm.atom_name, &namev);
+    str nm = "Error";
+    if value_is_string(namev) { nm = sview(namev); }
+    Value stack = vm_error_stack(vm, nm, msg, has_msg);
+    js_set_prop(target, bi_atom(vm, "stack"), stack);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&target.head);
 }

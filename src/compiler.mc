@@ -86,6 +86,8 @@ struct Compiler {
     str pending_label;
     bool in_module;
     StrMap<ModImport> mod_imports;   // valid while in_module
+    str src;        // source text, for line/col of stack-trace positions
+    str src_name;   // source filename
 }
 
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
@@ -98,10 +100,26 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.pending_label.len = 0;
     co.in_module = false;
     strmap_init<ModImport>(&co.mod_imports);
+    co.src.data = null;
+    co.src.len = 0;
+    co.src_name = "";
+}
+
+// Source text + filename for stack-trace positions.
+void compiler_set_source(Compiler* co, str src, str src_name) {
+    co.src = src;
+    co.src_name = src_name;
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
     diag_add(co.diags, DIAG_ERROR, n.span, msg);
+}
+
+// Records the source position of a node at the current code offset.
+private void emit_pos(Compiler* co, Node* n) {
+    if co.src.data == null { return; }
+    LineCol lc = diag_line_col(co.src, n.span.start);
+    ch_record_pos(&co.cur.ch, lc.line, lc.col);
 }
 
 private str take_label(Compiler* co) {
@@ -1438,6 +1456,7 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
 
     FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
         fs.is_gen, fs.is_async);
+    t.src_name = co.src_name;
     // Function.length: count leading params up to the first with a
     // default value or the rest parameter.
     i32 arity = 0;
@@ -1950,6 +1969,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     FScope* fs = co.cur;
     i32 k = n.kind;
+    emit_pos(co, n);   // source position for stack traces
 
     if k == N_EXPR_STMT {
         compile_expr(co, n.a);
@@ -2296,6 +2316,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     empty.data = null;
     empty.len = 0;
     FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false, false, false);
+    t.src_name = co.src_name;
     co.cur = null;
     fscope_free(&fs);
     return t;
@@ -2480,6 +2501,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     empty.data = null;
     empty.len = 0;
     FnTemplate* t = chunk_finish(&fs.ch, empty, n_params, fs.n_slots, false, false, false);
+    t.src_name = co.src_name;
     co.cur = null;
     co.in_module = false;
     vec_free(&mod_slots);

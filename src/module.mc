@@ -271,6 +271,10 @@ private i32 load_module(Loader* ld, str path) {
     i32 rmark = gc_root_mark(&ld.vm.heap);
     Compiler co;
     compiler_init(&co, &ld.diags, &ld.vm.heap, vm_atoms(ld.vm), &mod.arena);
+    str msrc;
+    msrc.data = mod.src_data;
+    msrc.len = mod.src_len;
+    compiler_set_source(&co, msrc, mod.path);
     Vec<str> specs = vec_new<str>(4);
     mod.tmpl = compile_module(&co, prog, &specs);
     vm_add_template_root(ld.vm, mod.tmpl);

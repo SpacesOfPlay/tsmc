@@ -38,6 +38,7 @@ struct Frame {
     JsFunction* fun;    // null for the script frame
     FnTemplate* tmpl;
     i32 ret_ip;
+    i32 cur_ip;         // this frame's active site (call/throw), for stacks
     i32 base;
     Value this_val;
     bool is_ctor;
@@ -710,6 +711,44 @@ void vm_throw(VM* vm, Value v) {
     vm.has_pending = true;
 }
 
+// Builds an Error `.stack`: a "Name: message" header, then one
+// "    at <fn> (<file>:<line>:<col>)" line per live frame, innermost
+// first. The caller keeps any referenced object rooted. Accurate for
+// user-constructed errors (the native-call site stores the caller's ip);
+// a VM-internal throw's innermost line is best-effort.
+Value vm_error_stack(VM* vm, str name, str msg, bool has_msg) {
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, name);
+    if has_msg && msg.len > 0 {
+        str_buf_add(&sb, ": ");
+        str_buf_add(&sb, msg);
+    }
+    for i32 i = vm.fp - 1; i >= 0; i-- {
+        Frame* fr = vm.frames + i;
+        FnTemplate* t = fr.tmpl;
+        if t == null { continue; }
+        i32 off = fr.cur_ip - 1;
+        if off < 0 { off = 0; }
+        i32 line = 0;
+        i32 col = 0;
+        tmpl_pos(t, off, &line, &col);
+        str_buf_add(&sb, "\n    at ");
+        if t.name.len > 0 { str_buf_add(&sb, t.name); }
+        else { str_buf_add(&sb, "<anonymous>"); }
+        str_buf_add(&sb, " (");
+        if t.src_name.len > 0 { str_buf_add(&sb, t.src_name); }
+        else { str_buf_add(&sb, "<anonymous>"); }
+        string ls = format(":{}:{}", line, col);
+        str_buf_add(&sb, ls);
+        free(ls);
+        str_buf_add(&sb, ")");
+    }
+    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return value_cell(&g.head);
+}
+
 Value vm_make_error(VM* vm, i32 kind, str msg) {
     JsObject* proto = vm.error_protos[kind];
     JsObject* e = js_new_object(&vm.heap, proto);
@@ -720,6 +759,8 @@ Value vm_make_error(VM* vm, i32 kind, str msg) {
     }
     GcString* ms = gc_new_string(&vm.heap, msg);
     js_set_prop(e, vm.atom_message, value_cell(&ms.head));
+    Value stack = vm_error_stack(vm, vm_error_kind_name(kind), msg, msg.len > 0);
+    js_set_prop(e, atom_intern(&vm.atoms, "stack"), stack);
     return vpop(vm);
 }
 
@@ -1372,6 +1413,13 @@ private i32 rd_u16(u8* code, i32 at) {
 
 private void print_uncaught(VM* vm, Value e) {
     if value_is_object(e) {
+        // prefer the full stack (Name: message + frames)
+        Value sv;
+        if js_get_prop(value_as_object(e), atom_intern(&vm.atoms, "stack"), &sv)
+            && value_is_string(sv) {
+            eprint("Uncaught {}\n", gc_string_view(value_as_string(sv)));
+            return;
+        }
         Value nv;
         Value mv;
         if js_get_prop(value_as_object(e), vm.atom_name, &nv)
@@ -2006,6 +2054,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_CALL, OP_NEW: {
                 i32 argc = rd_u16(code, ip);
                 ip += 2;
+                fr.cur_ip = ip;   // this frame's call site, for stack traces
                 Value fnv;
                 Value thisv;
                 if op == OP_NEW {
@@ -2055,6 +2104,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.fun = f;
                             nf.tmpl = ft;
                             nf.ret_ip = ip;
+                            nf.cur_ip = 0;
                             nf.base = base;
                             nf.this_val = thisv;
                             nf.is_ctor = op == OP_NEW;
@@ -2457,6 +2507,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, ov);
             }
             case OP_CALL_ARRAY, OP_NEW_ARRAY: {
+                fr.cur_ip = ip;   // call site, for stack traces
                 if op == OP_NEW_ARRAY {
                     Value fnv2 = vpeek(vm, 1);
                     if !value_is_callable(fnv2) {
@@ -2619,6 +2670,7 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.fun = null;
     fr.tmpl = t;
     fr.ret_ip = 0;
+    fr.cur_ip = 0;
     fr.base = base;
     fr.this_val = value_undefined();
     fr.is_ctor = false;
@@ -2810,6 +2862,7 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     nf.fun = g.fun;
     nf.tmpl = g.fun.tmpl;
     nf.ret_ip = g.resume_ip;
+    nf.cur_ip = g.resume_ip;
     nf.base = base;
     nf.this_val = g.this_val;
     nf.is_ctor = false;
@@ -3133,6 +3186,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.fun = f;
     nf.tmpl = ft;
     nf.ret_ip = 0;
+    nf.cur_ip = 0;
     nf.base = base;
     nf.this_val = thisv;
     nf.is_ctor = false;
@@ -3324,6 +3378,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         i32 rmark = gc_root_mark(&vm.heap);
         Compiler co;
         compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_source(&co, src, src_name);
         FnTemplate* t = compile_program(&co, prog);
         vec_push(&vm.troots, t);
         gc_root_reset(&vm.heap, rmark);

@@ -1,0 +1,7 @@
+Error: boom
+    at inner (error_stack.ts:10:5)
+    at outer (error_stack.ts:13:5)
+    at <anonymous> (error_stack.ts:16:5)
+wrap RangeError true
+AppError nope true true
+TypeError: Cannot read properties of undefined (reading 'prop') | frames: true
