@@ -3523,6 +3523,14 @@ private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, 
 
 // --- Function.prototype ------------------------------------------------------------------
 
+// The Function constructor compiles source at runtime; the interpreter
+// does not support dynamic code. The global exists so that references to
+// `Function` and `Function.prototype` resolve (only calling it throws).
+private Value nat_function_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    vm_throw_error(as_vm(vmp), ERR_TYPE, "Function constructor (dynamic code) is not supported");
+    return value_undefined();
+}
+
 private Value nat_fn_call(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value this_arg = arg_at(args, argc, 0);
@@ -5372,7 +5380,10 @@ void builtins_install(VM* vm) {
     def_method(vm, json_obj, "stringify", &nat_json_stringify);
     def_method(vm, json_obj, "parse", &nat_json_parse);
 
-    // Function.prototype
+    // Function constructor + Function.prototype
+    JsNative* function_ctor = def_global_fn(vm, "Function", &nat_function_ctor);
+    props_set_desc(&function_ctor.props, vm.atom_prototype, value_cell(&vm.function_proto.head), 0);
+    link_ctor(vm, vm.function_proto, function_ctor);
     def_method(vm, vm.function_proto, "call", &nat_fn_call);
     def_method(vm, vm.function_proto, "apply", &nat_fn_apply);
     def_method(vm, vm.function_proto, "bind", &nat_fn_bind);
