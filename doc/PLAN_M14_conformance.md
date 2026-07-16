@@ -21,7 +21,7 @@ Tier 1 (cheap and broad):
 Tier 2 (shares the ToPrimitive path with #2):
 
 5. **`Symbol.toPrimitive`** consulted first in ToPrimitive; **Date**
-   default hint resolves to string.
+   default hint resolves to string. — DONE (below).
 6. **Reflection over callables** — DONE (below).
 
 ---
@@ -235,3 +235,39 @@ every test including it (most of `built-ins/*`) failed before running.
   callable no-op is a separate change.
 - **`new Function(src)`** — dynamic code; out of scope for a
   type-strip-and-run interpreter.
+
+---
+
+## 5. Symbol.toPrimitive + ToPrimitive hints — DONE
+
+`Symbol.toPrimitive` did not exist (accessing it threw), so it was never
+consulted; ToPrimitive only distinguished string vs number, unary `+`/`-`
+did not coerce objects at all, template substitutions used the default
+hint, and `Date` had no default-hint override.
+
+### Approach
+
+- Added the well-known `Symbol.toPrimitive` (VM field + stable id, marked
+  as a root, registered on the `Symbol` constructor), mirroring
+  `Symbol.iterator`.
+- `vm_to_primitive` now takes a 3-way hint (`HINT_DEFAULT`/`STRING`/
+  `NUMBER`) and consults `obj[Symbol.toPrimitive](hint)` first, requiring
+  a primitive result (else `TypeError`). Callers pass the right hint:
+  `+`/`==` → default, `-`/`*`/`/`/`%`/`**`/relational → number,
+  `js_to_string_value` → string.
+- `vm_to_number` ToPrimitive's objects with the number hint, so unary
+  `+`/`-`, bitwise, etc. consult `valueOf`/`Symbol.toPrimitive` instead
+  of yielding `NaN`.
+- New `OP_TOSTR` (ToString, string hint) is emitted for each template
+  substitution, so `` `${obj}` `` uses the string hint rather than the
+  default hint via `OP_ADD`.
+- `Date.prototype[Symbol.toPrimitive]` delegates to `valueOf` (number
+  hint) or `toString` (string/default), so `date + date` concatenates
+  strings and `+date` is the timestamp.
+
+### Not doing (documented)
+
+- **`Date.prototype.toString` formatting** — Date has no human-readable
+  `toString` (falls back to `[object Object]`), so `date + date`, while
+  now a string, is not the locale string Node prints. A separate
+  date-formatting feature (`toString`/`toDateString`/`toTimeString`/…).

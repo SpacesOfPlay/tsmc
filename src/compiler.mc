@@ -1112,7 +1112,11 @@ private void compile_expr(Compiler* co, Node* n) {
                 }
             } else {
                 compile_expr(co, e);
-                ch_op(ch, OP_ADD);
+                // ToString the substitution (string hint) before joining,
+                // so it isn't coerced with the default hint via OP_ADD.
+                ch_op(ch, OP_TOSTR);
+                if !first { ch_op(ch, OP_ADD); }
+                first = false;
             }
         }
         return;

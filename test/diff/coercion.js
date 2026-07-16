@@ -30,3 +30,15 @@ console.log(symThrows(() => Number(Symbol())), symThrows(() => +Symbol()), symTh
 console.log(symThrows(() => Symbol() & 1), symThrows(() => [Symbol()].join(",")), symThrows(() => new String(Symbol())));
 console.log(String(Symbol("x")), Symbol("y").toString(), typeof Symbol());
 console.log(Symbol() == 1, (function(){ var s = Symbol(); return s == s; })());
+// Symbol.toPrimitive is consulted first, with the correct hint
+var prim = { [Symbol.toPrimitive](hint) { return hint === "number" ? 42 : hint === "string" ? "S" : "D"; } };
+console.log(+prim, prim * 2, prim - 0, prim < 100, `${prim}`, "" + prim, prim + 1, prim == "D");
+console.log(typeof Symbol.toPrimitive, `${{ toString() { return "ts"; } }}`);
+// unary +/- ToPrimitive objects via valueOf
+var vo = { valueOf() { return 7; } };
+console.log(+vo, -vo, vo * 3, `${vo}`);
+// Date: default/string hint -> string form; number hint -> timestamp
+var dt = new Date(0);
+console.log((dt + dt) === (dt.toString() + dt.toString()), typeof (+dt), +dt === dt.getTime());
+// toPrimitive returning an object throws
+console.log((function(){ try { return "" + { [Symbol.toPrimitive]() { return {}; } }; } catch (e) { return e instanceof TypeError; } })());

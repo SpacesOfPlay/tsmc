@@ -117,6 +117,8 @@ struct VM {
     Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
     Value sym_iterator;      // well-known Symbol.iterator
     u32 sym_iterator_id;
+    Value sym_to_primitive;  // well-known Symbol.toPrimitive
+    u32 sym_to_primitive_id;
     u32 atom_pstate;
     u32 atom_pvalue;
     u32 atom_pcbs;
@@ -198,6 +200,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         gc_mark_value(h, vec_get(&vm.symbols, i));
     }
     gc_mark_value(h, vm.sym_iterator);
+    gc_mark_value(h, vm.sym_to_primitive);
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.gen != null { gc_mark_cell(h, &fr.gen.head); }
@@ -374,13 +377,29 @@ f64 js_to_number(Value v) {
     return 0.0 / 0.0;   // undefined, objects (ToPrimitive deferred)
 }
 
-// ToNumber with the Symbol trap: implicit numeric coercion of a Symbol
-// is a TypeError. Every other type defers to js_to_number. Operands
-// reach here already ToPrimitive'd, so a Symbol here is a real Symbol.
+// ToPrimitive hints (ES 7.1.1). "default" and "number" share the ordinary
+// valueOf-first order; they differ only for Symbol.toPrimitive and Date.
+const i32 HINT_DEFAULT = 0;
+const i32 HINT_STRING = 1;
+const i32 HINT_NUMBER = 2;
+
+// ToNumber (ES 7.1.4). Objects are ToPrimitive'd with the number hint
+// first (so unary +/-, bitwise, etc. consult valueOf/Symbol.toPrimitive);
+// a Symbol throws. On a thrown coercion the caller sees NaN and unwinds
+// via has_pending.
 f64 vm_to_number(VM* vm, Value v) {
     if value_is_symbol(v) {
         vm_throw_error(vm, ERR_TYPE, "Cannot convert a Symbol value to a number");
         return 0.0 / 0.0;
+    }
+    if !value_is_primitive(v) {
+        Value p;
+        if !vm_to_primitive(vm, v, HINT_NUMBER, &p) { return 0.0 / 0.0; }
+        if value_is_symbol(p) {
+            vm_throw_error(vm, ERR_TYPE, "Cannot convert a Symbol value to a number");
+            return 0.0 / 0.0;
+        }
+        return js_to_number(p);
     }
     return js_to_number(v);
 }
@@ -586,7 +605,7 @@ Value js_to_string_value(VM* vm, Value v) {
     // object-like: ToPrimitive with the string hint (toString/valueOf),
     // then ToString the resulting primitive
     Value prim;
-    if !vm_to_primitive(vm, v, true, &prim) {
+    if !vm_to_primitive(vm, v, HINT_STRING, &prim) {
         GcString* g = gc_new_string(&vm.heap, "");
         return value_cell(&g.head);
     }
@@ -959,14 +978,36 @@ private bool value_is_primitive(Value v) {
     return value_is_string(v) || value_is_symbol(v) || value_is_bigint(v);
 }
 
-// ToPrimitive (ES 7.1.1): invoke valueOf/toString (ordered by hint)
-// and return the first primitive result. Non-references pass through.
-// v stays rooted by the caller; false on a thrown error.
-bool vm_to_primitive(VM* vm, Value v, bool prefer_string, Value* out) {
+// ToPrimitive (ES 7.1.1): if the object has a Symbol.toPrimitive method,
+// call it with the hint; otherwise invoke valueOf/toString ordered by
+// hint and return the first primitive. v stays rooted by the caller;
+// false on a thrown error.
+bool vm_to_primitive(VM* vm, Value v, i32 hint, Value* out) {
     if value_is_primitive(v) {
         *out = v;
         return true;
     }
+    // Symbol.toPrimitive takes precedence when present and callable.
+    Value exotic;
+    if !vm_get_prop_value(vm, v, vm.sym_to_primitive_id, &exotic) { return false; }
+    if value_is_callable(exotic) {
+        str hs = "default";
+        if hint == HINT_STRING { hs = "string"; }
+        if hint == HINT_NUMBER { hs = "number"; }
+        GcString* hg = gc_new_string(&vm.heap, hs);
+        Value ha = value_cell(&hg.head);
+        vpush(vm, ha);                       // root the hint string
+        Value r = vm_call_value(vm, exotic, v, &ha, 1);
+        vm.sp--;
+        if vm.has_pending { return false; }
+        if value_is_primitive(r) {
+            *out = r;
+            return true;
+        }
+        vm_throw_error(vm, ERR_TYPE, "Cannot convert object to a primitive value");
+        return false;
+    }
+    bool prefer_string = hint == HINT_STRING;
     u32 first = prefer_string ? atom_intern(&vm.atoms, "toString")
         : atom_intern(&vm.atoms, "valueOf");
     u32 second = prefer_string ? atom_intern(&vm.atoms, "valueOf")
@@ -1281,6 +1322,8 @@ void vm_init(VM* vm) {
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
+    vm.sym_to_primitive = value_undefined();
+    vm.sym_to_primitive_id = 0;
     vm.atom_pstate = atom_intern(&vm.atoms, "%state");
     vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
     vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
@@ -1289,10 +1332,14 @@ void vm_init(VM* vm) {
     vm.atom_next = atom_intern(&vm.atoms, "next");
     vm.exec_depth = 0;
     vm_install_globals(vm);
-    // Symbol.iterator: allocated first so its id is stable and shared
+    // Well-known symbols: allocated up front so their ids are stable and
+    // shared as property keys.
     Value itsym = vm_new_symbol(vm, value_undefined());
     vm.sym_iterator = itsym;
     vm.sym_iterator_id = value_as_symbol(itsym).id;
+    Value tpsym = vm_new_symbol(vm, value_undefined());
+    vm.sym_to_primitive = tpsym;
+    vm.sym_to_primitive_id = value_as_symbol(tpsym).id;
 }
 
 void vm_destroy(VM* vm) {
@@ -1345,15 +1392,15 @@ private void print_uncaught(VM* vm, Value e) {
 // 0 = completed (result on stack), 1 = uncaught exception (printed).
 // Replaces the top two stack operands with their primitives (number
 // hint) if either is a reference. false on a thrown error.
-private bool coerce_top2_prim(VM* vm) {
+private bool coerce_top2_prim(VM* vm, i32 hint) {
     if value_is_primitive(vpeek(vm, 1)) && value_is_primitive(vpeek(vm, 0)) {
         return true;
     }
     Value pa;
-    if !vm_to_primitive(vm, vpeek(vm, 1), false, &pa) { return false; }
+    if !vm_to_primitive(vm, vpeek(vm, 1), hint, &pa) { return false; }
     *(vm.stack + vm.sp - 2) = pa;
     Value pb;
-    if !vm_to_primitive(vm, vpeek(vm, 0), false, &pb) { return false; }
+    if !vm_to_primitive(vm, vpeek(vm, 0), hint, &pb) { return false; }
     *(vm.stack + vm.sp - 1) = pb;
     return true;
 }
@@ -1567,7 +1614,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_ADD: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm) { break case; }
+                    if !coerce_top2_prim(vm, HINT_DEFAULT) { break case; }
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
@@ -1612,7 +1659,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_SUB: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm) { break case; }
+                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
@@ -1637,7 +1684,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_MUL: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm) { break case; }
+                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
@@ -1662,7 +1709,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_DIV, OP_MOD, OP_POW: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm) { break case; }
+                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
@@ -1710,6 +1757,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 f64 r = vm_to_number(vm, v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
+            }
+            case OP_TOSTR: {
+                // ToString with the string hint (template substitutions)
+                Value s = js_to_string_value(vm, vpeek(vm, 0));
+                if !vm.has_pending {
+                    vm.sp--;
+                    vpush(vm, s);
+                }
             }
             case OP_INC, OP_DEC: {
                 Value v = vpeek(vm, 0);
@@ -1762,12 +1817,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 bool threw = false;
                 if a_ref && !b_ref && !value_is_null(b0) && !value_is_undefined(b0) {
                     Value pa;
-                    if vm_to_primitive(vm, a0, false, &pa) {
+                    if vm_to_primitive(vm, a0, HINT_DEFAULT, &pa) {
                         *(vm.stack + vm.sp - 2) = pa;
                     } else { threw = true; }
                 } else if b_ref && !a_ref && !value_is_null(a0) && !value_is_undefined(a0) {
                     Value pb;
-                    if vm_to_primitive(vm, b0, false, &pb) {
+                    if vm_to_primitive(vm, b0, HINT_DEFAULT, &pb) {
                         *(vm.stack + vm.sp - 1) = pb;
                     } else { threw = true; }
                 }
@@ -1785,7 +1840,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_LT, OP_GT, OP_LE, OP_GE: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm) { break case; }
+                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
@@ -3148,6 +3203,7 @@ u32 vm_atom(VM* vm, str name) {
 JsObject* vm_generator_proto(VM* vm) { return vm.generator_proto; }
 JsObject* vm_promise_proto(VM* vm) { return vm.promise_proto; }
 u32 vm_sym_iterator_id(VM* vm) { return vm.sym_iterator_id; }
+u32 vm_sym_to_primitive_id(VM* vm) { return vm.sym_to_primitive_id; }
 
 // --- regex integration ---------------------------------------------------
 

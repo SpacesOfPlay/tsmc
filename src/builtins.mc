@@ -4639,6 +4639,24 @@ private Value nat_date_toiso(void* vmp, Value callee, Value thisv, Value* args, 
     return r;
 }
 
+// Date.prototype[Symbol.toPrimitive]: a "number" hint takes valueOf (the
+// timestamp), while "string" and "default" take toString — so `date +
+// date` concatenates strings rather than adding timestamps.
+private Value nat_date_toprimitive(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value hint = arg_at(args, argc, 0);
+    bool number = value_is_string(hint) && str_equal(sview(hint), "number");
+    u32 key = number ? bi_atom(vm, "valueOf") : bi_atom(vm, "toString");
+    Value m;
+    if !vm_get_prop_value(vm, thisv, key, &m) { return value_undefined(); }
+    if !value_is_callable(m) {
+        vm_throw_error(vm, ERR_TYPE, "Date coercion method is not callable");
+        return value_undefined();
+    }
+    Value dummy = value_undefined();
+    return vm_call_value(vm, m, thisv, &dummy, 0);
+}
+
 // --- RegExp -----------------------------------------------------------------------------
 
 private Value nat_regexp_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5425,6 +5443,7 @@ void builtins_install(VM* vm) {
     // Symbol
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
+    props_set(&symbol_ctor.props, bi_atom(vm, "toPrimitive"), vm.sym_to_primitive);
     vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
     props_set_desc(&symbol_ctor.props, vm.atom_prototype, value_cell(&vm.symbol_proto.head), 0);
     def_method(vm, vm.symbol_proto, "toString", &nat_symbol_tostring);
@@ -5528,6 +5547,9 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.date_proto, "getUTCMilliseconds", &nat_date_getms);
     def_method(vm, vm.date_proto, "toISOString", &nat_date_toiso);
     def_method(vm, vm.date_proto, "toJSON", &nat_date_toiso);
+    JsNative* date_tp = js_new_native(&vm.heap, &nat_date_toprimitive, "[Symbol.toPrimitive]");
+    props_set_desc(&vm.date_proto.props, vm_sym_to_primitive_id(vm),
+        value_cell(&date_tp.head), METHOD_ATTRS);
 
     // RegExp
     vm.regexp_proto = js_new_object(&vm.heap, vm.object_proto);
