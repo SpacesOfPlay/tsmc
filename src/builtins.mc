@@ -4213,6 +4213,155 @@ private Value nat_promise_race(void* vmp, Value callee, Value thisv, Value* args
     return p;
 }
 
+// Promise.allSettled: never rejects; each element records
+// { status, value|reason } and the result fulfills when all settle.
+private Value settled_record(VM* vm, Value callee, Value* args, i32 argc, bool fulfilled) {
+    JsNative* me = value_as_native(callee);
+    JsObject* st = value_as_object(me.env0);
+    i32 idx = value_as_int(me.env1);
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* rec = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&rec.head));
+    if fulfilled {
+        js_set_prop(rec, vm_atom(vm, "status"), new_str(vm, "fulfilled"));
+        js_set_prop(rec, vm_atom(vm, "value"), arg_at(args, argc, 0));
+    } else {
+        js_set_prop(rec, vm_atom(vm, "status"), new_str(vm, "rejected"));
+        js_set_prop(rec, vm_atom(vm, "reason"), arg_at(args, argc, 0));
+    }
+    Value resultsv;
+    ignore js_get_prop(st, vm_atom(vm, "results"), &resultsv);
+    js_array_set(value_as_object(resultsv), idx, value_cell(&rec.head));
+    Value remv;
+    ignore js_get_prop(st, vm_atom(vm, "remaining"), &remv);
+    i32 rem = value_as_int(remv) - 1;
+    js_set_prop(st, vm_atom(vm, "remaining"), value_int(rem));
+    if rem == 0 {
+        Value pv;
+        ignore js_get_prop(st, vm_atom(vm, "promise"), &pv);
+        gc_root(&vm.heap, pv);
+        vm_promise_settle(vm, pv, resultsv, false);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+private Value nat_settled_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return settled_record(as_vm(vmp), callee, args, argc, true);
+}
+private Value nat_settled_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return settled_record(as_vm(vmp), callee, args, argc, false);
+}
+
+// Rejects a Promise.any with an AggregateError over the collected reasons.
+private void any_reject_all(VM* vm, Value pv, Value errsv) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, pv);
+    gc_root(&vm.heap, errsv);
+    JsObject* agg = js_new_object(&vm.heap, vm.error_protos[ERR_ERROR]);
+    gc_root(&vm.heap, value_cell(&agg.head));
+    js_set_prop(agg, vm.atom_name, new_str(vm, "AggregateError"));
+    js_set_prop(agg, vm.atom_message, new_str(vm, "All promises were rejected"));
+    js_set_prop(agg, vm_atom(vm, "errors"), errsv);
+    vm_promise_settle(vm, pv, value_cell(&agg.head), true);
+    gc_root_reset(&vm.heap, rm);
+}
+
+private Value nat_any_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    JsObject* st = value_as_object(me.env0);
+    Value pv;
+    ignore js_get_prop(st, vm_atom(vm, "promise"), &pv);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, pv);
+    Value a = arg_at(args, argc, 0);
+    gc_root(&vm.heap, a);
+    vm_promise_settle(vm, pv, a, false);   // first fulfillment wins (idempotent)
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+private Value nat_any_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    JsObject* st = value_as_object(me.env0);
+    i32 idx = value_as_int(me.env1);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value errsv;
+    ignore js_get_prop(st, vm_atom(vm, "results"), &errsv);
+    js_array_set(value_as_object(errsv), idx, arg_at(args, argc, 0));
+    Value remv;
+    ignore js_get_prop(st, vm_atom(vm, "remaining"), &remv);
+    i32 rem = value_as_int(remv) - 1;
+    js_set_prop(st, vm_atom(vm, "remaining"), value_int(rem));
+    if rem == 0 {
+        Value pv;
+        ignore js_get_prop(st, vm_atom(vm, "promise"), &pv);
+        any_reject_all(vm, pv, errsv);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// Shared setup for allSettled/any: a state object over an array input,
+// wiring each element's promise to the given fulfill/reject natives.
+// `any` inverts the empty/settle semantics via `is_any`.
+private Value promise_combine(VM* vm, Value list, NativeFn onful, NativeFn onrej, bool is_any) {
+    if !value_is_array(list) {
+        vm_throw_error(vm, ERR_TYPE, "Promise combinator expects an array");
+        return value_undefined();
+    }
+    JsObject* items = value_as_object(list);
+    i32 n = items.elen;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    JsObject* st = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&st.head));
+    JsObject* results = js_new_array(&vm.heap, vm.array_proto);
+    js_array_set_length(results, n);
+    js_set_prop(st, vm_atom(vm, "results"), value_cell(&results.head));
+    js_set_prop(st, vm_atom(vm, "remaining"), value_int(n));
+    js_set_prop(st, vm_atom(vm, "promise"), p);
+    if n == 0 {
+        if is_any { any_reject_all(vm, p, value_cell(&results.head)); }
+        else { vm_promise_settle(vm, p, value_cell(&results.head), false); }
+        gc_root_reset(&vm.heap, rm);
+        return p;
+    }
+    for i32 i = 0; i < n; i++ {
+        Value ev = js_array_get(items, i);
+        Value evp;
+        if vm_is_promise(vm, ev) {
+            evp = ev;
+        } else {
+            evp = vm_promise_new(vm);
+            vm_push(vm, evp);
+            vm_promise_settle(vm, evp, ev, false);
+            vm_pop(vm);
+        }
+        vm_push(vm, evp);
+        JsNative* onf = js_new_native(&vm.heap, onful, "combine");
+        onf.env0 = value_cell(&st.head);
+        onf.env1 = value_int(i);
+        vm_push(vm, value_cell(&onf.head));
+        JsNative* onr = js_new_native(&vm.heap, onrej, "combine");
+        onr.env0 = value_cell(&st.head);
+        onr.env1 = value_int(i);
+        Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
+        ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
+        vm_pop(vm);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+private Value nat_promise_allsettled(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return promise_combine(as_vm(vmp), arg_at(args, argc, 0), &nat_settled_ful, &nat_settled_rej, false);
+}
+private Value nat_promise_any(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return promise_combine(as_vm(vmp), arg_at(args, argc, 0), &nat_any_ful, &nat_any_rej, true);
+}
+
 // --- timers ------------------------------------------------------------------------------
 
 private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5734,6 +5883,8 @@ void builtins_install(VM* vm) {
     def_static(vm, promise_ctor, "resolve", &nat_promise_resolve);
     def_static(vm, promise_ctor, "reject", &nat_promise_reject);
     def_static(vm, promise_ctor, "all", &nat_promise_all);
+    def_static(vm, promise_ctor, "allSettled", &nat_promise_allsettled);
+    def_static(vm, promise_ctor, "any", &nat_promise_any);
     def_static(vm, promise_ctor, "race", &nat_promise_race);
     def_method(vm, vm.promise_proto, "then", &nat_promise_then);
     def_method(vm, vm.promise_proto, "catch", &nat_promise_catch);
