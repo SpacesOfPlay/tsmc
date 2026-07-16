@@ -7,6 +7,9 @@ console.log(Math.round(2.5), Math.round(-2.5), Math.round(0.5), Math.round(-0.5)
 console.log(Math.hypot(3, 4), Math.log2(8), Math.log10(1000));
 console.log(Math.max(-Infinity, 5), Math.min(Infinity, 5));
 console.log(Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, Number.EPSILON > 0);
+console.log(Number.MAX_VALUE, Number.MIN_VALUE, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY);
+console.log(Number.MAX_VALUE + Number.MAX_VALUE, -Number.MIN_VALUE + Number.MIN_VALUE);
+console.log(Object.keys(Number).length, Number.MAX_VALUE + -0 === Number.MAX_VALUE);
 console.log((123.456).toFixed(2), (0).toFixed(2), (1.005).toFixed(2), (-1.5).toFixed(0));
 console.log(parseInt("FF", 16), parseInt("777", 8), parseInt("101", 2));
 console.log(Number("0b101"), Number("0o17"), Number("0xff"), Number("0B11"), Number("0O10"));

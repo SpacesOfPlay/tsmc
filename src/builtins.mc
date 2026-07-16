@@ -5003,6 +5003,12 @@ private void def_value(VM* vm, JsObject* obj, str name, Value v) {
     props_set_desc(&obj.props, bi_atom(vm, name), v, 0);
 }
 
+// Numeric constant on a constructor (e.g. Number.MAX_VALUE): same frozen
+// attributes as def_value, but the props live on a JsNative ctor.
+private void num_const(VM* vm, JsNative* ctor, str name, f64 v) {
+    props_set_desc(&ctor.props, bi_atom(vm, name), value_number(v), 0);
+}
+
 // Links a prototype back to its constructor (proto.constructor = ctor).
 private void link_ctor(VM* vm, JsObject* proto, JsNative* ctor) {
     props_set_desc(&proto.props, bi_atom(vm, "constructor"), value_cell(&ctor.head), METHOD_ATTRS);
@@ -5147,12 +5153,17 @@ void builtins_install(VM* vm) {
     def_static(vm, number_ctor, "isNaN", &nat_num_isnan);
     def_static(vm, number_ctor, "parseInt", &nat_parseint);
     def_static(vm, number_ctor, "parseFloat", &nat_parsefloat);
-    props_set(&number_ctor.props, bi_atom(vm, "MAX_SAFE_INTEGER"), value_number(9007199254740991.0));
-    props_set(&number_ctor.props, bi_atom(vm, "MIN_SAFE_INTEGER"), value_number(-9007199254740991.0));
-    props_set(&number_ctor.props, bi_atom(vm, "EPSILON"), value_number(2.220446049250313e-16));
-    props_set(&number_ctor.props, bi_atom(vm, "POSITIVE_INFINITY"), value_number(1.0e308 * 10.0));
-    props_set(&number_ctor.props, bi_atom(vm, "NEGATIVE_INFINITY"), value_number(-1.0e308 * 10.0));
-    props_set(&number_ctor.props, bi_atom(vm, "NaN"), value_number(0.0 / 0.0));
+    // Numeric constants: spec attributes are all off (non-writable,
+    // non-enumerable, non-configurable). MIN_VALUE is the smallest
+    // positive denormal double.
+    num_const(vm, number_ctor, "MAX_VALUE", 1.7976931348623157e+308);
+    num_const(vm, number_ctor, "MIN_VALUE", 5.0e-324);
+    num_const(vm, number_ctor, "MAX_SAFE_INTEGER", 9007199254740991.0);
+    num_const(vm, number_ctor, "MIN_SAFE_INTEGER", -9007199254740991.0);
+    num_const(vm, number_ctor, "EPSILON", 2.220446049250313e-16);
+    num_const(vm, number_ctor, "POSITIVE_INFINITY", 1.0e308 * 10.0);
+    num_const(vm, number_ctor, "NEGATIVE_INFINITY", -1.0e308 * 10.0);
+    num_const(vm, number_ctor, "NaN", 0.0 / 0.0);
     def_method(vm, vm.number_proto, "toFixed", &nat_num_tofixed);
     def_method(vm, vm.number_proto, "toString", &nat_num_tostring);
     def_method(vm, vm.number_proto, "toExponential", &nat_num_toexponential);
