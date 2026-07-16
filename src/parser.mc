@@ -157,6 +157,15 @@ private bool is_binding_ident(i32 k) {
     return k == TOK_IDENT || is_ctx_ident(k);
 }
 
+// A genuine reserved word — invalid where the grammar needs an Identifier
+// (BindingIdentifier / IdentifierReference) rather than an IdentifierName.
+// yield/await are contextual (valid identifiers in sloppy code), so they
+// are excluded here.
+private bool is_reserved_word(i32 k) {
+    return tok_is_keyword(k) && !is_ctx_ident(k)
+        && k != TOK_KW_YIELD && k != TOK_KW_AWAIT;
+}
+
 private bool is_assign_op(i32 k) {
     return k == TOK_EQ || k == TOK_PLUS_EQ || k == TOK_MINUS_EQ
         || k == TOK_STAR_EQ || k == TOK_SLASH_EQ || k == TOK_PERCENT_EQ
@@ -514,11 +523,14 @@ private Node* parse_binding(Parser* p) {
                 expect(p, TOK_COLON, "expected ':'");
                 pp.b = parse_binding(p);
             } else {
+                i32 keyk = p.cur.kind;
                 pp.a = prop_name(p);
                 if eat(p, TOK_COLON) {
                     pp.b = parse_binding(p);
                 } else {
                     pp.flags |= NF_SHORTHAND;
+                    // shorthand binds the key as an identifier
+                    if is_reserved_word(keyk) { perror(p, "unexpected reserved word"); }
                     Node* t = nnew(p, N_IDENT);
                     t.name = pp.a.name;
                     pp.b = t;
@@ -682,12 +694,14 @@ private Node* parse_object(Parser* p) {
             advance(p);
         }
         if eat(p, TOK_STAR) { fnflags |= NF_GENERATOR; }
+        i32 keyk = TOK_IDENT;
         if at(p, TOK_LBRACK) {
             advance(p);
             pr.a = parse_assign(p);
             expect(p, TOK_RBRACK, "expected ']'");
             pr.flags |= NF_COMPUTED;
         } else {
+            keyk = p.cur.kind;
             pr.a = prop_name(p);
         }
         if at(p, TOK_LPAREN) || at(p, TOK_LT) {
@@ -697,9 +711,12 @@ private Node* parse_object(Parser* p) {
         } else if eat(p, TOK_EQ) {
             // destructuring cover grammar: shorthand with default
             pr.flags |= NF_SHORTHAND;
+            // shorthand key is an IdentifierReference — not a reserved word
+            if is_reserved_word(keyk) { perror(p, "unexpected reserved word"); }
             pr.b = parse_assign(p);
         } else {
             pr.flags |= NF_SHORTHAND;
+            if is_reserved_word(keyk) { perror(p, "unexpected reserved word"); }
         }
         vec_push(&p.scratch, nfin(p, pr));
         if !eat(p, TOK_COMMA) { break; }
