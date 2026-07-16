@@ -22,13 +22,7 @@ Tier 2 (shares the ToPrimitive path with #2):
 
 5. **`Symbol.toPrimitive`** consulted first in ToPrimitive; **Date**
    default hint resolves to string.
-6. **Reflection over callables** — `getOwnPropertyDescriptor`,
-   `hasOwnProperty`/`Object.hasOwn`, `getOwnPropertyNames`, and
-   `Object.keys` only read a `JsObject`'s props, so every static on a
-   constructor/function (`Number.MAX_VALUE`, `Array.isArray`, …) is
-   invisible to reflection even though direct reads work. Surfaced while
-   landing #1. The VM already switches object/function/native for its
-   own prop access; the reflection builtins need the same.
+6. **Reflection over callables** — DONE (below).
 
 ---
 
@@ -143,3 +137,42 @@ shorthand position via `is_reserved_word` (yield/await stay contextual);
 fixes the equivalent plain-keyword cases. On the full tree the escape
 work is net-positive (361 positive escaped tests vs 256 negatives, now
 both correct); the `--limit 1500` window had over-sampled the negatives.
+
+---
+
+## 6. Reflection over callables — DONE
+
+`getOwnPropertyDescriptor`, `hasOwnProperty` / `Object.hasOwn`,
+`getOwnPropertyNames`, and `Object.keys` only read a `JsObject`'s props,
+so every static on a constructor/function (`Number.MAX_VALUE`,
+`Array.isArray`, …) was invisible to reflection even though direct reads
+worked.
+
+### Approach
+
+- `value_props(v)` returns the own-property table for an object,
+  function, or native (null for primitives), mirroring the VM's own
+  object/function/native switch. The four reflection builtins use it, so
+  a constructor's statics are now reachable; array index/length handling
+  stays gated on `value_is_object`.
+- A `reflect_key` helper resolves the key for `getOwnPropertyDescriptor`
+  and both `hasOwn` variants: Symbols map to their reserved id (so
+  `getOwnPropertyDescriptor(o, sym)` and `o.hasOwnProperty(sym)` work and
+  no longer throw via the #3 ToString path), everything else is ToString'd.
+- `getOwnPropertyNames` now includes non-enumerable own keys (its whole
+  point) while skipping symbols and the engine's `%`-internal slots
+  (so `%prim` never leaks); `Object.keys`/`vm_own_keys` gained callable
+  support too.
+- Constructor `prototype` was registered enumerable (`props_set`
+  default) at all 17 built-in ctors, and `ensure_prototype` and the class
+  compiler set it enumerable as well — so `Object.keys(C)` wrongly listed
+  `prototype`. All now install it non-enumerable (built-ins frozen; the
+  lazy/class paths writable-but-non-enumerable, matching a function's own
+  `.prototype`).
+
+### Not doing (documented)
+
+- **Function `length`/`name` own properties** — user functions and
+  classes don't materialize `length`/`name`, so
+  `getOwnPropertyNames(f)` omits them (Node lists both). Separate from
+  reflection-over-callables; the props simply don't exist yet.

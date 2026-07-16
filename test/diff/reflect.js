@@ -31,3 +31,19 @@ console.log(Object.getPrototypeOf(Derived) === Base, Object.getPrototypeOf(Deepe
 const sym = Symbol("tag");
 console.log(sym.toString(), sym.description, typeof sym);
 console.log(Symbol().toString(), Symbol().description, String(Symbol("z")));
+
+// reflection reaches a constructor's own statics (not just plain objects)
+console.log(Object.getOwnPropertyDescriptor(Number, "MAX_VALUE").value === Number.MAX_VALUE);
+console.log(Object.prototype.hasOwnProperty.call(Number, "isNaN"), Object.hasOwn(Array, "isArray"));
+console.log(Object.getOwnPropertyNames(Number).includes("MAX_VALUE"));
+console.log(Object.keys(Number).length, Object.keys(Array).length, Object.keys(Math).length > 0);
+// symbol keys through reflection (no throw)
+const k = Symbol("k");
+const withSym = { [k]: 7, plain: 8 };
+console.log(withSym.hasOwnProperty(k), Object.hasOwn(withSym, k));
+console.log(Object.getOwnPropertyDescriptor(withSym, k).value, Object.keys(withSym).length);
+// class/function prototype is a non-enumerable own property
+class K { static st() {} im() {} }
+console.log(Object.keys(K).length, Object.getOwnPropertyDescriptor(K, "prototype").enumerable);
+// internal wrapper slot never leaks
+console.log(Object.getOwnPropertyNames(new Number(5)).length, Object.keys(new Boolean(true)).length);

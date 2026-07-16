@@ -524,6 +524,17 @@ bool value_is_array(Value v) {
     return value_is_object(v) && (value_as_object(v).obj_flags & OBJF_ARRAY) != 0;
 }
 
+// Own-property table for any value that carries one: ordinary objects,
+// functions, and natives (constructors keep their statics here). Returns
+// null for primitives. Lets reflection reach a constructor's own
+// properties, which a value_is_object check alone would miss.
+PropList* value_props(Value v) {
+    if value_is_object(v)   { return &value_as_object(v).props; }
+    if value_is_function(v) { return &value_as_function(v).props; }
+    if value_is_native(v)   { return &value_as_native(v).props; }
+    return null;
+}
+
 // A constructor's return value counts as an object (replaces the new
 // instance) for anything that isn't a primitive: strings and symbols
 // are primitives, everything else on the heap is a reference.

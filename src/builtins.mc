@@ -274,10 +274,12 @@ private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&arr.head));
     Value ov = arg_at(args, argc, 0);
-    if value_is_object(ov) {
-        JsObject* o = value_as_object(ov);
+    PropList* props = value_props(ov);
+    bool is_arr = value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_ARRAY) != 0;
+    if props != null {
         i32 n = 0;
-        if (o.obj_flags & OBJF_ARRAY) != 0 {
+        if is_arr {
+            JsObject* o = value_as_object(ov);
             for i32 i = 0; i < o.elen; i++ {
                 if !js_array_has(o, i) { continue; }
                 string s = format("{}", i);
@@ -287,13 +289,17 @@ private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value
                 n++;
             }
         }
-        for i32 i = 0; i < o.props.len; i++ {
-            u32 key = (o.props.items + i).key;
+        // all own string keys, enumerable or not, minus symbols and the
+        // engine's %-internal slots
+        for i32 i = 0; i < props.len; i++ {
+            u32 key = (props.items + i).key;
             if (key & 0x80000000) != 0 { continue; }
-            js_array_set(arr, n, new_str(vm, atom_name(&vm.atoms, key)));
+            str nm = atom_name(&vm.atoms, key);
+            if nm.len > 0 && *(nm.data) == '%' { continue; }
+            js_array_set(arr, n, new_str(vm, nm));
             n++;
         }
-        if (o.obj_flags & OBJF_ARRAY) != 0 {
+        if is_arr {
             js_array_set(arr, n, new_str(vm, "length"));
         }
     }
@@ -414,23 +420,39 @@ private Value nat_object_defineproperties(void* vmp, Value callee, Value thisv, 
     return ov;
 }
 
+// Property-key value → atom for reflection APIs: Symbols map to their
+// reserved id, everything else is ToString'd. `sk` receives the string
+// form (for the array index/length checks); it is left empty for symbols.
+private u32 reflect_key(VM* vm, Value kv, str* sk) {
+    if value_is_symbol(kv) {
+        *sk = "";
+        return value_as_symbol(kv).id;
+    }
+    Value ks = js_to_string_value(vm, kv);
+    vm_push(vm, ks);
+    u32 a = atom_intern(&vm.atoms, sview(ks));
+    *sk = atom_name(&vm.atoms, a);
+    vm_pop(vm);
+    return a;
+}
+
 private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) { return value_undefined(); }
-    JsObject* o = value_as_object(ov);
+    PropList* props = value_props(ov);
+    if props == null { return value_undefined(); }
     i32 rm = gc_root_mark(&vm.heap);
-    Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
-    gc_root(&vm.heap, kv);
-    str kname = sview(kv);
-    u32 key = atom_intern(&vm.atoms, kname);
+    str kname;
+    u32 key = reflect_key(vm, arg_at(args, argc, 1), &kname);
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
 
     // array index / length live outside the property table
-    if (o.obj_flags & OBJF_ARRAY) != 0 {
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_ARRAY) != 0 {
+        JsObject* o = value_as_object(ov);
         bool is_len = str_equal(kname, "length");
         i32 idx = -1;
-        if !is_len {
-            f64 nv = js_to_number(kv);
+        if !is_len && kname.len > 0 {
+            f64 nv = js_string_to_number(kname);
             i32 ni = cast(i32, nv);
             if cast(f64, ni) == nv && ni >= 0 && ni < o.elen { idx = ni; }
         }
@@ -447,7 +469,7 @@ private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Va
         }
     }
 
-    Prop* pe = props_entry(&o.props, key);
+    Prop* pe = props_entry(props, key);
     if pe == null {
         gc_root_reset(&vm.heap, rm);
         return value_undefined();
@@ -537,18 +559,17 @@ private Value nat_object_isextensible(void* vmp, Value callee, Value thisv, Valu
 
 private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    if !value_is_object(thisv) { return value_bool(false); }
-    JsObject* o = value_as_object(thisv);
+    PropList* props = value_props(thisv);
+    if props == null { return value_bool(false); }
     Value kv = arg_at(args, argc, 0);
-    if (o.obj_flags & OBJF_ARRAY) != 0 && value_is_int(kv) {
-        return value_bool(js_array_has(o, value_as_int(kv)));
+    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_ARRAY) != 0
+            && value_is_int(kv) {
+        return value_bool(js_array_has(value_as_object(thisv), value_as_int(kv)));
     }
-    i32 rm = gc_root_mark(&vm.heap);
-    Value ks = js_to_string_value(vm, kv);
-    gc_root(&vm.heap, ks);
-    u32 a = bi_atom(vm, sview(ks));
-    gc_root_reset(&vm.heap, rm);
-    return value_bool(props_get(&o.props, a) != null);
+    str sk;
+    u32 a = reflect_key(vm, kv, &sk);
+    if vm.has_pending { return value_bool(false); }
+    return value_bool(props_get(props, a) != null);
 }
 
 private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2087,18 +2108,17 @@ private Value nat_object_is(void* vmp, Value callee, Value thisv, Value* args, i
 private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) { return value_bool(false); }
-    JsObject* o = value_as_object(ov);
+    PropList* props = value_props(ov);
+    if props == null { return value_bool(false); }
     Value kv = arg_at(args, argc, 1);
-    if (o.obj_flags & OBJF_ARRAY) != 0 && value_is_int(kv) {
-        return value_bool(js_array_has(o, value_as_int(kv)));
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_ARRAY) != 0
+            && value_is_int(kv) {
+        return value_bool(js_array_has(value_as_object(ov), value_as_int(kv)));
     }
-    i32 rm = gc_root_mark(&vm.heap);
-    Value ks = js_to_string_value(vm, kv);
-    gc_root(&vm.heap, ks);
-    u32 a = bi_atom(vm, sview(ks));
-    gc_root_reset(&vm.heap, rm);
-    return value_bool(props_entry(&o.props, a) != null);
+    str sk;
+    u32 a = reflect_key(vm, kv, &sk);
+    if vm.has_pending { return value_bool(false); }
+    return value_bool(props_entry(props, a) != null);
 }
 
 // --- Number / Boolean ------------------------------------------------------------
@@ -5127,7 +5147,7 @@ void builtins_install(VM* vm) {
 
     // Object
     JsNative* object_ctor = def_global_fn(vm, "Object", &nat_object_ctor);
-    props_set(&object_ctor.props, vm.atom_prototype, value_cell(&vm.object_proto.head));
+    props_set_desc(&object_ctor.props, vm.atom_prototype, value_cell(&vm.object_proto.head), 0);
     def_static(vm, object_ctor, "keys", &nat_object_keys);
     def_static(vm, object_ctor, "values", &nat_object_values);
     def_static(vm, object_ctor, "entries", &nat_object_entries);
@@ -5153,7 +5173,7 @@ void builtins_install(VM* vm) {
 
     // Array
     JsNative* array_ctor = def_global_fn(vm, "Array", &nat_array_ctor);
-    props_set(&array_ctor.props, vm.atom_prototype, value_cell(&vm.array_proto.head));
+    props_set_desc(&array_ctor.props, vm.atom_prototype, value_cell(&vm.array_proto.head), 0);
     def_static(vm, array_ctor, "isArray", &nat_array_isarray);
     def_static(vm, array_ctor, "of", &nat_array_of);
     def_static(vm, array_ctor, "from", &nat_array_from);
@@ -5195,7 +5215,7 @@ void builtins_install(VM* vm) {
 
     // String
     JsNative* string_ctor = def_global_fn(vm, "String", &nat_string_ctor);
-    props_set(&string_ctor.props, vm.atom_prototype, value_cell(&vm.string_proto.head));
+    props_set_desc(&string_ctor.props, vm.atom_prototype, value_cell(&vm.string_proto.head), 0);
     def_static(vm, string_ctor, "fromCharCode", &nat_string_fromcharcode);
     def_static(vm, string_ctor, "fromCodePoint", &nat_string_fromcodepoint);
     def_static(vm, string_ctor, "raw", &nat_string_raw);
@@ -5236,7 +5256,7 @@ void builtins_install(VM* vm) {
 
     // Number / Boolean
     JsNative* number_ctor = def_global_fn(vm, "Number", &nat_number_ctor);
-    props_set(&number_ctor.props, vm.atom_prototype, value_cell(&vm.number_proto.head));
+    props_set_desc(&number_ctor.props, vm.atom_prototype, value_cell(&vm.number_proto.head), 0);
     def_static(vm, number_ctor, "isInteger", &nat_num_isinteger);
     def_static(vm, number_ctor, "isFinite", &nat_num_isfinite);
     def_static(vm, number_ctor, "isSafeInteger", &nat_num_issafeinteger);
@@ -5262,7 +5282,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.number_proto, "valueOf", &nat_num_valueof);
 
     JsNative* boolean_ctor = def_global_fn(vm, "Boolean", &nat_boolean_ctor);
-    props_set(&boolean_ctor.props, vm.atom_prototype, value_cell(&vm.boolean_proto.head));
+    props_set_desc(&boolean_ctor.props, vm.atom_prototype, value_cell(&vm.boolean_proto.head), 0);
     def_method(vm, vm.boolean_proto, "valueOf", &nat_bool_valueof);
     def_method(vm, vm.boolean_proto, "toString", &nat_bool_tostring);
 
@@ -5326,15 +5346,15 @@ void builtins_install(VM* vm) {
 
     // Errors
     JsNative* err_ctor = def_global_fn(vm, "Error", &nat_error_ctor);
-    props_set(&err_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_ERROR].head));
+    props_set_desc(&err_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_ERROR].head), 0);
     JsNative* te_ctor = def_global_fn(vm, "TypeError", &nat_typeerror_ctor);
-    props_set(&te_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_TYPE].head));
+    props_set_desc(&te_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_TYPE].head), 0);
     JsNative* re_ctor = def_global_fn(vm, "RangeError", &nat_rangeerror_ctor);
-    props_set(&re_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_RANGE].head));
+    props_set_desc(&re_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_RANGE].head), 0);
     JsNative* fe_ctor = def_global_fn(vm, "ReferenceError", &nat_referror_ctor);
-    props_set(&fe_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_REF].head));
+    props_set_desc(&fe_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_REF].head), 0);
     JsNative* se_ctor = def_global_fn(vm, "SyntaxError", &nat_syntaxerror_ctor);
-    props_set(&se_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_SYNTAX].head));
+    props_set_desc(&se_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_SYNTAX].head), 0);
     for i32 i = 0; i < 5; i++ {
         JsObject* ep = vm.error_protos[i];
         Value nm = new_str(vm, vm_error_kind_name(i));
@@ -5359,7 +5379,7 @@ void builtins_install(VM* vm) {
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
     vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
-    props_set(&symbol_ctor.props, vm.atom_prototype, value_cell(&vm.symbol_proto.head));
+    props_set_desc(&symbol_ctor.props, vm.atom_prototype, value_cell(&vm.symbol_proto.head), 0);
     def_method(vm, vm.symbol_proto, "toString", &nat_symbol_tostring);
     def_method(vm, vm.symbol_proto, "valueOf", &nat_symbol_valueof);
     def_accessor(vm, vm.symbol_proto, "description", &nat_symbol_description);
@@ -5368,7 +5388,7 @@ void builtins_install(VM* vm) {
     // BigInt
     JsNative* bigint_ctor = def_global_fn(vm, "BigInt", &nat_bigint_ctor);
     vm.bigint_proto = js_new_object(&vm.heap, vm.object_proto);
-    props_set(&bigint_ctor.props, vm.atom_prototype, value_cell(&vm.bigint_proto.head));
+    props_set_desc(&bigint_ctor.props, vm.atom_prototype, value_cell(&vm.bigint_proto.head), 0);
     def_method(vm, vm.bigint_proto, "toString", &nat_bigint_tostring);
     def_method(vm, vm.bigint_proto, "valueOf", &nat_bigint_valueof);
     def_method(vm, vm.bigint_proto, "toLocaleString", &nat_bigint_tostring);
@@ -5392,7 +5412,7 @@ void builtins_install(VM* vm) {
     // Promise
     vm.promise_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* promise_ctor = def_global_fn(vm, "Promise", &nat_promise_ctor);
-    props_set(&promise_ctor.props, vm.atom_prototype, value_cell(&vm.promise_proto.head));
+    props_set_desc(&promise_ctor.props, vm.atom_prototype, value_cell(&vm.promise_proto.head), 0);
     def_static(vm, promise_ctor, "resolve", &nat_promise_resolve);
     def_static(vm, promise_ctor, "reject", &nat_promise_reject);
     def_static(vm, promise_ctor, "all", &nat_promise_all);
@@ -5404,7 +5424,7 @@ void builtins_install(VM* vm) {
     // Map
     vm.map_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* map_ctor = def_global_fn(vm, "Map", &nat_map_ctor);
-    props_set(&map_ctor.props, vm.atom_prototype, value_cell(&vm.map_proto.head));
+    props_set_desc(&map_ctor.props, vm.atom_prototype, value_cell(&vm.map_proto.head), 0);
     def_method(vm, vm.map_proto, "set", &nat_map_set);
     def_method(vm, vm.map_proto, "get", &nat_map_get);
     def_method(vm, vm.map_proto, "has", &nat_map_has);
@@ -5421,7 +5441,7 @@ void builtins_install(VM* vm) {
     // Set
     vm.set_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* set_ctor = def_global_fn(vm, "Set", &nat_set_ctor);
-    props_set(&set_ctor.props, vm.atom_prototype, value_cell(&vm.set_proto.head));
+    props_set_desc(&set_ctor.props, vm.atom_prototype, value_cell(&vm.set_proto.head), 0);
     def_method(vm, vm.set_proto, "add", &nat_set_add);
     def_method(vm, vm.set_proto, "has", &nat_map_has);
     def_method(vm, vm.set_proto, "delete", &nat_map_delete);
@@ -5437,7 +5457,7 @@ void builtins_install(VM* vm) {
     // Date
     vm.date_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* date_ctor = def_global_fn(vm, "Date", &nat_date_ctor);
-    props_set(&date_ctor.props, vm.atom_prototype, value_cell(&vm.date_proto.head));
+    props_set_desc(&date_ctor.props, vm.atom_prototype, value_cell(&vm.date_proto.head), 0);
     def_static(vm, date_ctor, "now", &nat_date_now);
     def_static(vm, date_ctor, "UTC", &nat_date_utc);
     def_method(vm, vm.date_proto, "getTime", &nat_date_gettime);
@@ -5465,7 +5485,7 @@ void builtins_install(VM* vm) {
     // RegExp
     vm.regexp_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* regexp_ctor = def_global_fn(vm, "RegExp", &nat_regexp_ctor);
-    props_set(&regexp_ctor.props, vm.atom_prototype, value_cell(&vm.regexp_proto.head));
+    props_set_desc(&regexp_ctor.props, vm.atom_prototype, value_cell(&vm.regexp_proto.head), 0);
     def_method(vm, vm.regexp_proto, "test", &nat_regexp_test);
     def_method(vm, vm.regexp_proto, "exec", &nat_regexp_exec);
     def_method(vm, vm.regexp_proto, "toString", &nat_regexp_tostring);

@@ -720,7 +720,9 @@ private Value ensure_prototype(VM* vm, Value fnv) {
     JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
     if value_is_function(fnv) { props = &value_as_function(fnv).props; }
     if value_is_native(fnv) { props = &value_as_native(fnv).props; }
-    props_set(props, vm.atom_prototype, value_cell(&pr.head));
+    // .prototype is writable but never enumerated (matches a function's
+    // own prototype descriptor).
+    props_set_desc(props, vm.atom_prototype, value_cell(&pr.head), PROP_WRITABLE);
     return value_cell(&pr.head);
 }
 
@@ -2611,21 +2613,22 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&arr.head));
     i32 n = 0;
-    if value_is_object(objv) {
+    if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
         JsObject* o = value_as_object(objv);
-        if (o.obj_flags & OBJF_ARRAY) != 0 {
-            for i32 i = 0; i < o.elen; i++ {
-                if !js_array_has(o, i) { continue; }   // holes are not keys
-                string s = format("{}", i);
-                GcString* g = gc_new_string(&vm.heap, s);
-                free(s);
-                js_array_set(arr, n, value_cell(&g.head));
-                n++;
-            }
+        for i32 i = 0; i < o.elen; i++ {
+            if !js_array_has(o, i) { continue; }   // holes are not keys
+            string s = format("{}", i);
+            GcString* g = gc_new_string(&vm.heap, s);
+            free(s);
+            js_array_set(arr, n, value_cell(&g.head));
+            n++;
         }
-        for i32 i = 0; i < o.props.len; i++ {
-            if !prop_enumerable(vm, o.props.items + i) { continue; }
-            u32 pk = (o.props.items + i).key;
+    }
+    PropList* props = value_props(objv);
+    if props != null {
+        for i32 i = 0; i < props.len; i++ {
+            if !prop_enumerable(vm, props.items + i) { continue; }
+            u32 pk = (props.items + i).key;
             GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, pk));
             js_array_set(arr, n, value_cell(&g.head));
             n++;
