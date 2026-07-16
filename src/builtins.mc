@@ -1331,10 +1331,42 @@ private Value nat_arr_tosorted(void* vmp, Value callee, Value thisv, Value* args
 
 // --- String -------------------------------------------------------------------
 
+// Internal slot for a primitive-wrapper object's boxed value
+// ([[NumberData]] / [[BooleanData]] / [[StringData]]). The '%' prefix
+// keeps it out of enumeration and reflection.
+private void set_wrapped_prim(VM* vm, JsObject* o, Value p) {
+    props_set_desc(&o.props, bi_atom(vm, "%prim"), p, 0);
+}
+
+// If v is a wrapper object carrying a boxed primitive, returns it via out.
+private bool wrapped_prim(VM* vm, Value v, Value* out) {
+    if !value_is_object(v) { return false; }
+    Value* p = props_get(&value_as_object(v).props, bi_atom(vm, "%prim"));
+    if p == null { return false; }
+    *out = *p;
+    return true;
+}
+
+// Numeric this for Number.prototype methods: the number itself, or a
+// Number wrapper's boxed value. NaN for anything else (loose callers).
+private f64 num_this(VM* vm, Value thisv) {
+    if value_is_number(thisv) { return js_to_number(thisv); }
+    Value p;
+    if wrapped_prim(vm, thisv, &p) && value_is_number(p) { return js_to_number(p); }
+    return js_to_number(thisv);
+}
+
 private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    if argc == 0 { return new_str(vm, ""); }
-    return js_to_string_value(vm, *(args));
+    Value p = argc == 0 ? new_str(vm, "") : js_to_string_value(vm, *(args));
+    // new String(x): box the primitive on the fresh instance.
+    if value_is_object(thisv) {
+        JsObject* o = value_as_object(thisv);
+        set_wrapped_prim(vm, o, p);
+        props_set_desc(&o.props, bi_atom(vm, "length"), value_int(value_as_string(p).u16len), 0);
+        return thisv;
+    }
+    return p;
 }
 
 // Each argument is a UTF-16 code unit (ToUint16). Adjacent high+low
@@ -1922,7 +1954,12 @@ private Value nat_str_replaceall(void* vmp, Value callee, Value thisv, Value* ar
 }
 
 private Value nat_str_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return js_to_string_value(as_vm(vmp), thisv);
+    VM* vm = as_vm(vmp);
+    if value_is_string(thisv) { return thisv; }
+    Value p;
+    if wrapped_prim(vm, thisv, &p) && value_is_string(p) { return p; }
+    vm_throw_error(vm, ERR_TYPE, "String.prototype.toString requires that 'this' be a String");
+    return value_undefined();
 }
 
 private Value nat_str_concat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2054,14 +2091,47 @@ private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* arg
 // --- Number / Boolean ------------------------------------------------------------
 
 private Value nat_number_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    if argc == 0 { return value_int(0); }
-    Value x = *(args);
-    if value_is_bigint(x) { return js_number_value(bn_to_f64(bigint_view(value_as_bigint(x)))); }
-    return js_number_value(js_to_number(x));
+    VM* vm = as_vm(vmp);
+    Value p;
+    if argc == 0 {
+        p = value_int(0);
+    } else {
+        Value x = *(args);
+        if value_is_bigint(x) { p = js_number_value(bn_to_f64(bigint_view(value_as_bigint(x)))); }
+        else { p = js_number_value(js_to_number(x)); }
+    }
+    if value_is_object(thisv) { set_wrapped_prim(vm, value_as_object(thisv), p); return thisv; }
+    return p;
 }
 
 private Value nat_boolean_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return value_bool(js_truthy(arg_at(args, argc, 0)));
+    VM* vm = as_vm(vmp);
+    Value p = value_bool(js_truthy(arg_at(args, argc, 0)));
+    if value_is_object(thisv) { set_wrapped_prim(vm, value_as_object(thisv), p); return thisv; }
+    return p;
+}
+
+private Value nat_bool_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if value_is_bool(thisv) { return thisv; }
+    Value p;
+    if wrapped_prim(vm, thisv, &p) && value_is_bool(p) { return p; }
+    vm_throw_error(vm, ERR_TYPE, "Boolean.prototype.valueOf requires that 'this' be a Boolean");
+    return value_undefined();
+}
+
+private Value nat_bool_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value b = thisv;
+    if !value_is_bool(thisv) {
+        Value p;
+        if wrapped_prim(vm, thisv, &p) && value_is_bool(p) { b = p; }
+        else {
+            vm_throw_error(vm, ERR_TYPE, "Boolean.prototype.toString requires that 'this' be a Boolean");
+            return value_undefined();
+        }
+    }
+    return new_str(vm, value_is_true(b) ? "true" : "false");
 }
 
 private Value nat_num_isinteger(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2404,7 +2474,7 @@ private Value nat_parsefloat(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    f64 v = js_to_number(thisv);
+    f64 v = num_this(vm, thisv);
     i32 d = to_int_arg(arg_at(args, argc, 0));
     if d < 0 { d = 0; }
     if d > 20 { d = 20; }
@@ -2447,16 +2517,17 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    f64 nval = num_this(vm, thisv);
     i32 radix = argc > 0 && !value_is_undefined(*(args)) ? to_int_arg(*(args)) : 10;
     if radix == 10 {
-        return js_to_string_value(vm, thisv);
+        return js_to_string_value(vm, js_number_value(nval));
     }
     if radix < 2 || radix > 36 {
         vm_throw_error(vm, ERR_RANGE, "radix must be between 2 and 36");
         return value_undefined();
     }
     // integer part only for non-decimal radixes
-    f64 v = js_to_number(thisv);
+    f64 v = nval;
     if v != v { return new_str(vm, "NaN"); }
     bool neg = v < 0.0;
     i64 iv = cast(i64, fabs(v));
@@ -2528,12 +2599,17 @@ private i32 decimal_sig(f64 av, i32 sig, u8* digits) {
 }
 
 private Value nat_num_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return js_number_value(js_to_number(thisv));
+    VM* vm = as_vm(vmp);
+    if value_is_number(thisv) { return thisv; }
+    Value p;
+    if wrapped_prim(vm, thisv, &p) && value_is_number(p) { return p; }
+    vm_throw_error(vm, ERR_TYPE, "Number.prototype.valueOf requires that 'this' be a Number");
+    return value_undefined();
 }
 
 private Value nat_num_toexponential(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    f64 v = js_to_number(thisv);
+    f64 v = num_this(vm, thisv);
     f64 inf = 1.0e308 * 10.0;
     if v != v { return new_str(vm, "NaN"); }
     if v == inf { return new_str(vm, "Infinity"); }
@@ -2585,8 +2661,8 @@ private Value nat_num_toexponential(void* vmp, Value callee, Value thisv, Value*
 private Value nat_num_toprecision(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value pv = arg_at(args, argc, 0);
-    if value_is_undefined(pv) { return js_to_string_value(vm, thisv); }
-    f64 v = js_to_number(thisv);
+    f64 v = num_this(vm, thisv);
+    if value_is_undefined(pv) { return js_to_string_value(vm, js_number_value(v)); }
     f64 inf = 1.0e308 * 10.0;
     if v != v { return new_str(vm, "NaN"); }
     if v == inf { return new_str(vm, "Infinity"); }
@@ -2653,7 +2729,7 @@ private Value nat_num_toprecision(void* vmp, Value callee, Value thisv, Value* a
 // Basic en-US locale: thousands grouping, up to 3 fraction digits.
 private Value nat_num_tolocalestring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    f64 v = js_to_number(thisv);
+    f64 v = num_this(vm, thisv);
     f64 inf = 1.0e308 * 10.0;
     if v != v { return new_str(vm, "NaN"); }
     if v == inf { return new_str(vm, "\xe2\x88\x9e"); }
@@ -5173,6 +5249,8 @@ void builtins_install(VM* vm) {
 
     JsNative* boolean_ctor = def_global_fn(vm, "Boolean", &nat_boolean_ctor);
     props_set(&boolean_ctor.props, vm.atom_prototype, value_cell(&vm.boolean_proto.head));
+    def_method(vm, vm.boolean_proto, "valueOf", &nat_bool_valueof);
+    def_method(vm, vm.boolean_proto, "toString", &nat_bool_tostring);
 
     // Math
     JsObject* math_obj = js_new_object(&vm.heap, vm.object_proto);

@@ -47,3 +47,37 @@ registered writable/enumerable/configurable.
 - Register all eight numeric constants with attributes `{ writable:
   false, enumerable: false, configurable: false }` (flags = 0) to match
   the spec, via a small local helper.
+
+Cleared 5 of 27 test262 addition-area failures.
+
+---
+
+## 2. Primitive wrapper objects — DONE
+
+`new Number(1)`, `new Boolean(true)`, `new String("hi")` produced an
+object with the right prototype but never boxed the primitive, so
+`valueOf()` was `NaN`, coercion gave `[object Object]`, and Boolean had
+no prototype `valueOf`/`toString` at all.
+
+### Approach — internal `%prim` slot
+
+- Wrapper ctors detect construct mode (`this` is the fresh object) and
+  box the computed primitive under the internal key `%prim` (the `%`
+  prefix keeps it out of enumeration and reflection); a plain call still
+  returns the primitive. `new String` also sets a frozen `length`.
+- `Number`/`Boolean`/`String` `.prototype.valueOf`/`.toString` unwrap
+  `%prim` (fast-path the matching primitive, else `TypeError`). The
+  `num_this` helper feeds `toFixed`/`toExponential`/`toPrecision`/
+  `toLocaleString`. `ToPrimitive` (which drives `+`, template literals,
+  `String()`) then works unchanged because it already calls
+  `valueOf`/`toString` on the object.
+
+Cleared 10 more addition-area failures (22 → 12).
+
+### Not doing (documented)
+
+- **String exotic indexing** — `new String("hi")[0]`, index enumeration,
+  and `Object.keys` over a String wrapper (integer-indexed char access on
+  the wrapper object). Separate exotic-object behavior.
+- **`JSON.stringify` of wrappers** — `JSON.stringify(new Number(5))`
+  should serialize `5`, not `{}`. Lives in the JSON serializer.

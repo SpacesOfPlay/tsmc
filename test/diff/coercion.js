@@ -16,3 +16,10 @@ console.log(Boolean(""), Boolean("false"), Boolean(0), Boolean(NaN), Boolean([])
 console.log([3, 1, 10, 2].sort().join(","));
 console.log(["b", "a", "c"].sort().join(","));
 console.log([10, 9, 8, 100, 1].sort().join(","));
+// primitive-wrapper objects unwrap via valueOf/toString
+console.log(new Number(1) + 1, new Number(2) * 3, new Number(5).valueOf());
+console.log(new Boolean(true) + "", new Boolean(false).valueOf(), (true).toString());
+console.log(new String("hi").length, new String("ab").toUpperCase(), new String("x") + "y");
+console.log(`${new Number(7)}-${new Boolean(true)}`, new Number(255).toString(16));
+console.log(new Number(5) == 5, new Number(5) === 5, new String("a") == "a");
+console.log(typeof new Number(1), new Number(3).toFixed(2), (9).valueOf());
