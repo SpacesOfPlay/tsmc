@@ -1,0 +1,4 @@
+caught: real
+pos caught-boom
+finally: true
+done

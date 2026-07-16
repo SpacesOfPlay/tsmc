@@ -13,26 +13,35 @@ const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
 
 private void print_usage() {
-    print("usage: tsmc <script.ts>\n");
+    print("usage: tsmc [--gc-stress] <script.ts>\n");
     print("       tsmc --version\n");
 }
 
 i32 main() {
-    if get_argc() != 2 {
+    // Optional flags precede the script path.
+    bool gc_stress = false;
+    i32 i = 1;
+    while i < get_argc() {
+        str a = str_from_cstr(get_arg(i));
+        if str_equal(a, "--version") {
+            print("tsmc 0.1.0-dev\n");
+            return EXIT_OK;
+        }
+        if str_equal(a, "--help") || str_equal(a, "-h") {
+            print_usage();
+            return EXIT_OK;
+        }
+        // collect-on-every-allocation; a slow but thorough check for
+        // use-after-free / missing GC roots.
+        if str_equal(a, "--gc-stress") { gc_stress = true; i++; continue; }
+        break;
+    }
+    if i != get_argc() - 1 {
         print_usage();
         return EXIT_USAGE;
     }
 
-    str arg = str_from_cstr(get_arg(1));
-
-    if str_equal(arg, "--version") {
-        print("tsmc 0.1.0-dev\n");
-        return EXIT_OK;
-    }
-    if str_equal(arg, "--help") || str_equal(arg, "-h") {
-        print_usage();
-        return EXIT_OK;
-    }
+    str arg = str_from_cstr(get_arg(i));
 
     FileData src = file_read(arg);
     if src.data == null {
@@ -47,6 +56,7 @@ i32 main() {
 
     VM m;
     vm_init(&m);
+    m.heap.stress = gc_stress;
     builtins_install(&m);
     i32 status = module_run_entry(&m, source, arg);
     vm_destroy(&m);

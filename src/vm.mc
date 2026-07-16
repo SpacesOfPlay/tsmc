@@ -2020,6 +2020,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.is_ctor && !value_is_reference(res) { res = fr.this_val; }
                 vm.sp = fr.base - 2;
                 vpush(vm, res);
+                // A return inside a try leaves that try's handler open;
+                // drop every handler still belonging to this frame so a
+                // later throw doesn't unwind into the dead frame.
+                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                    vm.hp--;
+                }
                 vm.fp--;
                 if vm.fp < stop_fp { return 0; }
                 Frame* popped = vm.frames + vm.fp;
