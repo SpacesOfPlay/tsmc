@@ -10,7 +10,7 @@ percentage. Gaps found by probing common idioms against Node:
 - **Async completeness** — DONE. `Promise.allSettled`, `Promise.any`,
   and `for await…of` (§3).
 - **JSON.parse reviver** — DONE (§4).
-- **Regex** — lookbehind and the `/u` flag are unsupported.
+- **Regex** — DONE (§6): lookbehind and a `/u` subset.
 - **WeakMap / WeakSet** — DONE (§5).
 - Lower ROI / bigger surface: `Intl`, Node globals (`process`, `fs`,
   `Buffer`), `TextEncoder`/`TextDecoder`, `Object.groupBy`.
@@ -157,3 +157,35 @@ a flag).
 Functional behavior is identical to Node; the ephemeron marking (values
 kept alive only by a live key, including chains) is exercised under
 `--gc-stress`. Diff test `test/diff/weak.js`.
+
+---
+
+## 6. Regex: lookbehind + /u flag — DONE
+
+### Lookbehind — `(?<=...)` / `(?<!...)`
+
+Parsed into `RN_LOOKBEHIND` (distinct from named groups), compiled to
+`I_BEHIND_BEGIN`/`I_BEHIND_DONE`. The forward backtracker treats a
+lookbehind as "the body matches some span ending exactly at the anchor":
+`I_BEHIND_DONE` succeeds only at the recorded target position, and
+`I_BEHIND_BEGIN` scans candidate starts earliest-first (longest span =
+greedy right-to-left) up to the anchor, bounded by the body's max byte
+length (`rx_max_len`). Captures inside a positive lookbehind are kept.
+Matches Node across positive/negative, variable-length, alternation,
+captures-in-lookbehind, at-start, and lookbehind+lookahead.
+
+### /u flag (subset)
+
+In `/u` mode the parser decodes whole code points: `\u{...}` escapes,
+`\uXXXX` surrogate pairs, and astral literals become one atom (their UTF-8
+byte sequence, so quantifiers cover the code point), and `.` consumes a
+full UTF-8 sequence. `\uXXXX` outside `/u` now also encodes to UTF-8
+(fixes BMP escapes, previously truncated to a low byte).
+
+### Not doing (documented)
+
+- **Property escapes** (`\p{...}`) — need large Unicode tables; rejected
+  as a SyntaxError rather than silently mismatching.
+- **Astral ranges in character classes** — the class matcher stays
+  byte-oriented.
+- **Non-`/u` `.`** counts bytes, not UTF-16 code units.
