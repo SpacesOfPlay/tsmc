@@ -5691,6 +5691,16 @@ private void def_static(VM* vm, JsNative* ctor, str name, NativeFn f) {
     props_set_desc(&ctor.props, bi_atom(vm, name), value_cell(&m.head), METHOD_ATTRS);
 }
 
+// Installs the entry file's __filename / __dirname as global bindings.
+// These are entry-scoped, not per-module: imported modules see the entry
+// file's paths (documented in doc/PLAN_M16_node_globals.md). Set after
+// builtins_install, so they are not part of the globalThis snapshot,
+// matching Node (where they are module-local, not globalThis properties).
+void builtins_set_entry(VM* vm, str filename, str dirname) {
+    vm_set_global(vm, "__filename", new_str(vm, filename));
+    vm_set_global(vm, "__dirname", new_str(vm, dirname));
+}
+
 // Constants (e.g. Math.PI): non-writable, non-enumerable, non-configurable.
 private void def_value(VM* vm, JsObject* obj, str name, Value v) {
     props_set_desc(&obj.props, bi_atom(vm, name), v, 0);

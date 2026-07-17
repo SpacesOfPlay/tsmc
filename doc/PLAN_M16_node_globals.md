@@ -20,7 +20,7 @@ round-trips) plus targeted probes, not byte-equality with Node.
    latin1)`, indexing, `length`, `slice`, `write`, `equals`. **DONE.**
 3. **`TextEncoder` / `TextDecoder`** — UTF-8 encode/decode over the
    existing WTF-8 machinery. **DONE.**
-4. **`__dirname` / `__filename`** — module-local bindings.
+4. **`__dirname` / `__filename`** — module-local bindings. **DONE.**
 
 ## 1. process — DONE
 
@@ -120,3 +120,21 @@ clean under `--gc-stress`.
   `gbk`, `utf-16`) — only UTF-8 and latin1 are handled.
 - **`decode` of a plain `Array`** works here; Node requires an
   ArrayBufferView (Buffer/typed array).
+
+## 4. __dirname / __filename — DONE
+
+Installed as global bindings for the entry file: `__filename` is its
+absolute path, `__dirname` the containing directory (no trailing
+separator). The path is canonicalized (`canon_path`), with the Windows
+`\\?\` prefix stripped, so the value is byte-identical to Node's. Set
+after the globalThis snapshot, so — like Node — they are ordinary
+identifiers, not `globalThis` properties. Golden test `test/run/dirname.ts`
+asserts the shape and the `__dirname`/`__filename` relationship.
+
+### Not doing (documented)
+
+- **Per-module scoping** — the bindings are entry-scoped; an imported
+  module sees the *entry* file's `__dirname`/`__filename`, not its own
+  (true per-module values would need compiler-level module locals). Node
+  CommonJS gives each module its own; Node ESM has neither (it uses
+  `import.meta.url`), so tsmc is more permissive by always providing them.

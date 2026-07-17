@@ -18,6 +18,7 @@ import value;
 import gc;
 import object;
 import vm;
+import builtins;
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -406,8 +407,29 @@ private bool has_module_syntax(str src) {
     return found;
 }
 
+// Drops the Windows \\?\ prefix that GetFinalPathNameByHandle prepends.
+private str strip_unc(str p) {
+    if p.len >= 4 && *(p.data) == '\\' && *(p.data + 1) == '\\'
+        && *(p.data + 2) == '?' && *(p.data + 3) == '\\' {
+        str r;
+        r.data = p.data + 4;
+        r.len = p.len - 4;
+        return r;
+    }
+    return p;
+}
+
 // CLI entry: module graph if the file uses import/export, else script.
 i32 module_run_entry(VM* vm, str src, str path) {
+    // __filename / __dirname for the entry file (absolute, entry-scoped).
+    str fname = canon_path(path);
+    str fclean = strip_unc(fname);
+    str dir = dir_of(fclean);
+    str dname = dir;
+    if dname.len > 1 { dname.len = dname.len - 1; }  // drop trailing separator
+    builtins_set_entry(vm, fclean, dname);
+    free(fname.data);
+
     if has_module_syntax(src) {
         return module_run(vm, path);
     }
