@@ -36,7 +36,9 @@ i32 main() {
         if str_equal(a, "--gc-stress") { gc_stress = true; i++; continue; }
         break;
     }
-    if i != get_argc() - 1 {
+    // the first non-flag argument is the script; anything after it is
+    // passed through to the program as process.argv user arguments.
+    if i >= get_argc() {
         print_usage();
         return EXIT_USAGE;
     }

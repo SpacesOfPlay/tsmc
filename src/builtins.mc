@@ -5718,6 +5718,318 @@ private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
     vm_pop(vm);
 }
 
+// --- process ----------------------------------------------------------------
+//
+// A Node-like `process` global. OS facilities (pid, cwd, environment,
+// monotonic clock) are reached through platform externs behind `when`.
+
+struct ProcTimespec { i64 tv_sec; i64 tv_nsec; }
+
+// Enumerable data property (the normal writable/enumerable/configurable
+// shape), as opposed to def_value's frozen constants.
+private void def_value_enum(VM* vm, JsObject* obj, str name, Value v) {
+    props_set_desc(&obj.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
+// Splits a "NAME=VALUE" entry and adds it to the env object. `env` must be
+// reachable (rooted) already; new_str is the only collecting allocation.
+private void env_add(VM* vm, JsObject* env, str entry) {
+    if entry.len == 0 { return; }
+    // Windows exposes drive-cwd pseudo-vars like "=C:=..."; skip them.
+    if *(entry.data) == '=' { return; }
+    i32 eq = -1;
+    for i32 i = 0; i < entry.len; i++ {
+        if *(entry.data + i) == '=' { eq = i; break; }
+    }
+    if eq < 0 { return; }
+    str name;
+    name.data = entry.data;
+    name.len = eq;
+    str val;
+    val.data = entry.data + eq + 1;
+    val.len = entry.len - eq - 1;
+    u32 key = atom_intern(&vm.atoms, name);
+    Value vs = new_str(vm, val);
+    props_set_desc(&env.props, key, vs, PROP_DEFAULT);
+}
+
+when os(windows) {
+    private str os_platform_name() { return "win32"; }
+    private extern "kernel32.dll" u32 GetCurrentProcessId();
+    private extern "kernel32.dll" u32 GetCurrentDirectoryA(u32 len, u8* buf);
+    private extern "kernel32.dll" u8* GetEnvironmentStringsA();
+    private extern "kernel32.dll" i32 FreeEnvironmentStringsA(u8* p);
+    private extern "kernel32.dll" i32 QueryPerformanceCounter(i64* p);
+    private extern "kernel32.dll" i32 QueryPerformanceFrequency(i64* p);
+    private extern "msvcrt.dll" i32 _isatty(i32 fd);
+
+    private bool os_isatty(i32 fd) { return _isatty(fd) != 0; }
+    private i32 os_pid() { return cast(i32, GetCurrentProcessId()); }
+
+    private Value os_cwd_str(VM* vm) {
+        u8[4096] buf;
+        u32 n = GetCurrentDirectoryA(4096, &buf[0]);
+        str s;
+        s.data = &buf[0];
+        s.len = cast(i32, n);
+        return new_str(vm, s);
+    }
+
+    private u64 os_mono_ns() {
+        i64 freq = 0;
+        i64 ctr = 0;
+        ignore QueryPerformanceFrequency(&freq);
+        ignore QueryPerformanceCounter(&ctr);
+        if freq == 0 { return 0; }
+        u64 uc = cast(u64, ctr);
+        u64 uf = cast(u64, freq);
+        // split to avoid overflow: ns = secs*1e9 + rem*1e9/freq
+        u64 secs = uc / uf;
+        u64 rem = uc % uf;
+        return secs * 1000000000 + rem * 1000000000 / uf;
+    }
+
+    private void os_env_install(VM* vm, JsObject* env) {
+        u8* block = GetEnvironmentStringsA();
+        if block == null { return; }
+        u8* p = block;
+        while *p != 0 {
+            u8* start = p;
+            while *p != 0 { p++; }
+            // Windows env is case-insensitive; Node exposes it that way.
+            // Uppercase the NAME (ASCII) in the owned block so the common
+            // `process.env.PATH` lookup resolves the stored "Path" key.
+            for u8* q = start; q < p && *q != '='; q++ {
+                u8 ch = *q;
+                if ch >= 'a' && ch <= 'z' { *q = cast(u8, ch - 32); }
+            }
+            str entry;
+            entry.data = start;
+            entry.len = cast(i32, p - start);
+            env_add(vm, env, entry);
+            p++;
+        }
+        ignore FreeEnvironmentStringsA(block);
+    }
+}
+else {
+    when os(macos) || os(ios) {
+        private str os_platform_name() { return "darwin"; }
+        private extern "libSystem.B.dylib" i32 getpid();
+        private extern "libSystem.B.dylib" u8* getcwd(u8* buf, u64 size);
+        private extern "libSystem.B.dylib" i32 clock_gettime(i32 clk, ProcTimespec* ts);
+        private extern "libSystem.B.dylib" u8*** _NSGetEnviron();
+        private extern "libSystem.B.dylib" i32 isatty(i32 fd);
+        private u8** os_environ() { return *_NSGetEnviron(); }
+        private i32 os_mono_clock() { return 6; }  // CLOCK_MONOTONIC (darwin)
+    }
+    else {
+        private str os_platform_name() { return "linux"; }
+        private extern "libc.so.6" i32 getpid();
+        private extern "libc.so.6" u8* getcwd(u8* buf, u64 size);
+        private extern "libc.so.6" i32 clock_gettime(i32 clk, ProcTimespec* ts);
+        private extern "libc.so.6" u8** environ;
+        private extern "libc.so.6" i32 isatty(i32 fd);
+        private u8** os_environ() { return environ; }
+        private i32 os_mono_clock() { return 1; }  // CLOCK_MONOTONIC (linux)
+    }
+
+    private bool os_isatty(i32 fd) { return isatty(fd) != 0; }
+    private i32 os_pid() { return getpid(); }
+
+    private Value os_cwd_str(VM* vm) {
+        u8[4096] buf;
+        u8* r = getcwd(&buf[0], 4096);
+        if r == null { return new_str(vm, ""); }
+        return new_str(vm, str_from_cstr(&buf[0]));
+    }
+
+    private u64 os_mono_ns() {
+        ProcTimespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+        ignore clock_gettime(os_mono_clock(), &ts);
+        return cast(u64, ts.tv_sec) * 1000000000 + cast(u64, ts.tv_nsec);
+    }
+
+    private void os_env_install(VM* vm, JsObject* env) {
+        u8** e = os_environ();
+        if e == null { return; }
+        while *e != null {
+            env_add(vm, env, str_from_cstr(*e));
+            e++;
+        }
+    }
+}
+
+when arch(arm64) { private str os_arch_name() { return "arm64"; } }
+else { private str os_arch_name() { return "x64"; } }
+
+// Writes a string verbatim (no trailing newline) to stdout or stderr,
+// substituting U+FFFD for lone surrogates the UTF-8 sink can't take.
+private void proc_raw_write(VM* vm, Value sv, bool to_err) {
+    str view = sview(sv);
+    if wtf8_has_surrogate(view) {
+        str_buf sb;
+        str_buf_init(&sb);
+        wtf8_sanitize_into(&sb, view);
+        str clean = str_buf_to_str(&sb);
+        if to_err { eprint("{}", clean); } else { print("{}", clean); }
+        str_buf_free(&sb);
+    } else {
+        if to_err { eprint("{}", view); } else { print("{}", view); }
+    }
+}
+
+private Value nat_process_stdout_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value s = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, s);
+    proc_raw_write(vm, s, false);
+    vm_pop(vm);
+    return value_bool(true);
+}
+
+private Value nat_process_stderr_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value s = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, s);
+    proc_raw_write(vm, s, true);
+    vm_pop(vm);
+    return value_bool(true);
+}
+
+private Value nat_process_cwd(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return os_cwd_str(as_vm(vmp));
+}
+
+private Value nat_process_exit(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    i32 code = 0;
+    Value c = arg_at(args, argc, 0);
+    if !value_is_undefined(c) { code = to_int_arg(c); }
+    exit(code);
+    return value_undefined();
+}
+
+private Value nat_process_next_tick(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 0);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    Value scheduled = cb;
+    i32 rm = gc_root_mark(&vm.heap);
+    if argc > 1 {
+        // bind the extra args: cb.bind(undefined, ...rest)
+        Value* ba = alloc<Value>(argc);
+        *(ba) = value_undefined();
+        for i32 i = 1; i < argc; i++ { *(ba + i) = *(args + i); }
+        scheduled = nat_fn_bind(vmp, value_undefined(), cb, ba, argc);
+        free(ba);
+    }
+    gc_root(&vm.heap, scheduled);
+    // schedule via an already-resolved promise reaction
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, value_undefined(), false);
+    ignore vm_promise_then(vm, p, scheduled, value_undefined());
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_process_hrtime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u64 now = os_mono_ns();
+    u64 prev_total = 0;
+    Value pv = arg_at(args, argc, 0);
+    if value_is_array(pv) {
+        JsObject* pa = value_as_object(pv);
+        u64 ps = cast(u64, cast(i64, js_to_number(js_array_get(pa, 0))));
+        u64 pn = cast(u64, cast(i64, js_to_number(js_array_get(pa, 1))));
+        prev_total = ps * 1000000000 + pn;
+    }
+    u64 diff = now - prev_total;
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    js_array_set(arr, 0, value_number(cast(f64, diff / 1000000000)));
+    js_array_set(arr, 1, value_number(cast(f64, diff % 1000000000)));
+    vm_pop(vm);
+    return value_cell(&arr.head);
+}
+
+private Value nat_process_hrtime_bigint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u64 now = os_mono_ns();
+    BigNum bn = bn_from_i64(cast(i64, now));
+    GcBigInt* g = js_new_bigint(&vm.heap, bn);
+    bn_free(&bn);
+    return value_cell(&g.head);
+}
+
+private void process_install(VM* vm) {
+    JsObject* proc = js_new_object(&vm.heap, vm.object_proto);
+    // set as a global first so it is a GC root while we build its children
+    vm_set_global(vm, "process", value_cell(&proc.head));
+
+    // argv: [execPath, script, ...userArgs], mirroring Node's shape.
+    JsObject* argv = js_new_array(&vm.heap, vm.array_proto);
+    def_value_enum(vm, proc, "argv", value_cell(&argv.head));
+    i32 ac = get_argc();
+    js_array_set(argv, 0, new_str(vm, str_from_cstr(get_arg(0))));
+    i32 src = 1;
+    // skip interpreter flags (only --gc-stress can reach a running script)
+    while src < ac {
+        str a = str_from_cstr(get_arg(src));
+        if a.len >= 2 && *(a.data) == '-' && *(a.data + 1) == '-' { src++; continue; }
+        break;
+    }
+    i32 dst = 1;
+    while src < ac {
+        js_array_set(argv, dst, new_str(vm, str_from_cstr(get_arg(src))));
+        dst++;
+        src++;
+    }
+    def_value_enum(vm, proc, "argv0", new_str(vm, str_from_cstr(get_arg(0))));
+
+    // env: a snapshot object of the real environment.
+    JsObject* env = js_new_object(&vm.heap, vm.object_proto);
+    def_value_enum(vm, proc, "env", value_cell(&env.head));
+    os_env_install(vm, env);
+
+    def_value_enum(vm, proc, "platform", new_str(vm, os_platform_name()));
+    def_value_enum(vm, proc, "arch", new_str(vm, os_arch_name()));
+    def_value_enum(vm, proc, "pid", value_number(cast(f64, os_pid())));
+    def_value_enum(vm, proc, "version", new_str(vm, "v22.0.0"));
+
+    JsObject* vers = js_new_object(&vm.heap, vm.object_proto);
+    def_value_enum(vm, proc, "versions", value_cell(&vers.head));
+    def_value_enum(vm, vers, "node", new_str(vm, "22.0.0"));
+    def_value_enum(vm, vers, "tsmc", new_str(vm, "0.1.0-dev"));
+
+    // isTTY is present (true) only for a real terminal, matching Node,
+    // which leaves it undefined when the stream is piped or redirected.
+    JsObject* out = js_new_object(&vm.heap, vm.object_proto);
+    def_value_enum(vm, proc, "stdout", value_cell(&out.head));
+    def_method(vm, out, "write", &nat_process_stdout_write);
+    if os_isatty(1) { def_value_enum(vm, out, "isTTY", value_bool(true)); }
+
+    JsObject* errobj = js_new_object(&vm.heap, vm.object_proto);
+    def_value_enum(vm, proc, "stderr", value_cell(&errobj.head));
+    def_method(vm, errobj, "write", &nat_process_stderr_write);
+    if os_isatty(2) { def_value_enum(vm, errobj, "isTTY", value_bool(true)); }
+
+    def_method(vm, proc, "cwd", &nat_process_cwd);
+    def_method(vm, proc, "exit", &nat_process_exit);
+    def_method(vm, proc, "nextTick", &nat_process_next_tick);
+
+    // hrtime(prev?) -> [s, ns]; hrtime.bigint() -> nanoseconds
+    JsNative* hr = js_new_native(&vm.heap, &nat_process_hrtime, "hrtime");
+    props_set_desc(&proc.props, bi_atom(vm, "hrtime"), value_cell(&hr.head), PROP_DEFAULT);
+    JsNative* hrb = js_new_native(&vm.heap, &nat_process_hrtime_bigint, "bigint");
+    props_set_desc(&hr.props, bi_atom(vm, "bigint"), value_cell(&hrb.head), PROP_DEFAULT);
+}
+
 void builtins_install(VM* vm) {
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
@@ -6143,6 +6455,9 @@ void builtins_install(VM* vm) {
     link_ctor(vm, vm.set_proto, set_ctor);
     link_ctor(vm, vm.date_proto, date_ctor);
     link_ctor(vm, vm.regexp_proto, regexp_ctor);
+
+    // process: installed before the globalThis snapshot so it is mirrored.
+    process_install(vm);
 
     // globalThis: an object mirroring the global bindings. Snapshotting
     // the built-ins (rather than routing every property access to the
