@@ -6701,6 +6701,77 @@ private void buffer_install(VM* vm) {
     def_method(vm, vm.buffer_proto, "writeUInt32BE", &nat_buf_write_u32be);
 }
 
+// --- TextEncoder / TextDecoder ----------------------------------------------
+//
+// The WHATWG encoding APIs over UTF-8 (plus latin1 decode). TextEncoder
+// yields a Buffer (byte array) since there is no Uint8Array; TextDecoder
+// reads any byte array-like.
+
+private Value nat_textencoder_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* inst = js_new_object(&vm.heap, vm.textenc_proto);
+    return value_cell(&inst.head);
+}
+
+private Value nat_textencoder_encode(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value a = arg_at(args, argc, 0);
+    Value s = value_is_undefined(a) ? new_str(vm, "") : js_to_string_value(vm, a);
+    vm_push(vm, s);
+    str v = sview(s);
+    Value r = buf_from_bytes(vm, v.data, v.len);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_textdecoder_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* inst = js_new_object(&vm.heap, vm.textdec_proto);
+    vm_push(vm, value_cell(&inst.head));
+    str canon = "utf-8";
+    Value label = arg_at(args, argc, 0);
+    if value_is_string(label) {
+        str l = sview(label);
+        if ci_eq(l, "latin1") || ci_eq(l, "iso-8859-1") || ci_eq(l, "windows-1252") || ci_eq(l, "binary") {
+            canon = "windows-1252";
+        }
+        // any other label (including unknown ones) is treated as utf-8
+    }
+    def_value(vm, inst, "encoding", new_str(vm, canon));
+    def_value(vm, inst, "fatal", value_bool(false));
+    def_value(vm, inst, "ignoreBOM", value_bool(false));
+    vm_pop(vm);
+    return value_cell(&inst.head);
+}
+
+private Value nat_textdecoder_decode(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value inp = arg_at(args, argc, 0);
+    if !value_is_array(inp) { return new_str(vm, ""); }
+    JsObject* a = value_as_object(inp);
+    i32 enc = ENC_UTF8;
+    Value encv;
+    if vm_get_prop_value(vm, thisv, bi_atom(vm, "encoding"), &encv) && value_is_string(encv) {
+        if !ci_eq(sview(encv), "utf-8") { enc = ENC_LATIN1; }
+    }
+    return bytes_to_str(vm, a, enc, 0, a.elen);
+}
+
+private void textcodec_install(VM* vm) {
+    vm.textenc_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* ec = def_global_fn(vm, "TextEncoder", &nat_textencoder_ctor);
+    props_set_desc(&ec.props, vm.atom_prototype, value_cell(&vm.textenc_proto.head), 0);
+    link_ctor(vm, vm.textenc_proto, ec);
+    def_method(vm, vm.textenc_proto, "encode", &nat_textencoder_encode);
+    def_value(vm, vm.textenc_proto, "encoding", new_str(vm, "utf-8"));
+
+    vm.textdec_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* dc = def_global_fn(vm, "TextDecoder", &nat_textdecoder_ctor);
+    props_set_desc(&dc.props, vm.atom_prototype, value_cell(&vm.textdec_proto.head), 0);
+    link_ctor(vm, vm.textdec_proto, dc);
+    def_method(vm, vm.textdec_proto, "decode", &nat_textdecoder_decode);
+}
+
 void builtins_install(VM* vm) {
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
@@ -7127,9 +7198,10 @@ void builtins_install(VM* vm) {
     link_ctor(vm, vm.date_proto, date_ctor);
     link_ctor(vm, vm.regexp_proto, regexp_ctor);
 
-    // Buffer + process: installed before the globalThis snapshot so they
-    // are mirrored onto it.
+    // Buffer, text codecs, process: installed before the globalThis
+    // snapshot so they are mirrored onto it.
     buffer_install(vm);
+    textcodec_install(vm);
     process_install(vm);
 
     // globalThis: an object mirroring the global bindings. Snapshotting

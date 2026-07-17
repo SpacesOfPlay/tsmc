@@ -19,7 +19,7 @@ round-trips) plus targeted probes, not byte-equality with Node.
 2. **`Buffer`** — `from`/`alloc`/`concat`, `toString(utf8|hex|base64|
    latin1)`, indexing, `length`, `slice`, `write`, `equals`. **DONE.**
 3. **`TextEncoder` / `TextDecoder`** — UTF-8 encode/decode over the
-   existing WTF-8 machinery.
+   existing WTF-8 machinery. **DONE.**
 4. **`__dirname` / `__filename`** — module-local bindings.
 
 ## 1. process — DONE
@@ -96,3 +96,27 @@ numeric accessors, toJSON, and indexed writes); clean under `--gc-stress`.
   the `writeUInt*`/`writeInt*` methods mask correctly.
 - **64-bit and float accessors** (`readBigUInt64*`, `readFloat*`,
   `readDouble*`) and unusual encodings (`ucs2`/`utf16le`) are omitted.
+
+## 3. TextEncoder / TextDecoder — DONE
+
+- **`TextEncoder`** — `encode(string)` returns a Buffer of the UTF-8
+  bytes (there is no `Uint8Array`; a Buffer is byte-indexable and
+  spreads the same). `encoding` is `"utf-8"`.
+- **`TextDecoder`** — `new TextDecoder(label?)` accepts `utf-8` (default)
+  and the latin1 family (`latin1`/`iso-8859-1`/`windows-1252`, canonical
+  `encoding` `"windows-1252"`); `decode(bytes)` reads any byte array-like
+  (Buffer or the output of `encode`) and returns a string.
+
+Verified byte-identical to Node in `test/diff/textcodec.js` (UTF-8
+round-trips, multi-byte and astral text, latin1 decode, `instanceof`);
+clean under `--gc-stress`.
+
+### Not doing (documented)
+
+- **Streaming** (`decode(buf, { stream: true })`), `fatal` decoding
+  (invalid sequences pass through rather than throwing), `ignoreBOM`
+  handling, and `encodeInto` — the properties exist but are inert.
+- **Non-UTF-8 encoders** and legacy multibyte decoders (`shift_jis`,
+  `gbk`, `utf-16`) — only UTF-8 and latin1 are handled.
+- **`decode` of a plain `Array`** works here; Node requires an
+  ArrayBufferView (Buffer/typed array).

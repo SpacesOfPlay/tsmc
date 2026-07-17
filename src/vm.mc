@@ -107,6 +107,8 @@ struct VM {
     JsObject* symbol_proto;
     JsObject* bigint_proto;
     JsObject* buffer_proto;
+    JsObject* textenc_proto;
+    JsObject* textdec_proto;
     Vec<RegexProgPtr> regexps;
     u32 atom_rx;
     u32 atom_source;
@@ -246,6 +248,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
     if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
     if vm.buffer_proto != null { gc_mark_cell(h, &vm.buffer_proto.head); }
+    if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
+    if vm.textdec_proto != null { gc_mark_cell(h, &vm.textdec_proto.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
         VmJob* j = vm.jobs.data + i;
         gc_mark_value(h, j.a);
@@ -1412,6 +1416,8 @@ void vm_init(VM* vm) {
     vm.symbol_proto = null;
     vm.bigint_proto = null;
     vm.buffer_proto = null;
+    vm.textenc_proto = null;
+    vm.textdec_proto = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");
