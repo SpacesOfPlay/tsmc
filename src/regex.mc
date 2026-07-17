@@ -22,7 +22,8 @@ enum RxNodeKind {
     RN_REPEAT,     // child, a: min, b: max (-1 unbounded), greedy flag in c
     RN_GROUP,      // child, a: group index
     RN_NCGROUP,    // child
-    RN_LOOK,       // child, a: negate
+    RN_LOOK,       // child, a: negate (lookahead)
+    RN_LOOKBEHIND, // child, a: negate (lookbehind)
     RN_BACKREF,    // a: group index
     RN_BOL, RN_EOL, RN_WORDB, RN_NWORDB
 }
@@ -52,7 +53,8 @@ type RxNodePtr = RxNode*;
 
 enum RxOp {
     I_CHAR, I_ANY, I_CLASS, I_MATCH, I_JMP, I_SPLIT, I_SAVE,
-    I_BOL, I_EOL, I_WORDB, I_NWORDB, I_BACKREF, I_LOOK_BEGIN, I_LOOK_DONE
+    I_BOL, I_EOL, I_WORDB, I_NWORDB, I_BACKREF, I_LOOK_BEGIN, I_LOOK_DONE,
+    I_BEHIND_BEGIN, I_BEHIND_DONE
 }
 
 struct RxInst {
@@ -310,6 +312,12 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             if m == ':' { p.pos++; kind = RN_NCGROUP; }
             else if m == '=' { p.pos++; kind = RN_LOOK; neg_look = false; }
             else if m == '!' { p.pos++; kind = RN_LOOK; neg_look = true; }
+            else if m == '<' && px_at(p, p.pos + 1) == '=' {
+                p.pos += 2; kind = RN_LOOKBEHIND; neg_look = false;
+            }
+            else if m == '<' && px_at(p, p.pos + 1) == '!' {
+                p.pos += 2; kind = RN_LOOKBEHIND; neg_look = true;
+            }
             else if m == '<' && px_at(p, p.pos + 1) != '=' && px_at(p, p.pos + 1) != '!' {
                 // named capturing group (?<name>...)
                 p.pos++;   // consume '<'
@@ -337,6 +345,7 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         g.child = inner;
         if kind == RN_GROUP { g.a = gidx; }
         if kind == RN_LOOK { g.a = neg_look ? 1 : 0; }
+        if kind == RN_LOOKBEHIND { g.a = neg_look ? 1 : 0; }
         return g;
     }
     if c == '[' { return parse_class(p); }
@@ -509,6 +518,43 @@ private void emit_quant_child(Vec<RxInst>* code, RxNode* child, i32 kind, bool g
     }
 }
 
+// Maximum byte length a node can match; -1 if unbounded. Used to bound
+// the lookbehind scan.
+private i32 rx_max_len(RxNode* n) {
+    if n == null { return 0; }
+    i32 k = n.kind;
+    if k == RN_CHAR || k == RN_ANY || k == RN_CLASS { return 1; }
+    if k == RN_CONCAT {
+        i32 sum = 0;
+        for i32 i = 0; i < n.nkids; i++ {
+            i32 c = rx_max_len(*(n.kids + i));
+            if c < 0 { return -1; }
+            sum += c;
+        }
+        return sum;
+    }
+    if k == RN_ALT {
+        i32 mx = 0;
+        for i32 i = 0; i < n.nkids; i++ {
+            i32 c = rx_max_len(*(n.kids + i));
+            if c < 0 { return -1; }
+            if c > mx { mx = c; }
+        }
+        return mx;
+    }
+    if k == RN_QUEST { return rx_max_len(n.child); }
+    if k == RN_REPEAT {
+        if n.b < 0 { return -1; }   // unbounded upper
+        i32 c = rx_max_len(n.child);
+        if c < 0 { return -1; }
+        return c * n.b;
+    }
+    if k == RN_GROUP || k == RN_NCGROUP { return rx_max_len(n.child); }
+    if k == RN_STAR || k == RN_PLUS || k == RN_BACKREF { return -1; }
+    // RN_EMPTY and the zero-width anchors/lookarounds
+    return 0;
+}
+
 private void emit_node(Vec<RxInst>* code, RxNode* n) {
     i32 k = n.kind;
     if k == RN_EMPTY { return; }
@@ -574,6 +620,15 @@ private void emit_node(Vec<RxInst>* code, RxNode* n) {
         i32 b = emit(code, I_LOOK_BEGIN, n.a, 0, 0);
         emit_node(code, n.child);
         emit(code, I_LOOK_DONE, 0, 0, 0);
+        patch_y(code, b, code.len);
+        return;
+    }
+    if k == RN_LOOKBEHIND {
+        // cls carries the child's max byte length (-1 unbounded) so the
+        // matcher only scans back that far for a candidate start.
+        i32 b = emit(code, I_BEHIND_BEGIN, n.a, 0, rx_max_len(n.child));
+        emit_node(code, n.child);
+        emit(code, I_BEHIND_DONE, 0, 0, 0);
         patch_y(code, b, code.len);
         return;
     }
@@ -724,6 +779,7 @@ struct RxCtx {
     i32 len;
     i32* caps;
     i32 steps;
+    i32 look_end;   // target end position for the active lookbehind
 }
 
 const i32 RX_STEP_LIMIT = 2000000;
@@ -809,6 +865,11 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
         }
         if op == I_MATCH { return sp; }
         if op == I_LOOK_DONE { return sp; }
+        if op == I_BEHIND_DONE {
+            // the lookbehind body must end exactly at the anchor position
+            if sp == cx.look_end { return sp; }
+            return -1;
+        }
         if op == I_JMP { pc = inst.x; continue; }
         if op == I_SPLIT {
             i32 r = m(cx, inst.x, sp);
@@ -868,6 +929,25 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
             if ok { pc = inst.y; continue; }
             return -1;
         }
+        if op == I_BEHIND_BEGIN {
+            // succeeds if the body matches some span ending at sp; scan
+            // candidate starts back to sp - maxlen (or 0 if unbounded)
+            i32 target = sp;
+            i32 lo = 0;
+            if inst.cls >= 0 && target - inst.cls > 0 { lo = target - inst.cls; }
+            i32 saved = cx.look_end;
+            cx.look_end = target;
+            bool matched = false;
+            // longest span first (earliest start) = greedy right-to-left
+            for i32 s = lo; s <= target; s++ {
+                if m(cx, pc + 1, s) >= 0 { matched = true; break; }
+            }
+            cx.look_end = saved;
+            bool ok = matched;
+            if inst.x != 0 { ok = !ok; }   // negate
+            if ok { pc = inst.y; continue; }
+            return -1;
+        }
         return -1;
     }
     return -1;
@@ -882,6 +962,7 @@ bool regex_exec(RegexProg* prog, str subject, i32 start, i32* caps) {
     cx.s = subject.data;
     cx.len = subject.len;
     cx.caps = caps;
+    cx.look_end = -1;
     i32 base_i = start;
     if base_i < 0 { base_i = 0; }
     i32 last = subject.len;

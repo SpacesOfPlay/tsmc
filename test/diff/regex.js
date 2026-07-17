@@ -29,3 +29,12 @@ console.log("2021-05-15".replace(/(?<y>\d+)-(?<m>\d+)-(?<d>\d+)/, "$<d>/$<m>/$<y
 console.log("John Smith".replace(/(?<first>\w+)\s(?<last>\w+)/, "$<last>, $<first>"));
 console.log("a1b2".replace(/(?<l>[a-z])(?<n>\d)/g, "$<n>$<l>"));
 console.log("2021-05".replace(/(?<y>\d+)-(?<m>\d+)/, (m, y, mo, off, s, g) => g.y + "/" + g.m));
+
+// lookbehind
+console.log("$1,234.50".match(/(?<=\$)[\d,]+(\.\d+)?/)[0]);
+console.log("a1 b2 c3".match(/(?<!a)\d/g).join(","));
+console.log("foobar foobaz".replace(/(?<=foo)ba./g, "X"));
+console.log("2020-12-31".match(/(?<=-)\d+/g).join(","));
+console.log("abc123def".match(/(?<=([a-z]+))\d+/).slice(0, 2).join("|"));
+console.log("price 42, cost 99".match(/(?<=(price|cost) )\d+/g).join(","));
+console.log(/(?<=^ab)c/.test("abc"), /(?<!x)y/.test("zy"), /(?<!x)y/.test("xy"));
