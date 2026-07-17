@@ -45,3 +45,9 @@ console.log(/\u{1f600}/u.test("😀"), /\u{1f600}/u.test("😐"));
 console.log(/😀+/u.test("😀😀😀"), "a😀b😀c".match(/😀/gu).length);
 console.log("x😀y".match(/./gu).length, /😀|🎉/u.test("🎉"));
 console.log(/\u{48}\u{49}/u.test("HI"), /café/u.test("café"));
+
+// unicode (/u) astral ranges in character classes
+console.log(/[\u{1f600}-\u{1f64f}]/u.test("😀"), /[\u{1f600}-\u{1f64f}]/u.test("🎉"));
+console.log(/[😀-🙏]/u.test("😊"), /[^\u{1f600}-\u{1f64f}]/u.test("🎉"));
+console.log("a😀b🎉c".match(/[\u{1f300}-\u{1faff}]/gu).length);
+console.log("aA1_".match(/[\w]/gu).join(""), /[a-z😀]/u.test("😀"));

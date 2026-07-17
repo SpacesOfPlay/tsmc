@@ -175,6 +175,38 @@ private i32 utf8_seq_len(u8 c) {
     return 1;
 }
 
+// Reads the code point at p.pos and advances. In u mode a multi-byte
+// UTF-8 lead consumes the whole sequence, and a WTF-8 surrogate pair
+// (how astral chars appear in pattern source) folds to one astral code
+// point; otherwise a single byte.
+private i32 px_read_cp(RxParser* p) {
+    u8 c = px_cur(p);
+    bool uni = p.unicode;
+    bool hi = c >= 0x80;
+    if uni && hi {
+        i32 sl = utf8_seq_len(c);
+        i32 cp = c;
+        if sl == 2 { cp = ((c & 0x1F) << 6) | (px_at(p, p.pos + 1) & 0x3F); }
+        else if sl == 3 { cp = ((c & 0x0F) << 12) | ((px_at(p, p.pos + 1) & 0x3F) << 6) | (px_at(p, p.pos + 2) & 0x3F); }
+        else if sl == 4 { cp = ((c & 0x07) << 18) | ((px_at(p, p.pos + 1) & 0x3F) << 12) | ((px_at(p, p.pos + 2) & 0x3F) << 6) | (px_at(p, p.pos + 3) & 0x3F); }
+        p.pos += sl;
+        // fold a high/low WTF-8 surrogate pair into an astral code point
+        if cp >= 0xD800 && cp <= 0xDBFF {
+            u8 d = px_cur(p);
+            if (d & 0xF0) == 0xE0 {
+                i32 lo = ((d & 0x0F) << 12) | ((px_at(p, p.pos + 1) & 0x3F) << 6) | (px_at(p, p.pos + 2) & 0x3F);
+                if lo >= 0xDC00 && lo <= 0xDFFF {
+                    p.pos += 3;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+            }
+        }
+        return cp;
+    }
+    p.pos++;
+    return c;
+}
+
 private void class_add(Vec<RxRange>* rs, i32 lo, i32 hi) {
     RxRange r;
     r.lo = lo;
@@ -343,8 +375,7 @@ private RxNode* parse_class(RxParser* p) {
             }
             lo = escape_char(p);
         } else {
-            lo = px_cur(p);
-            p.pos++;
+            lo = px_read_cp(p);
         }
         // range a-b (but not if '-' is last before ']')
         if px_cur(p) == '-' && px_at(p, p.pos + 1) != ']' && p.pos + 1 < p.src.len {
@@ -354,8 +385,7 @@ private RxNode* parse_class(RxParser* p) {
                 p.pos++;
                 hi = escape_char(p);
             } else {
-                hi = px_cur(p);
-                p.pos++;
+                hi = px_read_cp(p);
             }
             class_add(&rs, lo, hi);
         } else {
@@ -472,14 +502,10 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         return cp_to_node(ch);
     }
     // literal: a whole code point in u mode, else a single byte
-    if p.unicode && c >= 0x80 {
-        i32 sl = utf8_seq_len(c);
-        i32 cp = c;
-        if sl == 2 { cp = ((c & 0x1F) << 6) | (px_at(p, p.pos + 1) & 0x3F); }
-        else if sl == 3 { cp = ((c & 0x0F) << 12) | ((px_at(p, p.pos + 1) & 0x3F) << 6) | (px_at(p, p.pos + 2) & 0x3F); }
-        else if sl == 4 { cp = ((c & 0x07) << 18) | ((px_at(p, p.pos + 1) & 0x3F) << 12) | ((px_at(p, p.pos + 2) & 0x3F) << 6) | (px_at(p, p.pos + 3) & 0x3F); }
-        p.pos += sl;
-        return cp_to_node(cp);
+    bool lit_uni = p.unicode;
+    bool lit_hi = c >= 0x80;
+    if lit_uni && lit_hi {
+        return cp_to_node(px_read_cp(p));
     }
     p.pos++;
     RxNode* n = rx_node(RN_CHAR);
@@ -897,24 +923,23 @@ private bool byte_eq(RxCtx* cx, u8 a, u8 b) {
     return false;
 }
 
-private bool in_class_raw(RxCtx* cx, i32 cls, u8 b) {
+private bool in_class_raw(RxCtx* cx, i32 cls, i32 cp) {
     i32 off = *(cx.prog.class_off + cls);
     i32 n = *(cx.prog.class_len + cls);
-    i32 bi = b;
     for i32 i = 0; i < n; i++ {
         RxRange r = *(cx.prog.class_ranges + off + i);
-        if bi >= r.lo && bi <= r.hi { return true; }
+        if cp >= r.lo && cp <= r.hi { return true; }
     }
     return false;
 }
 
-private bool class_match(RxCtx* cx, i32 cls, u8 b) {
-    bool hit = in_class_raw(cx, cls, b);
+private bool class_match(RxCtx* cx, i32 cls, i32 cp) {
+    bool hit = in_class_raw(cx, cls, cp);
     if !hit && cx.prog.ignore_case {
-        u8 alt = b;
-        if b >= 'a' && b <= 'z' { alt = cast(u8, b - 32); }
-        else if b >= 'A' && b <= 'Z' { alt = cast(u8, b + 32); }
-        if alt != b { hit = in_class_raw(cx, cls, alt); }
+        i32 alt = cp;
+        if cp >= 'a' && cp <= 'z' { alt = cp - 32; }
+        else if cp >= 'A' && cp <= 'Z' { alt = cp + 32; }
+        if alt != cp { hit = in_class_raw(cx, cls, alt); }
     }
     if *(cx.prog.class_neg + cls) { return !hit; }
     return hit;
@@ -952,7 +977,9 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
                 if cx.prog.dotall || (c != '\n' && c != '\r') {
                     pc++;
                     // u mode: `.` consumes a whole code point
-                    if cx.prog.unicode && c >= 0x80 {
+                    bool any_uni = cx.prog.unicode;
+                    bool any_hi = c >= 0x80;
+                    if any_uni && any_hi {
                         i32 sl = utf8_seq_len(c);
                         if sp + sl <= cx.len { sp += sl; } else { sp++; }
                     } else {
@@ -964,10 +991,33 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
             return -1;
         }
         if op == I_CLASS {
-            if sp < cx.len && class_match(cx, inst.cls, *(cx.s + sp)) {
-                pc++;
-                sp++;
-                continue;
+            if sp < cx.len {
+                u8 c = *(cx.s + sp);
+                bool cls_uni = cx.prog.unicode;
+                bool cls_hi = c >= 0x80;
+                if cls_uni && cls_hi {
+                    // u mode: decode and test a full code point
+                    i32 sl = utf8_seq_len(c);
+                    i32 cp = c;
+                    if sl == 2 && sp + 1 < cx.len {
+                        cp = ((c & 0x1F) << 6) | (*(cx.s + sp + 1) & 0x3F);
+                    } else if sl == 3 && sp + 2 < cx.len {
+                        cp = ((c & 0x0F) << 12) | ((*(cx.s + sp + 1) & 0x3F) << 6) | (*(cx.s + sp + 2) & 0x3F);
+                    } else if sl == 4 && sp + 3 < cx.len {
+                        cp = ((c & 0x07) << 18) | ((*(cx.s + sp + 1) & 0x3F) << 12) | ((*(cx.s + sp + 2) & 0x3F) << 6) | (*(cx.s + sp + 3) & 0x3F);
+                    }
+                    if class_match(cx, inst.cls, cp) {
+                        pc++;
+                        sp += sl;
+                        continue;
+                    }
+                    return -1;
+                }
+                if class_match(cx, inst.cls, cast(i32, c)) {
+                    pc++;
+                    sp++;
+                    continue;
+                }
             }
             return -1;
         }
@@ -1074,12 +1124,19 @@ bool regex_exec(RegexProg* prog, str subject, i32 start, i32* caps) {
     i32 base_i = start;
     if base_i < 0 { base_i = 0; }
     i32 last = subject.len;
-    for i32 i = base_i; i <= last; i++ {
+    i32 i = base_i;
+    while i <= last {
         for i32 j = 0; j < ncap; j++ { *(caps + j) = -1; }
         cx.steps = 0;
         i32 r = m(&cx, 0, i);
         if r >= 0 { return true; }
         if prog.sticky { return false; }
+        // u mode: only attempt at code-point boundaries
+        if prog.unicode && i < last {
+            i += utf8_seq_len(*(subject.data + i));
+        } else {
+            i++;
+        }
     }
     return false;
 }

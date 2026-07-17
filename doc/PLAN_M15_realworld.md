@@ -180,12 +180,17 @@ In `/u` mode the parser decodes whole code points: `\u{...}` escapes,
 `\uXXXX` surrogate pairs, and astral literals become one atom (their UTF-8
 byte sequence, so quantifiers cover the code point), and `.` consumes a
 full UTF-8 sequence. `\uXXXX` outside `/u` now also encodes to UTF-8
-(fixes BMP escapes, previously truncated to a low byte).
+(fixes BMP escapes, previously truncated to a low byte). Character classes
+decode code points too, so astral ranges (`[\u{1f600}-\u{1f64f}]`,
+`[😀-🙏]`) and negation over them match by code point; the class matcher
+carries code points (`i32`) end-to-end. Verified against Node in
+`test/diff/regex.js` (astral dot, literals, quantifiers, class ranges).
 
 ### Not doing (documented)
 
-- **Property escapes** (`\p{...}`) — need large Unicode tables; rejected
-  as a SyntaxError rather than silently mismatching.
-- **Astral ranges in character classes** — the class matcher stays
-  byte-oriented.
+- **Property escapes** (`\p{...}`) — need large Unicode tables. In `/u`
+  mode a `\p{`/`\P{` is rejected as a SyntaxError rather than silently
+  mismatching; Node accepts them, so this is a deliberate divergence and
+  is not in the diff suite. (Outside `/u`, `\p` is a literal `p`, matching
+  Node.)
 - **Non-`/u` `.`** counts bytes, not UTF-16 code units.
