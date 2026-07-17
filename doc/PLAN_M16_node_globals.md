@@ -17,7 +17,7 @@ round-trips) plus targeted probes, not byte-equality with Node.
    `cwd()`, `exit()`, `nextTick()`, `stdout`/`stderr`.write,
    `hrtime()`/`hrtime.bigint()`. **DONE.**
 2. **`Buffer`** — `from`/`alloc`/`concat`, `toString(utf8|hex|base64|
-   latin1)`, indexing, `length`, `slice`, `write`, `equals`.
+   latin1)`, indexing, `length`, `slice`, `write`, `equals`. **DONE.**
 3. **`TextEncoder` / `TextDecoder`** — UTF-8 encode/decode over the
    existing WTF-8 machinery.
 4. **`__dirname` / `__filename`** — module-local bindings.
@@ -63,3 +63,36 @@ A namespace object installed as the `process` global (and mirrored onto
   `process.on`, no real streams behind `stdout`/`stderr`.
 - **`process.stdin`** — no interactive input.
 - **Live `env`** — snapshot only; no propagation to spawned processes.
+
+## 2. Buffer — DONE
+
+Backed by a JS array of byte values whose prototype chains
+Buffer.prototype → Array.prototype, so indexing, `.length`, iteration,
+and spread come free; the Buffer methods live on Buffer.prototype.
+
+- **Statics**: `from(string, enc)` / `from(array)`, `alloc(n, fill?, enc?)`,
+  `allocUnsafe` (zeroed, like `alloc`), `concat(list, totalLength?)`,
+  `isBuffer`, `byteLength(string, enc)`.
+- **Encodings**: `utf8`/`utf-8`, `hex`, `base64`, `base64url`,
+  `latin1`/`binary`, `ascii` — both directions.
+- **Methods**: `toString(enc, start?, end?)`, `slice`/`subarray`,
+  `equals`, `compare`, `copy`, `fill`, `write`, `indexOf`, `includes`,
+  `toJSON`, and `readUInt8`/`readInt8`/`writeUInt8` plus the 16- and
+  32-bit LE/BE reads and writes.
+- `toJSON` yields `{ type: "Buffer", data: [...] }`, so
+  `JSON.stringify(buf)` matches Node.
+
+Verified byte-identical to Node in `test/diff/buffer.js` (construction,
+every encoding, slice/equals/compare/copy, write/fill/indexOf, the
+numeric accessors, toJSON, and indexed writes); clean under `--gc-stress`.
+
+### Not doing (documented)
+
+- **Copy-on-slice semantics** — `slice`/`subarray` copy bytes rather than
+  sharing the parent's memory, so writes to a slice don't alias the
+  parent (Node's do). `Array.isArray(buf)` is `true` here (Node: `false`,
+  since Buffer is a `Uint8Array`); no `ArrayBuffer`/typed-array backing.
+- **Out-of-range indexed writes** don't wrap (`buf[0] = 256` stores 256);
+  the `writeUInt*`/`writeInt*` methods mask correctly.
+- **64-bit and float accessors** (`readBigUInt64*`, `readFloat*`,
+  `readDouble*`) and unusual encodings (`ucs2`/`utf16le`) are omitted.
