@@ -78,6 +78,7 @@ struct RegexProg {
     bool ignore_case;
     bool multiline;
     bool dotall;
+    bool unicode;
     bool global;
     bool sticky;
 }
@@ -94,6 +95,7 @@ struct RxParser {
     i32 pos;
     i32 group_count;
     bool failed;
+    bool unicode;           // the /u flag: code-point mode
     Vec<RxClass> classes;   // owns range arrays until moved into prog
     Vec<RxGroupName> gnames;
 }
@@ -120,6 +122,57 @@ private RxNode* rx_kids(i32 kind, Vec<RxNodePtr>* items, i32 base_i) {
     }
     items.len = base_i;
     return n;
+}
+
+// Encodes a code point as one atom: a single RN_CHAR for ASCII, else an
+// RN_CONCAT of its UTF-8 bytes (so a quantifier applies to the whole
+// sequence). Matches the WTF-8 storage of strings.
+private RxNode* cp_to_node(i32 cp) {
+    u8[4] b;
+    i32 n = 0;
+    if cp <= 0x7F {
+        b[0] = cast(u8, cp);
+        n = 1;
+    } else if cp <= 0x7FF {
+        b[0] = cast(u8, 0xC0 | (cp >> 6));
+        b[1] = cast(u8, 0x80 | (cp & 0x3F));
+        n = 2;
+    } else if cp <= 0xFFFF {
+        b[0] = cast(u8, 0xE0 | (cp >> 12));
+        b[1] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+        b[2] = cast(u8, 0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        b[0] = cast(u8, 0xF0 | (cp >> 18));
+        b[1] = cast(u8, 0x80 | ((cp >> 12) & 0x3F));
+        b[2] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+        b[3] = cast(u8, 0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    if n == 1 {
+        RxNode* nd = rx_node(RN_CHAR);
+        nd.a = b[0];
+        return nd;
+    }
+    RxNode* cc = rx_node(RN_CONCAT);
+    cc.nkids = n;
+    cc.kids = cast(RxNode**, alloc(cast(i64, n) * 8));
+    for i32 i = 0; i < n; i++ {
+        RxNode* ch = rx_node(RN_CHAR);
+        ch.a = b[i];
+        *(cc.kids + i) = ch;
+    }
+    return cc;
+}
+
+// Length in bytes of the UTF-8 sequence whose lead byte is c (1 for
+// ASCII / continuation / invalid).
+private i32 utf8_seq_len(u8 c) {
+    if c < 0x80 { return 1; }
+    if (c & 0xE0) == 0xC0 { return 2; }
+    if (c & 0xF0) == 0xE0 { return 3; }
+    if (c & 0xF8) == 0xF0 { return 4; }
+    return 1;
 }
 
 private void class_add(Vec<RxRange>* rs, i32 lo, i32 hi) {
@@ -205,7 +258,23 @@ private i32 escape_char(RxParser* p) {
         return 'x';
     }
     if c == 'u' {
-        if px_cur(p) == '{' { return 'u'; }   // \u{...} not byte-representable simply
+        if px_cur(p) == '{' {
+            // \u{...} code-point escape (u mode)
+            if !p.unicode { return 'u'; }
+            p.pos++;   // '{'
+            i32 cp = 0;
+            i32 nd = 0;
+            while px_cur(p) != '}' && px_cur(p) != 0 {
+                i32 h = hexval(px_cur(p));
+                if h < 0 { p.failed = true; return 'u'; }
+                cp = cp * 16 + h;
+                nd++;
+                p.pos++;
+            }
+            if px_cur(p) == '}' && nd > 0 && cp <= 0x10FFFF { p.pos++; return cp; }
+            p.failed = true;
+            return 'u';
+        }
         i32 h1 = hexval(px_cur(p));
         i32 h2 = hexval(px_at(p, p.pos + 1));
         i32 h3 = hexval(px_at(p, p.pos + 2));
@@ -213,7 +282,22 @@ private i32 escape_char(RxParser* p) {
         if h1 >= 0 && h2 >= 0 && h3 >= 0 && h4 >= 0 {
             i32 cp = ((h1 * 16 + h2) * 16 + h3) * 16 + h4;
             p.pos += 4;
-            return cp & 0xFF;   // low byte (byte-oriented)
+            // u mode: combine a surrogate pair into an astral code point
+            if p.unicode && cp >= 0xD800 && cp <= 0xDBFF
+                    && px_cur(p) == '\\' && px_at(p, p.pos + 1) == 'u' {
+                i32 l1 = hexval(px_at(p, p.pos + 2));
+                i32 l2 = hexval(px_at(p, p.pos + 3));
+                i32 l3 = hexval(px_at(p, p.pos + 4));
+                i32 l4 = hexval(px_at(p, p.pos + 5));
+                if l1 >= 0 && l2 >= 0 && l3 >= 0 && l4 >= 0 {
+                    i32 lo = ((l1 * 16 + l2) * 16 + l3) * 16 + l4;
+                    if lo >= 0xDC00 && lo <= 0xDFFF {
+                        p.pos += 6;
+                        return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                }
+            }
+            return cp;
         }
         return 'u';
     }
@@ -379,12 +463,24 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             n.a = g;
             return n;
         }
+        if (e == 'p' || e == 'P') && p.unicode && px_at(p, p.pos + 1) == '{' {
+            // Unicode property escapes need large tables — unsupported.
+            p.failed = true;
+            return rx_node(RN_CHAR);
+        }
         i32 ch = escape_char(p);
-        RxNode* n = rx_node(RN_CHAR);
-        n.a = ch & 0xFF;
-        return n;
+        return cp_to_node(ch);
     }
-    // literal byte
+    // literal: a whole code point in u mode, else a single byte
+    if p.unicode && c >= 0x80 {
+        i32 sl = utf8_seq_len(c);
+        i32 cp = c;
+        if sl == 2 { cp = ((c & 0x1F) << 6) | (px_at(p, p.pos + 1) & 0x3F); }
+        else if sl == 3 { cp = ((c & 0x0F) << 12) | ((px_at(p, p.pos + 1) & 0x3F) << 6) | (px_at(p, p.pos + 2) & 0x3F); }
+        else if sl == 4 { cp = ((c & 0x07) << 18) | ((px_at(p, p.pos + 1) & 0x3F) << 12) | ((px_at(p, p.pos + 2) & 0x3F) << 6) | (px_at(p, p.pos + 3) & 0x3F); }
+        p.pos += sl;
+        return cp_to_node(cp);
+    }
     p.pos++;
     RxNode* n = rx_node(RN_CHAR);
     n.a = c;
@@ -643,6 +739,10 @@ RegexProg* regex_compile(str pattern, str flags) {
     p.pos = 0;
     p.group_count = 0;
     p.failed = false;
+    p.unicode = false;
+    for i32 i = 0; i < flags.len; i++ {
+        if *(flags.data + i) == 'u' { p.unicode = true; }
+    }
     vec_init<RxClass>(&p.classes, 4);
     vec_init<RxGroupName>(&p.gnames, 2);
     Vec<RxNodePtr> stack = vec_new<RxNodePtr>(8);
@@ -725,6 +825,7 @@ RegexProg* regex_compile(str pattern, str flags) {
     prog.dotall = false;
     prog.global = false;
     prog.sticky = false;
+    prog.unicode = false;
     for i32 i = 0; i < flags.len; i++ {
         u8 f = *(flags.data + i);
         if f == 'i' { prog.ignore_case = true; }
@@ -732,6 +833,7 @@ RegexProg* regex_compile(str pattern, str flags) {
         if f == 's' { prog.dotall = true; }
         if f == 'g' { prog.global = true; }
         if f == 'y' { prog.sticky = true; }
+        if f == 'u' { prog.unicode = true; }
     }
     return prog;
 }
@@ -849,7 +951,13 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
                 u8 c = *(cx.s + sp);
                 if cx.prog.dotall || (c != '\n' && c != '\r') {
                     pc++;
-                    sp++;
+                    // u mode: `.` consumes a whole code point
+                    if cx.prog.unicode && c >= 0x80 {
+                        i32 sl = utf8_seq_len(c);
+                        if sp + sl <= cx.len { sp += sl; } else { sp++; }
+                    } else {
+                        sp++;
+                    }
                     continue;
                 }
             }

@@ -38,3 +38,10 @@ console.log("2020-12-31".match(/(?<=-)\d+/g).join(","));
 console.log("abc123def".match(/(?<=([a-z]+))\d+/).slice(0, 2).join("|"));
 console.log("price 42, cost 99".match(/(?<=(price|cost) )\d+/g).join(","));
 console.log(/(?<=^ab)c/.test("abc"), /(?<!x)y/.test("zy"), /(?<!x)y/.test("xy"));
+
+// unicode (/u) flag: code-point escapes, astral dot/literals
+console.log(/^.$/u.test("😀"), /^.$/u.test("ab"));
+console.log(/\u{1f600}/u.test("😀"), /\u{1f600}/u.test("😐"));
+console.log(/😀+/u.test("😀😀😀"), "a😀b😀c".match(/😀/gu).length);
+console.log("x😀y".match(/./gu).length, /😀|🎉/u.test("🎉"));
+console.log(/\u{48}\u{49}/u.test("HI"), /café/u.test("café"));
