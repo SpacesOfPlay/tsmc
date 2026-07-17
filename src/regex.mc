@@ -181,9 +181,7 @@ private i32 utf8_seq_len(u8 c) {
 // point; otherwise a single byte.
 private i32 px_read_cp(RxParser* p) {
     u8 c = px_cur(p);
-    bool uni = p.unicode;
-    bool hi = c >= 0x80;
-    if uni && hi {
+    if p.unicode && c >= 0x80 {
         i32 sl = utf8_seq_len(c);
         i32 cp = c;
         if sl == 2 { cp = ((c & 0x1F) << 6) | (px_at(p, p.pos + 1) & 0x3F); }
@@ -502,9 +500,7 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         return cp_to_node(ch);
     }
     // literal: a whole code point in u mode, else a single byte
-    bool lit_uni = p.unicode;
-    bool lit_hi = c >= 0x80;
-    if lit_uni && lit_hi {
+    if p.unicode && c >= 0x80 {
         return cp_to_node(px_read_cp(p));
     }
     p.pos++;
@@ -977,9 +973,7 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
                 if cx.prog.dotall || (c != '\n' && c != '\r') {
                     pc++;
                     // u mode: `.` consumes a whole code point
-                    bool any_uni = cx.prog.unicode;
-                    bool any_hi = c >= 0x80;
-                    if any_uni && any_hi {
+                    if cx.prog.unicode && c >= 0x80 {
                         i32 sl = utf8_seq_len(c);
                         if sp + sl <= cx.len { sp += sl; } else { sp++; }
                     } else {
@@ -993,9 +987,7 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
         if op == I_CLASS {
             if sp < cx.len {
                 u8 c = *(cx.s + sp);
-                bool cls_uni = cx.prog.unicode;
-                bool cls_hi = c >= 0x80;
-                if cls_uni && cls_hi {
+                if cx.prog.unicode && c >= 0x80 {
                     // u mode: decode and test a full code point
                     i32 sl = utf8_seq_len(c);
                     i32 cp = c;
