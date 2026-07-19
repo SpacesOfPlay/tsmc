@@ -7114,6 +7114,21 @@ when os(windows) {
     private extern "kernel32.dll" i32 RemoveDirectoryA(u8* path);
     private extern "kernel32.dll" i32 MoveFileExA(u8* src, u8* dst, u32 flags);
     private extern "kernel32.dll" u32 GetFileAttributesA(u8* path);
+    // WIN32_FIND_DATAA: cFileName (u8[260]) at offset 44 after attrs + 3
+    // FILETIMEs (24) + size hi/lo (8) + 2 reserved (8).
+    struct _FindDataA {
+        u32 attrs;
+        u32 ct_lo; u32 ct_hi;
+        u32 at_lo; u32 at_hi;
+        u32 wt_lo; u32 wt_hi;
+        u32 sz_hi; u32 sz_lo;
+        u32 res0; u32 res1;
+        u8[260] name;
+        u8[14] altname;
+    }
+    private extern "kernel32.dll" i64 FindFirstFileA(u8* pattern, _FindDataA* data);
+    private extern "kernel32.dll" i32 FindNextFileA(i64 h, _FindDataA* data);
+    private extern "kernel32.dll" i32 FindClose(i64 h);
     private bool fs_mkdir1(u8* p) { return CreateDirectoryA(p, null) != 0; }
     private bool fs_rmdir1(u8* p) { return RemoveDirectoryA(p) != 0; }
     private bool fs_unlink1(u8* p) { return DeleteFileA(p) != 0; }
@@ -7125,6 +7140,28 @@ when os(windows) {
     }
     // FILETIME 100ns ticks since 1601 -> ms since Unix epoch
     private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 10000.0 - 11644473600000.0; }
+    private void fs_readdir_into(VM* vm, str dir, JsObject* arr) {
+        str_buf pat;
+        str_buf_init(&pat);
+        str_buf_add(&pat, dir);
+        str_buf_add_byte(&pat, path_sep_ch());
+        str_buf_add_byte(&pat, cast(u8, '*'));
+        u8* cpat = str_to_cstr(str_buf_to_str(&pat));
+        str_buf_free(&pat);
+        _FindDataA fd;
+        i64 h = FindFirstFileA(cpat, &fd);
+        free(cpat);
+        if h == 0 - 1 { return; }   // INVALID_HANDLE_VALUE
+        i32 idx = 0;
+        while true {
+            str name = str_from_cstr(&fd.name[0]);
+            bool dot = (name.len == 1 && *(name.data) == '.')
+                || (name.len == 2 && *(name.data) == '.' && *(name.data + 1) == '.');
+            if !dot { js_array_set(arr, idx, new_str(vm, name)); idx++; }
+            if FindNextFileA(h, &fd) == 0 { break; }
+        }
+        ignore FindClose(h);
+    }
 }
 else {
     when os(macos) || os(ios) {
@@ -7133,7 +7170,10 @@ else {
         private extern "libSystem.B.dylib" i32 rmdir(u8* path);
         private extern "libSystem.B.dylib" i32 rename(u8* old, u8* nw);
         private extern "libSystem.B.dylib" void* opendir(u8* path);
+        private extern "libSystem.B.dylib" u8* readdir(void* dp);
         private extern "libSystem.B.dylib" i32 closedir(void* dp);
+        // struct dirent (Darwin 64-bit inode): d_name at offset 21.
+        private u8* dirent_name(u8* de) { return de + 21; }
     }
     else {
         private extern "libc.so.6" i32 mkdir(u8* path, u32 mode);
@@ -7141,7 +7181,10 @@ else {
         private extern "libc.so.6" i32 rmdir(u8* path);
         private extern "libc.so.6" i32 rename(u8* old, u8* nw);
         private extern "libc.so.6" void* opendir(u8* path);
+        private extern "libc.so.6" u8* readdir(void* dp);
         private extern "libc.so.6" i32 closedir(void* dp);
+        // struct dirent (Linux): d_name (NUL-terminated) at offset 19.
+        private u8* dirent_name(u8* de) { return de + 19; }
     }
     private bool fs_mkdir1(u8* p) { return mkdir(p, 511) == 0; }   // 0o777
     private bool fs_rmdir1(u8* p) { return rmdir(p) == 0; }
@@ -7156,6 +7199,22 @@ else {
     }
     // ns since Unix epoch -> ms
     private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
+    private void fs_readdir_into(VM* vm, str dir, JsObject* arr) {
+        u8* cdir = str_to_cstr(dir);
+        void* dp = opendir(cdir);
+        free(cdir);
+        if dp == null { return; }
+        i32 idx = 0;
+        while true {
+            u8* de = readdir(dp);
+            if de == null { break; }
+            str name = str_from_cstr(dirent_name(de));
+            bool dot = (name.len == 1 && *(name.data) == '.')
+                || (name.len == 2 && *(name.data) == '.' && *(name.data + 1) == '.');
+            if !dot { js_array_set(arr, idx, new_str(vm, name)); idx++; }
+        }
+        ignore closedir(dp);
+    }
 }
 
 private void fs_throw(VM* vm, str op, str path) {
@@ -7166,8 +7225,13 @@ private void fs_throw(VM* vm, str op, str path) {
     str_buf_add(&m, " '");
     str_buf_add(&m, path);
     str_buf_add(&m, "'");
-    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
+    Value err = vm_make_error(vm, ERR_ERROR, str_buf_to_str(&m));
     str_buf_free(&m);
+    vm_push(vm, err);
+    GcString* cs = gc_new_string(&vm.heap, "ENOENT");
+    js_set_prop(value_as_object(err), atom_intern(&vm.atoms, "code"), value_cell(&cs.head));
+    vm_pop(vm);
+    vm_throw(vm, err);
 }
 
 // Encoding from a string arg or a `{ encoding }` options object; -1 = raw
@@ -7320,6 +7384,18 @@ private Value nat_fs_mkdir(void* vmp, Value callee, Value thisv, Value* args, i3
     return value_undefined();
 }
 
+private Value nat_fs_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    fs_readdir_into(vm, path, arr);
+    Value r = value_cell(&arr.head);
+    vm_pop(vm);   // arr
+    vm_pop(vm);   // path
+    return r;
+}
+
 private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
@@ -7379,6 +7455,7 @@ private JsObject* build_fs_module(VM* vm) {
     def_node_export(vm, mod, ns, "appendFileSync", &nat_fs_append_file);
     def_node_export(vm, mod, ns, "existsSync", &nat_fs_exists);
     def_node_export(vm, mod, ns, "mkdirSync", &nat_fs_mkdir);
+    def_node_export(vm, mod, ns, "readdirSync", &nat_fs_readdir);
     def_node_export(vm, mod, ns, "rmdirSync", &nat_fs_rmdir);
     def_node_export(vm, mod, ns, "unlinkSync", &nat_fs_unlink);
     def_node_export(vm, mod, ns, "renameSync", &nat_fs_rename);

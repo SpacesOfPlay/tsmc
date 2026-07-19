@@ -45,21 +45,23 @@ suite (deterministic).
 - **Shipped**: `readFileSync(path, enc?)` (encoding string or `{encoding}`
   → decoded string, else a Buffer), `writeFileSync(path, data, enc?)`
   (string or Buffer), `appendFileSync`, `existsSync`,
-  `mkdirSync(path, {recursive}?)`, `rmdirSync`, `unlinkSync`,
-  `renameSync`, `statSync` (→ `{ size, mtimeMs, isFile(), isDirectory() }`;
-  type via `opendir`/`GetFileAttributes`, avoiding `struct stat` layout).
+  `mkdirSync(path, {recursive}?)`, `readdirSync`, `rmdirSync`,
+  `unlinkSync`, `renameSync`, `statSync`
+  (→ `{ size, mtimeMs, isFile(), isDirectory() }`; type via
+  `opendir`/`GetFileAttributes`, avoiding `struct stat` layout).
+  `readdirSync` enumerates via `FindFirstFileA` (Windows) /
+  `opendir`+`readdir` (POSIX, per-platform `d_name` offset), skipping
+  `.`/`..`. Errors carry both an `ENOENT: …` message and `.code`
+  (`e.code === 'ENOENT'` works).
 - Contents can't be diff-tested against a fixed golden (host state), so fs
   round-trips real files in a per-process (pid-keyed) temp dir and prints
   only content/sizes/booleans — verified equal to Node, and gc-stressed.
 
 ## Not doing / deferred (documented)
 
-- **`readdirSync`** — deferred: the three `dirent` layouts (Windows
-  `WIN32_FIND_DATA`, Linux, macOS) are the messiest platform surface; the
-  read/write/stat core lands first. Next addition.
-- **`error.code`** — thrown errors carry an `ENOENT: …` message but not
-  yet a `.code` property; string-matching works, `e.code === 'ENOENT'`
-  does not. Follow-up.
+- **Error-code fidelity** — every failure reports `.code = 'ENOENT'`
+  regardless of the real errno (no errno plumbing), so a permission
+  failure still reads as `ENOENT`. The common not-found case is correct.
 - **Async / promises / streams / watch** — `fs.promises`, callback APIs,
   `createReadStream`, `watch`.
 - **File descriptors** — `openSync`/`readSync`/`writeSync(fd,...)`,

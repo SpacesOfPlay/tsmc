@@ -30,8 +30,11 @@ const bin = path.join(dir, "b.bin");
 fs.writeFileSync(bin, Buffer.from([1, 2, 3, 255]));
 console.log(fs.readFileSync(bin, "hex"), fs.statSync(bin).size);
 
+// readdir (sorted — enumeration order is host-defined)
+console.log(fs.readdirSync(dir).sort().join(","));
+
 try { fs.readFileSync(path.join(dir, "nope.txt")); console.log("no throw"); }
-catch (e) { console.log(e.message.includes("ENOENT")); }
+catch (e) { console.log(e.message.includes("ENOENT"), e.code); }
 
 // cleanup
 fs.unlinkSync(dst);
