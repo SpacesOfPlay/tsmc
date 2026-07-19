@@ -3,3 +3,4 @@ pi 3.14159
 area 12.57 version 1.0
 hello ababab
 default 42
+typeof function function object number undefined

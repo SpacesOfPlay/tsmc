@@ -1239,7 +1239,11 @@ private void compile_expr(Compiler* co, Node* n) {
         if n.op == TOK_KW_TYPEOF {
             if n.a.kind == N_IDENT {
                 FScope* fs = co.cur;
-                if find_local(fs, n.a.name) < 0 && resolve_upval(fs, n.a.name) < 0 {
+                // A module import reads from a dependency namespace, not a
+                // global, so it must go through the normal expression path.
+                bool is_import = co.in_module
+                    && strmap_get<ModImport>(&co.mod_imports, n.a.name) != null;
+                if !is_import && find_local(fs, n.a.name) < 0 && resolve_upval(fs, n.a.name) < 0 {
                     ch_op_u16(ch, OP_GETGLOBAL_SOFT, name_const(co, n.a.name));
                     ch_op(ch, OP_TYPEOF);
                     return;

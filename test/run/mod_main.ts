@@ -9,3 +9,5 @@ const c = new Circle(2);
 console.log("area", c.area().toFixed(2), "version", version);
 console.log(util.greeting, util.repeat("ab", 3));
 console.log("default", def(42));
+// typeof of imported bindings resolves through the import, not a soft global
+console.log("typeof", typeof add, typeof def, typeof util, typeof PI, typeof missing);
