@@ -451,6 +451,11 @@ private i32 eval_module(Loader* ld, i32 idx) {
     i32 st = vm_run_module_fn(ld.vm, mod.tmpl, argv, nargs);
     free(argv);
     mod.state = MOD_DONE;
+    // A top-level-await module runs as a coroutine; drain the event loop so
+    // its body (and thus its exports) completes before dependents evaluate.
+    if st == 0 && mod.tmpl.is_async {
+        st = vm_run_event_loop(ld.vm);
+    }
     return st;
 }
 

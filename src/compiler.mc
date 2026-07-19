@@ -2452,6 +2452,26 @@ private void mirror_export(Compiler* co, str ns_name, str name, str exported) {
 }
 
 
+// True if `n` contains an `await` (or `for await`) that belongs to the
+// module top level — i.e. not nested inside a function/arrow/method, which
+// carry their own async context.
+private bool node_has_tla(Node* n) {
+    if n == null { return false; }
+    if n.kind == N_FUNCTION { return false; }
+    if n.kind == N_AWAIT { return true; }
+    if n.kind == N_FOR_OF && (n.flags & NF_AWAIT) != 0 { return true; }
+    if n.kind == N_CLASS {
+        // class methods are functions; only the extends expression runs in
+        // module scope
+        return node_has_tla(n.a);
+    }
+    if node_has_tla(n.a) || node_has_tla(n.b) || node_has_tla(n.c) || node_has_tla(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if node_has_tla(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
 // Compiles a module. out_specs receives the dependency specifiers in
 // slot order (the evaluator passes namespaces in that order).
 FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
@@ -2459,6 +2479,12 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     fscope_init(&fs, null, false);
     co.cur = &fs;
     scan_inner(&fs.inner, prog, true);
+
+    // A module using top-level await compiles as an async function; its
+    // body runs as a coroutine that the event loop drains.
+    for i32 i = 0; i < prog.kids.len; i++ {
+        if node_has_tla(*(prog.kids.items + i)) { fs.is_async = true; break; }
+    }
 
     // 1. assign a dep slot per distinct specifier
     StrMap<i32> spec_slot;
@@ -2605,7 +2631,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     str empty;
     empty.data = null;
     empty.len = 0;
-    FnTemplate* t = chunk_finish(&fs.ch, empty, n_params, fs.n_slots, false, false, false);
+    FnTemplate* t = chunk_finish(&fs.ch, empty, n_params, fs.n_slots, false, false, fs.is_async);
     t.src_name = co.src_name;
     co.cur = null;
     co.in_module = false;
