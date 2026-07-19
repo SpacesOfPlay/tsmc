@@ -7641,6 +7641,355 @@ private JsObject* build_os_module(VM* vm) {
     return ns;
 }
 
+// --- events / EventEmitter --------------------------------------------------
+//
+// Per-instance state is a hidden `%events` object mapping each event name
+// (string) to an ordered listener array. `once` listeners are stored as a
+// self-removing wrapper native that carries the original in env2.
+
+private bool ee_is_once_wrapper(Value v) {
+    return value_is_native(v) && value_as_native(v).fun == &nat_ee_once_wrap;
+}
+
+// The original function behind a listener (a once-wrapper unwraps to its
+// stored original; a plain listener is itself).
+private Value ee_unwrap(Value v) {
+    if ee_is_once_wrapper(v) { return value_as_native(v).env2; }
+    return v;
+}
+
+private JsObject* ee_events(VM* vm, Value thisv, bool create) {
+    if !value_is_object(thisv) { return null; }
+    JsObject* self = value_as_object(thisv);
+    Value ev;
+    if js_get_prop(self, bi_atom(vm, "%events"), &ev) && value_is_object(ev) {
+        return value_as_object(ev);
+    }
+    if !create { return null; }
+    JsObject* e = js_new_object(&vm.heap, null);
+    props_set_desc(&self.props, bi_atom(vm, "%events"), value_cell(&e.head), 0);
+    return e;
+}
+
+private JsObject* ee_list(VM* vm, JsObject* events, str name, bool create) {
+    u32 atom = atom_intern(&vm.atoms, name);
+    Value a;
+    if js_get_prop(events, atom, &a) && value_is_array(a) { return value_as_object(a); }
+    if !create { return null; }
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    props_set_desc(&events.props, atom, value_cell(&arr.head), PROP_DEFAULT);
+    return arr;
+}
+
+// Removes the first listener that is `target` or a once-wrapper whose
+// original is `target`; compacts in place. Returns true if one was removed.
+private bool ee_remove_match(JsObject* list, Value target) {
+    for i32 i = 0; i < list.elen; i++ {
+        Value e = js_array_get(list, i);
+        if value_same_bits(e, target) || value_same_bits(ee_unwrap(e), target) {
+            for i32 j = i; j < list.elen - 1; j++ { js_array_set(list, j, js_array_get(list, j + 1)); }
+            js_array_set_length(list, list.elen - 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Adds `fn` to the listener array for arg[0]'s event; front-inserts when
+// `prepend`. Shared by on/prependListener (and the once variants via `fn`
+// being a wrapper).
+private Value ee_add(VM* vm, Value thisv, Value* args, i32 argc, Value cb, bool prepend) {
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    vm_push(vm, cb);
+    JsObject* events = ee_events(vm, thisv, true);
+    JsObject* list = ee_list(vm, events, sview(namev), true);
+    if prepend {
+        for i32 i = list.elen; i > 0; i-- { js_array_set(list, i, js_array_get(list, i - 1)); }
+        js_array_set(list, 0, cb);
+    } else {
+        js_array_set(list, list.elen, cb);
+    }
+    vm_pop(vm);
+    vm_pop(vm);
+    return thisv;
+}
+
+private Value nat_ee_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    // state is lazy; `new` supplies the instance as thisv (returning a
+    // non-reference keeps it — see OP_NEW). Nothing to initialize here.
+    return value_undefined();
+}
+
+private Value nat_ee_on(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 1);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "listener must be a function");
+        return value_undefined();
+    }
+    return ee_add(vm, thisv, args, argc, cb, false);
+}
+
+private Value nat_ee_prepend(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 1);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "listener must be a function");
+        return value_undefined();
+    }
+    return ee_add(vm, thisv, args, argc, cb, true);
+}
+
+// Builds a once-wrapper native carrying (emitter, event name, original cb).
+private Value ee_make_once(VM* vm, Value thisv, Value namev, Value cb) {
+    vm_push(vm, namev);
+    vm_push(vm, cb);
+    JsNative* w = js_new_native(&vm.heap, &nat_ee_once_wrap, "");
+    w.env0 = thisv;
+    w.env1 = namev;
+    w.env2 = cb;
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_cell(&w.head);
+}
+
+private Value nat_ee_once(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 1);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "listener must be a function");
+        return value_undefined();
+    }
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    Value w = ee_make_once(vm, thisv, namev, cb);
+    vm_push(vm, w);
+    Value r = ee_add(vm, thisv, args, argc, w, false);
+    vm_pop(vm);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_ee_prepend_once(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 1);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "listener must be a function");
+        return value_undefined();
+    }
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    Value w = ee_make_once(vm, thisv, namev, cb);
+    vm_push(vm, w);
+    Value r = ee_add(vm, thisv, args, argc, w, true);
+    vm_pop(vm);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_ee_once_wrap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* w = value_as_native(callee);
+    Value emitter = w.env0;
+    Value cb = w.env2;
+    // detach this wrapper before firing (fires exactly once)
+    JsObject* events = ee_events(vm, emitter, false);
+    if events != null {
+        JsObject* list = ee_list(vm, events, sview(w.env1), false);
+        if list != null { ignore ee_remove_match(list, callee); }
+    }
+    return vm_call_value(vm, cb, thisv, args, argc);
+}
+
+private Value nat_ee_off(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 1);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* events = ee_events(vm, thisv, false);
+    if events != null {
+        JsObject* list = ee_list(vm, events, sview(namev), false);
+        if list != null { ignore ee_remove_match(list, cb); }
+    }
+    vm_pop(vm);
+    return thisv;
+}
+
+private Value nat_ee_emit(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* events = ee_events(vm, thisv, false);
+    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    if list == null || list.elen == 0 {
+        bool is_error = str_equal(sview(namev), "error");
+        vm_pop(vm);
+        if is_error {
+            Value errv = arg_at(args, argc, 1);
+            if value_is_object(errv) { vm_throw(vm, errv); }
+            else { vm_throw_error(vm, ERR_ERROR, "Unhandled 'error' event"); }
+            return value_undefined();
+        }
+        return value_bool(false);
+    }
+    // snapshot: a listener (e.g. a once wrapper) may mutate the list
+    i32 n = list.elen;
+    JsObject* snap = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&snap.head));
+    for i32 i = 0; i < n; i++ { js_array_set(snap, i, js_array_get(list, i)); }
+    i32 nargs = argc > 1 ? argc - 1 : 0;
+    for i32 i = 0; i < n; i++ {
+        Value lf = js_array_get(snap, i);
+        ignore vm_call_value(vm, lf, thisv, args + 1, nargs);
+        if vm.has_pending { break; }
+    }
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_bool(true);
+}
+
+private Value nat_ee_listeners_impl(VM* vm, Value thisv, Value* args, i32 argc, bool raw) {
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&out.head));
+    JsObject* events = ee_events(vm, thisv, false);
+    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    if list != null {
+        for i32 i = 0; i < list.elen; i++ {
+            Value e = js_array_get(list, i);
+            js_array_set(out, i, raw ? e : ee_unwrap(e));
+        }
+    }
+    Value r = value_cell(&out.head);
+    vm_pop(vm);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_ee_listeners(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return nat_ee_listeners_impl(as_vm(vmp), thisv, args, argc, false);
+}
+private Value nat_ee_raw_listeners(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return nat_ee_listeners_impl(as_vm(vmp), thisv, args, argc, true);
+}
+
+private Value nat_ee_listener_count(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* events = ee_events(vm, thisv, false);
+    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    i32 c = list != null ? list.elen : 0;
+    vm_pop(vm);
+    return value_number(cast(f64, c));
+}
+
+private Value nat_ee_event_names(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&out.head));
+    JsObject* events = ee_events(vm, thisv, false);
+    i32 n = 0;
+    if events != null {
+        JsObject* keys = vm_own_keys(vm, value_cell(&events.head));
+        vm_push(vm, value_cell(&keys.head));
+        for i32 i = 0; i < keys.elen; i++ {
+            Value kv = js_array_get(keys, i);
+            Value av;
+            if js_get_prop(events, atom_intern(&vm.atoms, sview(kv)), &av)
+                && value_is_array(av) && value_as_object(av).elen > 0 {
+                js_array_set(out, n, kv);
+                n++;
+            }
+        }
+        vm_pop(vm);
+    }
+    Value r = value_cell(&out.head);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_ee_remove_all(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* events = ee_events(vm, thisv, false);
+    if events != null {
+        Value namev = arg_at(args, argc, 0);
+        if value_is_undefined(namev) {
+            // clear everything: replace with a fresh %events
+            JsObject* self = value_as_object(thisv);
+            JsObject* fresh = js_new_object(&vm.heap, null);
+            props_set_desc(&self.props, bi_atom(vm, "%events"), value_cell(&fresh.head), 0);
+        } else {
+            Value ns = js_to_string_value(vm, namev);
+            vm_push(vm, ns);
+            JsObject* list = ee_list(vm, events, sview(ns), false);
+            if list != null { js_array_set_length(list, 0); }
+            vm_pop(vm);
+        }
+    }
+    return thisv;
+}
+
+private Value nat_ee_set_max(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if value_is_object(thisv) {
+        js_set_prop(value_as_object(thisv), bi_atom(vm, "%maxListeners"),
+            value_number(cast(f64, to_int_arg(arg_at(args, argc, 0)))));
+    }
+    return thisv;
+}
+
+private Value nat_ee_get_max(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if value_is_object(thisv) {
+        Value m;
+        if js_get_prop(value_as_object(thisv), bi_atom(vm, "%maxListeners"), &m) && value_is_number(m) {
+            return m;
+        }
+    }
+    return value_number(10.0);
+}
+
+private JsObject* build_events_module(VM* vm) {
+    JsObject* proto = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&proto.head));
+    JsNative* ctor = js_new_native(&vm.heap, &nat_ee_ctor, "EventEmitter");
+    vm_push(vm, value_cell(&ctor.head));
+    props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&proto.head), 0);
+    link_ctor(vm, proto, ctor);
+
+    def_method(vm, proto, "on", &nat_ee_on);
+    def_method(vm, proto, "addListener", &nat_ee_on);
+    def_method(vm, proto, "once", &nat_ee_once);
+    def_method(vm, proto, "off", &nat_ee_off);
+    def_method(vm, proto, "removeListener", &nat_ee_off);
+    def_method(vm, proto, "emit", &nat_ee_emit);
+    def_method(vm, proto, "removeAllListeners", &nat_ee_remove_all);
+    def_method(vm, proto, "listeners", &nat_ee_listeners);
+    def_method(vm, proto, "rawListeners", &nat_ee_raw_listeners);
+    def_method(vm, proto, "listenerCount", &nat_ee_listener_count);
+    def_method(vm, proto, "eventNames", &nat_ee_event_names);
+    def_method(vm, proto, "prependListener", &nat_ee_prepend);
+    def_method(vm, proto, "prependOnceListener", &nat_ee_prepend_once);
+    def_method(vm, proto, "setMaxListeners", &nat_ee_set_max);
+    def_method(vm, proto, "getMaxListeners", &nat_ee_get_max);
+
+    props_set_desc(&ctor.props, bi_atom(vm, "EventEmitter"), value_cell(&ctor.head), PROP_DEFAULT);
+    props_set_desc(&ctor.props, bi_atom(vm, "defaultMaxListeners"), value_number(10.0), PROP_DEFAULT);
+
+    // namespace: default = the EventEmitter class (require('events') is the
+    // class in Node), plus a named EventEmitter export.
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&ctor.head), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "EventEmitter"), value_cell(&ctor.head), PROP_DEFAULT);
+    vm_pop(vm);
+    vm_pop(vm);
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -7655,6 +8004,10 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "os") {
         if vm.node_os_ns == null { vm.node_os_ns = build_os_module(vm); }
         return vm.node_os_ns;
+    }
+    if str_equal(name, "events") {
+        if vm.node_events_ns == null { vm.node_events_ns = build_events_module(vm); }
+        return vm.node_events_ns;
     }
     return null;
 }
