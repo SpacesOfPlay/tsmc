@@ -7642,6 +7642,742 @@ JsObject* builtins_node_module(VM* vm, str name) {
     return null;
 }
 
+// --- URLSearchParams --------------------------------------------------------
+//
+// Ordered [name, value] string pairs in a hidden "%pairs" JS array.
+
+private bool usp_unreserved(u8 c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '*' || c == '-' || c == '.' || c == '_';
+}
+private void usp_encode(str_buf* out, str s) {
+    str hexd = "0123456789ABCDEF";
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c == ' ' { str_buf_add_byte(out, cast(u8, '+')); }
+        else if usp_unreserved(c) { str_buf_add_byte(out, c); }
+        else {
+            str_buf_add_byte(out, cast(u8, '%'));
+            str_buf_add_byte(out, *(hexd.data + (c >> 4)));
+            str_buf_add_byte(out, *(hexd.data + (c & 0xF)));
+        }
+    }
+}
+private void usp_decode(str_buf* out, str s) {
+    i32 i = 0;
+    while i < s.len {
+        u8 c = *(s.data + i);
+        if c == '+' { str_buf_add_byte(out, cast(u8, ' ')); i++; }
+        else if c == '%' && i + 2 < s.len {
+            i32 hi = hex_val(*(s.data + i + 1));
+            i32 lo = hex_val(*(s.data + i + 2));
+            if hi >= 0 && lo >= 0 { str_buf_add_byte(out, cast(u8, (hi << 4) | lo)); i += 3; }
+            else { str_buf_add_byte(out, c); i++; }
+        } else { str_buf_add_byte(out, c); i++; }
+    }
+}
+
+private JsObject* usp_pairs(VM* vm, Value thisv) {
+    if !value_is_object(thisv) { return null; }
+    Value p;
+    if js_get_prop(value_as_object(thisv), bi_atom(vm, "%pairs"), &p) && value_is_array(p) {
+        return value_as_object(p);
+    }
+    return null;
+}
+
+// Appends [name, val]; `pairs` and both values must be reachable/rooted.
+private void usp_push_pair(VM* vm, JsObject* pairs, Value name, Value val) {
+    JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+    js_array_set(pairs, pairs.elen, value_cell(&pair.head));
+    js_array_set(pair, 0, name);
+    js_array_set(pair, 1, val);
+}
+
+private JsObject* usp_new(VM* vm) {
+    JsObject* o = js_new_object(&vm.heap, vm.usp_proto);
+    vm_push(vm, value_cell(&o.head));
+    JsObject* pairs = js_new_array(&vm.heap, vm.array_proto);
+    props_set_desc(&o.props, bi_atom(vm, "%pairs"), value_cell(&pairs.head), 0);
+    vm_pop(vm);
+    return o;
+}
+
+private void usp_parse_query(VM* vm, JsObject* pairs, str q) {
+    i32 i = 0;
+    while i < q.len {
+        i32 start = i;
+        while i < q.len && *(q.data + i) != '&' { i++; }
+        str seg;
+        seg.data = q.data + start;
+        seg.len = i - start;
+        if seg.len > 0 {
+            i32 eq = -1;
+            for i32 j = 0; j < seg.len; j++ { if *(seg.data + j) == '=' { eq = j; break; } }
+            str k;
+            str v;
+            if eq < 0 { k = seg; v.data = seg.data; v.len = 0; }
+            else { k.data = seg.data; k.len = eq; v.data = seg.data + eq + 1; v.len = seg.len - eq - 1; }
+            str_buf kb;
+            str_buf_init(&kb);
+            usp_decode(&kb, k);
+            Value kv = new_str(vm, str_buf_to_str(&kb));
+            str_buf_free(&kb);
+            vm_push(vm, kv);
+            str_buf vb;
+            str_buf_init(&vb);
+            usp_decode(&vb, v);
+            Value vv = new_str(vm, str_buf_to_str(&vb));
+            str_buf_free(&vb);
+            vm_push(vm, vv);
+            usp_push_pair(vm, pairs, kv, vv);
+            vm_pop(vm);
+            vm_pop(vm);
+        }
+        i++;
+    }
+}
+
+// Fills an existing USP object's pairs from an init value (string/array/
+// object/URLSearchParams). `o` must be rooted by the caller.
+private void usp_init_from(VM* vm, JsObject* o, Value init) {
+    JsObject* pairs = usp_pairs(vm, value_cell(&o.head));
+    if value_is_string(init) {
+        str q = sview(init);
+        if q.len > 0 && *(q.data) == '?' { q.data = q.data + 1; q.len = q.len - 1; }
+        usp_parse_query(vm, pairs, q);
+    } else if value_is_array(init) {
+        JsObject* a = value_as_object(init);
+        for i32 i = 0; i < a.elen; i++ {
+            Value e = js_array_get(a, i);
+            if value_is_array(e) {
+                JsObject* ep = value_as_object(e);
+                Value k = js_to_string_value(vm, js_array_get(ep, 0));
+                vm_push(vm, k);
+                Value v = js_to_string_value(vm, js_array_get(ep, 1));
+                vm_push(vm, v);
+                usp_push_pair(vm, pairs, k, v);
+                vm_pop(vm);
+                vm_pop(vm);
+            }
+        }
+    } else if value_is_object(init) {
+        JsObject* other = usp_pairs(vm, init);
+        if other != null {
+            for i32 i = 0; i < other.elen; i++ {
+                JsObject* pair = value_as_object(js_array_get(other, i));
+                usp_push_pair(vm, pairs, js_array_get(pair, 0), js_array_get(pair, 1));
+            }
+        } else {
+            JsObject* keys = vm_own_keys(vm, init);
+            vm_push(vm, value_cell(&keys.head));
+            for i32 i = 0; i < keys.elen; i++ {
+                Value kk = js_array_get(keys, i);
+                vm_push(vm, kk);
+                Value vv;
+                if vm_get_prop_value(vm, init, atom_intern(&vm.atoms, sview(kk)), &vv) {
+                    Value vs = js_to_string_value(vm, vv);
+                    vm_push(vm, vs);
+                    usp_push_pair(vm, pairs, kk, vs);
+                    vm_pop(vm);
+                }
+                vm_pop(vm);
+            }
+            vm_pop(vm);
+        }
+    }
+}
+
+private Value nat_usp_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = usp_new(vm);
+    vm_push(vm, value_cell(&o.head));
+    usp_init_from(vm, o, arg_at(args, argc, 0));
+    vm_pop(vm);
+    return value_cell(&o.head);
+}
+
+private Value nat_usp_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    Value r = value_null();
+    if pairs != null {
+        for i32 i = 0; i < pairs.elen; i++ {
+            JsObject* pair = value_as_object(js_array_get(pairs, i));
+            if js_strict_eq(js_array_get(pair, 0), namev) { r = js_array_get(pair, 1); break; }
+        }
+    }
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_usp_getall(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&out.head));
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null {
+        i32 n = 0;
+        for i32 i = 0; i < pairs.elen; i++ {
+            JsObject* pair = value_as_object(js_array_get(pairs, i));
+            if js_strict_eq(js_array_get(pair, 0), namev) { js_array_set(out, n, js_array_get(pair, 1)); n++; }
+        }
+    }
+    Value r = value_cell(&out.head);
+    vm_pop(vm);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_usp_has(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    bool found = false;
+    if pairs != null {
+        for i32 i = 0; i < pairs.elen; i++ {
+            JsObject* pair = value_as_object(js_array_get(pairs, i));
+            if js_strict_eq(js_array_get(pair, 0), namev) { found = true; break; }
+        }
+    }
+    vm_pop(vm);
+    return value_bool(found);
+}
+
+private Value nat_usp_append(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value k = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, k);
+    Value v = js_to_string_value(vm, arg_at(args, argc, 1));
+    vm_push(vm, v);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null { usp_push_pair(vm, pairs, k, v); }
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+// Removes every pair with `name` from the pairs array (compacting in place).
+private void usp_remove(JsObject* pairs, Value name) {
+    i32 w = 0;
+    for i32 i = 0; i < pairs.elen; i++ {
+        Value e = js_array_get(pairs, i);
+        JsObject* pair = value_as_object(e);
+        if !js_strict_eq(js_array_get(pair, 0), name) {
+            js_array_set(pairs, w, e);
+            w++;
+        }
+    }
+    js_array_set_length(pairs, w);
+}
+
+private Value nat_usp_delete(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, namev);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null { usp_remove(pairs, namev); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_usp_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value k = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, k);
+    Value v = js_to_string_value(vm, arg_at(args, argc, 1));
+    vm_push(vm, v);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null {
+        // set the first matching pair in place (preserving position) and
+        // drop the rest; append if none matched (WHATWG set semantics).
+        i32 first = -1;
+        for i32 i = 0; i < pairs.elen; i++ {
+            if js_strict_eq(js_array_get(value_as_object(js_array_get(pairs, i)), 0), k) { first = i; break; }
+        }
+        if first < 0 {
+            usp_push_pair(vm, pairs, k, v);
+        } else {
+            js_array_set(value_as_object(js_array_get(pairs, first)), 1, v);
+            i32 w = first + 1;
+            for i32 i = first + 1; i < pairs.elen; i++ {
+                Value e = js_array_get(pairs, i);
+                if !js_strict_eq(js_array_get(value_as_object(e), 0), k) { js_array_set(pairs, w, e); w++; }
+            }
+            js_array_set_length(pairs, w);
+        }
+    }
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_usp_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf out;
+    str_buf_init(&out);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null {
+        for i32 i = 0; i < pairs.elen; i++ {
+            if i > 0 { str_buf_add_byte(&out, cast(u8, '&')); }
+            JsObject* pair = value_as_object(js_array_get(pairs, i));
+            usp_encode(&out, sview(js_array_get(pair, 0)));
+            str_buf_add_byte(&out, cast(u8, '='));
+            usp_encode(&out, sview(js_array_get(pair, 1)));
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    return r;
+}
+
+private Value nat_usp_sort(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null {
+        // stable insertion sort by key bytes
+        for i32 i = 1; i < pairs.elen; i++ {
+            Value cur = js_array_get(pairs, i);
+            str ck = sview(js_array_get(value_as_object(cur), 0));
+            i32 j = i - 1;
+            while j >= 0 {
+                str jk = sview(js_array_get(value_as_object(js_array_get(pairs, j)), 0));
+                if js_str_cmp(jk, ck) <= 0 { break; }
+                js_array_set(pairs, j + 1, js_array_get(pairs, j));
+                j--;
+            }
+            js_array_set(pairs, j + 1, cur);
+        }
+    }
+    return value_undefined();
+}
+
+private Value nat_usp_foreach(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cb = arg_at(args, argc, 0);
+    if !value_is_callable(cb) { return value_undefined(); }
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs == null { return value_undefined(); }
+    for i32 i = 0; i < pairs.elen; i++ {
+        JsObject* pair = value_as_object(js_array_get(pairs, i));
+        Value[3] cargs;
+        cargs[0] = js_array_get(pair, 1);
+        cargs[1] = js_array_get(pair, 0);
+        cargs[2] = thisv;
+        ignore vm_call_value(vm, cb, arg_at(args, argc, 1), &cargs[0], 3);
+        if vm.has_pending { break; }
+    }
+    return value_undefined();
+}
+
+private Value nat_usp_size(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs == null { return value_number(0.0); }
+    return value_number(cast(f64, pairs.elen));
+}
+
+// Builds an array of keys / values / [k,v] pairs, then an index iterator.
+private Value usp_iter(VM* vm, Value thisv, i32 mode) {
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&out.head));
+    JsObject* pairs = usp_pairs(vm, thisv);
+    if pairs != null {
+        for i32 i = 0; i < pairs.elen; i++ {
+            JsObject* pair = value_as_object(js_array_get(pairs, i));
+            if mode == 0 { js_array_set(out, i, js_array_get(pair, 0)); }
+            else if mode == 1 { js_array_set(out, i, js_array_get(pair, 1)); }
+            else {
+                JsObject* e = js_new_array(&vm.heap, vm.array_proto);
+                js_array_set(out, i, value_cell(&e.head));
+                js_array_set(e, 0, js_array_get(pair, 0));
+                js_array_set(e, 1, js_array_get(pair, 1));
+            }
+        }
+    }
+    Value it = make_index_iterator(vm, value_cell(&out.head), 0);
+    vm_pop(vm);
+    return it;
+}
+private Value nat_usp_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return usp_iter(as_vm(vmp), thisv, 0);
+}
+private Value nat_usp_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return usp_iter(as_vm(vmp), thisv, 1);
+}
+private Value nat_usp_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return usp_iter(as_vm(vmp), thisv, 2);
+}
+
+// --- URL --------------------------------------------------------------------
+
+struct UrlParts {
+    str scheme; str user; str pass; str host; str port;
+    str path; str query; str hash;
+    bool has_authority; bool has_query; bool has_hash;
+}
+
+private bool url_scheme_char(u8 c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '+' || c == '.' || c == '-';
+}
+private bool is_origin_scheme(str s) {
+    return str_equal(s, "http") || str_equal(s, "https") || str_equal(s, "ws")
+        || str_equal(s, "wss") || str_equal(s, "ftp");
+}
+private bool is_default_port(str scheme, str port) {
+    if port.len == 0 { return false; }
+    i32 pn = 0;
+    for i32 i = 0; i < port.len; i++ {
+        u8 c = *(port.data + i);
+        if c < '0' || c > '9' { return false; }
+        pn = pn * 10 + cast(i32, c - '0');
+    }
+    if str_equal(scheme, "http") || str_equal(scheme, "ws") { return pn == 80; }
+    if str_equal(scheme, "https") || str_equal(scheme, "wss") { return pn == 443; }
+    if str_equal(scheme, "ftp") { return pn == 21; }
+    return false;
+}
+
+// Parses an absolute URL (must start with `scheme:`). Views into `s`.
+private bool parse_absolute(str s, UrlParts* out) {
+    out.user.len = 0; out.pass.len = 0; out.host.len = 0; out.port.len = 0;
+    out.path.len = 0; out.query.len = 0; out.hash.len = 0;
+    out.user.data = s.data; out.pass.data = s.data; out.host.data = s.data;
+    out.port.data = s.data; out.path.data = s.data; out.query.data = s.data; out.hash.data = s.data;
+    out.has_authority = false; out.has_query = false; out.has_hash = false;
+    if s.len == 0 { return false; }
+    u8 c0 = *(s.data);
+    if !((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z')) { return false; }
+    i32 colon = -1;
+    i32 j = 1;
+    while j < s.len {
+        u8 c = *(s.data + j);
+        if c == ':' { colon = j; break; }
+        if !url_scheme_char(c) { break; }
+        j++;
+    }
+    if colon < 0 { return false; }
+    out.scheme.data = s.data;
+    out.scheme.len = colon;
+    i32 i = colon + 1;
+    if i + 1 < s.len && *(s.data + i) == '/' && *(s.data + i + 1) == '/' {
+        out.has_authority = true;
+        i += 2;
+        i32 astart = i;
+        while i < s.len {
+            u8 c = *(s.data + i);
+            if c == '/' || c == '?' || c == '#' { break; }
+            i++;
+        }
+        str auth;
+        auth.data = s.data + astart;
+        auth.len = i - astart;
+        i32 at = -1;
+        for i32 k = 0; k < auth.len; k++ { if *(auth.data + k) == '@' { at = k; } }
+        str hostport;
+        if at >= 0 {
+            str ui;
+            ui.data = auth.data;
+            ui.len = at;
+            i32 uc = -1;
+            for i32 k = 0; k < ui.len; k++ { if *(ui.data + k) == ':' { uc = k; break; } }
+            if uc < 0 { out.user = ui; }
+            else {
+                out.user.data = ui.data; out.user.len = uc;
+                out.pass.data = ui.data + uc + 1; out.pass.len = ui.len - uc - 1;
+            }
+            hostport.data = auth.data + at + 1;
+            hostport.len = auth.len - at - 1;
+        } else { hostport = auth; }
+        i32 pc = -1;
+        for i32 k = 0; k < hostport.len; k++ { if *(hostport.data + k) == ':' { pc = k; } }
+        if pc < 0 { out.host = hostport; }
+        else {
+            out.host.data = hostport.data; out.host.len = pc;
+            out.port.data = hostport.data + pc + 1; out.port.len = hostport.len - pc - 1;
+        }
+    }
+    i32 pstart = i;
+    while i < s.len && *(s.data + i) != '?' && *(s.data + i) != '#' { i++; }
+    out.path.data = s.data + pstart;
+    out.path.len = i - pstart;
+    if i < s.len && *(s.data + i) == '?' {
+        out.has_query = true;
+        i++;
+        i32 qstart = i;
+        while i < s.len && *(s.data + i) != '#' { i++; }
+        out.query.data = s.data + qstart;
+        out.query.len = i - qstart;
+    }
+    if i < s.len && *(s.data + i) == '#' {
+        out.has_hash = true;
+        out.hash.data = s.data + i + 1;
+        out.hash.len = s.len - i - 1;
+    }
+    return true;
+}
+
+private void url_append_authority(str_buf* b, UrlParts* p, str port) {
+    if p.user.len > 0 || p.pass.len > 0 {
+        str_buf_add(b, p.user);
+        if p.pass.len > 0 { str_buf_add_byte(b, cast(u8, ':')); str_buf_add(b, p.pass); }
+        str_buf_add_byte(b, cast(u8, '@'));
+    }
+    str_buf_add(b, p.host);
+    if port.len > 0 { str_buf_add_byte(b, cast(u8, ':')); str_buf_add(b, port); }
+}
+
+private JsObject* build_url(VM* vm, UrlParts* p) {
+    JsObject* o = js_new_object(&vm.heap, vm.url_proto);
+    vm_push(vm, value_cell(&o.head));
+    str port = p.port;
+    if is_default_port(p.scheme, port) { port.len = 0; }
+
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add(&b, p.scheme);
+    str_buf_add_byte(&b, cast(u8, ':'));
+    def_value_enum(vm, o, "protocol", new_str(vm, str_buf_to_str(&b)));
+    str_buf_free(&b);
+
+    def_value_enum(vm, o, "username", new_str(vm, p.user));
+    def_value_enum(vm, o, "password", new_str(vm, p.pass));
+    def_value_enum(vm, o, "hostname", new_str(vm, p.host));
+    def_value_enum(vm, o, "port", new_str(vm, port));
+
+    str_buf hb;
+    str_buf_init(&hb);
+    str_buf_add(&hb, p.host);
+    if port.len > 0 { str_buf_add_byte(&hb, cast(u8, ':')); str_buf_add(&hb, port); }
+    def_value_enum(vm, o, "host", new_str(vm, str_buf_to_str(&hb)));
+    str_buf_free(&hb);
+
+    str pathname = p.path;
+    if p.has_authority && p.path.len == 0 { pathname = "/"; }
+    def_value_enum(vm, o, "pathname", new_str(vm, pathname));
+
+    str_buf sb;
+    str_buf_init(&sb);
+    if p.has_query { str_buf_add_byte(&sb, cast(u8, '?')); str_buf_add(&sb, p.query); }
+    def_value_enum(vm, o, "search", new_str(vm, str_buf_to_str(&sb)));
+    str_buf_free(&sb);
+
+    str_buf fb;
+    str_buf_init(&fb);
+    if p.has_hash { str_buf_add_byte(&fb, cast(u8, '#')); str_buf_add(&fb, p.hash); }
+    def_value_enum(vm, o, "hash", new_str(vm, str_buf_to_str(&fb)));
+    str_buf_free(&fb);
+
+    str_buf ob;
+    str_buf_init(&ob);
+    if is_origin_scheme(p.scheme) {
+        str_buf_add(&ob, p.scheme);
+        str_buf_add(&ob, "://");
+        str_buf_add(&ob, p.host);
+        if port.len > 0 { str_buf_add_byte(&ob, cast(u8, ':')); str_buf_add(&ob, port); }
+    } else { str_buf_add(&ob, "null"); }
+    def_value_enum(vm, o, "origin", new_str(vm, str_buf_to_str(&ob)));
+    str_buf_free(&ob);
+
+    str_buf hf;
+    str_buf_init(&hf);
+    str_buf_add(&hf, p.scheme);
+    str_buf_add_byte(&hf, cast(u8, ':'));
+    if p.has_authority { str_buf_add(&hf, "//"); url_append_authority(&hf, p, port); }
+    str_buf_add(&hf, pathname);
+    if p.has_query { str_buf_add_byte(&hf, cast(u8, '?')); str_buf_add(&hf, p.query); }
+    if p.has_hash { str_buf_add_byte(&hf, cast(u8, '#')); str_buf_add(&hf, p.hash); }
+    def_value_enum(vm, o, "href", new_str(vm, str_buf_to_str(&hf)));
+    str_buf_free(&hf);
+
+    JsObject* sp = usp_new(vm);
+    vm_push(vm, value_cell(&sp.head));
+    usp_parse_query(vm, usp_pairs(vm, value_cell(&sp.head)), p.query);
+    def_value_enum(vm, o, "searchParams", value_cell(&sp.head));
+    vm_pop(vm);
+
+    vm_pop(vm);
+    return o;
+}
+
+private Value nat_url_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value h;
+    if value_is_object(thisv) && js_get_prop(value_as_object(thisv), bi_atom(vm, "href"), &h) { return h; }
+    return new_str(vm, "");
+}
+
+// Collapses `.`/`..`/duplicate `/` in a URL path (always `/`-separated),
+// preserving a leading slash and a trailing slash.
+private void url_path_norm(str_buf* out, str p) {
+    bool abs = p.len > 0 && *(p.data) == '/';
+    Vec<str> segs = vec_new<str>(8);
+    i32 i = 0;
+    while i < p.len {
+        while i < p.len && *(p.data + i) == '/' { i++; }
+        i32 start = i;
+        while i < p.len && *(p.data + i) != '/' { i++; }
+        str seg;
+        seg.data = p.data + start;
+        seg.len = i - start;
+        if seg.len == 0 { }
+        else if seg.len == 1 && *(seg.data) == '.' { }
+        else if seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.' {
+            if segs.len > 0 { segs.len = segs.len - 1; }
+        }
+        else { vec_push(&segs, seg); }
+    }
+    if abs { str_buf_add_byte(out, cast(u8, '/')); }
+    for i32 k = 0; k < segs.len; k++ {
+        if k > 0 { str_buf_add_byte(out, cast(u8, '/')); }
+        str_buf_add(out, vec_get(&segs, k));
+    }
+    if p.len > 0 && *(p.data + p.len - 1) == '/' && segs.len > 0 { str_buf_add_byte(out, cast(u8, '/')); }
+    vec_free(&segs);
+}
+
+private str url_heapcopy(str_buf* out) {
+    str v = str_buf_to_str(out);
+    u8* d = alloc<u8>(v.len > 0 ? v.len : 1);
+    if v.len > 0 { memcpy(d, v.data, v.len); }
+    str r;
+    r.data = d;
+    r.len = v.len;
+    return r;
+}
+
+// Resolves `input` (a non-absolute reference) against base `bp`; returns a
+// heap-allocated absolute URL string (caller frees .data).
+private str resolve_relative(VM* vm, str input, UrlParts* bp) {
+    str_buf out;
+    str_buf_init(&out);
+    str port = bp.port;
+    bool two = input.len >= 2 && *(input.data) == '/' && *(input.data + 1) == '/';
+    if two {
+        str_buf_add(&out, bp.scheme);
+        str_buf_add_byte(&out, cast(u8, ':'));
+        str_buf_add(&out, input);
+    } else if input.len > 0 && *(input.data) == '/' {
+        str_buf_add(&out, bp.scheme); str_buf_add(&out, "://");
+        url_append_authority(&out, bp, port);
+        str_buf_add(&out, input);
+    } else if input.len > 0 && *(input.data) == '?' {
+        str_buf_add(&out, bp.scheme); str_buf_add(&out, "://");
+        url_append_authority(&out, bp, port);
+        str_buf_add(&out, bp.path);
+        str_buf_add(&out, input);
+    } else if input.len > 0 && *(input.data) == '#' {
+        str_buf_add(&out, bp.scheme); str_buf_add(&out, "://");
+        url_append_authority(&out, bp, port);
+        str_buf_add(&out, bp.path);
+        if bp.has_query { str_buf_add_byte(&out, cast(u8, '?')); str_buf_add(&out, bp.query); }
+        str_buf_add(&out, input);
+    } else {
+        str_buf_add(&out, bp.scheme); str_buf_add(&out, "://");
+        url_append_authority(&out, bp, port);
+        i32 lastslash = -1;
+        for i32 k = 0; k < bp.path.len; k++ { if *(bp.path.data + k) == '/' { lastslash = k; } }
+        str_buf cb;
+        str_buf_init(&cb);
+        if lastslash >= 0 { str seg; seg.data = bp.path.data; seg.len = lastslash + 1; str_buf_add(&cb, seg); }
+        else { str_buf_add_byte(&cb, cast(u8, '/')); }
+        i32 ip = 0;
+        while ip < input.len && *(input.data + ip) != '?' && *(input.data + ip) != '#' { ip++; }
+        str ipath;
+        ipath.data = input.data;
+        ipath.len = ip;
+        str_buf_add(&cb, ipath);
+        str_buf nb;
+        str_buf_init(&nb);
+        url_path_norm(&nb, str_buf_to_str(&cb));
+        str_buf_add(&out, str_buf_to_str(&nb));
+        if ip < input.len { str rest; rest.data = input.data + ip; rest.len = input.len - ip; str_buf_add(&out, rest); }
+        str_buf_free(&cb);
+        str_buf_free(&nb);
+    }
+    str r = url_heapcopy(&out);
+    str_buf_free(&out);
+    return r;
+}
+
+private Value nat_url_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value inputv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, inputv);
+    UrlParts parts;
+    if parse_absolute(sview(inputv), &parts) {
+        JsObject* o = build_url(vm, &parts);
+        vm_pop(vm);
+        return value_cell(&o.head);
+    }
+    // relative reference — resolve against a base
+    Value basev = arg_at(args, argc, 1);
+    if value_is_undefined(basev) || value_is_null(basev) {
+        vm_pop(vm);
+        vm_throw_error(vm, ERR_TYPE, "Invalid URL");
+        return value_undefined();
+    }
+    Value basestr = js_to_string_value(vm, basev);
+    vm_push(vm, basestr);
+    UrlParts bp;
+    if !parse_absolute(sview(basestr), &bp) {
+        vm_pop(vm);
+        vm_pop(vm);
+        vm_throw_error(vm, ERR_TYPE, "Invalid base URL");
+        return value_undefined();
+    }
+    str resolved = resolve_relative(vm, sview(inputv), &bp);
+    UrlParts rp;
+    bool rok = parse_absolute(resolved, &rp);
+    Value ret = value_undefined();
+    if rok {
+        JsObject* o = build_url(vm, &rp);
+        ret = value_cell(&o.head);
+    }
+    free(resolved.data);
+    vm_pop(vm);
+    vm_pop(vm);
+    if !rok { vm_throw_error(vm, ERR_TYPE, "Invalid URL"); }
+    return ret;
+}
+
+private void url_install(VM* vm) {
+    vm.url_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* ctor = def_global_fn(vm, "URL", &nat_url_ctor);
+    props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&vm.url_proto.head), 0);
+    link_ctor(vm, vm.url_proto, ctor);
+    def_method(vm, vm.url_proto, "toString", &nat_url_tostring);
+    def_method(vm, vm.url_proto, "toJSON", &nat_url_tostring);
+}
+
+private void usp_install(VM* vm) {
+    vm.usp_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* ctor = def_global_fn(vm, "URLSearchParams", &nat_usp_ctor);
+    props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&vm.usp_proto.head), 0);
+    link_ctor(vm, vm.usp_proto, ctor);
+    def_method(vm, vm.usp_proto, "get", &nat_usp_get);
+    def_method(vm, vm.usp_proto, "getAll", &nat_usp_getall);
+    def_method(vm, vm.usp_proto, "has", &nat_usp_has);
+    def_method(vm, vm.usp_proto, "set", &nat_usp_set);
+    def_method(vm, vm.usp_proto, "append", &nat_usp_append);
+    def_method(vm, vm.usp_proto, "delete", &nat_usp_delete);
+    def_method(vm, vm.usp_proto, "toString", &nat_usp_tostring);
+    def_method(vm, vm.usp_proto, "sort", &nat_usp_sort);
+    def_method(vm, vm.usp_proto, "forEach", &nat_usp_foreach);
+    def_method(vm, vm.usp_proto, "keys", &nat_usp_keys);
+    def_method(vm, vm.usp_proto, "values", &nat_usp_values);
+    def_method(vm, vm.usp_proto, "entries", &nat_usp_entries);
+    JsNative* it = js_new_native(&vm.heap, &nat_usp_entries, "[Symbol.iterator]");
+    props_set_desc(&vm.usp_proto.props, vm_sym_iterator_id(vm), value_cell(&it.head), METHOD_ATTRS);
+    def_accessor(vm, vm.usp_proto, "size", &nat_usp_size);
+}
+
 void builtins_install(VM* vm) {
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
@@ -8072,6 +8808,8 @@ void builtins_install(VM* vm) {
     // snapshot so they are mirrored onto it.
     buffer_install(vm);
     textcodec_install(vm);
+    usp_install(vm);
+    url_install(vm);
     process_install(vm);
 
     // globalThis: an object mirroring the global bindings. Snapshotting
