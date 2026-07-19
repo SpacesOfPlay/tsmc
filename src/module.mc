@@ -21,6 +21,7 @@ import atom;
 import vm;
 import builtins;
 import node_stream;
+import node_assert;
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -267,7 +268,8 @@ private str builtin_name(str spec) {
     }
     if str_equal(s, "fs") || str_equal(s, "path") || str_equal(s, "os")
         || str_equal(s, "events") || str_equal(s, "util")
-        || str_equal(s, "crypto") || str_equal(s, "stream") { return s; }
+        || str_equal(s, "crypto") || str_equal(s, "stream")
+        || str_equal(s, "assert") { return s; }
     str none;
     none.data = null;
     none.len = 0;
@@ -906,6 +908,7 @@ private Value make_require_fn(VM* vm, str module_path) {
 // as opposed to the natively-built namespaces. {null,0} if not one.
 private str builtin_js_source(str name) {
     if str_equal(name, "stream") { return node_stream_source(); }
+    if str_equal(name, "assert") { return node_assert_source(); }
     return null_str();
 }
 
