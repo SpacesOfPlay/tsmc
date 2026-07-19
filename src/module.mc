@@ -489,6 +489,7 @@ i32 module_run(VM* vm, str entry_path) {
     } else {
         status = eval_module(&ld, entry);
         if status == 0 { status = vm_run_event_loop(vm); }
+        if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
     }
 
     for i32 i = 0; i < ld.mods.len; i++ {

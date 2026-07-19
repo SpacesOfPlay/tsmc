@@ -128,6 +128,7 @@ struct VM {
     u32 atom_index;
     Vec<VmJob> jobs;         // microtask FIFO (head index avoids shifting)
     i32 job_head;
+    Vec<Value> rejections;   // promises rejected with no handler at reject time
     Vec<VmTimer> timers;
     i32 next_timer_id;
     i64 timer_seq;
@@ -139,6 +140,7 @@ struct VM {
     u32 atom_pstate;
     u32 atom_pvalue;
     u32 atom_pcbs;
+    u32 atom_phandled;
     u32 atom_value;
     u32 atom_done;
     u32 atom_next;
@@ -277,6 +279,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         gc_mark_value(h, j.a);
         gc_mark_value(h, j.b);
         gc_mark_value(h, j.c);
+    }
+    for i32 i = 0; i < vm.rejections.len; i++ {
+        gc_mark_value(h, vec_get(&vm.rejections, i));
     }
     for i32 i = 0; i < vm.timers.len; i++ {
         gc_mark_value(h, (vm.timers.data + i).cb);
@@ -1459,6 +1464,7 @@ void vm_init(VM* vm) {
     vm.atom_index = atom_intern(&vm.atoms, "index");
     vec_init<VmJob>(&vm.jobs, 8);
     vm.job_head = 0;
+    vec_init<Value>(&vm.rejections, 4);
     vec_init<VmTimer>(&vm.timers, 4);
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
@@ -1470,6 +1476,7 @@ void vm_init(VM* vm) {
     vm.atom_pstate = atom_intern(&vm.atoms, "%state");
     vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
     vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
+    vm.atom_phandled = atom_intern(&vm.atoms, "%handled");
     vm.atom_value = atom_intern(&vm.atoms, "value");
     vm.atom_done = atom_intern(&vm.atoms, "done");
     vm.atom_next = atom_intern(&vm.atoms, "next");
@@ -1492,6 +1499,7 @@ void vm_destroy(VM* vm) {
     }
     vec_free(&vm.troots);
     vec_free(&vm.jobs);
+    vec_free(&vm.rejections);
     vec_free(&vm.timers);
     vec_free(&vm.symbols);
     for i32 i = 0; i < vm.regexps.len; i++ {
@@ -3031,6 +3039,24 @@ private Value nat_adopt_rej(void* vmp, Value callee, Value thisv, Value* args, i
     return value_undefined();
 }
 
+// Drops handled / no-longer-rejected entries from the candidate list, so a
+// tight loop of reject-then-handle promises does not grow it unbounded.
+private void rejections_compact(VM* vm) {
+    i32 w = 0;
+    for i32 i = 0; i < vm.rejections.len; i++ {
+        Value pv = vec_get(&vm.rejections, i);
+        if !vm_is_promise(vm, pv) { continue; }
+        JsObject* p = value_as_object(pv);
+        Value* hv = props_get(&p.props, vm.atom_phandled);
+        if hv != null && value_is_true(*hv) { continue; }
+        Value* st = props_get(&p.props, vm.atom_pstate);
+        if st == null || value_as_int(*st) != 2 { continue; }
+        *(vm.rejections.data + w) = pv;
+        w++;
+    }
+    vm.rejections.len = w;
+}
+
 // pv and v stay rooted by the caller.
 void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
     if !vm_is_promise(vm, pv) { return; }
@@ -3051,6 +3077,17 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
     js_set_prop(p, vm.atom_pstate, value_int(rejected ? 2 : 1));
     js_set_prop(p, vm.atom_pvalue, v);
     Value* cbsv = props_get(&p.props, vm.atom_pcbs);
+    // rejecting with no reactions attached (and never handled) is a
+    // candidate unhandled rejection; recorded here, reported after the loop.
+    if rejected {
+        bool has_cbs = cbsv != null && value_is_array(*cbsv) && value_as_object(*cbsv).elen > 0;
+        Value* hv = props_get(&p.props, vm.atom_phandled);
+        bool handled = hv != null && value_is_true(*hv);
+        if !has_cbs && !handled {
+            if vm.rejections.len >= 64 { rejections_compact(vm); }
+            vec_push(&vm.rejections, pv);
+        }
+    }
     if cbsv != null && value_is_array(*cbsv) {
         JsObject* cbs = value_as_object(*cbsv);
         for i32 i = 0; i < cbs.elen; i++ {
@@ -3067,6 +3104,8 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
 // Registers reactions and returns the derived promise.
 Value vm_promise_then(VM* vm, Value pv, Value onf, Value onr) {
     if !vm_is_promise(vm, pv) { return value_undefined(); }
+    // attaching any reaction marks the rejection (if any) as handled
+    js_set_prop(value_as_object(pv), vm.atom_phandled, value_bool(true));
     vpush(vm, pv);
     vpush(vm, onf);
     vpush(vm, onr);
@@ -3251,6 +3290,32 @@ i32 vm_run_event_loop(VM* vm) {
     }
     vm.timers.len = 0;
     return 0;
+}
+
+// Reports any promise that settled rejected and was never handled (no
+// .then/.catch/await ever attached), matching Node's fatal-by-default
+// unhandled-rejection behavior. Returns 1 if any were found. Call after
+// the event loop has fully drained.
+i32 vm_report_unhandled(VM* vm) {
+    i32 found = 0;
+    for i32 i = 0; i < vm.rejections.len; i++ {
+        Value pv = vec_get(&vm.rejections, i);
+        if !vm_is_promise(vm, pv) { continue; }
+        JsObject* p = value_as_object(pv);
+        Value* st = props_get(&p.props, vm.atom_pstate);
+        if st == null || value_as_int(*st) != 2 { continue; }
+        Value* hv = props_get(&p.props, vm.atom_phandled);
+        if hv != null && value_is_true(*hv) { continue; }
+        // report once (mark handled so a later drain won't repeat it)
+        js_set_prop(p, vm.atom_phandled, value_bool(true));
+        Value* rv = props_get(&p.props, vm.atom_pvalue);
+        Value reason = rv != null ? *rv : value_undefined();
+        eprint("Unhandled promise rejection. ");
+        print_uncaught(vm, reason);
+        found = 1;
+    }
+    vm.rejections.len = 0;
+    return found;
 }
 
 // Stack already holds fn, this, args. Pops them; returns the result.
@@ -3491,6 +3556,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
             if status == 0 {
                 status = vm_run_event_loop(vm);
             }
+            if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
         }
     }
     if d.n_errors > 0 {

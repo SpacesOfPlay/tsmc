@@ -108,9 +108,11 @@ i32 main() {
     check_probes("const id = setTimeout(() => probe(99), 10); clearTimeout(id); setTimeout(() => probe(5), 20); probe(1);",
         &w12[0], 2, "clear timeout");
 
-    // a throw in a .then rejects the derived promise; unhandled
-    // rejections are not reported (documented), so the loop completes
-    check_eq(run_snippet("Promise.resolve().then(() => { throw new Error('unhandled'); });", false), 0, "throw in microtask rejects silently");
+    // a throw in a .then rejects the derived promise; with no handler it
+    // is an unhandled rejection, reported and exit 1 (matching Node)
+    check_eq(run_snippet("Promise.resolve().then(() => { throw new Error('unhandled'); });", false), 1, "unhandled rejection exits 1");
+    // the same rejection, handled by a .catch, completes cleanly
+    check_eq(run_snippet("Promise.resolve().then(() => { throw new Error('x'); }).catch(() => {});", false), 0, "handled rejection exits 0");
     // a throw in a timer callback is an uncaught exception
     check_eq(run_snippet("setTimeout(() => { throw new Error('boom'); }, 0);", false), 1, "throw in timer exits 1");
 
