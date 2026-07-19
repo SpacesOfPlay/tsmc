@@ -539,8 +539,13 @@ private void require_throw_missing(VM* vm, str spec) {
     str_buf_add(&m, "Cannot find module '");
     str_buf_add(&m, spec);
     str_buf_add(&m, "'");
-    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
+    Value err = vm_make_error(vm, ERR_ERROR, str_buf_to_str(&m));
     str_buf_free(&m);
+    vm_push(vm, err);
+    GcString* cs = gc_new_string(&vm.heap, "MODULE_NOT_FOUND");
+    js_set_prop(value_as_object(err), atom_intern(&vm.atoms, "code"), value_cell(&cs.head));
+    vm_pop(vm);
+    vm_throw(vm, err);
 }
 
 private str null_str() {
@@ -624,6 +629,131 @@ private str load_as_dir(VM* vm, str dir) {
     return load_index(dir);
 }
 
+// package.json "exports" resolution (conditional + subpath maps). Active
+// conditions for a require() are node / require / default, matched in the
+// object's key order (first match wins).
+
+private bool is_require_condition(str k) {
+    return str_equal(k, "require") || str_equal(k, "node") || str_equal(k, "default");
+}
+
+// Resolves an exports target (string / array fallback / conditions object)
+// to a heap file path under `pkg_dir`, or {null,0}.
+private str resolve_export_target(VM* vm, str pkg_dir, Value target) {
+    if value_is_string(target) {
+        str t = gc_string_view(value_as_string(target));
+        if t.len < 2 || *(t.data) != '.' { return null_str(); }   // must be "./..."
+        return path_under(pkg_dir, t);
+    }
+    if value_is_array(target) {
+        JsObject* a = value_as_object(target);
+        for i32 i = 0; i < a.elen; i++ {
+            str r = resolve_export_target(vm, pkg_dir, js_array_get(a, i));
+            if r.data != null {
+                if file_there(r) { return r; }
+                free(r.data);
+            }
+        }
+        return null_str();
+    }
+    if value_is_object(target) {
+        JsObject* keys = vm_own_keys(vm, target);
+        vm_push(vm, value_cell(&keys.head));
+        str result = null_str();
+        for i32 i = 0; i < keys.elen; i++ {
+            Value kv = js_array_get(keys, i);
+            str k = gc_string_view(value_as_string(kv));
+            if is_require_condition(k) {
+                Value v;
+                if js_get_prop(value_as_object(target), atom_intern(&vm.atoms, k), &v) {
+                    str r = resolve_export_target(vm, pkg_dir, v);
+                    if r.data != null { result = r; break; }
+                }
+            }
+        }
+        vm_pop(vm);
+        return result;
+    }
+    return null_str();
+}
+
+// PACKAGE_EXPORTS_RESOLVE for a require: choose the target for `subpath`
+// ("" -> ".", "sub" -> "./sub") and resolve it through the conditions.
+// `exports` must be kept rooted by the caller.
+private str resolve_exports(VM* vm, str pkg_dir, Value exports, str subpath) {
+    Value target = value_undefined();
+    bool have = false;
+    if value_is_string(exports) || value_is_array(exports) {
+        if subpath.len == 0 { target = exports; have = true; }
+    } else if value_is_object(exports) {
+        JsObject* eo = value_as_object(exports);
+        JsObject* keys = vm_own_keys(vm, exports);
+        vm_push(vm, value_cell(&keys.head));
+        bool is_subpath_map = false;
+        for i32 i = 0; i < keys.elen; i++ {
+            str k = gc_string_view(value_as_string(js_array_get(keys, i)));
+            if k.len > 0 && *(k.data) == '.' { is_subpath_map = true; break; }
+        }
+        vm_pop(vm);
+        if is_subpath_map {
+            str_buf kb;
+            str_buf_init(&kb);
+            str_buf_add(&kb, ".");
+            if subpath.len > 0 {
+                str_buf_add(&kb, "/");
+                str_buf_add(&kb, subpath);
+            }
+            u32 katom = atom_intern(&vm.atoms, str_buf_to_str(&kb));
+            str_buf_free(&kb);
+            if js_get_prop(eo, katom, &target) { have = true; }
+        } else if subpath.len == 0 {
+            target = exports;   // a bare conditions object maps "."
+            have = true;
+        }
+    }
+    if !have { return null_str(); }
+    return resolve_export_target(vm, pkg_dir, target);
+}
+
+// Resolves `subpath` within a located package directory. package.json
+// "exports", when present, is authoritative (non-listed subpaths are
+// blocked). Otherwise the legacy main/index (bare) or subpath-as-file/dir.
+private str resolve_package(VM* vm, str pkg_dir, str subpath) {
+    str pj = path_under(pkg_dir, "package.json");
+    bool handled = false;
+    str result = null_str();
+    if file_there(pj) {
+        FileData fd = file_read(pj);
+        if fd.data != null {
+            str text;
+            text.data = fd.data;
+            text.len = fd.len;
+            bool ok = false;
+            i32 rm = gc_root_mark(&vm.heap);
+            Value j = builtins_json_parse(vm, text, &ok);
+            gc_root(&vm.heap, j);
+            if ok && value_is_object(j) {
+                Value ev;
+                if js_get_prop(value_as_object(j), atom_intern(&vm.atoms, "exports"), &ev)
+                    && !value_is_undefined(ev) {
+                    result = resolve_exports(vm, pkg_dir, ev, subpath);
+                    handled = true;
+                }
+            }
+            gc_root_reset(&vm.heap, rm);
+            free(fd.data);
+        }
+    }
+    free(pj.data);
+    if handled { return result; }   // exports authoritative (may be null)
+    if subpath.len == 0 { return load_as_dir(vm, pkg_dir); }
+    str t = path_under(pkg_dir, subpath);
+    str r = load_as_file(t);
+    if r.data == null { r = load_as_dir(vm, t); }
+    free(t.data);
+    return r;
+}
+
 // Parent directory of `dir` (trailing separators trimmed); {null,0} at the
 // filesystem root (no further ancestor).
 private str parent_of(str dir) {
@@ -675,15 +805,26 @@ private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath) {
         guard++;
         str nm = path_under(cur, "node_modules");
         str base = path_under(nm, pkg);
-        str target;
-        if subpath.len > 0 { target = path_under(base, subpath); }
-        else { target = owned_str(base); }
-        str f = load_as_file(target);
-        if f.data == null { f = load_as_dir(vm, target); }
-        free(target.data);
+        str f = null_str();
+        bool stop = false;
+        if path_is_dir(base) {
+            // package directory found here: resolve within it — exports
+            // (authoritative: non-listed subpaths are blocked), else the
+            // legacy main / index / subpath-as-file. Stop walking.
+            f = resolve_package(vm, base, subpath);
+            stop = true;
+        } else {
+            // no package directory: try base[/subpath] as a bare file
+            str target;
+            if subpath.len > 0 { target = path_under(base, subpath); }
+            else { target = owned_str(base); }
+            f = load_as_file(target);
+            free(target.data);
+        }
         free(base.data);
         free(nm.data);
         if f.data != null { result = f; break; }   // cur freed after the loop
+        if stop { break; }
         str parent = parent_of(cur);
         free(cur.data);
         cur = parent;                                // {null,0} at the root
