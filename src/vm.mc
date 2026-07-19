@@ -111,6 +111,7 @@ struct VM {
     JsObject* textdec_proto;
     JsObject* node_fs_ns;      // built-in `fs` module namespace (lazy)
     JsObject* node_path_ns;    // built-in `path` module namespace (lazy)
+    JsObject* node_os_ns;      // built-in `os` module namespace (lazy)
     Vec<RegexProgPtr> regexps;
     u32 atom_rx;
     u32 atom_source;
@@ -254,6 +255,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.textdec_proto != null { gc_mark_cell(h, &vm.textdec_proto.head); }
     if vm.node_fs_ns != null { gc_mark_cell(h, &vm.node_fs_ns.head); }
     if vm.node_path_ns != null { gc_mark_cell(h, &vm.node_path_ns.head); }
+    if vm.node_os_ns != null { gc_mark_cell(h, &vm.node_os_ns.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
         VmJob* j = vm.jobs.data + i;
         gc_mark_value(h, j.a);
@@ -1424,6 +1426,7 @@ void vm_init(VM* vm) {
     vm.textdec_proto = null;
     vm.node_fs_ns = null;
     vm.node_path_ns = null;
+    vm.node_os_ns = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");

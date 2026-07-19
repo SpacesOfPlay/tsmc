@@ -7479,6 +7479,151 @@ private JsObject* build_path_module(VM* vm) {
     return ns;
 }
 
+// --- os: OS layer -----------------------------------------------------------
+
+when os(windows) {
+    private extern "msvcrt.dll" u8* getenv(u8* name);
+    private extern "kernel32.dll" i32 GetComputerNameA(u8* buf, u32* size);
+    struct _SysInfo {
+        u16 arch; u16 res; u32 pagesize;
+        void* minaddr; void* maxaddr; u64 mask;
+        u32 ncpu; u32 proctype; u32 alloc; u16 level; u16 rev;
+    }
+    private extern "kernel32.dll" void GetSystemInfo(_SysInfo* si);
+    private str os_type_str() { return "Windows_NT"; }
+    private str os_eol_str() { return "\r\n"; }
+    private i32 os_ncpu() { _SysInfo si; GetSystemInfo(&si); return cast(i32, si.ncpu); }
+    private bool os_hostname_into(u8* buf, i32 cap) {
+        u32 sz = cast(u32, cap);
+        return GetComputerNameA(buf, &sz) != 0;
+    }
+    private u8* os_home() { u8* h = getenv("USERPROFILE"); return h; }
+    private u8* os_tmp() { u8* t = getenv("TEMP"); if t == null { t = getenv("TMP"); } return t; }
+    private u8* os_user() { return getenv("USERNAME"); }
+    private u8* os_shell() { return null; }
+    private i32 os_uid() { return 0 - 1; }
+    private i32 os_gid() { return 0 - 1; }
+}
+else {
+    when os(macos) || os(ios) {
+        private extern "libSystem.B.dylib" u8* getenv(u8* name);
+        private extern "libSystem.B.dylib" i32 gethostname(u8* buf, u64 len);
+        private extern "libSystem.B.dylib" i64 sysconf(i32 name);
+        private extern "libSystem.B.dylib" i32 getuid();
+        private extern "libSystem.B.dylib" i32 getgid();
+        private str os_type_str() { return "Darwin"; }
+        private i32 os_ncpu_name() { return 58; }   // _SC_NPROCESSORS_ONLN (Darwin)
+    }
+    else {
+        private extern "libc.so.6" u8* getenv(u8* name);
+        private extern "libc.so.6" i32 gethostname(u8* buf, u64 len);
+        private extern "libc.so.6" i64 sysconf(i32 name);
+        private extern "libc.so.6" i32 getuid();
+        private extern "libc.so.6" i32 getgid();
+        private str os_type_str() { return "Linux"; }
+        private i32 os_ncpu_name() { return 84; }   // _SC_NPROCESSORS_ONLN (Linux)
+    }
+    private str os_eol_str() { return "\n"; }
+    private i32 os_ncpu() { i64 n = sysconf(os_ncpu_name()); if n < 1 { return 1; } return cast(i32, n); }
+    private bool os_hostname_into(u8* buf, i32 cap) { return gethostname(buf, cast(u64, cap)) == 0; }
+    private u8* os_home() { return getenv("HOME"); }
+    private u8* os_tmp() { return getenv("TMPDIR"); }
+    private u8* os_user() { return getenv("USER"); }
+    private u8* os_shell() { return getenv("SHELL"); }
+    private i32 os_uid() { return getuid(); }
+    private i32 os_gid() { return getgid(); }
+}
+
+private Value os_cstr_or_empty(VM* vm, u8* c) {
+    if c == null { return new_str(vm, ""); }
+    return new_str(vm, str_from_cstr(c));
+}
+
+private Value nat_os_platform(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return new_str(as_vm(vmp), os_platform_name());
+}
+private Value nat_os_arch(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return new_str(as_vm(vmp), os_arch_name());
+}
+private Value nat_os_type(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return new_str(as_vm(vmp), os_type_str());
+}
+private Value nat_os_endianness(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return new_str(as_vm(vmp), "LE");
+}
+private Value nat_os_homedir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return os_cstr_or_empty(as_vm(vmp), os_home());
+}
+private Value nat_os_tmpdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u8* t = os_tmp();
+    when os(windows) { if t == null { t = cast(u8*, str_to_cstr(".")); } }
+    str s;
+    if t == null { s = "/tmp"; } else { s = str_from_cstr(t); }
+    i32 end = s.len;   // Node trims a trailing separator (except a bare root)
+    while end > 1 && path_is_sep(*(s.data + end - 1)) { end--; }
+    s.len = end;
+    return new_str(vm, s);
+}
+private Value nat_os_hostname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u8[256] buf;
+    if os_hostname_into(&buf[0], 256) { return new_str(vm, str_from_cstr(&buf[0])); }
+    return new_str(vm, "");
+}
+private Value nat_os_cpus(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 n = os_ncpu();
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    for i32 i = 0; i < n; i++ {
+        JsObject* cpu = js_new_object(&vm.heap, vm.object_proto);
+        js_array_set(arr, i, value_cell(&cpu.head));
+        def_value_enum(vm, cpu, "model", new_str(vm, "unknown"));
+        def_value_enum(vm, cpu, "speed", value_number(0.0));
+        JsObject* times = js_new_object(&vm.heap, vm.object_proto);
+        def_value_enum(vm, cpu, "times", value_cell(&times.head));
+        def_value_enum(vm, times, "user", value_number(0.0));
+        def_value_enum(vm, times, "nice", value_number(0.0));
+        def_value_enum(vm, times, "sys", value_number(0.0));
+        def_value_enum(vm, times, "idle", value_number(0.0));
+        def_value_enum(vm, times, "irq", value_number(0.0));
+    }
+    Value r = value_cell(&arr.head);
+    vm_pop(vm);
+    return r;
+}
+private Value nat_os_userinfo(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&o.head));
+    def_value_enum(vm, o, "username", os_cstr_or_empty(vm, os_user()));
+    def_value_enum(vm, o, "homedir", os_cstr_or_empty(vm, os_home()));
+    def_value_enum(vm, o, "uid", value_number(cast(f64, os_uid())));
+    def_value_enum(vm, o, "gid", value_number(cast(f64, os_gid())));
+    u8* sh = os_shell();
+    def_value_enum(vm, o, "shell", sh == null ? value_null() : new_str(vm, str_from_cstr(sh)));
+    Value r = value_cell(&o.head);
+    vm_pop(vm);
+    return r;
+}
+
+private JsObject* build_os_module(VM* vm) {
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "platform", &nat_os_platform);
+    def_node_export(vm, mod, ns, "arch", &nat_os_arch);
+    def_node_export(vm, mod, ns, "type", &nat_os_type);
+    def_node_export(vm, mod, ns, "endianness", &nat_os_endianness);
+    def_node_export(vm, mod, ns, "homedir", &nat_os_homedir);
+    def_node_export(vm, mod, ns, "tmpdir", &nat_os_tmpdir);
+    def_node_export(vm, mod, ns, "hostname", &nat_os_hostname);
+    def_node_export(vm, mod, ns, "cpus", &nat_os_cpus);
+    def_node_export(vm, mod, ns, "userInfo", &nat_os_userinfo);
+    def_node_value(vm, mod, ns, "EOL", new_str(vm, os_eol_str()));
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -7489,6 +7634,10 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "fs") {
         if vm.node_fs_ns == null { vm.node_fs_ns = build_fs_module(vm); }
         return vm.node_fs_ns;
+    }
+    if str_equal(name, "os") {
+        if vm.node_os_ns == null { vm.node_os_ns = build_os_module(vm); }
+        return vm.node_os_ns;
     }
     return null;
 }
