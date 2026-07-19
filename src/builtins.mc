@@ -18,6 +18,8 @@ import bigint;
 import vm;
 import math;
 import file;
+import deflate;
+import inflate;
 
 // Platform math not covered by the math module: hyperbolic functions
 // and the accurate log1p/expm1, used by the extra Math.* methods.
@@ -8767,6 +8769,231 @@ private JsObject* build_crypto_module(VM* vm) {
     return ns;
 }
 
+// --- zlib -------------------------------------------------------------------
+//
+// zlib / gzip framing over the stdlib's raw DEFLATE (`deflate`/`inflate`).
+
+private u32 zlib_adler32(u8* data, i32 n) {
+    u32 a = 1;
+    u32 b = 0;
+    for i32 i = 0; i < n; i++ {
+        a = (a + cast(u32, *(data + i))) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+private u32 zlib_crc32(u8* data, i32 n) {
+    u32 crc = 0xFFFFFFFF;
+    for i32 i = 0; i < n; i++ {
+        crc = crc ^ cast(u32, *(data + i));
+        for i32 j = 0; j < 8; j++ {
+            u32 mask = 0 - (crc & 1);
+            crc = (crc >> 1) ^ (0xEDB88320 & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+// Raw DEFLATE compression; returns a heap buffer (caller frees) or null.
+private u8* zlib_deflate_raw(u8* src, i32 n, i32* outlen) {
+    i32 cap = n * 2 + 1024;
+    while cap <= 268435456 {
+        u8* dst = alloc<u8>(cap);
+        i32 used = 0;
+        i32 r = deflate(src, n, dst, cap, &used);
+        if r == 0 { *outlen = used; return dst; }
+        free(dst);
+        if r != 0 - 1 { return null; }   // not an overflow: real error
+        cap = cap * 2;
+    }
+    return null;
+}
+
+// Raw DEFLATE decompression; `hint` sizes the initial buffer (0 = default).
+private u8* zlib_inflate_raw(u8* src, i32 n, i32 hint, i32* outlen) {
+    i32 cap = hint > 0 ? hint : (n * 4 + 1024);
+    if cap < 256 { cap = 256; }
+    while cap <= 268435456 {
+        u8* dst = alloc<u8>(cap);
+        i32 srcused = 0;
+        i32 dstused = 0;
+        i32 r = inflate(src, n, dst, cap, &srcused, &dstused);
+        if r == 0 { *outlen = dstused; return dst; }
+        free(dst);
+        cap = cap * 2;   // grow (error may be output overflow)
+    }
+    return null;
+}
+
+// Raw input bytes of a string (UTF-8) or Buffer; heap buffer, caller frees.
+private u8* zlib_input(VM* vm, Value data, i32* outlen) {
+    if value_is_array(data) {
+        JsObject* b = value_as_object(data);
+        i32 n = b.elen;
+        u8* buf = alloc<u8>(n > 0 ? n : 1);
+        for i32 i = 0; i < n; i++ { *(buf + i) = cast(u8, buf_byte(b, i)); }
+        *outlen = n;
+        return buf;
+    }
+    Value s = js_to_string_value(vm, data);
+    vm_push(vm, s);
+    str_buf sb;
+    str_buf_init(&sb);
+    str_to_bytes(&sb, sview(s), ENC_UTF8);
+    i32 n = sb.len;
+    u8* buf = alloc<u8>(n > 0 ? n : 1);
+    if n > 0 { memcpy(buf, sb.data, cast(i64, n)); }
+    str_buf_free(&sb);
+    vm_pop(vm);
+    *outlen = n;
+    return buf;
+}
+
+private Value nat_zlib_deflate_raw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 inlen = 0;
+    u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
+    i32 outlen = 0;
+    u8* out = zlib_deflate_raw(in, inlen, &outlen);
+    free(in);
+    if out == null { vm_throw_error(vm, ERR_ERROR, "deflate failed"); return value_undefined(); }
+    Value r = buf_from_bytes(vm, out, outlen);
+    free(out);
+    return r;
+}
+
+private Value nat_zlib_inflate_raw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 inlen = 0;
+    u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
+    i32 outlen = 0;
+    u8* out = zlib_inflate_raw(in, inlen, 0, &outlen);
+    free(in);
+    if out == null { vm_throw_error(vm, ERR_ERROR, "incorrect data check"); return value_undefined(); }
+    Value r = buf_from_bytes(vm, out, outlen);
+    free(out);
+    return r;
+}
+
+private Value nat_zlib_deflate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 inlen = 0;
+    u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
+    i32 rawlen = 0;
+    u8* raw = zlib_deflate_raw(in, inlen, &rawlen);
+    if raw == null { free(in); vm_throw_error(vm, ERR_ERROR, "deflate failed"); return value_undefined(); }
+    u32 adler = zlib_adler32(in, inlen);
+    free(in);
+    i32 total = rawlen + 6;
+    u8* out = alloc<u8>(total);
+    *(out) = 0x78;
+    *(out + 1) = 0x9C;
+    memcpy(out + 2, raw, cast(i64, rawlen));
+    free(raw);
+    *(out + 2 + rawlen) = cast(u8, (adler >> 24) & 0xFF);
+    *(out + 3 + rawlen) = cast(u8, (adler >> 16) & 0xFF);
+    *(out + 4 + rawlen) = cast(u8, (adler >> 8) & 0xFF);
+    *(out + 5 + rawlen) = cast(u8, adler & 0xFF);
+    Value r = buf_from_bytes(vm, out, total);
+    free(out);
+    return r;
+}
+
+private Value nat_zlib_inflate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 inlen = 0;
+    u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
+    if inlen < 6 { free(in); vm_throw_error(vm, ERR_ERROR, "incorrect header check"); return value_undefined(); }
+    // skip the 2-byte zlib header; DEFLATE's end marker stops before the
+    // 4-byte Adler trailer
+    i32 outlen = 0;
+    u8* out = zlib_inflate_raw(in + 2, inlen - 2, 0, &outlen);
+    free(in);
+    if out == null { vm_throw_error(vm, ERR_ERROR, "incorrect data check"); return value_undefined(); }
+    Value r = buf_from_bytes(vm, out, outlen);
+    free(out);
+    return r;
+}
+
+private Value nat_zlib_gzip(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 inlen = 0;
+    u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
+    i32 rawlen = 0;
+    u8* raw = zlib_deflate_raw(in, inlen, &rawlen);
+    if raw == null { free(in); vm_throw_error(vm, ERR_ERROR, "gzip failed"); return value_undefined(); }
+    u32 crc = zlib_crc32(in, inlen);
+    u32 isize = cast(u32, inlen);
+    free(in);
+    i32 total = 10 + rawlen + 8;
+    u8* out = alloc<u8>(total);
+    memset(cast(u8*, out), 0, cast(i64, total));
+    *(out) = 0x1F;
+    *(out + 1) = 0x8B;
+    *(out + 2) = 0x08;   // CM = deflate
+    // FLG (3), MTIME (4-7) = 0, XFL (8) = 0 already zeroed
+    *(out + 9) = 0xFF;   // OS = unknown
+    memcpy(out + 10, raw, cast(i64, rawlen));
+    free(raw);
+    i32 tp = 10 + rawlen;
+    *(out + tp) = cast(u8, crc & 0xFF);
+    *(out + tp + 1) = cast(u8, (crc >> 8) & 0xFF);
+    *(out + tp + 2) = cast(u8, (crc >> 16) & 0xFF);
+    *(out + tp + 3) = cast(u8, (crc >> 24) & 0xFF);
+    *(out + tp + 4) = cast(u8, isize & 0xFF);
+    *(out + tp + 5) = cast(u8, (isize >> 8) & 0xFF);
+    *(out + tp + 6) = cast(u8, (isize >> 16) & 0xFF);
+    *(out + tp + 7) = cast(u8, (isize >> 24) & 0xFF);
+    Value r = buf_from_bytes(vm, out, total);
+    free(out);
+    return r;
+}
+
+private Value nat_zlib_gunzip(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 n = 0;
+    u8* src = zlib_input(vm, arg_at(args, argc, 0), &n);
+    if n < 18 || *(src) != 0x1F || *(src + 1) != 0x8B || *(src + 2) != 0x08 {
+        free(src);
+        vm_throw_error(vm, ERR_ERROR, "incorrect header check");
+        return value_undefined();
+    }
+    u8 flg = *(src + 3);
+    i32 pos = 10;
+    if (flg & 4) != 0 {   // FEXTRA
+        i32 xlen = cast(i32, *(src + pos)) | (cast(i32, *(src + pos + 1)) << 8);
+        pos += 2 + xlen;
+    }
+    if (flg & 8) != 0 { while pos < n && *(src + pos) != 0 { pos++; } pos++; }    // FNAME
+    if (flg & 16) != 0 { while pos < n && *(src + pos) != 0 { pos++; } pos++; }   // FCOMMENT
+    if (flg & 2) != 0 { pos += 2; }                                              // FHCRC
+    i32 isize = cast(i32, *(src + n - 4)) | (cast(i32, *(src + n - 3)) << 8)
+        | (cast(i32, *(src + n - 2)) << 16) | (cast(i32, *(src + n - 1)) << 24);
+    i32 deflate_len = n - pos - 8;
+    i32 outlen = 0;
+    u8* out = null;
+    if deflate_len > 0 && pos < n { out = zlib_inflate_raw(src + pos, deflate_len, isize, &outlen); }
+    free(src);
+    if out == null { vm_throw_error(vm, ERR_ERROR, "incorrect data check"); return value_undefined(); }
+    Value r = buf_from_bytes(vm, out, outlen);
+    free(out);
+    return r;
+}
+
+private JsObject* build_zlib_module(VM* vm) {
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "deflateRawSync", &nat_zlib_deflate_raw);
+    def_node_export(vm, mod, ns, "inflateRawSync", &nat_zlib_inflate_raw);
+    def_node_export(vm, mod, ns, "deflateSync", &nat_zlib_deflate);
+    def_node_export(vm, mod, ns, "inflateSync", &nat_zlib_inflate);
+    def_node_export(vm, mod, ns, "gzipSync", &nat_zlib_gzip);
+    def_node_export(vm, mod, ns, "gunzipSync", &nat_zlib_gunzip);
+    def_node_export(vm, mod, ns, "unzipSync", &nat_zlib_gunzip);
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -8796,6 +9023,10 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "crypto") {
         if vm.node_crypto_ns == null { vm.node_crypto_ns = build_crypto_module(vm); }
         return vm.node_crypto_ns;
+    }
+    if str_equal(name, "zlib") {
+        if vm.node_zlib_ns == null { vm.node_zlib_ns = build_zlib_module(vm); }
+        return vm.node_zlib_ns;
     }
     return null;
 }

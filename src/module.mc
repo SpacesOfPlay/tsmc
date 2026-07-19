@@ -269,7 +269,8 @@ private str builtin_name(str spec) {
     if str_equal(s, "fs") || str_equal(s, "path") || str_equal(s, "os")
         || str_equal(s, "events") || str_equal(s, "util")
         || str_equal(s, "crypto") || str_equal(s, "stream")
-        || str_equal(s, "assert") || str_equal(s, "fs/promises") { return s; }
+        || str_equal(s, "assert") || str_equal(s, "fs/promises")
+        || str_equal(s, "zlib") { return s; }
     str none;
     none.data = null;
     none.len = 0;
