@@ -110,6 +110,7 @@ struct VM {
     JsObject* textenc_proto;
     JsObject* textdec_proto;
     JsObject* node_fs_ns;      // built-in `fs` module namespace (lazy)
+    JsObject* node_fsp_ns;     // built-in `fs/promises` module namespace (lazy)
     JsObject* node_path_ns;    // built-in `path` module namespace (lazy)
     JsObject* node_os_ns;      // built-in `os` module namespace (lazy)
     JsObject* node_events_ns;  // built-in `events` module namespace (lazy)
@@ -261,6 +262,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
     if vm.textdec_proto != null { gc_mark_cell(h, &vm.textdec_proto.head); }
     if vm.node_fs_ns != null { gc_mark_cell(h, &vm.node_fs_ns.head); }
+    if vm.node_fsp_ns != null { gc_mark_cell(h, &vm.node_fsp_ns.head); }
     if vm.node_path_ns != null { gc_mark_cell(h, &vm.node_path_ns.head); }
     if vm.node_os_ns != null { gc_mark_cell(h, &vm.node_os_ns.head); }
     if vm.node_events_ns != null { gc_mark_cell(h, &vm.node_events_ns.head); }
@@ -1439,6 +1441,7 @@ void vm_init(VM* vm) {
     vm.textenc_proto = null;
     vm.textdec_proto = null;
     vm.node_fs_ns = null;
+    vm.node_fsp_ns = null;
     vm.node_path_ns = null;
     vm.node_os_ns = null;
     vm.node_events_ns = null;

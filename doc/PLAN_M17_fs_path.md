@@ -57,13 +57,33 @@ suite (deterministic).
   round-trips real files in a per-process (pid-keyed) temp dir and prints
   only content/sizes/booleans — verified equal to Node, and gc-stressed.
 
+## Async fs — DONE (M26)
+
+The callback and promise APIs, wrapping the sync cores: each async
+function runs the sync native, then turns its result / pending error into
+a settled Promise or a scheduled `(err, value)` callback (fs callbacks
+fire on a microtask, so they are asynchronous like Node).
+
+- **Callback API** on `fs`: `readFile`, `writeFile`, `appendFile`, `mkdir`,
+  `readdir`, `rmdir`, `unlink`, `rename`, `stat` — `(…, cb(err, result))`.
+- **`fs.promises`** — the same nine as promise-returning methods.
+- **`fs/promises`** module — `require('fs/promises')` /
+  `import { readFile } from 'fs/promises'` returns those promise methods.
+
+Verified byte-identical to Node in `test/diff/fs_async.js` (await,
+rejections with `.code`, callbacks, buffer results) and clean under
+`--gc-stress`; ESM import of `fs/promises` verified too.
+
 ## Not doing / deferred (documented)
 
 - **Error-code fidelity** — every failure reports `.code = 'ENOENT'`
   regardless of the real errno (no errno plumbing), so a permission
   failure still reads as `ENOENT`. The common not-found case is correct.
-- **Async / promises / streams / watch** — `fs.promises`, callback APIs,
-  `createReadStream`, `watch`.
+- **`createReadStream` / `createWriteStream` / `watch`** — the streaming
+  and watch surface (would build on the `stream` module).
+- **True async I/O** — the async fns do the work synchronously and settle
+  on a microtask; there is no thread-pool, so ordering versus other I/O
+  is microtask-based, not libuv-phased.
 - **File descriptors** — `openSync`/`readSync`/`writeSync(fd,...)`,
   `fstatSync`.
 - **Permissions / ownership / links** — `chmodSync`, `symlinkSync`,

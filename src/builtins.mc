@@ -7464,6 +7464,146 @@ private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32
     return r;
 }
 
+// --- fs async: promise + callback wrappers over the sync cores ---
+//
+// Each sync native returns a result and sets vm.has_pending on throw. The
+// async wrappers run the sync core, then turn its result / pending error
+// into a settled Promise (fs.promises) or a scheduled (err, value)
+// callback (fs.readFile etc.).
+
+private Value fs_promise_of(VM* vm, Value r) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, r);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    if vm.has_pending {
+        Value err = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        gc_root(&vm.heap, err);
+        vm_promise_settle(vm, p, err, true);
+    } else {
+        vm_promise_settle(vm, p, r, false);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+// Runs a sync fs native over `args` and wraps the outcome in a Promise.
+private Value fs_promise_run(VM* vm, NativeFn sync, Value callee, Value* args, i32 argc) {
+    Value r = sync(cast(void*, vm), callee, value_undefined(), args, argc);
+    return fs_promise_of(vm, r);
+}
+
+// Invokes cb(err, value) later (env0 = cb, env1 = err, env2 = value).
+private Value nat_fs_cb_invoke(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    Value[2] a;
+    a[0] = me.env1;
+    a[1] = me.env2;
+    ignore vm_call_value(vm, me.env0, value_undefined(), &a[0], 2);
+    return value_undefined();
+}
+
+// Schedules cb(err, value) as a microtask (fs callbacks are asynchronous).
+private void fs_schedule_cb(VM* vm, Value cb, Value err, Value value) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, cb);
+    gc_root(&vm.heap, err);
+    gc_root(&vm.heap, value);
+    JsNative* inv = js_new_native(&vm.heap, &nat_fs_cb_invoke, "");
+    inv.env0 = cb;
+    inv.env1 = err;
+    inv.env2 = value;
+    gc_root(&vm.heap, value_cell(&inv.head));
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, value_undefined(), false);
+    ignore vm_promise_then(vm, p, value_cell(&inv.head), value_undefined());
+    gc_root_reset(&vm.heap, rm);
+}
+
+// Runs a sync fs native over (args minus the trailing callback), then
+// schedules cb(err, result).
+private Value fs_cb_run(VM* vm, NativeFn sync, Value callee, Value* args, i32 argc) {
+    if argc == 0 { return value_undefined(); }
+    Value cb = *(args + argc - 1);
+    Value r = sync(cast(void*, vm), callee, value_undefined(), args, argc - 1);
+    Value err = value_null();
+    Value val = r;
+    if vm.has_pending {
+        err = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        val = value_undefined();
+    }
+    if value_is_callable(cb) { fs_schedule_cb(vm, cb, err, val); }
+    return value_undefined();
+}
+
+private Value nat_fsp_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_read_file, callee, args, argc); }
+private Value nat_fsp_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_write_file, callee, args, argc); }
+private Value nat_fsp_append_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_append_file, callee, args, argc); }
+private Value nat_fsp_mkdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_mkdir, callee, args, argc); }
+private Value nat_fsp_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_readdir, callee, args, argc); }
+private Value nat_fsp_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rmdir, callee, args, argc); }
+private Value nat_fsp_unlink(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_unlink, callee, args, argc); }
+private Value nat_fsp_rename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rename, callee, args, argc); }
+private Value nat_fsp_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_stat, callee, args, argc); }
+
+private Value nat_fscb_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_read_file, callee, args, argc); }
+private Value nat_fscb_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_write_file, callee, args, argc); }
+private Value nat_fscb_append_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_append_file, callee, args, argc); }
+private Value nat_fscb_mkdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_mkdir, callee, args, argc); }
+private Value nat_fscb_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_readdir, callee, args, argc); }
+private Value nat_fscb_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_rmdir, callee, args, argc); }
+private Value nat_fscb_unlink(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_unlink, callee, args, argc); }
+private Value nat_fscb_rename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_rename, callee, args, argc); }
+private Value nat_fscb_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_stat, callee, args, argc); }
+
+private Value get_prop_or_undef(VM* vm, JsObject* o, str name) {
+    Value v;
+    if js_get_prop(o, bi_atom(vm, name), &v) { return v; }
+    return value_undefined();
+}
+
+// The fs.promises object (also the `fs/promises` module's default).
+private JsObject* build_fs_promises(VM* vm) {
+    JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
+    def_method(vm, pr, "readFile", &nat_fsp_read_file);
+    def_method(vm, pr, "writeFile", &nat_fsp_write_file);
+    def_method(vm, pr, "appendFile", &nat_fsp_append_file);
+    def_method(vm, pr, "mkdir", &nat_fsp_mkdir);
+    def_method(vm, pr, "readdir", &nat_fsp_readdir);
+    def_method(vm, pr, "rmdir", &nat_fsp_rmdir);
+    def_method(vm, pr, "unlink", &nat_fsp_unlink);
+    def_method(vm, pr, "rename", &nat_fsp_rename);
+    def_method(vm, pr, "stat", &nat_fsp_stat);
+    return pr;
+}
+
+// Namespace for `require('fs/promises')` / `import ... from 'fs/promises'`.
+JsObject* builtins_fs_promises_module(VM* vm) {
+    if vm.node_fsp_ns != null { return vm.node_fsp_ns; }
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    vm.node_fsp_ns = ns;
+    JsObject* pr = build_fs_promises(vm);
+    props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&pr.head), PROP_DEFAULT);
+    // mirror each promise method as a named export
+    props_set_desc(&ns.props, bi_atom(vm, "readFile"), get_prop_or_undef(vm, pr, "readFile"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "writeFile"), get_prop_or_undef(vm, pr, "writeFile"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "appendFile"), get_prop_or_undef(vm, pr, "appendFile"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "mkdir"), get_prop_or_undef(vm, pr, "mkdir"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "readdir"), get_prop_or_undef(vm, pr, "readdir"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "rmdir"), get_prop_or_undef(vm, pr, "rmdir"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "unlink"), get_prop_or_undef(vm, pr, "unlink"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "rename"), get_prop_or_undef(vm, pr, "rename"), PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "stat"), get_prop_or_undef(vm, pr, "stat"), PROP_DEFAULT);
+    return ns;
+}
+
 private JsObject* build_fs_module(VM* vm) {
     JsObject* mod;
     JsObject* ns = new_node_module(vm, &mod);
@@ -7477,6 +7617,19 @@ private JsObject* build_fs_module(VM* vm) {
     def_node_export(vm, mod, ns, "unlinkSync", &nat_fs_unlink);
     def_node_export(vm, mod, ns, "renameSync", &nat_fs_rename);
     def_node_export(vm, mod, ns, "statSync", &nat_fs_stat);
+    // callback (async) API
+    def_node_export(vm, mod, ns, "readFile", &nat_fscb_read_file);
+    def_node_export(vm, mod, ns, "writeFile", &nat_fscb_write_file);
+    def_node_export(vm, mod, ns, "appendFile", &nat_fscb_append_file);
+    def_node_export(vm, mod, ns, "mkdir", &nat_fscb_mkdir);
+    def_node_export(vm, mod, ns, "readdir", &nat_fscb_readdir);
+    def_node_export(vm, mod, ns, "rmdir", &nat_fscb_rmdir);
+    def_node_export(vm, mod, ns, "unlink", &nat_fscb_unlink);
+    def_node_export(vm, mod, ns, "rename", &nat_fscb_rename);
+    def_node_export(vm, mod, ns, "stat", &nat_fscb_stat);
+    // fs.promises
+    JsObject* pr = build_fs_promises(vm);
+    def_node_value(vm, mod, ns, "promises", value_cell(&pr.head));
     return ns;
 }
 
@@ -8624,6 +8777,9 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "fs") {
         if vm.node_fs_ns == null { vm.node_fs_ns = build_fs_module(vm); }
         return vm.node_fs_ns;
+    }
+    if str_equal(name, "fs/promises") {
+        return builtins_fs_promises_module(vm);
     }
     if str_equal(name, "os") {
         if vm.node_os_ns == null { vm.node_os_ns = build_os_module(vm); }
