@@ -222,6 +222,64 @@ private i32 find_module(Loader* ld, str canon) {
     return -1;
 }
 
+private bool str_has_prefix(str s, str pre) {
+    if s.len < pre.len { return false; }
+    for i32 i = 0; i < pre.len; i++ {
+        if *(s.data + i) != *(pre.data + i) { return false; }
+    }
+    return true;
+}
+
+// If spec names a supported built-in module ("fs"/"path", with or without
+// a "node:" prefix), returns the bare name; else {null, 0}.
+private str builtin_name(str spec) {
+    str s = spec;
+    if str_has_prefix(s, "node:") {
+        s.data = s.data + 5;
+        s.len = s.len - 5;
+    }
+    if str_equal(s, "fs") || str_equal(s, "path") { return s; }
+    str none;
+    none.data = null;
+    none.len = 0;
+    return none;
+}
+
+// Binds a synthetic, pre-evaluated module for a built-in namespace.
+// Deduped by a "node:<name>" canonical key. Returns the module index,
+// or -1 if the name is unknown.
+private i32 load_builtin_module(Loader* ld, str name) {
+    str_buf cb;
+    str_buf_init(&cb);
+    str_buf_add(&cb, "node:");
+    str_buf_add(&cb, name);
+    str canon = raw_from(&cb);
+    str_buf_free(&cb);
+    i32 existing = find_module(ld, canon);
+    if existing >= 0 { free(canon.data); return existing; }
+
+    JsObject* ns = builtins_node_module(ld.vm, name);
+    if ns == null { free(canon.data); return -1; }
+
+    Module* mod = new(Module);
+    u8* pc = alloc<u8>(name.len > 0 ? name.len : 1);
+    if name.len > 0 { memcpy(pc, name.data, name.len); }
+    mod.path.data = pc;
+    mod.path.len = name.len;
+    mod.canon = canon;
+    mod.src_data = null;
+    mod.src_len = 0;
+    mod.state = MOD_DONE;
+    mod.ok = true;
+    vec_init<i32>(&mod.dep_idx, 1);
+    bump_init(&mod.arena);
+    mod.tmpl = null;
+    mod.ns = ns;
+    i32 idx = ld.mods.len;
+    vec_push(&ld.mods, mod);
+    return idx;
+}
+
 // Loads path (and its deps) into the loader; returns the module index
 // or -1 on failure.
 private i32 load_module(Loader* ld, str path) {
@@ -297,6 +355,17 @@ private i32 load_module(Loader* ld, str path) {
     // resolve and load dependencies (specifier views live in the arena)
     for i32 i = 0; i < specs.len; i++ {
         str spec = vec_get(&specs, i);
+        // built-in modules (fs / path, incl. node: prefix) bind directly
+        str bname = builtin_name(spec);
+        if bname.data != null {
+            i32 dep = load_builtin_module(ld, bname);
+            if dep < 0 {
+                eprint("tsmc: unknown built-in module '{}'\n", spec);
+                ld.failed = true;
+            }
+            vec_push(&mod.dep_idx, dep);
+            continue;
+        }
         str resolved = resolve_specifier(mod.path, spec);
         if resolved.data == null {
             eprint("tsmc: cannot resolve '{}' from '{}'\n", spec, mod.path);

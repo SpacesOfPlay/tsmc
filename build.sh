@@ -131,7 +131,7 @@ run_tests() {
     step "gc stress"
     n_stress=0
     n_stress_fail=0
-    for f in "$PROJECT_DIR"/test/run/*.ts "$PROJECT_DIR"/test/diff/*.js; do
+    for f in "$PROJECT_DIR"/test/run/*.ts "$PROJECT_DIR"/test/diff/*.js "$PROJECT_DIR"/test/diff/*.mjs; do
         [ -e "$f" ] || continue
         n_stress=$((n_stress + 1))
         if ! "$OUT_EXE" --gc-stress "$f" > /dev/null 2>&1; then
@@ -178,9 +178,9 @@ run_diff() {
     node_bin="${NODE:-$(command -v node 2>/dev/null)}"
     if [ -z "$node_bin" ]; then echo "  skipped - node not found (set NODE)"; return; fi
     n_fail=0
-    for f in "$PROJECT_DIR"/test/diff/*.js; do
+    for f in "$PROJECT_DIR"/test/diff/*.js "$PROJECT_DIR"/test/diff/*.mjs; do
         [ -e "$f" ] || continue
-        name="$(basename "$f" .js)"
+        name="$(basename "$(basename "$f" .js)" .mjs)"
         if [ "$("$node_bin" "$f" 2>&1)" = "$("$OUT_EXE" "$f" 2>&1)" ]; then
             pass "$name"
         else

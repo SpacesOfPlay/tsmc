@@ -107,7 +107,8 @@ function Run-Tests {
     # We only assert a clean exit (0), not output — slow but thorough.
     Step "gc stress"
     $stressScripts = @($runTests) +
-        @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue | Sort-Object Name)
+        @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.mjs") -ErrorAction SilentlyContinue) | Sort-Object Name
     $stressFail = 0
     foreach ($f in $stressScripts) {
         & $OutExe "--gc-stress" $f.FullName > $null 2> $null
@@ -143,7 +144,8 @@ function Run-Diff {
     Step "differential (vs node)"
     $node = if ($env:NODE) { $env:NODE } else { (Get-Command node -ErrorAction SilentlyContinue).Source }
     if (-not $node) { Write-Host "  skipped - node not found (set NODE)"; return }
-    $scripts = @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue | Sort-Object Name)
+    $scripts = @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.mjs") -ErrorAction SilentlyContinue) | Sort-Object Name
     $fail = 0
     foreach ($f in $scripts) {
         $ref = (& $node $f.FullName 2>&1) -join "`n"

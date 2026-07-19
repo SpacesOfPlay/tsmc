@@ -17,6 +17,7 @@ import ustr;
 import bigint;
 import vm;
 import math;
+import file;
 
 // Platform math not covered by the math module: hyperbolic functions
 // and the accurate log1p/expm1, used by the extra Math.* methods.
@@ -6780,6 +6781,639 @@ private void textcodec_install(VM* vm) {
     props_set_desc(&dc.props, vm.atom_prototype, value_cell(&vm.textdec_proto.head), 0);
     link_ctor(vm, vm.textdec_proto, dc);
     def_method(vm, vm.textdec_proto, "decode", &nat_textdecoder_decode);
+}
+
+// --- node built-in modules: path / fs ---------------------------------------
+//
+// Reached via `import path from 'path'` / `import fs from 'fs'` (and the
+// `node:` prefix). The loader binds a synthetic module whose namespace
+// carries `default` (the module object) plus every function as a named
+// export, so all three import forms work.
+
+when os(windows) {
+    private bool path_is_sep(u8 c) { return c == '/' || c == '\\'; }
+    private str path_sep_str() { return "\\"; }
+    private u8 path_sep_ch() { return cast(u8, 92); }   // backslash
+    private str path_delim_str() { return ";"; }
+}
+else {
+    private bool path_is_sep(u8 c) { return c == '/'; }
+    private str path_sep_str() { return "/"; }
+    private u8 path_sep_ch() { return cast(u8, '/'); }
+    private str path_delim_str() { return ":"; }
+}
+
+// Coerces arg[i] to a string and keeps it rooted for the caller (which
+// must vm_pop once done reading the returned view).
+private str path_arg(VM* vm, Value* args, i32 argc, i32 i) {
+    Value sv = js_to_string_value(vm, arg_at(args, argc, i));
+    vm_push(vm, sv);
+    return sview(sv);
+}
+
+// Trailing separators removed, but a lone root (or "C:\") is kept.
+private i32 path_trim_end(str p) {
+    i32 end = p.len;
+    while end > 1 && path_is_sep(*(p.data + end - 1)) { end--; }
+    return end;
+}
+
+private i32 path_last_sep(str p, i32 end) {
+    i32 last = -1;
+    for i32 i = 0; i < end; i++ {
+        if path_is_sep(*(p.data + i)) { last = i; }
+    }
+    return last;
+}
+
+private Value nat_path_dirname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str p = path_arg(vm, args, argc, 0);
+    i32 end = path_trim_end(p);
+    i32 last = path_last_sep(p, end);
+    Value r;
+    if last < 0 { r = new_str(vm, "."); }
+    else {
+        // last == 0 keeps the input's own leading separator (Node preserves
+        // separator style; "/" -> "/", "\\" -> "\\").
+        str d;
+        d.data = p.data;
+        d.len = last == 0 ? 1 : last;
+        r = new_str(vm, d);
+    }
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_path_basename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str p = path_arg(vm, args, argc, 0);
+    i32 end = path_trim_end(p);
+    i32 last = path_last_sep(p, end);
+    str base;
+    base.data = p.data + (last + 1);
+    base.len = end - (last + 1);
+    Value ev = arg_at(args, argc, 1);
+    if value_is_string(ev) {
+        str ext = sview(ev);
+        if ext.len > 0 && ext.len < base.len {
+            bool match = true;
+            for i32 i = 0; i < ext.len; i++ {
+                if *(base.data + base.len - ext.len + i) != *(ext.data + i) { match = false; break; }
+            }
+            if match { base.len = base.len - ext.len; }
+        }
+    }
+    Value r = new_str(vm, base);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_path_extname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str p = path_arg(vm, args, argc, 0);
+    i32 end = path_trim_end(p);
+    i32 start = path_last_sep(p, end) + 1;
+    i32 dot = -1;
+    for i32 i = start; i < end; i++ {
+        if *(p.data + i) == '.' { dot = i; }
+    }
+    str e;
+    if dot <= start { e.data = p.data; e.len = 0; }   // no dot, or leading dot only
+    else { e.data = p.data + dot; e.len = end - dot; }
+    Value r = new_str(vm, e);
+    vm_pop(vm);
+    return r;
+}
+
+private bool path_absolute(str p) {
+    if p.len == 0 { return false; }
+    if path_is_sep(*(p.data)) { return true; }
+    when os(windows) {
+        // drive-absolute: "C:\" or "C:/"
+        if p.len >= 3 {
+            u8 c0 = *(p.data);
+            bool letter = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
+            if letter && *(p.data + 1) == ':' && path_is_sep(*(p.data + 2)) { return true; }
+        }
+    }
+    return false;
+}
+
+private Value nat_path_isabsolute(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str p = path_arg(vm, args, argc, 0);
+    bool r = path_absolute(p);
+    vm_pop(vm);
+    return value_bool(r);
+}
+
+// Normalizes a path (collapse `.`/`..`/duplicate separators), preserving
+// an absolute root, a Windows drive prefix, and a trailing separator.
+private void path_norm_into(str_buf* out, str p) {
+    i32 mark = out.len;
+    i32 n = p.len;
+    str root;
+    root.data = p.data;
+    root.len = 0;
+    i32 i = 0;
+    when os(windows) {
+        if n >= 2 {
+            u8 c0 = *(p.data);
+            bool letter = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
+            if letter && *(p.data + 1) == ':' { root.len = 2; i = 2; }
+        }
+    }
+    bool is_abs = i < n && path_is_sep(*(p.data + i));
+    Vec<str> segs = vec_new<str>(8);
+    while i < n {
+        while i < n && path_is_sep(*(p.data + i)) { i++; }
+        i32 start = i;
+        while i < n && !path_is_sep(*(p.data + i)) { i++; }
+        str seg;
+        seg.data = p.data + start;
+        seg.len = i - start;
+        if seg.len == 0 { /* trailing */ }
+        else if seg.len == 1 && *(seg.data) == '.' { /* skip */ }
+        else if seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.' {
+            if segs.len > 0 {
+                str top = vec_get(&segs, segs.len - 1);
+                bool top_dd = top.len == 2 && *(top.data) == '.' && *(top.data + 1) == '.';
+                if !top_dd { segs.len = segs.len - 1; }
+                else if !is_abs { vec_push(&segs, seg); }
+            } else if !is_abs { vec_push(&segs, seg); }
+        }
+        else { vec_push(&segs, seg); }
+    }
+    if root.len > 0 { str_buf_add(out, root); }
+    if is_abs { str_buf_add_byte(out, path_sep_ch()); }
+    for i32 k = 0; k < segs.len; k++ {
+        if k > 0 { str_buf_add_byte(out, path_sep_ch()); }
+        str_buf_add(out, vec_get(&segs, k));
+    }
+    bool had_trail = n > 0 && path_is_sep(*(p.data + n - 1));
+    if had_trail && segs.len > 0 { str_buf_add_byte(out, path_sep_ch()); }
+    if out.len == mark { str_buf_add(out, "."); }
+    vec_free(&segs);
+}
+
+private Value nat_path_normalize(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str p = path_arg(vm, args, argc, 0);
+    str_buf out;
+    str_buf_init(&out);
+    path_norm_into(&out, p);
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    vm_pop(vm);
+    return r;
+}
+
+private Value nat_path_join(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf raw;
+    str_buf_init(&raw);
+    i32 pushed = 0;
+    bool any = false;
+    for i32 i = 0; i < argc; i++ {
+        Value sv = js_to_string_value(vm, arg_at(args, argc, i));
+        vm_push(vm, sv);
+        pushed++;
+        str s = sview(sv);
+        if s.len > 0 {
+            if any { str_buf_add_byte(&raw, path_sep_ch()); }
+            str_buf_add(&raw, s);
+            any = true;
+        }
+    }
+    str_buf out;
+    str_buf_init(&out);
+    if !any { str_buf_add(&out, "."); }
+    else { path_norm_into(&out, str_buf_to_str(&raw)); }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    str_buf_free(&raw);
+    for i32 i = 0; i < pushed; i++ { vm_pop(vm); }
+    return r;
+}
+
+private Value nat_path_resolve(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf acc;
+    str_buf_init(&acc);
+    bool have_abs = false;
+    i32 pushed = 0;
+    for i32 i = 0; i < argc; i++ {
+        Value sv = js_to_string_value(vm, arg_at(args, argc, i));
+        vm_push(vm, sv);
+        pushed++;
+        str s = sview(sv);
+        if s.len == 0 { continue; }
+        if path_absolute(s) {
+            acc.len = 0;
+            str_buf_add(&acc, s);
+            have_abs = true;
+        } else {
+            if acc.len > 0 { str_buf_add_byte(&acc, path_sep_ch()); }
+            str_buf_add(&acc, s);
+        }
+    }
+    // still relative -> prepend cwd
+    if !have_abs {
+        Value cwd = os_cwd_str(vm);
+        vm_push(vm, cwd);
+        pushed++;
+        str c = sview(cwd);
+        str_buf pre;
+        str_buf_init(&pre);
+        str_buf_add(&pre, c);
+        if acc.len > 0 { str_buf_add_byte(&pre, path_sep_ch()); str_buf_add(&pre, str_buf_to_str(&acc)); }
+        acc.len = 0;
+        str_buf_add(&acc, str_buf_to_str(&pre));
+        str_buf_free(&pre);
+    }
+    str_buf out;
+    str_buf_init(&out);
+    path_norm_into(&out, str_buf_to_str(&acc));
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    str_buf_free(&acc);
+    for i32 i = 0; i < pushed; i++ { vm_pop(vm); }
+    return r;
+}
+
+private Value nat_path_parse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&o.head));
+    str p = path_arg(vm, args, argc, 0);
+    i32 end = path_trim_end(p);
+    i32 last = path_last_sep(p, end);
+    // dir
+    str dir;
+    if last < 0 { dir.data = p.data; dir.len = 0; }
+    else if last == 0 { dir.data = p.data; dir.len = 1; }
+    else { dir.data = p.data; dir.len = last; }
+    // base
+    str base;
+    base.data = p.data + (last + 1);
+    base.len = end - (last + 1);
+    // ext / name
+    i32 dot = -1;
+    for i32 i = 0; i < base.len; i++ { if *(base.data + i) == '.' { dot = i; } }
+    str ext;
+    str name;
+    if dot <= 0 { ext.data = base.data; ext.len = 0; name = base; }
+    else { ext.data = base.data + dot; ext.len = base.len - dot; name.data = base.data; name.len = dot; }
+    str root;
+    root.data = p.data;
+    root.len = path_absolute(p) ? 1 : 0;
+    when os(windows) {
+        if p.len >= 3 && path_absolute(p) && *(p.data + 1) == ':' { root.len = 3; }
+    }
+    def_value_enum(vm, o, "root", new_str(vm, root));
+    def_value_enum(vm, o, "dir", new_str(vm, dir));
+    def_value_enum(vm, o, "base", new_str(vm, base));
+    def_value_enum(vm, o, "ext", new_str(vm, ext));
+    def_value_enum(vm, o, "name", new_str(vm, name));
+    vm_pop(vm);   // p's string
+    Value r = value_cell(&o.head);
+    vm_pop(vm);   // o
+    return r;
+}
+
+private void def_node_export(VM* vm, JsObject* mod, JsObject* ns, str name, NativeFn f) {
+    JsNative* n = js_new_native(&vm.heap, f, name);
+    Value v = value_cell(&n.head);
+    props_set_desc(&mod.props, bi_atom(vm, name), v, PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
+private void def_node_value(VM* vm, JsObject* mod, JsObject* ns, str name, Value v) {
+    props_set_desc(&mod.props, bi_atom(vm, name), v, PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
+// Builds a namespace: default = a fresh module object, named exports
+// mirrored onto both. The namespace is permanently rooted; the module
+// object stays reachable through the namespace's `default` slot.
+private JsObject* new_node_module(VM* vm, JsObject** out_mod) {
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    JsObject* mod = js_new_object(&vm.heap, vm.object_proto);
+    props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&mod.head), PROP_DEFAULT);
+    *out_mod = mod;
+    return ns;
+}
+
+// --- fs: OS layer (dir/type ops; read/write/stat use the file lib) ---
+
+when os(windows) {
+    private extern "kernel32.dll" i32 CreateDirectoryA(u8* path, void* sec);
+    private extern "kernel32.dll" i32 DeleteFileA(u8* path);
+    private extern "kernel32.dll" i32 RemoveDirectoryA(u8* path);
+    private extern "kernel32.dll" i32 MoveFileExA(u8* src, u8* dst, u32 flags);
+    private extern "kernel32.dll" u32 GetFileAttributesA(u8* path);
+    private bool fs_mkdir1(u8* p) { return CreateDirectoryA(p, null) != 0; }
+    private bool fs_rmdir1(u8* p) { return RemoveDirectoryA(p) != 0; }
+    private bool fs_unlink1(u8* p) { return DeleteFileA(p) != 0; }
+    private bool fs_rename1(u8* a, u8* b) { return MoveFileExA(a, b, 1) != 0; }  // REPLACE_EXISTING
+    private bool fs_is_dir(u8* p) {
+        u32 a = GetFileAttributesA(p);
+        if a == 0xFFFFFFFF { return false; }
+        return (a & 0x10) != 0;   // FILE_ATTRIBUTE_DIRECTORY
+    }
+    // FILETIME 100ns ticks since 1601 -> ms since Unix epoch
+    private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 10000.0 - 11644473600000.0; }
+}
+else {
+    when os(macos) || os(ios) {
+        private extern "libSystem.B.dylib" i32 mkdir(u8* path, u32 mode);
+        private extern "libSystem.B.dylib" i32 unlink(u8* path);
+        private extern "libSystem.B.dylib" i32 rmdir(u8* path);
+        private extern "libSystem.B.dylib" i32 rename(u8* old, u8* nw);
+        private extern "libSystem.B.dylib" void* opendir(u8* path);
+        private extern "libSystem.B.dylib" i32 closedir(void* dp);
+    }
+    else {
+        private extern "libc.so.6" i32 mkdir(u8* path, u32 mode);
+        private extern "libc.so.6" i32 unlink(u8* path);
+        private extern "libc.so.6" i32 rmdir(u8* path);
+        private extern "libc.so.6" i32 rename(u8* old, u8* nw);
+        private extern "libc.so.6" void* opendir(u8* path);
+        private extern "libc.so.6" i32 closedir(void* dp);
+    }
+    private bool fs_mkdir1(u8* p) { return mkdir(p, 511) == 0; }   // 0o777
+    private bool fs_rmdir1(u8* p) { return rmdir(p) == 0; }
+    private bool fs_unlink1(u8* p) { return unlink(p) == 0; }
+    private bool fs_rename1(u8* a, u8* b) { return rename(a, b) == 0; }
+    // opendir succeeds only for directories — layout-free type check
+    private bool fs_is_dir(u8* p) {
+        void* d = opendir(p);
+        if d == null { return false; }
+        ignore closedir(d);
+        return true;
+    }
+    // ns since Unix epoch -> ms
+    private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
+}
+
+private void fs_throw(VM* vm, str op, str path) {
+    str_buf m;
+    str_buf_init(&m);
+    str_buf_add(&m, "ENOENT: no such file or directory, ");
+    str_buf_add(&m, op);
+    str_buf_add(&m, " '");
+    str_buf_add(&m, path);
+    str_buf_add(&m, "'");
+    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
+    str_buf_free(&m);
+}
+
+// Encoding from a string arg or a `{ encoding }` options object; -1 = raw
+// bytes (return a Buffer).
+private i32 fs_enc_arg(VM* vm, Value v) {
+    if value_is_string(v) { return buf_parse_enc(v, ENC_UTF8); }
+    if value_is_object(v) {
+        Value ev;
+        if vm_get_prop_value(vm, v, bi_atom(vm, "encoding"), &ev) && value_is_string(ev) {
+            return buf_parse_enc(ev, ENC_UTF8);
+        }
+    }
+    return -1;
+}
+
+private Value nat_fs_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    FileData fd = file_read(path);
+    if fd.data == null {
+        fs_throw(vm, "open", path);
+        vm_pop(vm);
+        return value_undefined();
+    }
+    i32 enc = fs_enc_arg(vm, arg_at(args, argc, 1));
+    JsObject* b = value_as_object(buf_from_bytes(vm, fd.data, fd.len));
+    free(fd.data);
+    Value r;
+    if enc >= 0 { r = bytes_to_str(vm, b, enc, 0, b.elen); }
+    else { r = value_cell(&b.head); }
+    vm_pop(vm);
+    return r;
+}
+
+// Fills `out` with the bytes of a string/Buffer `data` under `enc`.
+private void fs_data_bytes(VM* vm, str_buf* out, Value data, i32 enc) {
+    if value_is_array(data) {
+        JsObject* b = value_as_object(data);
+        for i32 i = 0; i < b.elen; i++ { str_buf_add_byte(out, cast(u8, buf_byte(b, i))); }
+    } else {
+        Value s = js_to_string_value(vm, data);
+        vm_push(vm, s);
+        str_to_bytes(out, sview(s), enc);
+        vm_pop(vm);
+    }
+}
+
+private Value nat_fs_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
+    str_buf bytes;
+    str_buf_init(&bytes);
+    fs_data_bytes(vm, &bytes, arg_at(args, argc, 1), enc);
+    FileData fd;
+    fd.data = bytes.data;
+    fd.len = bytes.len;
+    bool ok = file_write(path, fd);
+    str_buf_free(&bytes);
+    if !ok { fs_throw(vm, "open", path); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
+    str_buf bytes;
+    str_buf_init(&bytes);
+    FileData old = file_read(path);
+    if old.data != null {
+        str_buf_add_bytes(&bytes, old.data, old.len);
+        free(old.data);
+    }
+    fs_data_bytes(vm, &bytes, arg_at(args, argc, 1), enc);
+    FileData fd;
+    fd.data = bytes.data;
+    fd.len = bytes.len;
+    bool ok = file_write(path, fd);
+    str_buf_free(&bytes);
+    if !ok { fs_throw(vm, "open", path); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    bool ok = file_exists(path);
+    vm_pop(vm);
+    return value_bool(ok);
+}
+
+private Value nat_fs_unlink(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    u8* c = str_to_cstr(path);
+    bool ok = fs_unlink1(c);
+    free(c);
+    if !ok { fs_throw(vm, "unlink", path); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_rename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str src = path_arg(vm, args, argc, 0);
+    str dst = path_arg(vm, args, argc, 1);
+    u8* cf = str_to_cstr(src);
+    u8* ct = str_to_cstr(dst);
+    bool ok = fs_rename1(cf, ct);
+    free(cf);
+    free(ct);
+    if !ok { fs_throw(vm, "rename", src); }
+    vm_pop(vm);   // dst
+    vm_pop(vm);   // src
+    return value_undefined();
+}
+
+private Value nat_fs_mkdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    bool recursive = false;
+    Value opts = arg_at(args, argc, 1);
+    if value_is_object(opts) {
+        Value rv;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "recursive"), &rv) { recursive = js_truthy(rv); }
+    }
+    if recursive {
+        // create each ancestor in turn; ignore already-exists failures
+        for i32 i = 1; i <= path.len; i++ {
+            bool at_end = i == path.len;
+            if at_end || path_is_sep(*(path.data + i)) {
+                if i == 0 { continue; }
+                str pre;
+                pre.data = path.data;
+                pre.len = i;
+                u8* c = str_to_cstr(pre);
+                ignore fs_mkdir1(c);
+                free(c);
+            }
+        }
+    } else {
+        u8* c = str_to_cstr(path);
+        ignore fs_mkdir1(c);
+        free(c);
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    u8* c = str_to_cstr(path);
+    bool ok = fs_rmdir1(c);
+    free(c);
+    if !ok { fs_throw(vm, "rmdir", path); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_stat_isfile(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value d;
+    if vm_get_prop_value(as_vm(vmp), thisv, bi_atom(as_vm(vmp), "isDirectory_"), &d) {
+        return value_bool(!js_truthy(d));
+    }
+    return value_bool(true);
+}
+private Value nat_fs_stat_isdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value d;
+    if vm_get_prop_value(as_vm(vmp), thisv, bi_atom(as_vm(vmp), "isDirectory_"), &d) {
+        return value_bool(js_truthy(d));
+    }
+    return value_bool(false);
+}
+
+private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    FileStamp st = file_stamp(path);
+    if !st.ok {
+        fs_throw(vm, "stat", path);
+        vm_pop(vm);
+        return value_undefined();
+    }
+    u8* c = str_to_cstr(path);
+    bool isdir = fs_is_dir(c);
+    free(c);
+    vm_pop(vm);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&o.head));
+    def_value_enum(vm, o, "size", value_number(cast(f64, st.size)));
+    def_value_enum(vm, o, "mtimeMs", value_number(fs_mtime_ms(st.mtime)));
+    props_set_desc(&o.props, bi_atom(vm, "isDirectory_"), value_bool(isdir), 0);  // hidden flag
+    def_method(vm, o, "isFile", &nat_fs_stat_isfile);
+    def_method(vm, o, "isDirectory", &nat_fs_stat_isdir);
+    Value r = value_cell(&o.head);
+    vm_pop(vm);
+    return r;
+}
+
+private JsObject* build_fs_module(VM* vm) {
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "readFileSync", &nat_fs_read_file);
+    def_node_export(vm, mod, ns, "writeFileSync", &nat_fs_write_file);
+    def_node_export(vm, mod, ns, "appendFileSync", &nat_fs_append_file);
+    def_node_export(vm, mod, ns, "existsSync", &nat_fs_exists);
+    def_node_export(vm, mod, ns, "mkdirSync", &nat_fs_mkdir);
+    def_node_export(vm, mod, ns, "rmdirSync", &nat_fs_rmdir);
+    def_node_export(vm, mod, ns, "unlinkSync", &nat_fs_unlink);
+    def_node_export(vm, mod, ns, "renameSync", &nat_fs_rename);
+    def_node_export(vm, mod, ns, "statSync", &nat_fs_stat);
+    return ns;
+}
+
+private JsObject* build_path_module(VM* vm) {
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "join", &nat_path_join);
+    def_node_export(vm, mod, ns, "resolve", &nat_path_resolve);
+    def_node_export(vm, mod, ns, "normalize", &nat_path_normalize);
+    def_node_export(vm, mod, ns, "dirname", &nat_path_dirname);
+    def_node_export(vm, mod, ns, "basename", &nat_path_basename);
+    def_node_export(vm, mod, ns, "extname", &nat_path_extname);
+    def_node_export(vm, mod, ns, "isAbsolute", &nat_path_isabsolute);
+    def_node_export(vm, mod, ns, "parse", &nat_path_parse);
+    def_node_value(vm, mod, ns, "sep", new_str(vm, path_sep_str()));
+    def_node_value(vm, mod, ns, "delimiter", new_str(vm, path_delim_str()));
+    return ns;
+}
+
+// Returns the namespace of the named built-in module, or null. `name` has
+// any `node:` prefix already stripped by the caller.
+JsObject* builtins_node_module(VM* vm, str name) {
+    if str_equal(name, "path") {
+        if vm.node_path_ns == null { vm.node_path_ns = build_path_module(vm); }
+        return vm.node_path_ns;
+    }
+    if str_equal(name, "fs") {
+        if vm.node_fs_ns == null { vm.node_fs_ns = build_fs_module(vm); }
+        return vm.node_fs_ns;
+    }
+    return null;
 }
 
 void builtins_install(VM* vm) {
