@@ -7990,6 +7990,389 @@ private JsObject* build_events_module(VM* vm) {
     return ns;
 }
 
+// --- util -------------------------------------------------------------------
+
+// promisify: the wrapper (env0 = original) builds a Promise and calls the
+// original with a trailing (err, value) callback (env0 = the promise).
+private Value nat_promisify_cb(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value p = value_as_native(callee).env0;
+    Value err = arg_at(args, argc, 0);
+    if !value_is_null(err) && !value_is_undefined(err) {
+        vm_promise_settle(vm, p, err, true);
+    } else {
+        vm_promise_settle(vm, p, arg_at(args, argc, 1), false);
+    }
+    return value_undefined();
+}
+
+private Value nat_promisified(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value original = value_as_native(callee).env0;
+    Value p = vm_promise_new(vm);
+    vm_push(vm, p);
+    JsNative* cb = js_new_native(&vm.heap, &nat_promisify_cb, "");
+    cb.env0 = p;
+    Value cbv = value_cell(&cb.head);
+    vm_push(vm, cbv);
+    Value* callargs = alloc<Value>(argc + 1);
+    for i32 i = 0; i < argc; i++ { *(callargs + i) = *(args + i); }
+    *(callargs + argc) = cbv;
+    ignore vm_call_value(vm, original, thisv, callargs, argc + 1);
+    free(callargs);
+    vm_pop(vm);
+    vm_pop(vm);
+    return p;
+}
+
+private Value nat_util_promisify(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value orig = arg_at(args, argc, 0);
+    if !value_is_callable(orig) {
+        vm_throw_error(vm, ERR_TYPE, "The \"original\" argument must be a function");
+        return value_undefined();
+    }
+    vm_push(vm, orig);
+    JsNative* w = js_new_native(&vm.heap, &nat_promisified, "");
+    w.env0 = orig;
+    vm_pop(vm);
+    return value_cell(&w.head);
+}
+
+// callbackify: on settle, invoke the trailing cb(err, value) as a
+// microtask (via a resolved-promise reaction).
+private Value nat_callbackify_ok(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cbv = value_as_native(callee).env0;
+    Value[2] ca;
+    ca[0] = value_null();
+    ca[1] = arg_at(args, argc, 0);
+    ignore vm_call_value(vm, cbv, value_undefined(), &ca[0], 2);
+    return value_undefined();
+}
+private Value nat_callbackify_err(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cbv = value_as_native(callee).env0;
+    Value[1] ca;
+    ca[0] = arg_at(args, argc, 0);
+    ignore vm_call_value(vm, cbv, value_undefined(), &ca[0], 1);
+    return value_undefined();
+}
+private Value nat_callbackified(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value original = value_as_native(callee).env0;
+    i32 nargs = argc > 0 ? argc - 1 : 0;
+    Value cbv = arg_at(args, argc, nargs);   // last arg is the callback
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, cbv);
+    Value p = vm_call_value(vm, original, thisv, args, nargs);
+    gc_root(&vm.heap, p);
+    if vm_is_promise(vm, p) {
+        JsNative* onok = js_new_native(&vm.heap, &nat_callbackify_ok, "");
+        onok.env0 = cbv;
+        JsNative* onerr = js_new_native(&vm.heap, &nat_callbackify_err, "");
+        onerr.env0 = cbv;
+        ignore vm_promise_then(vm, p, value_cell(&onok.head), value_cell(&onerr.head));
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+private Value nat_util_callbackify(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value orig = arg_at(args, argc, 0);
+    if !value_is_callable(orig) {
+        vm_throw_error(vm, ERR_TYPE, "The \"original\" argument must be a function");
+        return value_undefined();
+    }
+    vm_push(vm, orig);
+    JsNative* w = js_new_native(&vm.heap, &nat_callbackified, "");
+    w.env0 = orig;
+    vm_pop(vm);
+    return value_cell(&w.head);
+}
+
+// inspect: the console string form; a top-level string is single-quoted
+// (matching Node), unlike console.log.
+private Value util_inspect_value(VM* vm, Value v) {
+    if value_is_string(v) {
+        str s = sview(v);
+        str_buf sb;
+        str_buf_init(&sb);
+        str_buf_add_byte(&sb, cast(u8, 39));   // '
+        for i32 i = 0; i < s.len; i++ {
+            u8 c = *(s.data + i);
+            if c == 39 || c == 92 { str_buf_add_byte(&sb, cast(u8, 92)); }   // escape ' and backslash
+            str_buf_add_byte(&sb, c);
+        }
+        str_buf_add_byte(&sb, cast(u8, 39));
+        Value r = new_str(vm, str_buf_to_str(&sb));
+        str_buf_free(&sb);
+        return r;
+    }
+    return js_console_string(vm, v);
+}
+
+private Value nat_util_inspect(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return util_inspect_value(as_vm(vmp), arg_at(args, argc, 0));
+}
+
+// Appends the number-to-string of `x` (a JS number Value) to sb.
+private void util_append_num(VM* vm, str_buf* sb, f64 x) {
+    Value s = js_to_string_value(vm, value_number(x));
+    str_buf_add(sb, sview(s));
+}
+
+private Value nat_util_format(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf out;
+    str_buf_init(&out);
+    i32 next = 1;
+    Value fmtv = arg_at(args, argc, 0);
+    // specifier processing only kicks in with a substitution argument; a
+    // lone format string is returned verbatim (Node behavior).
+    if argc >= 2 && value_is_string(fmtv) {
+        str f = sview(fmtv);
+        i32 i = 0;
+        while i < f.len {
+            u8 c = *(f.data + i);
+            if c == '%' && i + 1 < f.len {
+                u8 spec = *(f.data + i + 1);
+                if spec == '%' { str_buf_add_byte(&out, cast(u8, '%')); i += 2; continue; }
+                bool known = spec == 's' || spec == 'd' || spec == 'i' || spec == 'f'
+                    || spec == 'j' || spec == 'o' || spec == 'O' || spec == 'c';
+                if known {
+                    if next >= argc {
+                        str_buf_add_byte(&out, cast(u8, '%'));
+                        str_buf_add_byte(&out, spec);
+                    } else {
+                        Value a = *(args + next);
+                        next++;
+                        i32 rm = gc_root_mark(&vm.heap);
+                        gc_root(&vm.heap, a);
+                        if spec == 's' {
+                            Value s = js_console_string(vm, a);
+                            str_buf_add(&out, sview(s));
+                        } else if spec == 'd' || spec == 'f' {
+                            util_append_num(vm, &out, js_to_number(a));
+                        } else if spec == 'i' {
+                            f64 n = js_to_number(a);
+                            if n != n { str_buf_add(&out, "NaN"); }
+                            else { util_append_num(vm, &out, cast(f64, cast(i64, n))); }
+                        } else if spec == 'j' {
+                            Value jr = nat_json_stringify(vmp, callee, thisv, args + next - 1, 1);
+                            if vm.has_pending { vm.has_pending = false; vm.pending = value_undefined(); str_buf_add(&out, "[Circular]"); }
+                            else if value_is_string(jr) { str_buf_add(&out, sview(jr)); }
+                            else { str_buf_add(&out, "undefined"); }
+                        } else if spec == 'c' {
+                            // CSS directive: consume the arg, emit nothing
+                        } else {
+                            Value s = util_inspect_value(vm, a);   // %o / %O
+                            str_buf_add(&out, sview(s));
+                        }
+                        gc_root_reset(&vm.heap, rm);
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            str_buf_add_byte(&out, c);
+            i++;
+        }
+    } else {
+        next = 0;
+    }
+    // remaining args (space-joined, console.log-style)
+    for i32 k = next; k < argc; k++ {
+        if out.len > 0 || k > next { str_buf_add_byte(&out, cast(u8, ' ')); }
+        i32 rm = gc_root_mark(&vm.heap);
+        Value s = js_console_string(vm, *(args + k));
+        gc_root(&vm.heap, s);
+        str_buf_add(&out, sview(s));
+        gc_root_reset(&vm.heap, rm);
+    }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    return r;
+}
+
+private Value nat_util_inherits(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ctor = arg_at(args, argc, 0);
+    Value superc = arg_at(args, argc, 1);
+    if !value_is_callable(ctor) || !value_is_callable(superc) {
+        vm_throw_error(vm, ERR_TYPE, "inherits expects two constructors");
+        return value_undefined();
+    }
+    // super proto
+    Value sp;
+    JsObject* super_proto = null;
+    if vm_get_prop_value(vm, superc, vm.atom_prototype, &sp) && value_is_object(sp) {
+        super_proto = value_as_object(sp);
+    }
+    JsObject* newproto = js_new_object(&vm.heap, super_proto);
+    vm_push(vm, value_cell(&newproto.head));
+    props_set_desc(&newproto.props, atom_intern(&vm.atoms, "constructor"), ctor, METHOD_ATTRS);
+    // set ctor.prototype = newproto, ctor.super_ = superc
+    if value_is_native(ctor) {
+        props_set_desc(&value_as_native(ctor).props, vm.atom_prototype, value_cell(&newproto.head), PROP_WRITABLE);
+        props_set_desc(&value_as_native(ctor).props, atom_intern(&vm.atoms, "super_"), superc, PROP_DEFAULT);
+    } else if value_is_function(ctor) {
+        props_set_desc(&value_as_function(ctor).props, vm.atom_prototype, value_cell(&newproto.head), PROP_WRITABLE);
+        props_set_desc(&value_as_function(ctor).props, atom_intern(&vm.atoms, "super_"), superc, PROP_DEFAULT);
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+// deprecate: passthrough wrapper (env0 = original fn). No warning emitted.
+private Value nat_deprecated_call(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return vm_call_value(vm, value_as_native(callee).env0, thisv, args, argc);
+}
+private Value nat_util_deprecate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value orig = arg_at(args, argc, 0);
+    if !value_is_callable(orig) { return orig; }
+    vm_push(vm, orig);
+    JsNative* w = js_new_native(&vm.heap, &nat_deprecated_call, "deprecated");
+    w.env0 = orig;
+    vm_pop(vm);
+    return value_cell(&w.head);
+}
+
+// --- util.isDeepStrictEqual ---
+
+private bool proto_chain_has(Value v, JsObject* target) {
+    if !value_is_object(v) && !value_is_array(v) { return false; }
+    JsObject* cur = value_as_object(v).proto;
+    while cur != null {
+        if cur == target { return true; }
+        cur = cur.proto;
+    }
+    return false;
+}
+
+private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
+    if depth > 200 { return false; }
+    if js_same_value(a, b) { return true; }
+    // both dates: compare time value
+    if proto_chain_has(a, vm.date_proto) && proto_chain_has(b, vm.date_proto) {
+        Value ta;
+        Value tb;
+        u32 tatom = atom_intern(&vm.atoms, "%t");
+        bool ha = js_get_prop(value_as_object(a), tatom, &ta);
+        bool hb = js_get_prop(value_as_object(b), tatom, &tb);
+        if ha && hb { return js_to_number(ta) == js_to_number(tb); }
+    }
+    bool aarr = value_is_array(a);
+    bool barr = value_is_array(b);
+    if aarr != barr { return false; }
+    if aarr {
+        JsObject* ao = value_as_object(a);
+        JsObject* bo = value_as_object(b);
+        if ao.elen != bo.elen { return false; }
+        for i32 i = 0; i < ao.elen; i++ {
+            if !deep_equal(vm, js_array_get(ao, i), js_array_get(bo, i), depth + 1) { return false; }
+        }
+        return true;
+    }
+    if value_is_object(a) && value_is_object(b) {
+        i32 rm = gc_root_mark(&vm.heap);
+        JsObject* ak = vm_own_keys(vm, a);
+        gc_root(&vm.heap, value_cell(&ak.head));
+        JsObject* bk = vm_own_keys(vm, b);
+        gc_root(&vm.heap, value_cell(&bk.head));
+        bool eq = ak.elen == bk.elen;
+        for i32 i = 0; eq && i < ak.elen; i++ {
+            Value kv = js_array_get(ak, i);
+            u32 katom = atom_intern(&vm.atoms, sview(kv));
+            Value av;
+            Value bv;
+            bool hb = js_get_prop(value_as_object(b), katom, &bv);
+            bool ha = js_get_prop(value_as_object(a), katom, &av);
+            if !ha || !hb || !deep_equal(vm, av, bv, depth + 1) { eq = false; }
+        }
+        gc_root_reset(&vm.heap, rm);
+        return eq;
+    }
+    return false;
+}
+
+private Value nat_util_deep_equal(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return value_bool(deep_equal(vm, arg_at(args, argc, 0), arg_at(args, argc, 1), 0));
+}
+
+// --- util.types ---
+
+private Value nat_types_is_date(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(proto_chain_has(arg_at(args, argc, 0), as_vm(vmp).date_proto));
+}
+private Value nat_types_is_regexp(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(proto_chain_has(arg_at(args, argc, 0), as_vm(vmp).regexp_proto));
+}
+private Value nat_types_is_map(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    return value_bool(value_is_map(v) && !value_as_map(v).is_set);
+}
+private Value nat_types_is_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    return value_bool(value_is_map(v) && value_as_map(v).is_set);
+}
+private Value nat_types_is_promise(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(vm_is_promise(as_vm(vmp), arg_at(args, argc, 0)));
+}
+private Value nat_types_is_native_error(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(proto_chain_has(arg_at(args, argc, 0), as_vm(vmp).error_protos[ERR_ERROR]));
+}
+private Value nat_types_is_async_fn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    return value_bool(value_is_function(v) && value_as_function(v).tmpl != null && value_as_function(v).tmpl.is_async);
+}
+private Value nat_types_is_gen_fn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    return value_bool(value_is_function(v) && value_as_function(v).tmpl != null && value_as_function(v).tmpl.is_gen);
+}
+private Value nat_types_false(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(false);
+}
+
+private Value util_global(VM* vm, str name) {
+    Value* g = intmap_get<Value>(&vm.globals, bi_atom(vm, name));
+    if g != null { return *g; }
+    return value_undefined();
+}
+
+private JsObject* build_util_module(VM* vm) {
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "promisify", &nat_util_promisify);
+    def_node_export(vm, mod, ns, "callbackify", &nat_util_callbackify);
+    def_node_export(vm, mod, ns, "format", &nat_util_format);
+    def_node_export(vm, mod, ns, "inspect", &nat_util_inspect);
+    def_node_export(vm, mod, ns, "inherits", &nat_util_inherits);
+    def_node_export(vm, mod, ns, "deprecate", &nat_util_deprecate);
+    def_node_export(vm, mod, ns, "isDeepStrictEqual", &nat_util_deep_equal);
+    def_node_value(vm, mod, ns, "TextEncoder", util_global(vm, "TextEncoder"));
+    def_node_value(vm, mod, ns, "TextDecoder", util_global(vm, "TextDecoder"));
+
+    // util.types
+    JsObject* types = js_new_object(&vm.heap, vm.object_proto);
+    def_node_value(vm, mod, ns, "types", value_cell(&types.head));
+    def_method(vm, types, "isDate", &nat_types_is_date);
+    def_method(vm, types, "isRegExp", &nat_types_is_regexp);
+    def_method(vm, types, "isMap", &nat_types_is_map);
+    def_method(vm, types, "isSet", &nat_types_is_set);
+    def_method(vm, types, "isPromise", &nat_types_is_promise);
+    def_method(vm, types, "isNativeError", &nat_types_is_native_error);
+    def_method(vm, types, "isAsyncFunction", &nat_types_is_async_fn);
+    def_method(vm, types, "isGeneratorFunction", &nat_types_is_gen_fn);
+    def_method(vm, types, "isTypedArray", &nat_types_false);
+    def_method(vm, types, "isArrayBuffer", &nat_types_false);
+    def_method(vm, types, "isProxy", &nat_types_false);
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -8008,6 +8391,10 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "events") {
         if vm.node_events_ns == null { vm.node_events_ns = build_events_module(vm); }
         return vm.node_events_ns;
+    }
+    if str_equal(name, "util") {
+        if vm.node_util_ns == null { vm.node_util_ns = build_util_module(vm); }
+        return vm.node_util_ns;
     }
     return null;
 }

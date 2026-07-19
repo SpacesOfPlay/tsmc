@@ -265,7 +265,7 @@ private str builtin_name(str spec) {
         s.len = s.len - 5;
     }
     if str_equal(s, "fs") || str_equal(s, "path") || str_equal(s, "os")
-        || str_equal(s, "events") { return s; }
+        || str_equal(s, "events") || str_equal(s, "util") { return s; }
     str none;
     none.data = null;
     none.len = 0;
