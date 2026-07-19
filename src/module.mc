@@ -20,6 +20,7 @@ import object;
 import atom;
 import vm;
 import builtins;
+import node_stream;
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -266,7 +267,7 @@ private str builtin_name(str spec) {
     }
     if str_equal(s, "fs") || str_equal(s, "path") || str_equal(s, "os")
         || str_equal(s, "events") || str_equal(s, "util")
-        || str_equal(s, "crypto") { return s; }
+        || str_equal(s, "crypto") || str_equal(s, "stream") { return s; }
     str none;
     none.data = null;
     none.len = 0;
@@ -287,7 +288,14 @@ private i32 load_builtin_module(Loader* ld, str name) {
     if existing >= 0 { free(canon.data); return existing; }
 
     JsObject* ns = builtins_node_module(ld.vm, name);
-    if ns == null { free(canon.data); return -1; }
+    if ns == null {
+        // JS-source built-in (e.g. stream): run it, wrap exports as a namespace
+        str jsrc = builtin_js_source(name);
+        if jsrc.data == null { free(canon.data); return -1; }
+        Value exports = run_js_builtin(ld.vm, name, jsrc);
+        if !value_is_object(exports) && !value_is_function(exports) { free(canon.data); return -1; }
+        ns = js_builtin_namespace(ld.vm, exports);
+    }
 
     Module* mod = new(Module);
     u8* pc = alloc<u8>(name.len > 0 ? name.len : 1);
@@ -894,10 +902,116 @@ private Value make_require_fn(VM* vm, str module_path) {
     return value_cell(&n.head);
 }
 
+// Built-in modules implemented as embedded JS source (compiled+run once),
+// as opposed to the natively-built namespaces. {null,0} if not one.
+private str builtin_js_source(str name) {
+    if str_equal(name, "stream") { return node_stream_source(); }
+    return null_str();
+}
+
+// Compiles+runs an embedded JS built-in as a CJS module and caches it by
+// "builtin:<name>". Its `require` reaches the other built-ins (e.g. the
+// stream source requires 'events'). Returns module.exports.
+private Value run_js_builtin(VM* vm, str name, str src) {
+    str_buf kb;
+    str_buf_init(&kb);
+    str_buf_add(&kb, "builtin:");
+    str_buf_add(&kb, name);
+    str canon = raw_from(&kb);
+    str_buf_free(&kb);
+    u32 key = atom_intern(&vm.atoms, canon);
+    u32 exports_atom = atom_intern(&vm.atoms, "exports");
+    JsObject* cache = require_cache(vm);
+    Value cached;
+    if js_get_prop(cache, key, &cached) {
+        free(canon.data);
+        Value ex;
+        if value_is_object(cached) && js_get_prop(value_as_object(cached), exports_atom, &ex) { return ex; }
+        return value_undefined();
+    }
+    free(canon.data);
+
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* module = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&module.head));
+    JsObject* exports = js_new_object(&vm.heap, vm.object_proto);
+    js_set_prop(module, exports_atom, value_cell(&exports.head));
+    js_set_prop(cache, key, value_cell(&module.head));
+
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    Parser p;
+    parser_init(&p, src, &d, &arena);
+    Node* prog = parse_program(&p);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    lower_program(&lw, prog);
+    if d.n_errors == 0 {
+        i32 cm = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_source(&co, src, name);
+        FnTemplate* t = compile_cjs_module(&co, prog);
+        vm_add_template_root(vm, t);
+        gc_root_reset(&vm.heap, cm);
+        if d.n_errors == 0 {
+            Value reqfn = make_require_fn(vm, name);
+            gc_root(&vm.heap, reqfn);
+            Value dnv = new_js_str(vm, name);
+            gc_root(&vm.heap, dnv);
+            Value[5] cjs_args;
+            cjs_args[0] = value_cell(&exports.head);
+            cjs_args[1] = reqfn;
+            cjs_args[2] = value_cell(&module.head);
+            cjs_args[3] = dnv;
+            cjs_args[4] = dnv;
+            JsFunction* f = js_new_function(&vm.heap, t, 0);
+            ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
+        } else {
+            diags_print(&d, name, name);
+        }
+    } else {
+        diags_print(&d, name, name);
+    }
+    parser_destroy(&p);
+    lower_destroy(&lw);
+    Value result = value_undefined();
+    if !vm.has_pending {
+        Value ex;
+        if js_get_prop(module, exports_atom, &ex) { result = ex; }
+    }
+    gc_root_reset(&vm.heap, rm);
+    bump_destroy(&arena);
+    diags_free(&d);
+    return result;
+}
+
+// Namespace wrapper for an embedded JS built-in: default = exports, plus
+// each of exports' own keys as a named export (so ESM `import { X }` works).
+private JsObject* js_builtin_namespace(VM* vm, Value exports) {
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    props_set_desc(&ns.props, atom_intern(&vm.atoms, "default"), exports, PROP_DEFAULT);
+    JsObject* keys = vm_own_keys(vm, exports);
+    vm_push(vm, value_cell(&keys.head));
+    for i32 i = 0; i < keys.elen; i++ {
+        Value kv = js_array_get(keys, i);
+        u32 katom = atom_intern(&vm.atoms, gc_string_view(value_as_string(kv)));
+        Value v;
+        if vm_get_prop_value(vm, exports, katom, &v) {
+            props_set_desc(&ns.props, katom, v, PROP_DEFAULT);
+        }
+    }
+    vm_pop(vm);
+    return ns;
+}
+
 // Synchronously loads and evaluates the CJS module named by `spec` from a
 // module at `importer_path`; returns its `module.exports`.
 Value module_require(VM* vm, str importer_path, str spec) {
-    // 1. built-in module (fs / path / os, incl. node: prefix)
+    // 1. built-in module (fs / path / os / ..., incl. node: prefix)
     str bname = builtin_name(spec);
     if bname.data != null {
         JsObject* ns = builtins_node_module(vm, bname);
@@ -906,6 +1020,9 @@ Value module_require(VM* vm, str importer_path, str spec) {
             if js_get_prop(ns, atom_intern(&vm.atoms, "default"), &def) { return def; }
             return value_cell(&ns.head);
         }
+        // JS-source built-in (e.g. stream)
+        str jsrc = builtin_js_source(bname);
+        if jsrc.data != null { return run_js_builtin(vm, bname, jsrc); }
     }
     // 2. resolve (relative/absolute file, or a node_modules package)
     str resolved = resolve_require(vm, importer_path, spec);
