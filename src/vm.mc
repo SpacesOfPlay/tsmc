@@ -114,6 +114,8 @@ struct VM {
     JsObject* node_os_ns;      // built-in `os` module namespace (lazy)
     JsObject* node_events_ns;  // built-in `events` module namespace (lazy)
     JsObject* node_util_ns;    // built-in `util` module namespace (lazy)
+    JsObject* node_crypto_ns;  // built-in `crypto` module namespace (lazy)
+    JsObject* crypto_hash_proto;   // Hash.prototype for createHash
     JsObject* url_proto;
     JsObject* usp_proto;       // URLSearchParams.prototype
     JsObject* require_cache;    // CommonJS module cache: canon path -> module obj
@@ -263,6 +265,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.node_os_ns != null { gc_mark_cell(h, &vm.node_os_ns.head); }
     if vm.node_events_ns != null { gc_mark_cell(h, &vm.node_events_ns.head); }
     if vm.node_util_ns != null { gc_mark_cell(h, &vm.node_util_ns.head); }
+    if vm.node_crypto_ns != null { gc_mark_cell(h, &vm.node_crypto_ns.head); }
+    if vm.crypto_hash_proto != null { gc_mark_cell(h, &vm.crypto_hash_proto.head); }
     if vm.url_proto != null { gc_mark_cell(h, &vm.url_proto.head); }
     if vm.usp_proto != null { gc_mark_cell(h, &vm.usp_proto.head); }
     if vm.require_cache != null { gc_mark_cell(h, &vm.require_cache.head); }
@@ -1439,6 +1443,8 @@ void vm_init(VM* vm) {
     vm.node_os_ns = null;
     vm.node_events_ns = null;
     vm.node_util_ns = null;
+    vm.node_crypto_ns = null;
+    vm.crypto_hash_proto = null;
     vm.url_proto = null;
     vm.usp_proto = null;
     vm.require_cache = null;

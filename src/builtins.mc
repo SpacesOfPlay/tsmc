@@ -8373,6 +8373,247 @@ private JsObject* build_util_module(VM* vm) {
     return ns;
 }
 
+// --- crypto -----------------------------------------------------------------
+//
+// SHA-256 (FIPS 180-4) plus a platform CSPRNG for randomBytes / randomUUID.
+
+private u32 sha_rotr(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }
+
+private void sha256_block(u8* block, u32* state, u32* k) {
+    u32[64] w;
+    for i32 i = 0; i < 16; i++ {
+        i32 off = i * 4;
+        u32 b0 = cast(u32, *(block + off));
+        u32 b1 = cast(u32, *(block + off + 1));
+        u32 b2 = cast(u32, *(block + off + 2));
+        u32 b3 = cast(u32, *(block + off + 3));
+        w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+    for i32 i = 16; i < 64; i++ {
+        u32 w15 = w[i - 15];
+        u32 w2 = w[i - 2];
+        u32 s0 = sha_rotr(w15, 7) ^ sha_rotr(w15, 18) ^ (w15 >> 3);
+        u32 s1 = sha_rotr(w2, 17) ^ sha_rotr(w2, 19) ^ (w2 >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    // working variables in a small memory-backed array
+    u32[8] v;
+    for i32 i = 0; i < 8; i++ { v[i] = *(state + i); }
+    for i32 i = 0; i < 64; i++ {
+        u32 e = v[4];
+        u32 S1 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+        u32 ch = v[6] ^ (e & (v[5] ^ v[6]));
+        u32 t1 = v[7] + S1 + ch + *(k + i) + w[i];
+        u32 a = v[0];
+        u32 S0 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+        u32 maj = (a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2]);
+        u32 t2 = S0 + maj;
+        v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = v[3] + t1;
+        v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = t1 + t2;
+    }
+    for i32 i = 0; i < 8; i++ { *(state + i) = *(state + i) + v[i]; }
+}
+
+// Hashes `len` bytes at `data` into 32 output bytes.
+private void sha256_hash(u8* data, i32 len, u8* out) {
+    u32[64] k = {
+        0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+        0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+        0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+        0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+        0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+        0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+        0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+        0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
+    };
+    u32[8] state = {
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+    };
+    i32 pos = 0;
+    while pos + 64 <= len {
+        sha256_block(data + pos, &state[0], &k[0]);
+        pos = pos + 64;
+    }
+    u8[128] final_buf;
+    memset(cast(void*, &final_buf[0]), 0, 128);
+    i32 remaining = len - pos;
+    if remaining > 0 { memcpy(cast(void*, &final_buf[0]), cast(void*, data + pos), cast(i64, remaining)); }
+    final_buf[remaining] = 0x80;
+    if remaining >= 56 {
+        sha256_block(&final_buf[0], &state[0], &k[0]);
+        memset(cast(void*, &final_buf[0]), 0, 64);
+    }
+    i64 bitlen = cast(i64, len) * 8;
+    final_buf[56] = cast(u8, bitlen >> 56);
+    final_buf[57] = cast(u8, (bitlen >> 48) & 0xFF);
+    final_buf[58] = cast(u8, (bitlen >> 40) & 0xFF);
+    final_buf[59] = cast(u8, (bitlen >> 32) & 0xFF);
+    final_buf[60] = cast(u8, (bitlen >> 24) & 0xFF);
+    final_buf[61] = cast(u8, (bitlen >> 16) & 0xFF);
+    final_buf[62] = cast(u8, (bitlen >> 8) & 0xFF);
+    final_buf[63] = cast(u8, bitlen & 0xFF);
+    sha256_block(&final_buf[0], &state[0], &k[0]);
+    for i32 i = 0; i < 8; i++ {
+        u32 v = state[i];
+        *(out + i * 4) = cast(u8, v >> 24);
+        *(out + i * 4 + 1) = cast(u8, (v >> 16) & 0xFF);
+        *(out + i * 4 + 2) = cast(u8, (v >> 8) & 0xFF);
+        *(out + i * 4 + 3) = cast(u8, v & 0xFF);
+    }
+}
+
+// Platform CSPRNG: fills `n` bytes at `buf`. Returns false if unavailable.
+when os(windows) {
+    private extern "advapi32.dll" u8 SystemFunction036(void* buf, u32 len);
+    private bool os_random(u8* buf, i32 n) { return SystemFunction036(cast(void*, buf), cast(u32, n)) != 0; }
+}
+else {
+    when os(macos) || os(ios) {
+        private extern "libSystem.B.dylib" void arc4random_buf(void* buf, u64 n);
+        private bool os_random(u8* buf, i32 n) { arc4random_buf(cast(void*, buf), cast(u64, n)); return true; }
+    }
+    else {
+        private extern "libc.so.6" i64 getrandom(void* buf, u64 len, u32 flags);
+        private bool os_random(u8* buf, i32 n) {
+            i32 got = 0;
+            while got < n {
+                i64 r = getrandom(cast(void*, buf + got), cast(u64, n - got), 0);
+                if r <= 0 { return got > 0; }
+                got += cast(i32, r);
+            }
+            return true;
+        }
+    }
+}
+
+private bool crypto_is_sha256(str a) {
+    return ci_eq(a, "sha256") || ci_eq(a, "sha-256");
+}
+
+private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, algv);
+    if !crypto_is_sha256(sview(algv)) {
+        vm_pop(vm);
+        vm_throw_error(vm, ERR_ERROR, "Digest method not supported (only sha256)");
+        return value_undefined();
+    }
+    JsObject* h = js_new_object(&vm.heap, vm.crypto_hash_proto);
+    vm_push(vm, value_cell(&h.head));
+    Value accbuf = buf_from_bytes(vm, null, 0);
+    props_set_desc(&h.props, bi_atom(vm, "%buf"), accbuf, 0);
+    vm_pop(vm);   // h
+    vm_pop(vm);   // algv
+    return value_cell(&h.head);
+}
+
+// Appends the bytes of `data` (string in `enc`, or a Buffer) to the hash's
+// accumulator.
+private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return thisv; }
+    Value bufv;
+    if !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv) || !value_is_array(bufv) {
+        return thisv;
+    }
+    JsObject* acc = value_as_object(bufv);
+    Value data = arg_at(args, argc, 0);
+    if value_is_array(data) {
+        JsObject* b = value_as_object(data);
+        for i32 i = 0; i < b.elen; i++ { js_array_set(acc, acc.elen, value_number(cast(f64, buf_byte(b, i)))); }
+    } else {
+        i32 enc = buf_parse_enc(arg_at(args, argc, 1), ENC_UTF8);
+        Value s = js_to_string_value(vm, data);
+        vm_push(vm, s);
+        str_buf sb;
+        str_buf_init(&sb);
+        str_to_bytes(&sb, sview(s), enc);
+        for i32 i = 0; i < sb.len; i++ { js_array_set(acc, acc.elen, value_number(cast(f64, *(sb.data + i)))); }
+        str_buf_free(&sb);
+        vm_pop(vm);
+    }
+    return thisv;
+}
+
+private Value nat_hash_digest(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value bufv;
+    if !value_is_object(thisv)
+        || !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv)
+        || !value_is_array(bufv) {
+        return value_undefined();
+    }
+    JsObject* acc = value_as_object(bufv);
+    i32 n = acc.elen;
+    u8* data = alloc<u8>(n > 0 ? n : 1);
+    for i32 i = 0; i < n; i++ { *(data + i) = cast(u8, buf_byte(acc, i)); }
+    u8[32] digest;
+    sha256_hash(data, n, &digest[0]);
+    free(data);
+    Value b = buf_from_bytes(vm, &digest[0], 32);
+    Value encv = arg_at(args, argc, 0);
+    if value_is_string(encv) {
+        vm_push(vm, b);
+        i32 enc = buf_parse_enc(encv, ENC_HEX);
+        Value r = bytes_to_str(vm, value_as_object(b), enc, 0, 32);
+        vm_pop(vm);
+        return r;
+    }
+    return b;
+}
+
+private Value nat_crypto_random_bytes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 n = to_int_arg(arg_at(args, argc, 0));
+    if n < 0 { n = 0; }
+    u8* buf = alloc<u8>(n > 0 ? n : 1);
+    if !os_random(buf, n) {
+        free(buf);
+        vm_throw_error(vm, ERR_ERROR, "randomBytes: no secure random source");
+        return value_undefined();
+    }
+    Value r = buf_from_bytes(vm, buf, n);
+    free(buf);
+    return r;
+}
+
+private Value nat_crypto_random_uuid(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u8[16] b;
+    if !os_random(&b[0], 16) {
+        vm_throw_error(vm, ERR_ERROR, "randomUUID: no secure random source");
+        return value_undefined();
+    }
+    b[6] = cast(u8, (b[6] & 0x0F) | 0x40);   // version 4
+    b[8] = cast(u8, (b[8] & 0x3F) | 0x80);   // variant 1
+    str hexd = "0123456789abcdef";
+    u8[36] out;
+    i32 p = 0;
+    for i32 i = 0; i < 16; i++ {
+        if i == 4 || i == 6 || i == 8 || i == 10 { out[p] = cast(u8, '-'); p++; }
+        out[p] = *(hexd.data + (b[i] >> 4)); p++;
+        out[p] = *(hexd.data + (b[i] & 0xF)); p++;
+    }
+    str s;
+    s.data = &out[0];
+    s.len = 36;
+    return new_str(vm, s);
+}
+
+private JsObject* build_crypto_module(VM* vm) {
+    vm.crypto_hash_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_method(vm, vm.crypto_hash_proto, "update", &nat_hash_update);
+    def_method(vm, vm.crypto_hash_proto, "digest", &nat_hash_digest);
+
+    JsObject* mod;
+    JsObject* ns = new_node_module(vm, &mod);
+    def_node_export(vm, mod, ns, "createHash", &nat_crypto_create_hash);
+    def_node_export(vm, mod, ns, "randomBytes", &nat_crypto_random_bytes);
+    def_node_export(vm, mod, ns, "randomUUID", &nat_crypto_random_uuid);
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -8395,6 +8636,10 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "util") {
         if vm.node_util_ns == null { vm.node_util_ns = build_util_module(vm); }
         return vm.node_util_ns;
+    }
+    if str_equal(name, "crypto") {
+        if vm.node_crypto_ns == null { vm.node_crypto_ns = build_crypto_module(vm); }
+        return vm.node_crypto_ns;
     }
     return null;
 }
