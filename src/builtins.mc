@@ -3543,6 +3543,23 @@ private Value json_revive(VM* vm, Value holder, Value keyv, Value val, Value rev
     return result;
 }
 
+// Parses JSON `text` to a Value; sets *ok. For internal callers (require
+// of a .json file, package.json). No reviver.
+Value builtins_json_parse(VM* vm, str text, bool* ok) {
+    i32 rm = gc_root_mark(&vm.heap);
+    JsonParser p;
+    p.s = text;
+    p.pos = 0;
+    p.failed = false;
+    Value r = json_parse_value(vm, &p);
+    gc_root(&vm.heap, r);
+    json_ws(&p);
+    *ok = !p.failed && p.pos == p.s.len;
+    gc_root_reset(&vm.heap, rm);
+    if !*ok { return value_undefined(); }
+    return r;
+}
+
 private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 rm = gc_root_mark(&vm.heap);

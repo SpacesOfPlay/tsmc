@@ -40,6 +40,14 @@ when os(windows) {
         CloseHandle(h);
         return n > 0 && n < cap;
     }
+    extern "kernel32.dll" u32 GetFileAttributesA(u8* path);
+    private bool path_is_dir(str p) {
+        u8* c = str_to_cstr(p);
+        u32 a = GetFileAttributesA(c);
+        free(c);
+        if a == 0xFFFFFFFF { return false; }
+        return (a & 0x10) != 0;   // FILE_ATTRIBUTE_DIRECTORY
+    }
 }
 when os(linux) {
     extern "libc.so.6" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
@@ -50,7 +58,24 @@ when os(android) {
 when os(macos) || os(ios) {
     extern "libSystem.B.dylib" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
 }
+when os(macos) || os(ios) {
+    extern "libSystem.B.dylib" void* opendir(u8* path);
+    extern "libSystem.B.dylib" i32 closedir(void* dp);
+}
+when os(linux) || os(android) {
+    extern "libc.so.6" void* opendir(u8* path);
+    extern "libc.so.6" i32 closedir(void* dp);
+}
 when !os(windows) {
+    // opendir succeeds only for directories — a layout-free type check.
+    private bool path_is_dir(str p) {
+        u8* c = str_to_cstr(p);
+        void* d = opendir(c);
+        free(c);
+        if d == null { return false; }
+        ignore closedir(d);
+        return true;
+    }
     // resolved buffer must hold PATH_MAX; callers pass 4096.
     private bool canon_into(u8* cpath, u8* buf, i32 cap) {
         return sys_realpath(cpath, buf) != null;
@@ -508,13 +533,167 @@ private JsObject* require_cache(VM* vm) {
     return vm.require_cache;
 }
 
-// A require spec is a file reference if relative (./ ../), absolute, or a
-// Windows drive path. Bare names go to built-ins or fail (node_modules is
-// the documented deferral).
-private bool spec_is_relative(str s) {
-    if s.len >= 2 && *(s.data) == '.' && (*(s.data + 1) == '/' || *(s.data + 1) == '\\') { return true; }
-    if s.len >= 3 && *(s.data) == '.' && *(s.data + 1) == '.'
-        && (*(s.data + 2) == '/' || *(s.data + 2) == '\\') { return true; }
+private void require_throw_missing(VM* vm, str spec) {
+    str_buf m;
+    str_buf_init(&m);
+    str_buf_add(&m, "Cannot find module '");
+    str_buf_add(&m, spec);
+    str_buf_add(&m, "'");
+    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
+    str_buf_free(&m);
+}
+
+private str null_str() {
+    str r;
+    r.data = null;
+    r.len = 0;
+    return r;
+}
+
+private str owned_str(str s) {
+    u8* d = alloc<u8>(s.len > 0 ? s.len : 1);
+    if s.len > 0 { memcpy(d, s.data, s.len); }
+    str r;
+    r.data = d;
+    r.len = s.len;
+    return r;
+}
+
+// dir + '/' + sub, normalized (`.`/`..`/duplicate separators collapsed).
+private str path_under(str dir, str sub) {
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, dir);
+    str_buf_add(&sb, "/");
+    str_buf_add(&sb, sub);
+    str combined = str_buf_to_str(&sb);
+    str r = path_join(combined, "");
+    str_buf_free(&sb);
+    return r;
+}
+
+// LOAD_AS_FILE(base): base itself (only if a regular file, not a
+// directory), then base + a source/data extension.
+private str load_as_file(str base) {
+    if file_there(base) && !path_is_dir(base) { return owned_str(base); }
+    str[5] tries = { ".js", ".ts", ".cjs", ".mjs", ".json" };
+    for i32 e = 0; e < 5; e++ {
+        str c = try_candidate(base, tries[e]);
+        if c.data != null { return c; }
+    }
+    return null_str();
+}
+
+// LOAD_INDEX(dir): dir/index.<ext>.
+private str load_index(str dir) {
+    str[5] tries = { "/index.js", "/index.ts", "/index.cjs", "/index.mjs", "/index.json" };
+    for i32 e = 0; e < 5; e++ {
+        str c = try_candidate(dir, tries[e]);
+        if c.data != null { return c; }
+    }
+    return null_str();
+}
+
+// LOAD_AS_DIRECTORY(dir): package.json "main" (as file then index), else
+// dir/index.<ext>.
+private str load_as_dir(VM* vm, str dir) {
+    str pj = path_under(dir, "package.json");
+    if file_there(pj) {
+        FileData fd = file_read(pj);
+        if fd.data != null {
+            str text;
+            text.data = fd.data;
+            text.len = fd.len;
+            bool ok = false;
+            Value j = builtins_json_parse(vm, text, &ok);
+            free(fd.data);
+            if ok && value_is_object(j) {
+                Value mainv;
+                if js_get_prop(value_as_object(j), atom_intern(&vm.atoms, "main"), &mainv)
+                    && value_is_string(mainv) {
+                    str mp = path_under(dir, gc_string_view(value_as_string(mainv)));
+                    str r = load_as_file(mp);
+                    if r.data == null { r = load_index(mp); }
+                    free(mp.data);
+                    if r.data != null { free(pj.data); return r; }
+                }
+            }
+        }
+    }
+    free(pj.data);
+    return load_index(dir);
+}
+
+// Parent directory of `dir` (trailing separators trimmed); {null,0} at the
+// filesystem root (no further ancestor).
+private str parent_of(str dir) {
+    i32 end = dir.len;
+    while end > 0 && (*(dir.data + end - 1) == '/' || *(dir.data + end - 1) == '\\') { end--; }
+    i32 sep = -1;
+    for i32 i = 0; i < end; i++ {
+        if *(dir.data + i) == '/' || *(dir.data + i) == '\\' { sep = i; }
+    }
+    if sep < 0 { return null_str(); }
+    // keep a lone root ("/" or "C:/") rather than emptying it
+    i32 plen = sep == 0 ? 1 : sep;
+    str p;
+    p.data = dir.data;
+    p.len = plen;
+    return owned_str(p);
+}
+
+// A bare specifier's package name is its first segment (or first two for a
+// `@scope/name`); the remainder is the subpath.
+private void split_pkg(str spec, str* pkg, str* subpath) {
+    i32 slashes_needed = (spec.len > 0 && *(spec.data) == '@') ? 2 : 1;
+    i32 seen = 0;
+    i32 cut = spec.len;
+    for i32 i = 0; i < spec.len; i++ {
+        if *(spec.data + i) == '/' {
+            seen++;
+            if seen == slashes_needed { cut = i; break; }
+        }
+    }
+    pkg.data = spec.data;
+    pkg.len = cut;
+    if cut < spec.len {
+        subpath.data = spec.data + cut + 1;
+        subpath.len = spec.len - cut - 1;
+    } else {
+        subpath.data = spec.data;
+        subpath.len = 0;
+    }
+}
+
+// LOAD_NODE_MODULES: walk up from `start_dir` trying
+// <d>/node_modules/<pkg>[/<subpath>] at each level. Heap path or null.
+private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath) {
+    str cur = owned_str(start_dir);
+    str result = null_str();
+    i32 guard = 0;
+    while guard < 64 {
+        guard++;
+        str nm = path_under(cur, "node_modules");
+        str base = path_under(nm, pkg);
+        str target;
+        if subpath.len > 0 { target = path_under(base, subpath); }
+        else { target = owned_str(base); }
+        str f = load_as_file(target);
+        if f.data == null { f = load_as_dir(vm, target); }
+        free(target.data);
+        free(base.data);
+        free(nm.data);
+        if f.data != null { result = f; break; }   // cur freed after the loop
+        str parent = parent_of(cur);
+        free(cur.data);
+        cur = parent;                                // {null,0} at the root
+        if cur.data == null { break; }
+    }
+    if cur.data != null { free(cur.data); }
+    return result;
+}
+
+private bool spec_is_absolute(str s) {
     if s.len >= 1 && (*(s.data) == '/' || *(s.data) == '\\') { return true; }
     when os(windows) {
         if s.len >= 3 {
@@ -526,14 +705,39 @@ private bool spec_is_relative(str s) {
     return false;
 }
 
-private void require_throw_missing(VM* vm, str spec) {
-    str_buf m;
-    str_buf_init(&m);
-    str_buf_add(&m, "Cannot find module '");
-    str_buf_add(&m, spec);
-    str_buf_add(&m, "'");
-    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
-    str_buf_free(&m);
+private bool spec_is_dot(str s) {
+    if s.len >= 2 && *(s.data) == '.' && (*(s.data + 1) == '/' || *(s.data + 1) == '\\') { return true; }
+    if s.len >= 3 && *(s.data) == '.' && *(s.data + 1) == '.'
+        && (*(s.data + 2) == '/' || *(s.data + 2) == '\\') { return true; }
+    return false;
+}
+
+// Full CJS resolution of `spec` from a module at `importer_path`. Returns a
+// heap file path (caller frees .data) or {null,0} if unresolved.
+private str resolve_require(VM* vm, str importer_path, str spec) {
+    str idir = dir_of(importer_path);   // includes trailing separator
+    if spec_is_absolute(spec) {
+        str r = load_as_file(spec);
+        if r.data == null { r = load_as_dir(vm, spec); }
+        return r;
+    }
+    if spec_is_dot(spec) {
+        str base = path_under(idir, spec);
+        str r = load_as_file(base);
+        if r.data == null { r = load_as_dir(vm, base); }
+        free(base.data);
+        return r;
+    }
+    // bare specifier -> node_modules walk
+    str pkg;
+    str subpath;
+    split_pkg(spec, &pkg, &subpath);
+    // trim idir's trailing separator for a clean start point
+    str start = idir;
+    if start.len > 1 && (*(start.data + start.len - 1) == '/' || *(start.data + start.len - 1) == '\\') {
+        start.len = start.len - 1;
+    }
+    return load_node_modules(vm, start, pkg, subpath);
 }
 
 // A `require` bound to the requiring module's path (env0), so nested
@@ -560,12 +764,8 @@ Value module_require(VM* vm, str importer_path, str spec) {
             return value_cell(&ns.head);
         }
     }
-    // 2. relative/absolute file only
-    if !spec_is_relative(spec) {
-        require_throw_missing(vm, spec);
-        return value_undefined();
-    }
-    str resolved = resolve_specifier(importer_path, spec);
+    // 2. resolve (relative/absolute file, or a node_modules package)
+    str resolved = resolve_require(vm, importer_path, spec);
     if resolved.data == null {
         require_throw_missing(vm, spec);
         return value_undefined();
@@ -592,6 +792,36 @@ Value module_require(VM* vm, str importer_path, str spec) {
         free(resolved.data);
         free(canon.data);
         return value_undefined();
+    }
+
+    // 4b. a .json file: parse and cache the value directly (no compilation)
+    bool is_json = resolved.len >= 5
+        && *(resolved.data + resolved.len - 5) == '.'
+        && *(resolved.data + resolved.len - 4) == 'j'
+        && *(resolved.data + resolved.len - 3) == 's'
+        && *(resolved.data + resolved.len - 2) == 'o'
+        && *(resolved.data + resolved.len - 1) == 'n';
+    if is_json {
+        str text;
+        text.data = fd.data;
+        text.len = fd.len;
+        bool ok = false;
+        i32 jm = gc_root_mark(&vm.heap);
+        Value parsed = builtins_json_parse(vm, text, &ok);
+        gc_root(&vm.heap, parsed);
+        Value ret = value_undefined();
+        if ok {
+            JsObject* jm2 = js_new_object(&vm.heap, vm.object_proto);
+            js_set_prop(jm2, exports_atom, parsed);
+            js_set_prop(cache, key, value_cell(&jm2.head));
+            ret = parsed;
+        }
+        gc_root_reset(&vm.heap, jm);
+        free(fd.data);
+        free(resolved.data);
+        free(canon.data);
+        if !ok { vm_throw_error(vm, ERR_SYNTAX, "invalid JSON in required module"); }
+        return ret;
     }
 
     // 5. module + exports; cache BEFORE running (circular require sees the
