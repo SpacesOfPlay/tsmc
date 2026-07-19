@@ -114,6 +114,7 @@ struct VM {
     JsObject* node_os_ns;      // built-in `os` module namespace (lazy)
     JsObject* url_proto;
     JsObject* usp_proto;       // URLSearchParams.prototype
+    JsObject* require_cache;    // CommonJS module cache: canon path -> module obj
     Vec<RegexProgPtr> regexps;
     u32 atom_rx;
     u32 atom_source;
@@ -260,6 +261,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.node_os_ns != null { gc_mark_cell(h, &vm.node_os_ns.head); }
     if vm.url_proto != null { gc_mark_cell(h, &vm.url_proto.head); }
     if vm.usp_proto != null { gc_mark_cell(h, &vm.usp_proto.head); }
+    if vm.require_cache != null { gc_mark_cell(h, &vm.require_cache.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
         VmJob* j = vm.jobs.data + i;
         gc_mark_value(h, j.a);
@@ -1433,6 +1435,7 @@ void vm_init(VM* vm) {
     vm.node_os_ns = null;
     vm.url_proto = null;
     vm.usp_proto = null;
+    vm.require_cache = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");

@@ -2395,6 +2395,38 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     return t;
 }
 
+// Compiles a CommonJS module: the body as a 5-parameter function
+// (exports, require, module, __dirname, __filename). The params are forced
+// to cells so nested functions capture them; free names still resolve to
+// globals. Called with those five arguments at require time.
+FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
+    FScope fs;
+    fscope_init(&fs, null, false);
+    co.cur = &fs;
+    scan_inner(&fs.inner, prog, true);
+    str[5] pnames = { "exports", "require", "module", "__dirname", "__filename" };
+    for i32 i = 0; i < 5; i++ { strmap_set<i32>(&fs.inner, pnames[i], 1); }
+    Vec<i32> pslots = vec_new<i32>(5);
+    for i32 i = 0; i < 5; i++ {
+        i32 bi = declare(co, pnames[i], false, false);
+        vec_push(&pslots, vec_get(&fs.binds, bi).slot);
+    }
+    for i32 i = 0; i < 5; i++ { ch_op_u16(&fs.ch, OP_CELLIFY, vec_get(&pslots, i)); }
+    vec_free(&pslots);
+    hoist_vars(co, prog);
+    compile_block_stmts(co, &prog.kids);
+    ch_op(&fs.ch, OP_UNDEF);
+    ch_op(&fs.ch, OP_RETURN);
+    str empty;
+    empty.data = null;
+    empty.len = 0;
+    FnTemplate* t = chunk_finish(&fs.ch, empty, 5, fs.n_slots, false, false, false);
+    t.src_name = co.src_name;
+    co.cur = null;
+    fscope_free(&fs);
+    return t;
+}
+
 // --- module compilation -----------------------------------------------------------
 
 private bool node_has_source(Node* n) {

@@ -17,6 +17,7 @@ import compiler;
 import value;
 import gc;
 import object;
+import atom;
 import vm;
 import builtins;
 
@@ -488,6 +489,208 @@ private str strip_unc(str p) {
     return p;
 }
 
+// --- CommonJS require -------------------------------------------------------
+
+private Value new_js_str(VM* vm, str s) {
+    GcString* g = gc_new_string(&vm.heap, s);
+    return value_cell(&g.head);
+}
+
+private str js_str_view(Value v) {
+    return gc_string_view(value_as_string(v));
+}
+
+// Per-VM CJS module cache (canonical path -> module object), lazily made.
+private JsObject* require_cache(VM* vm) {
+    if vm.require_cache == null {
+        vm.require_cache = js_new_object(&vm.heap, null);
+    }
+    return vm.require_cache;
+}
+
+// A require spec is a file reference if relative (./ ../), absolute, or a
+// Windows drive path. Bare names go to built-ins or fail (node_modules is
+// the documented deferral).
+private bool spec_is_relative(str s) {
+    if s.len >= 2 && *(s.data) == '.' && (*(s.data + 1) == '/' || *(s.data + 1) == '\\') { return true; }
+    if s.len >= 3 && *(s.data) == '.' && *(s.data + 1) == '.'
+        && (*(s.data + 2) == '/' || *(s.data + 2) == '\\') { return true; }
+    if s.len >= 1 && (*(s.data) == '/' || *(s.data) == '\\') { return true; }
+    when os(windows) {
+        if s.len >= 3 {
+            u8 c = *(s.data);
+            bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            if letter && *(s.data + 1) == ':' { return true; }
+        }
+    }
+    return false;
+}
+
+private void require_throw_missing(VM* vm, str spec) {
+    str_buf m;
+    str_buf_init(&m);
+    str_buf_add(&m, "Cannot find module '");
+    str_buf_add(&m, spec);
+    str_buf_add(&m, "'");
+    vm_throw_error(vm, ERR_ERROR, str_buf_to_str(&m));
+    str_buf_free(&m);
+}
+
+// A `require` bound to the requiring module's path (env0), so nested
+// requires resolve relative to their own module's directory.
+private Value make_require_fn(VM* vm, str module_path) {
+    Value pv = new_js_str(vm, module_path);
+    vm_push(vm, pv);
+    JsNative* n = js_new_native(&vm.heap, &nat_require, "require");
+    n.env0 = pv;
+    vm_pop(vm);
+    return value_cell(&n.head);
+}
+
+// Synchronously loads and evaluates the CJS module named by `spec` from a
+// module at `importer_path`; returns its `module.exports`.
+Value module_require(VM* vm, str importer_path, str spec) {
+    // 1. built-in module (fs / path / os, incl. node: prefix)
+    str bname = builtin_name(spec);
+    if bname.data != null {
+        JsObject* ns = builtins_node_module(vm, bname);
+        if ns != null {
+            Value def;
+            if js_get_prop(ns, atom_intern(&vm.atoms, "default"), &def) { return def; }
+            return value_cell(&ns.head);
+        }
+    }
+    // 2. relative/absolute file only
+    if !spec_is_relative(spec) {
+        require_throw_missing(vm, spec);
+        return value_undefined();
+    }
+    str resolved = resolve_specifier(importer_path, spec);
+    if resolved.data == null {
+        require_throw_missing(vm, spec);
+        return value_undefined();
+    }
+    str canon = canon_path(resolved);
+    u32 key = atom_intern(&vm.atoms, canon);
+    u32 exports_atom = atom_intern(&vm.atoms, "exports");
+    JsObject* cache = require_cache(vm);
+
+    // 3. cache hit -> current module.exports
+    Value cached;
+    if js_get_prop(cache, key, &cached) {
+        free(resolved.data);
+        free(canon.data);
+        Value ex;
+        if value_is_object(cached) && js_get_prop(value_as_object(cached), exports_atom, &ex) { return ex; }
+        return value_undefined();
+    }
+
+    // 4. read source
+    FileData fd = file_read(resolved);
+    if fd.data == null {
+        require_throw_missing(vm, spec);
+        free(resolved.data);
+        free(canon.data);
+        return value_undefined();
+    }
+
+    // 5. module + exports; cache BEFORE running (circular require sees the
+    //    partial exports)
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* module = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&module.head));
+    JsObject* exports = js_new_object(&vm.heap, vm.object_proto);
+    js_set_prop(module, exports_atom, value_cell(&exports.head));
+    js_set_prop(module, atom_intern(&vm.atoms, "id"), new_js_str(vm, canon));
+    js_set_prop(cache, key, value_cell(&module.head));
+
+    str fdir = dir_of(resolved);
+    str dname = fdir;
+    if dname.len > 1 { dname.len = dname.len - 1; }   // drop trailing sep
+
+    // 6. compile as a CJS wrapper function and run it
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    str src;
+    src.data = fd.data;
+    src.len = fd.len;
+    Parser p;
+    parser_init(&p, src, &d, &arena);
+    Node* prog = parse_program(&p);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    lower_program(&lw, prog);
+
+    if d.n_errors == 0 {
+        i32 cm = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        // owned source name (persists with the forever-rooted template)
+        u8* nb = alloc<u8>(resolved.len > 0 ? resolved.len : 1);
+        if resolved.len > 0 { memcpy(nb, resolved.data, resolved.len); }
+        str owned_name;
+        owned_name.data = nb;
+        owned_name.len = resolved.len;
+        compiler_set_source(&co, src, owned_name);
+        FnTemplate* t = compile_cjs_module(&co, prog);
+        vm_add_template_root(vm, t);
+        gc_root_reset(&vm.heap, cm);
+
+        if d.n_errors == 0 {
+            Value reqfn = make_require_fn(vm, resolved);
+            gc_root(&vm.heap, reqfn);
+            Value dnv = new_js_str(vm, dname);
+            gc_root(&vm.heap, dnv);
+            Value fnv = new_js_str(vm, resolved);
+            gc_root(&vm.heap, fnv);
+            Value[5] cjs_args;
+            cjs_args[0] = value_cell(&exports.head);
+            cjs_args[1] = reqfn;
+            cjs_args[2] = value_cell(&module.head);
+            cjs_args[3] = dnv;
+            cjs_args[4] = fnv;
+            JsFunction* f = js_new_function(&vm.heap, t, 0);
+            ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
+        } else {
+            diags_print(&d, resolved, owned_name);
+            vm_throw_error(vm, ERR_SYNTAX, "error compiling required module");
+        }
+    } else {
+        diags_print(&d, resolved, resolved);
+        vm_throw_error(vm, ERR_SYNTAX, "error parsing required module");
+    }
+
+    parser_destroy(&p);
+    lower_destroy(&lw);
+
+    // 7. result = final module.exports (unless the body threw)
+    Value result = value_undefined();
+    if !vm.has_pending {
+        Value ex;
+        if js_get_prop(module, exports_atom, &ex) { result = ex; }
+    }
+    gc_root_reset(&vm.heap, rm);
+    bump_destroy(&arena);
+    diags_free(&d);
+    free(fd.data);
+    free(resolved.data);
+    free(canon.data);
+    return result;
+}
+
+private Value nat_require(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    Value specv = argc > 0 ? *(args) : value_undefined();
+    if !value_is_string(specv) {
+        vm_throw_error(vm, ERR_TYPE, "require path must be a string");
+        return value_undefined();
+    }
+    str base = js_str_view(value_as_native(callee).env0);
+    return module_require(vm, base, js_str_view(specv));
+}
+
 // CLI entry: module graph if the file uses import/export, else script.
 i32 module_run_entry(VM* vm, str src, str path) {
     // __filename / __dirname for the entry file (absolute, entry-scoped).
@@ -502,5 +705,7 @@ i32 module_run_entry(VM* vm, str src, str path) {
     if has_module_syntax(src) {
         return module_run(vm, path);
     }
+    // plain script: expose a CommonJS `require` bound to the entry file
+    vm_set_global(vm, "require", make_require_fn(vm, path));
     return vm_run_source(vm, src, path);
 }

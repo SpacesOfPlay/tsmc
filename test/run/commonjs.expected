@@ -1,0 +1,7 @@
+5 20
+GO! cjs strings.js
+true 1 2 3
+A B B A undefined
+B
+Error Error
+function function
