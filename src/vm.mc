@@ -14,6 +14,7 @@ import atom;
 import object;
 import ustr;
 import bigint;
+import os_time;
 import bytecode;
 import ast;
 import bump;
@@ -65,9 +66,22 @@ struct VmJob {
 struct VmTimer {
     i32 id;
     bool alive;
-    f64 due;
+    f64 due;      // absolute deadline, milliseconds on the monotonic clock
     i64 seq;
     Value cb;
+}
+
+// An I/O handle keeps the reactor alive while open (Node's ref/unref) and
+// is the dispatch target for socket events. Dormant in M31 (nothing
+// registers one yet); the fd/kind/interest fields are filled in M32 when
+// real sockets arrive.
+struct IoHandle {
+    i64 fd;         // OS socket; -1 while unused
+    i32 kind;       // 0 = none (M32: listener / connecting / connected)
+    i32 interest;   // readiness mask for the poll layer (M32)
+    bool reffed;    // does this handle keep the loop alive?
+    bool alive;     // false once closed; slots are cleared between runs
+    Value owner;    // JS Socket/Server object; GC-marked, dispatch target
 }
 
 struct VM {
@@ -143,6 +157,7 @@ struct VM {
     Vec<VmTimer> timers;
     i32 next_timer_id;
     i64 timer_seq;
+    Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
     Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
     Value sym_iterator;      // well-known Symbol.iterator
     u32 sym_iterator_id;
@@ -306,6 +321,10 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 i = 0; i < vm.timers.len; i++ {
         gc_mark_value(h, (vm.timers.data + i).cb);
+    }
+    for i32 i = 0; i < vm.handles.len; i++ {
+        IoHandle* hd = vm.handles.data + i;
+        if hd.alive { gc_mark_value(h, hd.owner); }
     }
     for i32 i = 0; i < vm.symbols.len; i++ {
         gc_mark_value(h, vec_get(&vm.symbols, i));
@@ -1651,6 +1670,7 @@ void vm_init(VM* vm) {
     vec_init<VmTimer>(&vm.timers, 4);
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
+    vec_init<IoHandle>(&vm.handles, 4);
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -1687,6 +1707,7 @@ void vm_destroy(VM* vm) {
     vec_free(&vm.jobs);
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
+    vec_free(&vm.handles);
     vec_free(&vm.symbols);
     for i32 i = 0; i < vm.regexps.len; i++ {
         regex_free(vec_get(&vm.regexps, i));
@@ -3421,14 +3442,58 @@ private Value make_async_from_call(VM* vm, JsFunction* f, i32 argc) {
     return rp;
 }
 
+// --- I/O handles -------------------------------------------------------------------
+//
+// The handle table is the reactor's set of live OS resources. In M31
+// nothing registers a handle; the API and its ref-count exist so the loop
+// exit condition and GC rooting are in place for the socket work in M32.
+
+// Registers a handle (reffed + alive) and returns its slot index as id.
+i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
+    IoHandle h;
+    h.fd = fd;
+    h.kind = kind;
+    h.interest = 0;
+    h.reffed = true;
+    h.alive = true;
+    h.owner = owner;
+    vec_push(&vm.handles, h);
+    return vm.handles.len - 1;
+}
+
+void vm_handle_close(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).alive = false; }
+}
+
+void vm_handle_ref(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).reffed = true; }
+}
+
+void vm_handle_unref(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).reffed = false; }
+}
+
+// True while any open handle is still keeping the process alive.
+bool vm_handles_alive(VM* vm) {
+    for i32 i = 0; i < vm.handles.len; i++ {
+        IoHandle* h = vm.handles.data + i;
+        if h.alive && h.reffed { return true; }
+    }
+    return false;
+}
+
 // --- timers and the event loop -----------------------------------------------------
+
+// Monotonic clock in milliseconds, the unit timer deadlines are kept in.
+private f64 vm_now_ms(VM* vm) { return cast(f64, vm_clock_ns()) / 1000000.0; }
 
 i32 vm_add_timer(VM* vm, Value cbfn, f64 delay) {
     VmTimer tm;
     tm.id = vm.next_timer_id;
     vm.next_timer_id++;
     tm.alive = true;
-    tm.due = delay;
+    // absolute deadline: negative/NaN delays clamp to "due now"
+    tm.due = vm_now_ms(vm) + (delay > 0.0 ? delay : 0.0);
     tm.seq = vm.timer_seq;
     vm.timer_seq++;
     tm.cb = cbfn;
@@ -3443,8 +3508,13 @@ void vm_clear_timer(VM* vm, i32 id) {
     }
 }
 
-// Drains microtasks, then fires timers in (delay, order) sequence —
-// virtual time, no sleeping. 1 = uncaught exception in a job.
+// The reactor. Drains microtasks, then either fires the earliest due
+// timer or waits on the monotonic clock until it comes due — real time,
+// not virtual. Stays alive while any timer or ref'd handle remains, and
+// returns 1 on an uncaught exception in a job. (M32 replaces the timer-
+// only wait with a WSAPoll over the handle set.)
+const i64 REACTOR_IDLE_MS = 5;
+
 i32 vm_run_event_loop(VM* vm) {
     while true {
         while vm.job_head < vm.jobs.len {
@@ -3484,6 +3554,7 @@ i32 vm_run_event_loop(VM* vm) {
         }
         vm.jobs.len = 0;
         vm.job_head = 0;
+        // earliest live timer by (deadline, insertion order)
         i32 best = -1;
         for i32 i = 0; i < vm.timers.len; i++ {
             VmTimer* tm = vm.timers.data + i;
@@ -3495,7 +3566,23 @@ i32 vm_run_event_loop(VM* vm) {
             VmTimer* bt = vm.timers.data + best;
             if tm.due < bt.due || (tm.due == bt.due && tm.seq < bt.seq) { best = i; }
         }
-        if best < 0 { break; }
+        if best < 0 {
+            // no timers left — keep running only if a handle holds us open
+            if !vm_handles_alive(vm) { break; }
+            // M31 has no fd wakeups yet, so poll at a coarse interval; M32
+            // swaps this for WSAPoll(handles, timeout) which wakes on I/O.
+            vm_wait_ms(REACTOR_IDLE_MS);
+            continue;
+        }
+        f64 now = vm_now_ms(vm);
+        f64 due = (vm.timers.data + best).due;
+        if due > now {
+            // not due yet — sleep until the deadline, then re-check
+            i64 wait = cast(i64, due - now);
+            if wait < 1 { wait = 1; }
+            vm_wait_ms(wait);
+            continue;
+        }
         VmTimer* bt2 = vm.timers.data + best;
         Value cbfn = bt2.cb;
         bt2.alive = false;
@@ -3512,6 +3599,7 @@ i32 vm_run_event_loop(VM* vm) {
         }
     }
     vm.timers.len = 0;
+    vm.handles.len = 0;
     return 0;
 }
 

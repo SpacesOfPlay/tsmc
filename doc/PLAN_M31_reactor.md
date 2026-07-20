@@ -132,3 +132,30 @@ wall-clock time on any non-zero delay. Guard rails:
 ref-count API + GC marking; a `Sleep`-based `os_wait`; a reactor unit
 test; delay audit applied; full suite + `--gc-stress` green. No new
 globals, modules, or JS-visible behavior beyond real-time timers.
+
+## Shipped
+
+- **`vm_run_event_loop`** now fires the earliest timer only when it is
+  due and otherwise sleeps on the monotonic clock until its deadline;
+  exit is governed by `jobs || alive timers || ref'd handles`.
+  `VmTimer.due` became an absolute millisecond deadline (`vm_add_timer`
+  stamps `now + delay`).
+- **`IoHandle` + `vm.handles`** with `vm_handle_add/close/ref/unref` and
+  `vm_handles_alive`, GC-marked via each live handle's `owner`. Dormant
+  (nothing registers a handle yet); `test/unit/test_reactor.mc` covers
+  the ref-count logic and that the loop terminates once a handle closes.
+- **`src/os_time.mc`** (new): `vm_clock_ns` + `vm_wait_ms`. Placed below
+  the builtins layer — not in builtins — so `vm.mc` and its standalone
+  unit tests can use them without importing builtins (which imports
+  `vm`). Windows uses `Sleep`; POSIX uses `nanosleep`.
+- **Verification:** full suite green (51 tests, +`test_reactor`),
+  `--gc-stress` clean, and the differential harness byte-identical to
+  Node (notably `promises`/`events`/`fs_async`/`coremodules`). A manual
+  timing check confirmed `setTimeout`/`await sleep(n)` now consume real
+  wall-clock time. Largest suite delay is 20 ms, so no trimming was
+  needed and the gated run stays ~6 s.
+
+Deviation from plan: the wait primitive lives in the new `os_time.mc`
+module rather than inside the loop file, for the import-layering reason
+above. `WSAPoll` remains deferred to M32 as planned — M31 waits via
+`Sleep`, since there are no fds to poll yet.
