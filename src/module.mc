@@ -270,7 +270,9 @@ private str builtin_name(str spec) {
         || str_equal(s, "events") || str_equal(s, "util")
         || str_equal(s, "crypto") || str_equal(s, "stream")
         || str_equal(s, "assert") || str_equal(s, "fs/promises")
-        || str_equal(s, "zlib") { return s; }
+        || str_equal(s, "zlib") || str_equal(s, "process")
+        || str_equal(s, "buffer") || str_equal(s, "timers")
+        || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
     none.len = 0;
@@ -913,9 +915,23 @@ private Value make_require_fn(VM* vm, str module_path) {
 
 // Built-in modules implemented as embedded JS source (compiled+run once),
 // as opposed to the natively-built namespaces. {null,0} if not one.
+// `timers/promises`: awaitable delays over the global setTimeout.
+private str node_timers_promises_source() {
+    return
+        "'use strict';\n"
+        "exports.setTimeout = function (ms, value, opts) {\n"
+        "  return new Promise(function (res) { setTimeout(function () { res(value); }, ms); });\n"
+        "};\n"
+        "exports.setImmediate = function (value, opts) {\n"
+        "  return new Promise(function (res) { setTimeout(function () { res(value); }, 0); });\n"
+        "};\n"
+        ;
+}
+
 private str builtin_js_source(str name) {
     if str_equal(name, "stream") { return node_stream_source(); }
     if str_equal(name, "assert") { return node_assert_source(); }
+    if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     return null_str();
 }
 

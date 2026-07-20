@@ -117,6 +117,9 @@ struct VM {
     JsObject* node_util_ns;    // built-in `util` module namespace (lazy)
     JsObject* node_crypto_ns;  // built-in `crypto` module namespace (lazy)
     JsObject* node_zlib_ns;    // built-in `zlib` module namespace (lazy)
+    JsObject* node_process_ns; // built-in `process` module namespace (lazy)
+    JsObject* node_buffer_ns;  // built-in `buffer` module namespace (lazy)
+    JsObject* node_timers_ns;  // built-in `timers` module namespace (lazy)
     JsObject* crypto_hash_proto;   // Hash.prototype for createHash
     JsObject* url_proto;
     JsObject* usp_proto;       // URLSearchParams.prototype
@@ -272,6 +275,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.node_util_ns != null { gc_mark_cell(h, &vm.node_util_ns.head); }
     if vm.node_crypto_ns != null { gc_mark_cell(h, &vm.node_crypto_ns.head); }
     if vm.node_zlib_ns != null { gc_mark_cell(h, &vm.node_zlib_ns.head); }
+    if vm.node_process_ns != null { gc_mark_cell(h, &vm.node_process_ns.head); }
+    if vm.node_buffer_ns != null { gc_mark_cell(h, &vm.node_buffer_ns.head); }
+    if vm.node_timers_ns != null { gc_mark_cell(h, &vm.node_timers_ns.head); }
     if vm.crypto_hash_proto != null { gc_mark_cell(h, &vm.crypto_hash_proto.head); }
     if vm.url_proto != null { gc_mark_cell(h, &vm.url_proto.head); }
     if vm.usp_proto != null { gc_mark_cell(h, &vm.usp_proto.head); }
@@ -1455,6 +1461,9 @@ void vm_init(VM* vm) {
     vm.node_util_ns = null;
     vm.node_crypto_ns = null;
     vm.node_zlib_ns = null;
+    vm.node_process_ns = null;
+    vm.node_buffer_ns = null;
+    vm.node_timers_ns = null;
     vm.crypto_hash_proto = null;
     vm.url_proto = null;
     vm.usp_proto = null;

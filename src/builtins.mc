@@ -8994,6 +8994,61 @@ private JsObject* build_zlib_module(VM* vm) {
     return ns;
 }
 
+// --- core-module forms of globals (process / buffer / timers) ---------------
+
+private void def_global_both(VM* vm, JsObject* mod, JsObject* ns, str name) {
+    Value v = util_global(vm, name);
+    props_set_desc(&mod.props, bi_atom(vm, name), v, PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
+// `process` module: default is the process global; its own keys are also
+// named exports (so `import { argv } from 'process'` works).
+private JsObject* build_process_module(VM* vm) {
+    Value proc = util_global(vm, "process");
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    props_set_desc(&ns.props, bi_atom(vm, "default"), proc, PROP_DEFAULT);
+    if value_is_object(proc) {
+        JsObject* keys = vm_own_keys(vm, proc);
+        vm_push(vm, value_cell(&keys.head));
+        for i32 i = 0; i < keys.elen; i++ {
+            Value kv = js_array_get(keys, i);
+            u32 katom = atom_intern(&vm.atoms, sview(kv));
+            Value v;
+            if vm_get_prop_value(vm, proc, katom, &v) { props_set_desc(&ns.props, katom, v, PROP_DEFAULT); }
+        }
+        vm_pop(vm);
+    }
+    return ns;
+}
+
+private JsObject* build_buffer_module(VM* vm) {
+    JsObject* mod = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&mod.head));
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&mod.head), PROP_DEFAULT);
+    def_global_both(vm, mod, ns, "Buffer");
+    vm_pop(vm);
+    return ns;
+}
+
+private JsObject* build_timers_module(VM* vm) {
+    JsObject* mod = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&mod.head));
+    JsObject* ns = js_new_object(&vm.heap, null);
+    gc_root(&vm.heap, value_cell(&ns.head));
+    props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&mod.head), PROP_DEFAULT);
+    def_global_both(vm, mod, ns, "setTimeout");
+    def_global_both(vm, mod, ns, "clearTimeout");
+    def_global_both(vm, mod, ns, "setInterval");
+    def_global_both(vm, mod, ns, "clearInterval");
+    def_global_both(vm, mod, ns, "queueMicrotask");
+    vm_pop(vm);
+    return ns;
+}
+
 // Returns the namespace of the named built-in module, or null. `name` has
 // any `node:` prefix already stripped by the caller.
 JsObject* builtins_node_module(VM* vm, str name) {
@@ -9027,6 +9082,18 @@ JsObject* builtins_node_module(VM* vm, str name) {
     if str_equal(name, "zlib") {
         if vm.node_zlib_ns == null { vm.node_zlib_ns = build_zlib_module(vm); }
         return vm.node_zlib_ns;
+    }
+    if str_equal(name, "process") {
+        if vm.node_process_ns == null { vm.node_process_ns = build_process_module(vm); }
+        return vm.node_process_ns;
+    }
+    if str_equal(name, "buffer") {
+        if vm.node_buffer_ns == null { vm.node_buffer_ns = build_buffer_module(vm); }
+        return vm.node_buffer_ns;
+    }
+    if str_equal(name, "timers") {
+        if vm.node_timers_ns == null { vm.node_timers_ns = build_timers_module(vm); }
+        return vm.node_timers_ns;
     }
     return null;
 }
