@@ -7,6 +7,7 @@
 str node_fetch_source() {
     return "'use strict';
 const http = require('http');
+const https = require('https');
 
 function makeHeaders(obj) {
   return {
@@ -48,19 +49,22 @@ function fetch(resource, options) {
     let urlStr = typeof resource === 'string' ? resource : (resource && resource.url) || String(resource);
     let u;
     try { u = new URL(urlStr); } catch (e) { reject(new TypeError('Failed to parse URL: ' + urlStr)); return; }
-    if (u.protocol !== 'http:') {
-      reject(new TypeError('fetch: unsupported protocol ' + u.protocol + ' (only http: is supported)'));
+    const secure = u.protocol === 'https:';
+    if (!secure && u.protocol !== 'http:') {
+      reject(new TypeError('fetch: unsupported protocol ' + u.protocol));
       return;
     }
+    const mod = secure ? https : http;
     const headers = {};
     const oh = options.headers || {};
     for (const k in oh) headers[k] = oh[k];
-    const req = http.request({
+    const req = mod.request({
       host: u.hostname,
-      port: u.port || 80,
+      port: u.port || (secure ? 443 : 80),
       method: (options.method || 'GET').toUpperCase(),
       path: u.pathname + (u.search || ''),
       headers: headers,
+      servername: u.hostname,
     }, function (res) {
       const chunks = [];
       res.on('data', function (c) { chunks.push(c); });

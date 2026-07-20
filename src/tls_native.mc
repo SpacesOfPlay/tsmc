@@ -25,7 +25,16 @@ private ptls_cipher_suite_t g_cs128;
 private ptls_key_exchange_algorithm_t*[2] g_keyex;
 private ptls_cipher_suite_t*[2] g_cslist;
 private ptls_context_t g_ctx;
+private ptls_verify_certificate_t g_reject_verify;
 private bool g_inited = false;
+
+// Default verifier: refuse every certificate (graceful handshake failure
+// rather than the abort a null verify_certificate would cause).
+private i32 tls_reject_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
+                                 u8* server_name, verify_sign_fn* out_verify_sign,
+                                 void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
+    return 0 - 1;
+}
 
 private void tls_ctx_init() {
     if g_inited { return; }
@@ -66,7 +75,13 @@ private void tls_ctx_init() {
     g_ctx.get_time = &mc_picotls_get_time;
     g_ctx.key_exchanges = &g_keyex[0];
     g_ctx.cipher_suites = &g_cslist[0];
-    // verify_certificate left null -> accept any cert (insecure; TODO trust)
+    // Default: refuse (a null verify_certificate would make picotls abort on
+    // the server's CertificateVerify). tls_set_ecdsa_pin overrides this;
+    // general trust is DESIGN 4.1. The algos still advertise so the server
+    // proceeds far enough to be cleanly rejected.
+    g_reject_verify.cb = tls_reject_verify_cb;
+    g_reject_verify.algos = &ecdsa_p256_pl_verify_algos[0];
+    g_ctx.verify_certificate = &g_reject_verify;
     g_inited = true;
 }
 
@@ -95,6 +110,7 @@ struct TlsSession {
     u8[8192] recv_small;
     u8[16384] cipher_in;      // inbound ciphertext awaiting decrypt
     i32 cipher_in_len;
+    bool checked_connect;     // confirmed the non-blocking TCP connect
     bool started;
     bool established;
     bool failed;
@@ -115,6 +131,7 @@ TlsSession* tls_session_new(u8* sni) {
     ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
     s.send_off = 0;
     s.cipher_in_len = 0;
+    s.checked_connect = false;
     s.started = false;
     s.established = false;
     s.failed = false;
@@ -191,6 +208,11 @@ private bool tls_flush(TlsSession* s, i64 fd) {
 i32 tls_pump(TlsSession* s, i64 fd) {
     if s.failed { return TLS_ERR; }
     i32 flags = 0;
+    // confirm the non-blocking TCP connect completed before any TLS I/O
+    if !s.checked_connect {
+        if net_os_connect_result(fd) != 0 { s.failed = true; return TLS_ERR; }
+        s.checked_connect = true;
+    }
     if !s.started {
         s.started = true;
         u64 c = 0;

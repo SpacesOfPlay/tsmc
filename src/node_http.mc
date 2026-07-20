@@ -215,7 +215,12 @@ class ClientRequest extends EventEmitter {
     this._ended = false;
     this._sent = false;
     if (typeof cb === 'function') this.on('response', cb);
-    this.socket = net.connect(this.port, this.host);
+    if (options._tls) {
+      const tls = require('tls');
+      this.socket = tls.connect({ port: this.port, host: this.host, servername: options.servername || this.host });
+    } else {
+      this.socket = net.connect(this.port, this.host);
+    }
     this.socket.on('connect', () => this._trySend());
     this.socket.on('error', (e) => this.emit('error', e));
     this._parse();

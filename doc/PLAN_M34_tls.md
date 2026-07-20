@@ -38,10 +38,22 @@ Original increment-2 scope, for reference — A `src/tls_native.mc` that:
    the ~2x compile-time cost, justified once TLS is in use. Validate with
    a native non-blocking HTTPS GET to a real host (SPKI-pinned; non-gated,
    network-dependent).
-3. **JS `tls` module + `https`.** `tls.connect` → `TLSSocket` shaped like
-   `net.Socket` (emits `secureConnect`/`data`/…). `node_http`/`node_fetch`
-   switch on `https:` to route through a `TLSSocket`. Loopback https diff
-   test with a pinned cert (deterministic).
+3. **JS `tls` module + `https` (done).** picotls is now compiled into the
+   tsmc binary (builtins imports `tls_native`; ~60k lines, build still
+   ~1s). Native `__tls_connect/pump/read/write/close/established/pin_ecdsa`
+   over the handle `ext` pointer (holding the `TlsSession`); the reactor's
+   existing dispatch hook drives them via `owner.__onReady`. JS `tls`
+   (`src/node_tls.mc`): `TLSSocket` shaped like `net.Socket`
+   (`secureConnect`/`connect`/`data`/`end`/`close`), `tls.connect`,
+   `tls.setEcdsaPin`. `https` (`src/node_https.mc`) = `http` with `_tls`
+   +port 443; `node_http` `ClientRequest` connects via `tls.connect` when
+   `_tls`; `node_fetch` routes `https:` through it. **Secure by default:**
+   the context defaults to a *reject* verifier (a null one would abort on
+   CertificateVerify), so untrusted https fails cleanly (`TLS error`)
+   rather than crashing; a pin allows the connection. Verified end to end:
+   `fetch('https://example.com')` with the pin returns `200 text/html`
+   (`test/tls/https_fetch.js`, manual/network); no-pin rejects gracefully.
+   A *gated* loopback https test still needs picotls server mode (below).
 4. **Certificate trust.** First cut: SPKI pin / explicit
    `rejectUnauthorized:false` bypass (DESIGN §4.1 option b). CA-bundle
    chain validation is a later milestone.

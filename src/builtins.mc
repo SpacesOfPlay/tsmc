@@ -21,6 +21,7 @@ import file;
 import deflate;
 import inflate;
 import net_os;
+import tls_native;
 
 // Platform math not covered by the math module: hyperbolic functions
 // and the accurate log1p/expm1, used by the extra Math.* methods.
@@ -7805,9 +7806,132 @@ private Value nat_net_ref(void* vmp, Value callee, Value thisv, Value* args, i32
     return value_undefined();
 }
 
+// --- TLS (https) ------------------------------------------------------------
+//
+// A TLS session (src/tls_native.mc) is stashed on the handle's ext pointer.
+// The JS TLSSocket calls these from its __onReady, the same dispatch path
+// as plain sockets.
+
+private i32 hex2(u8 c) {
+    if c >= '0' && c <= '9' { return cast(i32, c) - '0'; }
+    if c >= 'a' && c <= 'f' { return cast(i32, c) - 'a' + 10; }
+    if c >= 'A' && c <= 'F' { return cast(i32, c) - 'A' + 10; }
+    return 0;
+}
+
+private Value nat_tls_pin_ecdsa(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value hv = arg_at(args, argc, 0);
+    if !value_is_string(hv) { return value_undefined(); }
+    str h = sview(hv);
+    if h.len < 64 { return value_undefined(); }
+    u8[32] pin;
+    for i32 i = 0; i < 32; i++ {
+        pin[i] = cast(u8, (hex2(*(h.data + i * 2)) << 4) | hex2(*(h.data + i * 2 + 1)));
+    }
+    tls_set_ecdsa_pin(&pin[0]);
+    return value_undefined();
+}
+
+private Value nat_tls_connect(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u32 ip = net_host_to_ip(vm, arg_at(args, argc, 0), false);
+    if ip == 0 { return value_int(-1); }
+    i32 port = to_int_arg(arg_at(args, argc, 1));
+    i64 fd = net_os_connect_start(ip, cast(u16, port));
+    if fd == -1 { return value_int(-1); }
+    Value sniv = arg_at(args, argc, 2);
+    u8[256] sni;
+    bool has_sni = value_is_string(sniv);
+    if has_sni {
+        str h = sview(sniv);
+        i32 n = h.len < 255 ? h.len : 255;
+        for i32 i = 0; i < n; i++ { sni[i] = *(h.data + i); }
+        sni[n] = 0;
+    }
+    TlsSession* s = tls_session_new(has_sni ? &sni[0] : null);
+    if s == null { net_os_close(fd); return value_int(-1); }
+    i32 id = vm_handle_add(vm, fd, 0, value_undefined());
+    vm_handle_set_interest(vm, id, cast(i16, NET_POLLIN | NET_POLLOUT));
+    vm_handle_set_ext(vm, id, cast(void*, s));
+    return value_int(id);
+}
+
+private Value nat_tls_pump(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    i64 fd = vm_handle_fd(vm, id);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    if s == null || fd < 0 { return value_int(TLS_ERR); }
+    i32 flags = tls_pump(s, fd);
+    i16 mask = NET_POLLIN;
+    if (flags & TLS_WANT_WRITE) != 0 { mask = cast(i16, NET_POLLIN | NET_POLLOUT); }
+    vm_handle_set_interest(vm, id, mask);
+    return value_int(flags);
+}
+
+private Value nat_tls_read(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    if s == null { return value_null(); }
+    u8[16384] buf;
+    i32 n = tls_read(s, &buf[0], 16384);
+    if n <= 0 { return value_null(); }
+    return buf_from_bytes(vm, &buf[0], n);
+}
+
+private Value nat_tls_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    i64 fd = vm_handle_fd(vm, id);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    Value bufv = arg_at(args, argc, 1);
+    i32 off = to_int_arg(arg_at(args, argc, 2));
+    if s == null || fd < 0 || !value_is_object(bufv) { return value_int(NET_ERR); }
+    JsObject* o = value_as_object(bufv);
+    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
+    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    if off < 0 { off = 0; }
+    if off >= len { return value_int(0); }
+    i32 chunk = len - off;
+    if chunk > 16384 { chunk = 16384; }
+    u8[16384] tmp;
+    for i32 i = 0; i < chunk; i++ {
+        i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, off + i))) : buf_byte(o, off + i);
+        tmp[i] = cast(u8, b & 0xFF);
+    }
+    return value_int(tls_write(s, fd, &tmp[0], chunk) ? chunk : NET_ERR);
+}
+
+private Value nat_tls_close(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    if s != null { tls_session_free(s); vm_handle_set_ext(vm, id, null); }
+    i64 fd = vm_handle_fd(vm, id);
+    if fd >= 0 { net_os_close(fd); }
+    vm_handle_close(vm, id);
+    vm_handle_unref(vm, id);
+    return value_undefined();
+}
+
+private Value nat_tls_established(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
+    return value_bool(s != null && tls_established(s));
+}
+
 private void net_install(VM* vm) {
     ignore net_os_init();
     vm_set_reactor_hook(vm, &net_reactor_dispatch);
+    ignore def_global_fn(vm, "__tls_connect", &nat_tls_connect);
+    ignore def_global_fn(vm, "__tls_pump", &nat_tls_pump);
+    ignore def_global_fn(vm, "__tls_read", &nat_tls_read);
+    ignore def_global_fn(vm, "__tls_write", &nat_tls_write);
+    ignore def_global_fn(vm, "__tls_close", &nat_tls_close);
+    ignore def_global_fn(vm, "__tls_established", &nat_tls_established);
+    ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);
     ignore def_global_fn(vm, "__net_listen", &nat_net_listen);
     ignore def_global_fn(vm, "__net_accept", &nat_net_accept);

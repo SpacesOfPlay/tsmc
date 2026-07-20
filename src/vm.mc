@@ -83,6 +83,7 @@ struct IoHandle {
     bool reffed;    // does this handle keep the loop alive?
     bool alive;     // false once closed; slots are cleared between runs
     Value owner;    // JS Socket/Server object; GC-marked, dispatch target
+    void* ext;      // native side-state (e.g. a TLS session); not GC-traced
 }
 
 // Called by the reactor for each ready handle: (vm, handle index, revents).
@@ -3465,6 +3466,7 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
     h.reffed = true;
     h.alive = true;
     h.owner = owner;
+    h.ext = null;
     vec_push(&vm.handles, h);
     return vm.handles.len - 1;
 }
@@ -3507,6 +3509,15 @@ Value vm_handle_owner(VM* vm, i32 idx) {
 
 void vm_handle_set_owner(VM* vm, i32 idx, Value owner) {
     if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).owner = owner; }
+}
+
+void vm_handle_set_ext(VM* vm, i32 idx, void* ext) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).ext = ext; }
+}
+
+void* vm_handle_ext(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).ext; }
+    return null;
 }
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
