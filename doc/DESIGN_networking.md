@@ -156,6 +156,36 @@ HTTP layers land and are testable, and schedule the CA-chain verifier
 (a) as the milestone that makes HTTPS trustworthy — treating the
 transminc re-export as an explicit dependency/risk, not a surprise.
 
+### 4.2 Vendored, but not yet co-compilable — the generic-param blocker
+
+The TLS core is vendored into `src/tls/` (subset only; see
+`src/tls/THIRD_PARTY.md`) and verified to build + run a full TLS 1.3
+handshake standalone (`test/tls/handshake_selftest.mc`). It does **not
+yet co-compile into the `tsmc` binary**: importing it alongside the tsmc
+stack is blocked by a minc parser issue.
+
+minc registers **generic type-parameter names in the global parse
+namespace**, so a bare `T`/`V` used as a *local variable* is misparsed as
+a type-first array declaration (`T[i] = x` → "expected IDENT"). tsmc's
+containers leak exactly two such names — `V` (`IntMap<V>`/`StrMap<V>` in
+`src/map.mc`) and `T` (`Vec<T>` in stdlib `vec.mc`) — and the
+transminc-ported crypto uses `T`/`V` as locals (e.g. the uECC RFC-6979
+nonce loop). Concretely:
+
+- **`V`** is fixable tsmc-side (rename the `map.mc` parameter; there is no
+  stdlib `map.mc`, so `src/map.mc` is authoritative).
+- **`T`** is *not* — `import vec;` resolves to stdlib `vec.mc` even when a
+  `src/vec.mc` fork exists (stdlib wins for names present there), and the
+  deploy's `vec.mc` is gitignored/refreshed.
+
+The clean fix is at the root, which we own: either **scope generic type
+parameters in minc** so they don't pollute the global type namespace
+(fixes this for *all* transminc-ported code, not just picotls), or have
+**transminc avoid emitting single-letter locals** that collide. Patching
+the vendored crypto's locals would work but re-breaks on every re-export,
+so it is not the plan. This blocker gates the "https over TLS" stage, not
+the plaintext `net`/`http` stages, so it does not hold up M32.
+
 ## 5. DNS
 
 `net_connect` takes a raw `u32` IP; real code passes hostnames. Add
