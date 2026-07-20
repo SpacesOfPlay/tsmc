@@ -23,6 +23,7 @@ import builtins;
 import node_stream;
 import node_assert;
 import node_net;
+import node_http;
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -301,7 +302,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "assert") || str_equal(s, "fs/promises")
         || str_equal(s, "zlib") || str_equal(s, "process")
         || str_equal(s, "buffer") || str_equal(s, "timers")
-        || str_equal(s, "net")
+        || str_equal(s, "net") || str_equal(s, "http")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -962,6 +963,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "stream") { return node_stream_source(); }
     if str_equal(name, "assert") { return node_assert_source(); }
     if str_equal(name, "net") { return node_net_source(); }
+    if str_equal(name, "http") { return node_http_source(); }
     if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     return null_str();
 }
