@@ -15,6 +15,7 @@ import object;
 import ustr;
 import bigint;
 import os_time;
+import net_os;
 import bytecode;
 import ast;
 import bump;
@@ -78,11 +79,16 @@ struct VmTimer {
 struct IoHandle {
     i64 fd;         // OS socket; -1 while unused
     i32 kind;       // 0 = none (M32: listener / connecting / connected)
-    i32 interest;   // readiness mask for the poll layer (M32)
+    i16 interest;   // poll readiness mask (NET_POLLIN/OUT); 0 = not polled
     bool reffed;    // does this handle keep the loop alive?
     bool alive;     // false once closed; slots are cleared between runs
     Value owner;    // JS Socket/Server object; GC-marked, dispatch target
 }
+
+// Called by the reactor for each ready handle: (vm, handle index, revents).
+// The `net` module installs the implementation, keeping vm.mc free of any
+// dependency on builtins.
+type ReactorHook = fn(VM*, i32, i16): void;
 
 struct VM {
     GcHeap heap;
@@ -158,6 +164,7 @@ struct VM {
     i32 next_timer_id;
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
+    ReactorHook reactor_hook;   // net module's ready-handle dispatcher, or null
     Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
     Value sym_iterator;      // well-known Symbol.iterator
     u32 sym_iterator_id;
@@ -1671,6 +1678,7 @@ void vm_init(VM* vm) {
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
+    vm.reactor_hook = null;
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -3482,6 +3490,23 @@ bool vm_handles_alive(VM* vm) {
     return false;
 }
 
+// Which readiness a handle waits on (NET_POLLIN / NET_POLLOUT); 0 = none.
+void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).interest = events; }
+}
+
+i64 vm_handle_fd(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).fd; }
+    return -1;
+}
+
+Value vm_handle_owner(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).owner; }
+    return value_undefined();
+}
+
+void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
+
 // --- timers and the event loop -----------------------------------------------------
 
 // Monotonic clock in milliseconds, the unit timer deadlines are kept in.
@@ -3514,6 +3539,49 @@ void vm_clear_timer(VM* vm, i32 id) {
 // returns 1 on an uncaught exception in a job. (M32 replaces the timer-
 // only wait with a WSAPoll over the handle set.)
 const i64 REACTOR_IDLE_MS = 5;
+
+// Builds a poll set from the pollable handles, waits up to timeout_ms
+// (-1 blocks until I/O), and dispatches every ready handle through the
+// reactor hook. If nothing is pollable, just sleeps out the deadline.
+private void reactor_poll(VM* vm, i64 timeout_ms) {
+    i32 npoll = 0;
+    for i32 i = 0; i < vm.handles.len; i++ {
+        IoHandle* h = vm.handles.data + i;
+        if h.alive && h.interest != 0 && h.fd >= 0 { npoll++; }
+    }
+    if npoll == 0 {
+        vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
+        return;
+    }
+    NetPollFd* pf = alloc<NetPollFd>(npoll);
+    i32* hidx = alloc<i32>(npoll);
+    i32 k = 0;
+    for i32 i = 0; i < vm.handles.len; i++ {
+        IoHandle* h = vm.handles.data + i;
+        if h.alive && h.interest != 0 && h.fd >= 0 {
+            (pf + k).fd = h.fd;
+            (pf + k).events = h.interest;
+            (pf + k).revents = 0;
+            *(hidx + k) = i;
+            k++;
+        }
+    }
+    i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
+    i32 r = net_os_poll(pf, npoll, to);
+    if r > 0 && vm.reactor_hook != null {
+        for i32 j = 0; j < npoll; j++ {
+            i16 re = (pf + j).revents;
+            // dispatch by index; the hook re-reads vm.handles, so a
+            // vec_push growing the table mid-loop is safe
+            if re != 0 {
+                vm.reactor_hook(vm, *(hidx + j), re);
+                if vm.has_pending { break; }
+            }
+        }
+    }
+    free(pf);
+    free(hidx);
+}
 
 i32 vm_run_event_loop(VM* vm) {
     while true {
@@ -3566,21 +3634,27 @@ i32 vm_run_event_loop(VM* vm) {
             VmTimer* bt = vm.timers.data + best;
             if tm.due < bt.due || (tm.due == bt.due && tm.seq < bt.seq) { best = i; }
         }
-        if best < 0 {
-            // no timers left — keep running only if a handle holds us open
-            if !vm_handles_alive(vm) { break; }
-            // M31 has no fd wakeups yet, so poll at a coarse interval; M32
-            // swaps this for WSAPoll(handles, timeout) which wakes on I/O.
-            vm_wait_ms(REACTOR_IDLE_MS);
-            continue;
-        }
         f64 now = vm_now_ms(vm);
-        f64 due = (vm.timers.data + best).due;
-        if due > now {
-            // not due yet — sleep until the deadline, then re-check
-            i64 wait = cast(i64, due - now);
-            if wait < 1 { wait = 1; }
-            vm_wait_ms(wait);
+        bool timer_due = best >= 0 && (vm.timers.data + best).due <= now;
+        if !timer_due {
+            // nothing to fire yet — poll the sockets, bounded by the next
+            // timer deadline (or block until I/O when only handles remain)
+            if best < 0 && !vm_handles_alive(vm) { break; }
+            i64 timeout;
+            if best < 0 {
+                timeout = -1;
+            } else {
+                f64 d = (vm.timers.data + best).due - now;
+                timeout = d < 1.0 ? 1 : cast(i64, d);
+            }
+            reactor_poll(vm, timeout);
+            if vm.has_pending {
+                Value e = vm.pending;
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                print_uncaught(vm, e);
+                return 1;
+            }
             continue;
         }
         VmTimer* bt2 = vm.timers.data + best;
