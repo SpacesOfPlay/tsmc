@@ -234,3 +234,26 @@ i32 ecdsa_p256_pinned_verify_cert_cb(ptls_verify_certificate_t* self,
     *out_verify_data = cast(void*, ctx);
     return 0;
 }
+
+// LOCAL ADDITION (tsmc) — accept any P-256 cert without a pin: extract the
+// pubkey and arm verify_sign so the handshake signature is checked, but the
+// chain/hostname are not. Returns -1 if the leaf is not P-256. Re-apply on
+// re-export (see src/tls/THIRD_PARTY.md).
+i32 ecdsa_p256_accept_verify_cert_cb(ptls_verify_certificate_t* self,
+                                     ptls_t* tls, u8* server_name,
+                                     verify_sign_fn* out_verify_sign,
+                                     void** out_verify_data,
+                                     ptls_iovec_t* certs, u64 num_certs) {
+    if num_certs == cast(u64, 0) { return 0 - 1; }
+    u8* spki_start;
+    u64 spki_len;
+    if mc_x509_locate_spki(certs[0].base, certs[0].len, &spki_start, &spki_len) != 0 { return 0 - 1; }
+    ecdsa_p256_verify_ctx_t* ctx = new(ecdsa_p256_verify_ctx_t);
+    if mc_spki_extract_p256_pubkey(spki_start, spki_len, &ctx.public_key_xy[0]) != 0 {
+        free(cast(void*, ctx));
+        return 0 - 1;
+    }
+    *out_verify_sign = ecdsa_p256_pl_verify_sign;
+    *out_verify_data = cast(void*, ctx);
+    return 0;
+}

@@ -54,9 +54,22 @@ Original increment-2 scope, for reference — A `src/tls_native.mc` that:
    `fetch('https://example.com')` with the pin returns `200 text/html`
    (`test/tls/https_fetch.js`, manual/network); no-pin rejects gracefully.
    A *gated* loopback https test still needs picotls server mode (below).
-4. **Certificate trust.** First cut: SPKI pin / explicit
-   `rejectUnauthorized:false` bypass (DESIGN §4.1 option b). CA-bundle
-   chain validation is a later milestone.
+4. **Certificate trust (done — insecure-skip-verify).** Default verifier
+   parses the leaf cert, extracts its key (ECDSA-P256 or RSA, auto-
+   dispatched), and verifies the CertificateVerify signature — but does
+   **not** validate the chain or hostname. So `fetch('https://any-host')`
+   works while the peer is proven to hold the presented cert's key. This is
+   the DESIGN §4.1 (b) posture; **CA-bundle chain validation (real trust)
+   is the remaining milestone.** `tls.setEcdsaPin(hex)` tightens to an SPKI
+   pin. The two accept-all callbacks are local additions to the vendored
+   bridges (`ecdsa_p256_accept_verify_cert_cb` / `rsa_pss_accept_verify_cert_cb`)
+   because the crypto helpers are file-private — re-apply on re-export (see
+   `src/tls/THIRD_PARTY.md`). Verified against example.com/google
+   (ECDSA) and api.github.com (RSA).
+
+**Security note:** https is convenient-but-insecure by default (no chain
+validation → MITM possible). Real security needs the CA-bundle milestone;
+until then, pin for anything sensitive.
 
 ## Known issues to handle before increment 2
 

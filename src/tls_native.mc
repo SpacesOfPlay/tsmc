@@ -25,14 +25,28 @@ private ptls_cipher_suite_t g_cs128;
 private ptls_key_exchange_algorithm_t*[2] g_keyex;
 private ptls_cipher_suite_t*[2] g_cslist;
 private ptls_context_t g_ctx;
-private ptls_verify_certificate_t g_reject_verify;
+private ptls_verify_certificate_t g_accept_verify;
+// signature schemes to advertise: ECDSA-P256 + RSA-PSS (SHA-256/384/512).
+private u16[5] g_accept_algos = { 0x0403, 0x0804, 0x0805, 0x0806, 0xffff };
 private bool g_inited = false;
 
-// Default verifier: refuse every certificate (graceful handshake failure
-// rather than the abort a null verify_certificate would cause).
-private i32 tls_reject_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
+// Default verifier: parse the leaf cert, extract its public key (ECDSA-P256
+// or RSA), and verify the handshake CertificateVerify signature against it —
+// but do NOT validate the certificate chain or hostname. This authenticates
+// that the peer holds the presented cert's private key while accepting any
+// cert (an "insecure skip verify"). Full CA-chain trust is a later
+// milestone (DESIGN 4.1); tls_set_ecdsa_pin adds SPKI pinning on top.
+private i32 tls_accept_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
                                  u8* server_name, verify_sign_fn* out_verify_sign,
                                  void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
+    // try P-256, then RSA (the bridge callbacks extract the pubkey and arm
+    // verify_sign; they only touch the leaf cert's key, not the chain)
+    if ecdsa_p256_accept_verify_cert_cb(self, tls, server_name, out_verify_sign, out_verify_data, certs, num_certs) == 0 {
+        return 0;
+    }
+    if rsa_pss_accept_verify_cert_cb(self, tls, server_name, out_verify_sign, out_verify_data, certs, num_certs) == 0 {
+        return 0;
+    }
     return 0 - 1;
 }
 
@@ -75,13 +89,11 @@ private void tls_ctx_init() {
     g_ctx.get_time = &mc_picotls_get_time;
     g_ctx.key_exchanges = &g_keyex[0];
     g_ctx.cipher_suites = &g_cslist[0];
-    // Default: refuse (a null verify_certificate would make picotls abort on
-    // the server's CertificateVerify). tls_set_ecdsa_pin overrides this;
-    // general trust is DESIGN 4.1. The algos still advertise so the server
-    // proceeds far enough to be cleanly rejected.
-    g_reject_verify.cb = tls_reject_verify_cb;
-    g_reject_verify.algos = &ecdsa_p256_pl_verify_algos[0];
-    g_ctx.verify_certificate = &g_reject_verify;
+    // Default: accept any cert but verify the handshake signature (see
+    // tls_accept_verify_cb). tls_set_ecdsa_pin tightens this to a pin.
+    g_accept_verify.cb = tls_accept_verify_cb;
+    g_accept_verify.algos = &g_accept_algos[0];
+    g_ctx.verify_certificate = &g_accept_verify;
     g_inited = true;
 }
 

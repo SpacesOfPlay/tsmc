@@ -534,3 +534,27 @@ i32 rsa_pss_pinned_verify_cert_cb(ptls_verify_certificate_t* self,
     *out_verify_data = cast(void*, ctx);
     return 0;
 }
+
+// LOCAL ADDITION (tsmc) — accept any RSA cert without a pin: extract the
+// pubkey and arm verify_sign (checks the handshake signature; not the
+// chain/hostname). Returns -1 if the leaf is not RSA. Re-apply on re-export
+// (see src/tls/THIRD_PARTY.md).
+i32 rsa_pss_accept_verify_cert_cb(ptls_verify_certificate_t* self,
+                                  ptls_t* tls, u8* server_name,
+                                  verify_sign_fn* out_verify_sign,
+                                  void** out_verify_data,
+                                  ptls_iovec_t* certs, u64 num_certs) {
+    if num_certs == cast(u64, 0) { return 0 - 1; }
+    u8* spki_start;
+    u64 spki_len;
+    if rsa_x509_locate_spki(certs[0].base, certs[0].len, &spki_start, &spki_len) != 0 { return 0 - 1; }
+    rsa_verify_ctx_t* ctx = new(rsa_verify_ctx_t);
+    if mc_spki_extract_rsa_pubkey(spki_start, spki_len, &ctx.modulus[0],
+                                  &ctx.modulus_len, &ctx.exponent) != 0 {
+        free(cast(void*, ctx));
+        return 0 - 1;
+    }
+    *out_verify_sign = rsa_pss_pl_verify_sign;
+    *out_verify_data = cast(void*, ctx);
+    return 0;
+}
