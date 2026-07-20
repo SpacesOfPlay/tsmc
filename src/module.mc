@@ -24,6 +24,7 @@ import node_stream;
 import node_assert;
 import node_net;
 import node_http;
+import node_fetch;
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -303,6 +304,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "zlib") || str_equal(s, "process")
         || str_equal(s, "buffer") || str_equal(s, "timers")
         || str_equal(s, "net") || str_equal(s, "http")
+        || str_equal(s, "_fetch")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -964,6 +966,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "assert") { return node_assert_source(); }
     if str_equal(name, "net") { return node_net_source(); }
     if str_equal(name, "http") { return node_http_source(); }
+    if str_equal(name, "_fetch") { return node_fetch_source(); }
     if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     return null_str();
 }
@@ -1241,7 +1244,26 @@ private Value nat_require(void* vmp, Value callee, Value thisv, Value* args, i32
 }
 
 // CLI entry: module graph if the file uses import/export, else script.
+// The global `fetch`: lazily loads the JS impl (`_fetch`) on first call
+// and forwards, so scripts that never fetch pay nothing for it.
+private Value nat_fetch(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    str none;
+    none.data = null;
+    none.len = 0;
+    Value impl = module_require(vm, none, "_fetch");
+    if vm.has_pending { return value_undefined(); }
+    if !value_is_object(impl) { return value_undefined(); }
+    Value impl_fetch;
+    if !vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, "fetch"), &impl_fetch) { return value_undefined(); }
+    if !value_is_callable(impl_fetch) { return value_undefined(); }
+    return vm_call_value(vm, impl_fetch, value_undefined(), args, argc);
+}
+
 i32 module_run_entry(VM* vm, str src, str path) {
+    // `fetch` is a global in Node 18+; install it as a lazy native.
+    vm_set_global(vm, "fetch", vm_make_native(vm, &nat_fetch, "fetch"));
+
     // __filename / __dirname for the entry file (absolute, entry-scoped).
     str fname = canon_path(path);
     str fclean = strip_unc(fname);

@@ -38,3 +38,22 @@ plaintext.
 
 - `https`/TLS (separate milestone, now unblocked).
 - Keep-alive agent/pool, HTTP/2, trailers, Expect/continue, upgrades.
+
+## Shipped
+
+Both increments landed, byte-identical to Node, `--gc-stress` clean:
+
+1. **`http`** — `src/node_http.mc`; `test/diff/http.js` (GET 404 + POST
+   echo), 100 KB POST verified.
+2. **`fetch`** — `src/node_fetch.mc` (internal `_fetch` module) exposing
+   `fetch`/`Response`/`Headers`-like, over the `http` client + global
+   `URL`. Installed as a **lazy native global** in `module_run_entry`
+   (`nat_fetch` forwards to the JS impl on first call, so non-fetching
+   scripts pay nothing). `res.status`/`ok`/`headers.get`/`text()`/`json()`
+   work; `test/diff/fetch.js` (GET/JSON/POST) matches Node.
+
+Deviations: `fetch` is installed after the `globalThis` snapshot, so bare
+`fetch(...)` works but `globalThis.fetch` is not populated (minor).
+`https:` URLs reject with a clear TypeError until TLS lands. `Headers`/
+`Request`/`Response` are not yet globals (the impl uses them internally;
+`fetch` returns a `Response`).
