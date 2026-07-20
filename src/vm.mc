@@ -109,6 +109,13 @@ struct VM {
     JsObject* buffer_proto;
     JsObject* textenc_proto;
     JsObject* textdec_proto;
+    JsObject* ta_proto;        // %TypedArray%.prototype (shared methods)
+    JsObject* arraybuffer_proto;
+    JsObject* dataview_proto;
+    JsObject*[9] ta_protos;    // per-kind TypedArray.prototype (instanceof)
+    u32 atom_ta_off;
+    u32 atom_ta_len;
+    u32 atom_ta_kind;
     JsObject* node_fs_ns;      // built-in `fs` module namespace (lazy)
     JsObject* node_fsp_ns;     // built-in `fs/promises` module namespace (lazy)
     JsObject* node_path_ns;    // built-in `path` module namespace (lazy)
@@ -265,6 +272,12 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
     if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
     if vm.buffer_proto != null { gc_mark_cell(h, &vm.buffer_proto.head); }
+    if vm.ta_proto != null { gc_mark_cell(h, &vm.ta_proto.head); }
+    if vm.arraybuffer_proto != null { gc_mark_cell(h, &vm.arraybuffer_proto.head); }
+    if vm.dataview_proto != null { gc_mark_cell(h, &vm.dataview_proto.head); }
+    for i32 i = 0; i < 9; i++ {
+        if vm.ta_protos[i] != null { gc_mark_cell(h, &vm.ta_protos[i].head); }
+    }
     if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
     if vm.textdec_proto != null { gc_mark_cell(h, &vm.textdec_proto.head); }
     if vm.node_fs_ns != null { gc_mark_cell(h, &vm.node_fs_ns.head); }
@@ -892,6 +905,13 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = value_int(o.elen);
             return true;
         }
+        if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 {
+                *out = vm_ta_get(vm, o, idx);   // undefined when out of range
+                return true;
+            }
+        }
         ignore js_get_prop(o, a, out);
         return true;
     }
@@ -1013,6 +1033,13 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             vm_throw_error(vm, ERR_RANGE, "invalid array length");
             return false;
         }
+        if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 {
+                vm_ta_set(vm, o, idx, v);   // out-of-range writes are ignored
+                return true;
+            }
+        }
         // a setter anywhere on the chain intercepts the write
         JsObject* cur = o;
         while cur != null {
@@ -1070,6 +1097,123 @@ private i32 val_to_index(Value v) {
         if cast(f64, i) == d && i >= 0 { return i; }
     }
     return -1;
+}
+
+// --- TypedArray element access ----------------------------------------------
+// Element kinds: 0 Int8, 1 Uint8, 2 Uint8Clamped, 3 Int16, 4 Uint16,
+// 5 Int32, 6 Uint32, 7 Float32, 8 Float64. Storage is platform-endian
+// (little-endian), so reads/writes go through memcpy of the native width.
+
+i32 ta_elem_size(i32 kind) {
+    if kind <= 2 { return 1; }
+    if kind <= 4 { return 2; }
+    if kind == 8 { return 8; }
+    return 4;
+}
+
+// Parses a property atom as a canonical array index ("0" or a no-leading-
+// zero decimal) or returns -1. Used to route typed-array index properties
+// (t["0"], Object.values, spread) through the element accessors.
+i32 ta_atom_index(VM* vm, u32 a) {
+    if (a & 0x80000000) != 0 { return -1; }   // symbol keys are never indices
+    str s = atom_name(&vm.atoms, a);
+    if s.len == 0 { return -1; }
+    if *(s.data) == '0' { return s.len == 1 ? 0 : -1; }
+    i64 v = 0;
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c < '0' || c > '9' { return -1; }
+        v = v * 10 + cast(i64, c - '0');
+        if v > 2147483647 { return -1; }
+    }
+    return cast(i32, v);
+}
+
+str ta_kind_name(i32 kind) {
+    if kind == 0 { return "Int8Array"; }
+    if kind == 1 { return "Uint8Array"; }
+    if kind == 2 { return "Uint8ClampedArray"; }
+    if kind == 3 { return "Int16Array"; }
+    if kind == 4 { return "Uint16Array"; }
+    if kind == 5 { return "Int32Array"; }
+    if kind == 6 { return "Uint32Array"; }
+    if kind == 7 { return "Float32Array"; }
+    return "Float64Array";
+}
+
+Value ta_read(u8* p, i32 kind) {
+    if kind == 0 {
+        i32 v = cast(i32, *p);
+        if v >= 128 { v -= 256; }
+        return value_int(v);
+    }
+    if kind == 1 || kind == 2 { return value_int(cast(i32, *p)); }
+    if kind == 3 {
+        u16 w;
+        memcpy(cast(u8*, &w), p, cast(i64, 2));
+        i32 v = cast(i32, w);
+        if v >= 32768 { v -= 65536; }
+        return value_int(v);
+    }
+    if kind == 4 { u16 w; memcpy(cast(u8*, &w), p, cast(i64, 2)); return value_int(cast(i32, w)); }
+    if kind == 5 { i32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_int(v); }
+    if kind == 6 { u32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_number(cast(f64, v)); }
+    if kind == 7 { f32 f; memcpy(cast(u8*, &f), p, cast(i64, 4)); return value_number(cast(f64, f)); }
+    f64 d;
+    memcpy(cast(u8*, &d), p, cast(i64, 8));
+    return value_number(d);
+}
+
+void ta_write(u8* p, i32 kind, f64 num) {
+    if kind == 8 { memcpy(p, cast(u8*, &num), cast(i64, 8)); return; }
+    if kind == 7 { f32 f = cast(f32, num); memcpy(p, cast(u8*, &f), cast(i64, 4)); return; }
+    if kind == 2 {   // Uint8Clamped
+        i32 c;
+        if num != num || num <= 0.0 { c = 0; }
+        else if num >= 255.0 { c = 255; }
+        else { c = cast(i32, num + 0.5); }
+        *p = cast(u8, c);
+        return;
+    }
+    i64 iv = 0;
+    f64 inf = 1.0e308 * 10.0;
+    if num == num && num != inf && num != 0.0 - inf { iv = cast(i64, num); }
+    u32 u = cast(u32, iv);
+    if kind == 0 || kind == 1 { *p = cast(u8, u & 0xFF); return; }
+    if kind == 3 || kind == 4 { u16 w = cast(u16, u & 0xFFFF); memcpy(p, cast(u8*, &w), cast(i64, 2)); return; }
+    memcpy(p, cast(u8*, &u), cast(i64, 4));
+}
+
+// True for a TypedArray view; the element get/set below read its bytes.
+bool vm_is_typed_array(Value v) {
+    return value_is_object(v) && (value_as_object(v).obj_flags & OBJF_TYPEDARRAY) != 0;
+}
+
+private i32 ta_prop_int(VM* vm, JsObject* o, u32 atom) {
+    Value* p = props_get(&o.props, atom);
+    if p == null { return 0; }
+    return value_as_int(*p);
+}
+
+Value vm_ta_get(VM* vm, JsObject* o, i32 idx) {
+    i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+    if idx < 0 || idx >= len { return value_undefined(); }
+    if o.elen < 1 { return value_undefined(); }
+    GcBytes* gb = value_as_bytes(*(o.elems));
+    i32 off = ta_prop_int(vm, o, vm.atom_ta_off);
+    i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
+    return ta_read(gb_data(gb) + off + idx * ta_elem_size(kind), kind);
+}
+
+void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
+    i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+    if idx < 0 || idx >= len { return; }
+    if o.elen < 1 { return; }
+    GcBytes* gb = value_as_bytes(*(o.elems));
+    i32 off = ta_prop_int(vm, o, vm.atom_ta_off);
+    i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
+    f64 num = js_to_number(v);
+    ta_write(gb_data(gb) + off + idx * ta_elem_size(kind), kind, num);
 }
 
 // Key value → property atom; key must stay rooted by the caller.
@@ -1250,6 +1394,29 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
             if vec_get(seen, i) == id { str_buf_add(sb, "[Circular]"); return; }
         }
         JsObject* o = value_as_object(v);
+        if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
+            i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+            if depth < 0 {
+                // Node shows [TypedArrayName] at the depth limit
+                str_buf_add(sb, "[");
+                str_buf_add(sb, ta_kind_name(kind));
+                str_buf_add(sb, "]");
+                return;
+            }
+            str_buf_add(sb, ta_kind_name(kind));
+            string hdr = format("({}) ", len);
+            str_buf_add(sb, hdr);
+            free(hdr);
+            if len == 0 { str_buf_add(sb, "[]"); return; }
+            str_buf_add(sb, "[ ");
+            for i32 i = 0; i < len; i++ {
+                if i > 0 { str_buf_add(sb, ", "); }
+                inspect_into(vm, sb, vm_ta_get(vm, o, i), depth - 1, true, seen);
+            }
+            str_buf_add(sb, " ]");
+            return;
+        }
         bool is_arr = (o.obj_flags & OBJF_ARRAY) != 0;
         if depth < 0 {
             str_buf_add(sb, is_arr ? "[Array]" : "[Object]");
@@ -1451,6 +1618,10 @@ void vm_init(VM* vm) {
     vm.symbol_proto = null;
     vm.bigint_proto = null;
     vm.buffer_proto = null;
+    vm.ta_proto = null;
+    vm.arraybuffer_proto = null;
+    vm.dataview_proto = null;
+    for i32 i = 0; i < 9; i++ { vm.ta_protos[i] = null; }
     vm.textenc_proto = null;
     vm.textdec_proto = null;
     vm.node_fs_ns = null;
@@ -1489,6 +1660,9 @@ void vm_init(VM* vm) {
     vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
     vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
     vm.atom_phandled = atom_intern(&vm.atoms, "%handled");
+    vm.atom_ta_off = atom_intern(&vm.atoms, "%taoff");
+    vm.atom_ta_len = atom_intern(&vm.atoms, "%talen");
+    vm.atom_ta_kind = atom_intern(&vm.atoms, "%takind");
     vm.atom_value = atom_intern(&vm.atoms, "value");
     vm.atom_done = atom_intern(&vm.atoms, "done");
     vm.atom_next = atom_intern(&vm.atoms, "next");
@@ -2323,6 +2497,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         break case;
                     }
                 }
+                if vm_is_typed_array(objv) {
+                    i32 idx = val_to_index(key);
+                    if idx >= 0 {
+                        Value r = vm_ta_get(vm, value_as_object(objv), idx);
+                        vm.sp -= 2;
+                        vpush(vm, r);
+                        break case;
+                    }
+                }
                 if value_is_string(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
@@ -2368,6 +2551,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         js_array_set(value_as_object(objv), idx, v);
+                        vm.sp -= 3;
+                        vpush(vm, v);
+                        break case;
+                    }
+                }
+                if vm_is_typed_array(objv) {
+                    i32 idx = val_to_index(key);
+                    if idx >= 0 {
+                        vm_ta_set(vm, value_as_object(objv), idx, v);
                         vm.sp -= 3;
                         vpush(vm, v);
                         break case;
@@ -2551,6 +2743,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             u32 a2 = atom_intern(&vm.atoms, ks);
                             free(ks);
                             js_set_prop(d, a2, js_array_get(s, i));
+                        }
+                    } else if (s.obj_flags & OBJF_TYPEDARRAY) != 0 {
+                        i32 len = ta_prop_int(vm, s, vm.atom_ta_len);
+                        for i32 i = 0; i < len; i++ {
+                            string ks = format("{}", i);
+                            u32 a2 = atom_intern(&vm.atoms, ks);
+                            free(ks);
+                            js_set_prop(d, a2, vm_ta_get(vm, s, i));
                         }
                     }
                     for i32 i = 0; i < s.props.len; i++ {
@@ -2849,6 +3049,17 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
         JsObject* o = value_as_object(objv);
         for i32 i = 0; i < o.elen; i++ {
             if !js_array_has(o, i) { continue; }   // holes are not keys
+            string s = format("{}", i);
+            GcString* g = gc_new_string(&vm.heap, s);
+            free(s);
+            js_array_set(arr, n, value_cell(&g.head));
+            n++;
+        }
+    } else if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
+        // typed arrays enumerate their indices as own keys
+        JsObject* o = value_as_object(objv);
+        i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+        for i32 i = 0; i < len; i++ {
             string s = format("{}", i);
             GcString* g = gc_new_string(&vm.heap, s);
             free(s);

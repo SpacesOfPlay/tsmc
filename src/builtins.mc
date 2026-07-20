@@ -150,6 +150,12 @@ private Value nat_object_values(void* vmp, Value callee, Value thisv, Value* arg
                 js_array_set(arr, n, js_array_get(o, i));
                 n++;
             }
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 len = ta_len(vm, o);
+            for i32 i = 0; i < len; i++ {
+                js_array_set(arr, n, vm_ta_get(vm, o, i));
+                n++;
+            }
         }
         for i32 i = 0; i < o.props.len; i++ {
             if !prop_enumerable(vm, o.props.items + i) { continue; }
@@ -187,6 +193,18 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
                 free(s);
                 js_array_set(pair, 0, ks);
                 js_array_set(pair, 1, js_array_get(o, i));
+                n++;
+            }
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 len = ta_len(vm, o);
+            for i32 i = 0; i < len; i++ {
+                JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+                js_array_set(arr, n, value_cell(&pair.head));
+                string s = format("{}", i);
+                Value ks = new_str(vm, s);
+                free(s);
+                js_array_set(pair, 0, ks);
+                js_array_set(pair, 1, vm_ta_get(vm, o, i));
                 n++;
             }
         }
@@ -601,6 +619,13 @@ private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32
     str sk;
     u32 a = reflect_key(vm, kv, &sk);
     if vm.has_pending { return value_bool(false); }
+    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_TYPEDARRAY) != 0 {
+        i32 idx = ta_atom_index(vm, a);
+        if idx >= 0 {
+            JsObject* o = value_as_object(thisv);
+            return value_bool(idx < ta_len(vm, o));
+        }
+    }
     if props_get(props, a) != null { return value_bool(true); }
     Value fv;
     return value_bool(fn_own_synth(vm, thisv, a, &fv));
@@ -3157,6 +3182,42 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
         }
         if o.elen > 0 { json_indent_into(sb, gap, depth); }
         str_buf_add(sb, "]");
+    } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+        // a typed array serializes like an object keyed by its indices
+        str_buf_add(sb, "{");
+        i32 len = ta_len(vm, o);
+        bool first = true;
+        for i32 i = 0; i < len; i++ {
+            i32 rm = gc_root_mark(&vm.heap);
+            string ks = format("{}", i);
+            u32 key = atom_intern(&vm.atoms, ks);
+            free(ks);
+            Value cval = json_transform(vm, ctx, v, atom_name(&vm.atoms, key), vm_ta_get(vm, o, i));
+            gc_root(&vm.heap, cval);
+            if value_is_undefined(cval) || value_is_callable(cval) {
+                gc_root_reset(&vm.heap, rm);
+                if vm.has_pending { ignore vec_pop(seen); return false; }
+                continue;
+            }
+            str_buf sub;
+            str_buf_init(&sub);
+            bool wrote = json_write(vm, &sub, cval, ctx, depth + 1);
+            gc_root_reset(&vm.heap, rm);
+            if !wrote {
+                str_buf_free(&sub);
+                if vm.has_pending { ignore vec_pop(seen); return false; }
+                continue;
+            }
+            if !first { str_buf_add(sb, ","); }
+            json_indent_into(sb, gap, depth + 1);
+            json_escape_into(sb, atom_name(&vm.atoms, key));
+            str_buf_add(sb, gap.len > 0 ? ": " : ":");
+            str_buf_add(sb, str_buf_to_str(&sub));
+            str_buf_free(&sub);
+            first = false;
+        }
+        if !first { json_indent_into(sb, gap, depth); }
+        str_buf_add(sb, "}");
     } else {
         str_buf_add(sb, "{");
         bool first = true;
@@ -6692,6 +6753,866 @@ private Value nat_buffer_ctor(void* vmp, Value callee, Value thisv, Value* args,
         return value_cell(&buf_new(vm, size).head);
     }
     return nat_buffer_from(vmp, callee, thisv, args, argc);
+}
+
+// --- ArrayBuffer / TypedArray / DataView ------------------------------------
+//
+// An ArrayBuffer owns a GcBytes cell (raw storage). Typed arrays and
+// DataViews are views: they hold the same GcBytes in elems[0] (so the GC
+// keeps it alive) plus hidden layout props (%taoff/%talen/%takind) and
+// visible descriptor props (buffer/byteOffset/byteLength/length). Element
+// access goes through vm_ta_get / vm_ta_set from the index opcodes.
+
+private bool is_arraybuffer(VM* vm, Value v) {
+    return value_is_object(v) && value_as_object(v).proto == vm.arraybuffer_proto;
+}
+
+private bool is_dataview(VM* vm, Value v) {
+    return value_is_object(v) && value_as_object(v).proto == vm.dataview_proto;
+}
+
+private i32 ta_len(VM* vm, JsObject* o) {
+    Value* p = props_get(&o.props, vm.atom_ta_len);
+    return p == null ? 0 : value_as_int(*p);
+}
+
+private i32 ta_off(VM* vm, JsObject* o) {
+    Value* p = props_get(&o.props, vm.atom_ta_off);
+    return p == null ? 0 : value_as_int(*p);
+}
+
+private i32 ta_kind(VM* vm, JsObject* o) {
+    Value* p = props_get(&o.props, vm.atom_ta_kind);
+    return p == null ? 0 : value_as_int(*p);
+}
+
+private i32 ab_len(VM* vm, JsObject* ab) {
+    return value_as_bytes(*(ab.elems)).len;
+}
+
+// Fetches the ArrayBuffer backing a view (stored in the hidden %tabuf prop;
+// the public `buffer` property is a prototype getter over this).
+private JsObject* ta_buffer(VM* vm, JsObject* o) {
+    Value* p = props_get(&o.props, bi_atom(vm, "%tabuf"));
+    return p == null ? null : value_as_object(*p);
+}
+
+// Allocates a fresh ArrayBuffer of nbytes zeroed bytes.
+private JsObject* ab_new(VM* vm, i32 nbytes) {
+    if nbytes < 0 { nbytes = 0; }
+    JsObject* ab = js_new_object(&vm.heap, vm.arraybuffer_proto);
+    vm_push(vm, value_cell(&ab.head));
+    GcBytes* gb = js_new_bytes(&vm.heap, nbytes);
+    vm_push(vm, value_cell(&gb.head));
+    js_array_set(ab, 0, value_cell(&gb.head));   // elems[0] roots the bytes
+    vm.sp -= 2;
+    return ab;   // byteLength is a prototype getter over the bytes cell
+}
+
+// Builds a typed-array view of `kind` over `buffer` starting at byte
+// offset `boff` with `len` elements. Shares the buffer's byte storage.
+private Value ta_make(VM* vm, i32 kind, JsObject* buffer, i32 boff, i32 len) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&buffer.head));
+    JsObject* ta = js_new_object(&vm.heap, vm.ta_protos[kind]);
+    ta.obj_flags = ta.obj_flags | OBJF_TYPEDARRAY;
+    gc_root(&vm.heap, value_cell(&ta.head));
+    GcBytes* gb = value_as_bytes(*(buffer.elems));
+    js_array_set(ta, 0, value_cell(&gb.head));
+    // hidden layout; length/byteLength/byteOffset/buffer are prototype getters
+    props_set_desc(&ta.props, vm.atom_ta_off, value_int(boff), 0);
+    props_set_desc(&ta.props, vm.atom_ta_len, value_int(len), 0);
+    props_set_desc(&ta.props, vm.atom_ta_kind, value_int(kind), 0);
+    props_set_desc(&ta.props, bi_atom(vm, "%tabuf"), value_cell(&buffer.head), 0);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&ta.head);
+}
+
+// Allocates a fresh buffer and a view of `kind` covering all of it.
+private Value ta_alloc(VM* vm, i32 kind, i32 len) {
+    if len < 0 { len = 0; }
+    JsObject* ab = ab_new(vm, len * ta_elem_size(kind));
+    vm_push(vm, value_cell(&ab.head));
+    Value r = ta_make(vm, kind, ab, 0, len);
+    vm_pop(vm);
+    return r;
+}
+
+private JsObject* this_ta(VM* vm, Value thisv) {
+    if !vm_is_typed_array(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "method called on a non-typed-array");
+        return null;
+    }
+    return value_as_object(thisv);
+}
+
+// Prototype getters (so length/byteLength/byteOffset/buffer are not own
+// properties, matching Node's hasOwnProperty / Object.keys behaviour).
+private Value nat_ta_get_length(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    return value_int(ta_len(vm, o));
+}
+
+private Value nat_ta_get_bytelength(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    return value_int(ta_len(vm, o) * ta_elem_size(ta_kind(vm, o)));
+}
+
+private Value nat_ta_get_byteoffset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    return value_int(ta_off(vm, o));
+}
+
+private Value nat_ta_get_buffer(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    JsObject* buf = ta_buffer(vm, o);
+    return buf == null ? value_undefined() : value_cell(&buf.head);
+}
+
+private Value nat_ab_get_bytelength(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_arraybuffer(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Method get ArrayBuffer.prototype.byteLength called on incompatible receiver");
+        return value_undefined();
+    }
+    return value_int(ab_len(vm, value_as_object(thisv)));
+}
+
+private Value nat_arraybuffer_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 len = to_int_arg(arg_at(args, argc, 0));
+    if len < 0 {
+        vm_throw_error(vm, ERR_RANGE, "Invalid array buffer length");
+        return value_undefined();
+    }
+    return value_cell(&ab_new(vm, len).head);
+}
+
+private Value nat_ab_slice(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_arraybuffer(vm, thisv) { return value_undefined(); }
+    JsObject* ab = value_as_object(thisv);
+    i32 len = ab_len(vm, ab);
+    i32 b = buf_clamp(argc > 0 ? to_int_arg(arg_at(args, argc, 0)) : 0, len);
+    i32 e = len;
+    if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
+        e = buf_clamp(to_int_arg(arg_at(args, argc, 1)), len);
+    }
+    if e < b { e = b; }
+    i32 n = e - b;
+    JsObject* nb = ab_new(vm, n);
+    GcBytes* src = value_as_bytes(*(ab.elems));
+    GcBytes* dst = value_as_bytes(*(nb.elems));
+    if n > 0 { memcpy(gb_data(dst), gb_data(src) + b, cast(i64, n)); }
+    return value_cell(&nb.head);
+}
+
+private Value nat_ab_isview(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value v = arg_at(args, argc, 0);
+    if vm_is_typed_array(v) || is_dataview(vm, v) { return value_bool(true); }
+    return value_bool(false);
+}
+
+// The one typed-array constructor; the element kind comes from env0, set
+// per global (Int8Array..Float64Array) at install time.
+private Value nat_ta_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 kind = value_as_int(value_as_native(callee).env0);
+    i32 esz = ta_elem_size(kind);
+    Value a0 = arg_at(args, argc, 0);
+
+    if is_arraybuffer(vm, a0) {
+        JsObject* ab = value_as_object(a0);
+        i32 ablen = ab_len(vm, ab);
+        i32 boff = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
+        if boff < 0 { boff = 0; }
+        i32 len;
+        if argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) {
+            len = to_int_arg(arg_at(args, argc, 2));
+        } else {
+            len = (ablen - boff) / esz;
+        }
+        if len < 0 { len = 0; }
+        return ta_make(vm, kind, ab, boff, len);
+    }
+    if value_is_object(a0) {
+        // Copy from an array, typed array, iterable, or array-like.
+        Value[1] fa = { a0 };
+        Value arr = nat_array_from(vmp, callee, value_undefined(), &fa[0], 1);
+        if vm.has_pending { return value_undefined(); }
+        vm_push(vm, arr);
+        JsObject* sa = value_as_object(arr);
+        i32 n = sa.elen;
+        Value rv = ta_alloc(vm, kind, n);
+        vm_push(vm, rv);
+        JsObject* out = value_as_object(rv);
+        for i32 i = 0; i < n; i++ {
+            vm_ta_set(vm, out, i, js_array_get(sa, i));
+        }
+        vm.sp -= 2;
+        return rv;
+    }
+    i32 len = value_is_number(a0) ? to_int_arg(a0) : 0;
+    if len < 0 {
+        vm_throw_error(vm, ERR_RANGE, "Invalid typed array length");
+        return value_undefined();
+    }
+    return ta_alloc(vm, kind, len);
+}
+
+private Value nat_ta_from(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 kind = value_as_int(value_as_native(callee).env0);
+    Value src = arg_at(args, argc, 0);
+    Value mapfn = arg_at(args, argc, 1);
+    Value[2] fa = { src, mapfn };
+    Value arr = nat_array_from(vmp, callee, value_undefined(), &fa[0], value_is_callable(mapfn) ? 2 : 1);
+    if vm.has_pending { return value_undefined(); }
+    vm_push(vm, arr);
+    JsObject* sa = value_as_object(arr);
+    i32 n = sa.elen;
+    Value rv = ta_alloc(vm, kind, n);
+    vm_push(vm, rv);
+    JsObject* out = value_as_object(rv);
+    for i32 i = 0; i < n; i++ {
+        vm_ta_set(vm, out, i, js_array_get(sa, i));
+    }
+    vm.sp -= 2;
+    return rv;
+}
+
+private Value nat_ta_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 kind = value_as_int(value_as_native(callee).env0);
+    Value rv = ta_alloc(vm, kind, argc);
+    vm_push(vm, rv);
+    JsObject* out = value_as_object(rv);
+    for i32 i = 0; i < argc; i++ {
+        vm_ta_set(vm, out, i, *(args + i));
+    }
+    vm_pop(vm);
+    return rv;
+}
+
+// Normalizes a relative index (negatives count from the end) into [0,len].
+private i32 ta_rel(i32 i, i32 len) {
+    if i < 0 {
+        i = len + i;
+        if i < 0 { i = 0; }
+    } else if i > len {
+        i = len;
+    }
+    return i;
+}
+
+private Value nat_ta_at(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    i32 i = to_int_arg(arg_at(args, argc, 0));
+    if i < 0 { i += len; }
+    if i < 0 || i >= len { return value_undefined(); }
+    return vm_ta_get(vm, o, i);
+}
+
+private Value nat_ta_fill(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    Value v = arg_at(args, argc, 0);
+    i32 start = argc > 1 ? ta_rel(to_int_arg(arg_at(args, argc, 1)), len) : 0;
+    i32 end = len;
+    if argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) {
+        end = ta_rel(to_int_arg(arg_at(args, argc, 2)), len);
+    }
+    for i32 i = start; i < end; i++ { vm_ta_set(vm, o, i, v); }
+    return thisv;
+}
+
+private Value nat_ta_reverse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    for i32 i = 0; i < len / 2; i++ {
+        Value a = vm_ta_get(vm, o, i);
+        Value b = vm_ta_get(vm, o, len - 1 - i);
+        vm_ta_set(vm, o, i, b);
+        vm_ta_set(vm, o, len - 1 - i, a);
+    }
+    return thisv;
+}
+
+private Value nat_ta_join(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    str sep = ",";
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sepv = arg_at(args, argc, 0);
+    if !value_is_undefined(sepv) {
+        Value ss = js_to_string_value(vm, sepv);
+        gc_root(&vm.heap, ss);
+        sep = sview(ss);
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    for i32 i = 0; i < len; i++ {
+        if i > 0 { str_buf_add(&sb, sep); }
+        Value es = js_to_string_value(vm, vm_ta_get(vm, o, i));
+        gc_root(&vm.heap, es);
+        str_buf_add(&sb, sview(es));
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_ta_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return nat_ta_join(vmp, callee, thisv, null, 0);
+}
+
+private Value nat_ta_indexof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_int(-1); }
+    i32 len = ta_len(vm, o);
+    f64 s = js_to_number(arg_at(args, argc, 0));
+    i32 start = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
+    if start < 0 { start = len + start; if start < 0 { start = 0; } }
+    for i32 i = start; i < len; i++ {
+        if js_to_number(vm_ta_get(vm, o, i)) == s { return value_int(i); }
+    }
+    return value_int(-1);
+}
+
+private Value nat_ta_lastindexof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_int(-1); }
+    i32 len = ta_len(vm, o);
+    f64 s = js_to_number(arg_at(args, argc, 0));
+    i32 start = len - 1;
+    if argc > 1 {
+        start = to_int_arg(arg_at(args, argc, 1));
+        if start < 0 { start = len + start; }
+        if start >= len { start = len - 1; }
+    }
+    for i32 i = start; i >= 0; i-- {
+        if js_to_number(vm_ta_get(vm, o, i)) == s { return value_int(i); }
+    }
+    return value_int(-1);
+}
+
+private Value nat_ta_includes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_bool(false); }
+    i32 len = ta_len(vm, o);
+    f64 s = js_to_number(arg_at(args, argc, 0));
+    bool snan = s != s;
+    i32 start = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
+    if start < 0 { start = len + start; if start < 0 { start = 0; } }
+    for i32 i = start; i < len; i++ {
+        f64 e = js_to_number(vm_ta_get(vm, o, i));
+        if e == s { return value_bool(true); }
+        if snan && e != e { return value_bool(true); }
+    }
+    return value_bool(false);
+}
+
+private Value nat_ta_subarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    i32 kind = ta_kind(vm, o);
+    i32 boff = ta_off(vm, o);
+    i32 esz = ta_elem_size(kind);
+    JsObject* buf = ta_buffer(vm, o);
+    i32 b = argc > 0 ? ta_rel(to_int_arg(arg_at(args, argc, 0)), len) : 0;
+    i32 e = len;
+    if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
+        e = ta_rel(to_int_arg(arg_at(args, argc, 1)), len);
+    }
+    if e < b { e = b; }
+    return ta_make(vm, kind, buf, boff + b * esz, e - b);
+}
+
+private Value nat_ta_slice(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    i32 kind = ta_kind(vm, o);
+    i32 b = argc > 0 ? ta_rel(to_int_arg(arg_at(args, argc, 0)), len) : 0;
+    i32 e = len;
+    if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
+        e = ta_rel(to_int_arg(arg_at(args, argc, 1)), len);
+    }
+    if e < b { e = b; }
+    i32 n = e - b;
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    Value rv = ta_alloc(vm, kind, n);
+    gc_root(&vm.heap, rv);
+    JsObject* out = value_as_object(rv);
+    for i32 i = 0; i < n; i++ { vm_ta_set(vm, out, i, vm_ta_get(vm, o, b + i)); }
+    gc_root_reset(&vm.heap, rm);
+    return rv;
+}
+
+private Value nat_ta_set_meth(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    i32 offset = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
+    if offset < 0 {
+        vm_throw_error(vm, ERR_RANGE, "offset is out of bounds");
+        return value_undefined();
+    }
+    // Snapshot the source into a plain array so overlapping views are safe.
+    Value[1] fa = { arg_at(args, argc, 0) };
+    Value arr = nat_array_from(vmp, callee, value_undefined(), &fa[0], 1);
+    if vm.has_pending { return value_undefined(); }
+    vm_push(vm, arr);
+    JsObject* sa = value_as_object(arr);
+    i32 n = sa.elen;
+    if offset + n > len {
+        vm_pop(vm);
+        vm_throw_error(vm, ERR_RANGE, "offset is out of bounds");
+        return value_undefined();
+    }
+    for i32 i = 0; i < n; i++ { vm_ta_set(vm, o, offset + i, js_array_get(sa, i)); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+// Shared implementation for the callback iterators (map/filter/... modes).
+private Value ta_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) {
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 len = ta_len(vm, o);
+    i32 kind = ta_kind(vm, o);
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* out = null;
+    JsObject* tmp = null;
+    if mode == IT_MAP {
+        Value rv = ta_alloc(vm, kind, len);
+        gc_root(&vm.heap, rv);
+        out = value_as_object(rv);
+    } else if mode == IT_FILTER {
+        tmp = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&tmp.head));
+    }
+    i32 kept = 0;
+    for i32 i = 0; i < len; i++ {
+        Value e = vm_ta_get(vm, o, i);
+        Value[3] cargs = { e, value_int(i), thisv };
+        Value r = vm_call_value(vm, fun, value_undefined(), &cargs[0], 3);
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+        if mode == IT_MAP {
+            vm_ta_set(vm, out, i, r);
+        } else if mode == IT_FILTER {
+            if js_truthy(r) { js_array_set(tmp, kept, e); kept++; }
+        } else if mode == IT_SOME {
+            if js_truthy(r) { gc_root_reset(&vm.heap, rm); return value_bool(true); }
+        } else if mode == IT_EVERY {
+            if !js_truthy(r) { gc_root_reset(&vm.heap, rm); return value_bool(false); }
+        } else if mode == IT_FIND {
+            if js_truthy(r) { gc_root_reset(&vm.heap, rm); return e; }
+        } else if mode == IT_FINDINDEX {
+            if js_truthy(r) { gc_root_reset(&vm.heap, rm); return value_int(i); }
+        }
+    }
+    if mode == IT_MAP {
+        Value rv = value_cell(&out.head);
+        gc_root_reset(&vm.heap, rm);
+        return rv;
+    }
+    if mode == IT_FILTER {
+        Value rv = ta_alloc(vm, kind, kept);
+        vm_push(vm, rv);
+        JsObject* res = value_as_object(rv);
+        for i32 i = 0; i < kept; i++ { vm_ta_set(vm, res, i, js_array_get(tmp, i)); }
+        vm.sp--;
+        gc_root_reset(&vm.heap, rm);
+        return rv;
+    }
+    gc_root_reset(&vm.heap, rm);
+    if mode == IT_SOME { return value_bool(false); }
+    if mode == IT_EVERY { return value_bool(true); }
+    if mode == IT_FINDINDEX { return value_int(-1); }
+    return value_undefined();
+}
+
+private Value nat_ta_map(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_MAP);
+}
+private Value nat_ta_filter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_FILTER);
+}
+private Value nat_ta_foreach(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_FOREACH);
+}
+private Value nat_ta_some(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_SOME);
+}
+private Value nat_ta_every(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_EVERY);
+}
+private Value nat_ta_find(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_FIND);
+}
+private Value nat_ta_findindex(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_iterate(as_vm(vmp), thisv, args, argc, IT_FINDINDEX);
+}
+
+private Value ta_reduce_impl(VM* vm, Value thisv, Value* args, i32 argc, bool right) {
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 len = ta_len(vm, o);
+    i32 i = right ? len - 1 : 0;
+    i32 step = right ? -1 : 1;
+    Value acc;
+    if argc > 1 {
+        acc = *(args + 1);
+    } else {
+        if len == 0 {
+            vm_throw_error(vm, ERR_TYPE, "Reduce of empty array with no initial value");
+            return value_undefined();
+        }
+        acc = vm_ta_get(vm, o, i);
+        i += step;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    i32 seen = right ? (len - 1 - i) : i;
+    while seen < len {
+        gc_root(&vm.heap, acc);
+        Value[4] cargs = { acc, vm_ta_get(vm, o, i), value_int(i), thisv };
+        acc = vm_call_value(vm, fun, value_undefined(), &cargs[0], 4);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+        i += step;
+        seen++;
+    }
+    return acc;
+}
+
+private Value nat_ta_reduce(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_reduce_impl(as_vm(vmp), thisv, args, argc, false);
+}
+private Value nat_ta_reduceright(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_reduce_impl(as_vm(vmp), thisv, args, argc, true);
+}
+
+private Value nat_ta_iter_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    Value src = me.env0;
+    i32 i = value_as_int(me.env1);
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&r.head));
+    JsObject* o = value_as_object(src);
+    i32 len = ta_len(vm, o);
+    if i >= len {
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
+        js_set_prop(r, vm_atom(vm, "value"), value_undefined());
+    } else {
+        me.env1 = value_int(i + 1);
+        i32 kind = value_as_int(me.env2);
+        Value elem = vm_ta_get(vm, o, i);
+        Value outv = elem;
+        if kind == 1 {
+            outv = value_int(i);
+        } else if kind == 2 {
+            vm_push(vm, elem);
+            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+            vm_push(vm, value_cell(&pair.head));
+            js_array_set(pair, 0, value_int(i));
+            js_array_set(pair, 1, elem);
+            outv = value_cell(&pair.head);
+            vm.sp -= 2;
+        }
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
+        js_set_prop(r, vm_atom(vm, "value"), outv);
+    }
+    return vm_pop_ret(vm, value_cell(&r.head));
+}
+
+private Value make_ta_iterator(VM* vm, Value src, i32 kind) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, src);
+    JsObject* it = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&it.head));
+    JsNative* nx = js_new_native(&vm.heap, &nat_ta_iter_next, "next");
+    nx.env0 = src;
+    nx.env1 = value_int(0);
+    nx.env2 = value_int(kind);
+    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
+    js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&it.head);
+}
+
+private Value nat_ta_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if this_ta(vm, thisv) == null { return value_undefined(); }
+    return make_ta_iterator(vm, thisv, 0);
+}
+private Value nat_ta_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if this_ta(vm, thisv) == null { return value_undefined(); }
+    return make_ta_iterator(vm, thisv, 1);
+}
+private Value nat_ta_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if this_ta(vm, thisv) == null { return value_undefined(); }
+    return make_ta_iterator(vm, thisv, 2);
+}
+
+// --- DataView ---------------------------------------------------------------
+
+// Reads a value of `kind` from `base`, honouring endianness (native x64 is
+// little-endian, so a big-endian read gathers the bytes reversed first).
+private Value dv_read(u8* base, i32 kind, bool le) {
+    i32 sz = ta_elem_size(kind);
+    u8[8] tmp;
+    for i32 i = 0; i < sz; i++ {
+        *(&tmp[0] + i) = le ? *(base + i) : *(base + sz - 1 - i);
+    }
+    return ta_read(&tmp[0], kind);
+}
+
+private void dv_write(u8* base, i32 kind, f64 num, bool le) {
+    i32 sz = ta_elem_size(kind);
+    u8[8] tmp;
+    ta_write(&tmp[0], kind, num);
+    for i32 i = 0; i < sz; i++ {
+        *(base + i) = le ? *(&tmp[0] + i) : *(&tmp[0] + sz - 1 - i);
+    }
+}
+
+private Value nat_dataview_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value a0 = arg_at(args, argc, 0);
+    if !is_arraybuffer(vm, a0) {
+        vm_throw_error(vm, ERR_TYPE, "First argument to DataView constructor must be an ArrayBuffer");
+        return value_undefined();
+    }
+    JsObject* ab = value_as_object(a0);
+    i32 ablen = ab_len(vm, ab);
+    i32 boff = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
+    if boff < 0 { boff = 0; }
+    i32 blen;
+    if argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) {
+        blen = to_int_arg(arg_at(args, argc, 2));
+    } else {
+        blen = ablen - boff;
+    }
+    if blen < 0 { blen = 0; }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, a0);
+    JsObject* dv = js_new_object(&vm.heap, vm.dataview_proto);
+    gc_root(&vm.heap, value_cell(&dv.head));
+    GcBytes* gb = value_as_bytes(*(ab.elems));
+    js_array_set(dv, 0, value_cell(&gb.head));
+    props_set_desc(&dv.props, vm.atom_ta_off, value_int(boff), 0);
+    props_set_desc(&dv.props, vm.atom_ta_len, value_int(blen), 0);
+    props_set_desc(&dv.props, bi_atom(vm, "%tabuf"), value_cell(&ab.head), 0);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&dv.head);   // buffer/byteOffset/byteLength are getters
+}
+
+private Value nat_dv_get_buffer(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_dataview(vm, thisv) { return value_undefined(); }
+    Value* p = props_get(&value_as_object(thisv).props, bi_atom(vm, "%tabuf"));
+    return p == null ? value_undefined() : *p;
+}
+
+private Value nat_dv_get_bytelength(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_dataview(vm, thisv) { return value_undefined(); }
+    return value_int(ta_len(vm, value_as_object(thisv)));
+}
+
+private Value nat_dv_get_byteoffset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_dataview(vm, thisv) { return value_undefined(); }
+    return value_int(ta_off(vm, value_as_object(thisv)));
+}
+
+private Value nat_dv_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_dataview(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Method DataView.prototype.get called on incompatible receiver");
+        return value_undefined();
+    }
+    JsObject* dv = value_as_object(thisv);
+    i32 kind = value_as_int(value_as_native(callee).env0);
+    i32 sz = ta_elem_size(kind);
+    i32 off = to_int_arg(arg_at(args, argc, 0));
+    bool le = kind <= 2 ? false : js_truthy(arg_at(args, argc, 1));
+    i32 len = ta_len(vm, dv);
+    if off < 0 || off + sz > len {
+        vm_throw_error(vm, ERR_RANGE, "Offset is outside the bounds of the DataView");
+        return value_undefined();
+    }
+    GcBytes* gb = value_as_bytes(*(dv.elems));
+    return dv_read(gb_data(gb) + ta_off(vm, dv) + off, kind, le);
+}
+
+private Value nat_dv_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !is_dataview(vm, thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Method DataView.prototype.set called on incompatible receiver");
+        return value_undefined();
+    }
+    JsObject* dv = value_as_object(thisv);
+    i32 kind = value_as_int(value_as_native(callee).env0);
+    i32 sz = ta_elem_size(kind);
+    i32 off = to_int_arg(arg_at(args, argc, 0));
+    f64 num = js_to_number(arg_at(args, argc, 1));
+    bool le = kind <= 2 ? false : js_truthy(arg_at(args, argc, 2));
+    i32 len = ta_len(vm, dv);
+    if off < 0 || off + sz > len {
+        vm_throw_error(vm, ERR_RANGE, "Offset is outside the bounds of the DataView");
+        return value_undefined();
+    }
+    GcBytes* gb = value_as_bytes(*(dv.elems));
+    dv_write(gb_data(gb) + ta_off(vm, dv) + off, kind, num, le);
+    return value_undefined();
+}
+
+private void dv_get(VM* vm, str name, i32 kind) {
+    JsNative* n = js_new_native(&vm.heap, &nat_dv_get, name);
+    n.env0 = value_int(kind);
+    props_set_desc(&vm.dataview_proto.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
+}
+
+private void dv_set_m(VM* vm, str name, i32 kind) {
+    JsNative* n = js_new_native(&vm.heap, &nat_dv_set, name);
+    n.env0 = value_int(kind);
+    props_set_desc(&vm.dataview_proto.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
+}
+
+private void dataview_install(VM* vm) {
+    vm.dataview_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* ctor = def_global_fn(vm, "DataView", &nat_dataview_ctor);
+    props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&vm.dataview_proto.head), 0);
+    link_ctor(vm, vm.dataview_proto, ctor);
+    def_accessor(vm, vm.dataview_proto, "buffer", &nat_dv_get_buffer);
+    def_accessor(vm, vm.dataview_proto, "byteLength", &nat_dv_get_bytelength);
+    def_accessor(vm, vm.dataview_proto, "byteOffset", &nat_dv_get_byteoffset);
+    dv_get(vm, "getInt8", 0);    dv_set_m(vm, "setInt8", 0);
+    dv_get(vm, "getUint8", 1);   dv_set_m(vm, "setUint8", 1);
+    dv_get(vm, "getInt16", 3);   dv_set_m(vm, "setInt16", 3);
+    dv_get(vm, "getUint16", 4);  dv_set_m(vm, "setUint16", 4);
+    dv_get(vm, "getInt32", 5);   dv_set_m(vm, "setInt32", 5);
+    dv_get(vm, "getUint32", 6);  dv_set_m(vm, "setUint32", 6);
+    dv_get(vm, "getFloat32", 7); dv_set_m(vm, "setFloat32", 7);
+    dv_get(vm, "getFloat64", 8); dv_set_m(vm, "setFloat64", 8);
+}
+
+// Installs one concrete typed-array constructor (e.g. Uint8Array), whose
+// prototype chains to the shared %TypedArray% prototype.
+private void install_one_ta(VM* vm, i32 kind, str name) {
+    JsObject* proto = js_new_object(&vm.heap, vm.ta_proto);
+    vm.ta_protos[kind] = proto;
+    JsNative* ctor = js_new_native(&vm.heap, &nat_ta_ctor, name);
+    ctor.env0 = value_int(kind);
+    vm_set_global(vm, name, value_cell(&ctor.head));
+    props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&proto.head), 0);
+    link_ctor(vm, proto, ctor);
+    num_const(vm, ctor, "BYTES_PER_ELEMENT", cast(f64, ta_elem_size(kind)));
+    def_value(vm, proto, "BYTES_PER_ELEMENT", value_int(ta_elem_size(kind)));
+    JsNative* fromn = js_new_native(&vm.heap, &nat_ta_from, "from");
+    fromn.env0 = value_int(kind);
+    props_set_desc(&ctor.props, bi_atom(vm, "from"), value_cell(&fromn.head), METHOD_ATTRS);
+    JsNative* ofn = js_new_native(&vm.heap, &nat_ta_of, "of");
+    ofn.env0 = value_int(kind);
+    props_set_desc(&ctor.props, bi_atom(vm, "of"), value_cell(&ofn.head), METHOD_ATTRS);
+}
+
+private void typedarray_install(VM* vm) {
+    // ArrayBuffer
+    vm.arraybuffer_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* abctor = def_global_fn(vm, "ArrayBuffer", &nat_arraybuffer_ctor);
+    props_set_desc(&abctor.props, vm.atom_prototype, value_cell(&vm.arraybuffer_proto.head), 0);
+    link_ctor(vm, vm.arraybuffer_proto, abctor);
+    def_static(vm, abctor, "isView", &nat_ab_isview);
+    def_method(vm, vm.arraybuffer_proto, "slice", &nat_ab_slice);
+    def_accessor(vm, vm.arraybuffer_proto, "byteLength", &nat_ab_get_bytelength);
+
+    // %TypedArray%.prototype: the shared method set for every kind.
+    vm.ta_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_accessor(vm, vm.ta_proto, "length", &nat_ta_get_length);
+    def_accessor(vm, vm.ta_proto, "byteLength", &nat_ta_get_bytelength);
+    def_accessor(vm, vm.ta_proto, "byteOffset", &nat_ta_get_byteoffset);
+    def_accessor(vm, vm.ta_proto, "buffer", &nat_ta_get_buffer);
+    def_method(vm, vm.ta_proto, "set", &nat_ta_set_meth);
+    def_method(vm, vm.ta_proto, "subarray", &nat_ta_subarray);
+    def_method(vm, vm.ta_proto, "slice", &nat_ta_slice);
+    def_method(vm, vm.ta_proto, "fill", &nat_ta_fill);
+    def_method(vm, vm.ta_proto, "join", &nat_ta_join);
+    def_method(vm, vm.ta_proto, "indexOf", &nat_ta_indexof);
+    def_method(vm, vm.ta_proto, "lastIndexOf", &nat_ta_lastindexof);
+    def_method(vm, vm.ta_proto, "includes", &nat_ta_includes);
+    def_method(vm, vm.ta_proto, "forEach", &nat_ta_foreach);
+    def_method(vm, vm.ta_proto, "map", &nat_ta_map);
+    def_method(vm, vm.ta_proto, "filter", &nat_ta_filter);
+    def_method(vm, vm.ta_proto, "reduce", &nat_ta_reduce);
+    def_method(vm, vm.ta_proto, "reduceRight", &nat_ta_reduceright);
+    def_method(vm, vm.ta_proto, "find", &nat_ta_find);
+    def_method(vm, vm.ta_proto, "findIndex", &nat_ta_findindex);
+    def_method(vm, vm.ta_proto, "some", &nat_ta_some);
+    def_method(vm, vm.ta_proto, "every", &nat_ta_every);
+    def_method(vm, vm.ta_proto, "at", &nat_ta_at);
+    def_method(vm, vm.ta_proto, "reverse", &nat_ta_reverse);
+    def_method(vm, vm.ta_proto, "keys", &nat_ta_keys);
+    def_method(vm, vm.ta_proto, "values", &nat_ta_values);
+    def_method(vm, vm.ta_proto, "entries", &nat_ta_entries);
+    def_method(vm, vm.ta_proto, "toString", &nat_ta_tostring);
+    JsNative* si = js_new_native(&vm.heap, &nat_ta_values, "[Symbol.iterator]");
+    props_set_desc(&vm.ta_proto.props, vm_sym_iterator_id(vm), value_cell(&si.head), METHOD_ATTRS);
+
+    install_one_ta(vm, 0, "Int8Array");
+    install_one_ta(vm, 1, "Uint8Array");
+    install_one_ta(vm, 2, "Uint8ClampedArray");
+    install_one_ta(vm, 3, "Int16Array");
+    install_one_ta(vm, 4, "Uint16Array");
+    install_one_ta(vm, 5, "Int32Array");
+    install_one_ta(vm, 6, "Uint32Array");
+    install_one_ta(vm, 7, "Float32Array");
+    install_one_ta(vm, 8, "Float64Array");
+
+    dataview_install(vm);
 }
 
 private void buffer_install(VM* vm) {
@@ -10262,6 +11183,7 @@ void builtins_install(VM* vm) {
 
     // Buffer, text codecs, process: installed before the globalThis
     // snapshot so they are mirrored onto it.
+    typedarray_install(vm);
     buffer_install(vm);
     textcodec_install(vm);
     usp_install(vm);

@@ -24,6 +24,7 @@ const i32 GC_SYMBOL   = 7;
 const i32 GC_GENERATOR = 8;
 const i32 GC_MAP      = 9;
 const i32 GC_BIGINT   = 10;
+const i32 GC_BYTES    = 11;   // raw byte buffer (ArrayBuffer backing store)
 
 const i32 GEN_START = 0;
 const i32 GEN_SUSPENDED = 1;
@@ -32,6 +33,7 @@ const i32 GEN_DONE = 3;
 
 const i32 OBJF_ARRAY = 1;
 const i32 OBJF_NONEXT = 2;   // not extensible (Object.preventExtensions)
+const i32 OBJF_TYPEDARRAY = 4;   // a TypedArray view (element access reads bytes)
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.
@@ -189,6 +191,26 @@ struct JsObject {
     i32 elen;
     i32 ecap;
 }
+
+// A raw byte buffer (the backing store of an ArrayBuffer). Bytes live
+// inline after the header; no references, so the tracer skips it.
+struct GcBytes {
+    GcCell head;
+    i32 len;
+}
+
+u8* gb_data(GcBytes* g) { return cast(u8*, g) + sizeof(GcBytes); }
+
+GcBytes* js_new_bytes(GcHeap* h, i32 len) {
+    i32 n = len > 0 ? len : 0;
+    GcBytes* g = cast(GcBytes*, gc_alloc(h, GC_BYTES, sizeof(GcBytes) + cast(i64, n)));
+    g.len = n;
+    memset(gb_data(g), 0, cast(i64, n));
+    return g;
+}
+
+bool value_is_bytes(Value v) { return value_is_kind(v, GC_BYTES); }
+GcBytes* value_as_bytes(Value v) { return cast(GcBytes*, value_as_cell(v)); }
 
 struct JsFunction {
     GcCell head;
@@ -361,6 +383,7 @@ void js_trace(GcHeap* h, GcCell* c) {
         return;
     }
     if c.kind == GC_BIGINT { return; }   // inline limbs, no references
+    if c.kind == GC_BYTES { return; }    // inline bytes, no references
     eprint("gc: unknown runtime cell kind {}\n", c.kind);
     exit(70);
 }
