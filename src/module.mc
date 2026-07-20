@@ -51,24 +51,35 @@ when os(windows) {
         return (a & 0x10) != 0;   // FILE_ATTRIBUTE_DIRECTORY
     }
 }
-when os(linux) {
-    extern "libc.so.6" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
-}
-when os(android) {
-    extern "libc.so" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
-}
-when os(macos) || os(ios) {
+else when os(macos) || os(ios) {
     extern "libSystem.B.dylib" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
-}
-when os(macos) || os(ios) {
     extern "libSystem.B.dylib" void* opendir(u8* path);
     extern "libSystem.B.dylib" i32 closedir(void* dp);
 }
-when os(linux) || os(android) {
+else when os(linux) {
+    extern "libc.so.6" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
     extern "libc.so.6" void* opendir(u8* path);
     extern "libc.so.6" i32 closedir(void* dp);
 }
-when !os(windows) {
+else when os(android) {
+    extern "libc.so" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
+    extern "libc.so" void* opendir(u8* path);
+    extern "libc.so" i32 closedir(void* dp);
+}
+else when os(wasm) {
+    // Sandbox: no directories and nothing to canonicalize against. A
+    // false canon_into leaves canon_path on its lexical fallback, and
+    // no-directory means a specifier resolves as a plain file.
+    private bool canon_into(u8* cpath, u8* buf, i32 cap) { return false; }
+    private bool path_is_dir(str p) { return false; }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_module;
+}
+
+when os(macos) || os(ios) || os(linux) || os(android) {
     // opendir succeeds only for directories — a layout-free type check.
     private bool path_is_dir(str p) {
         u8* c = str_to_cstr(p);
@@ -180,11 +191,28 @@ private str path_join(str dir, str spec) {
     return r;
 }
 
-private bool file_there(str path) {
-    u8* c = str_to_cstr(path);
-    bool ok = file_exists(c);
-    free(c);
-    return ok;
+when os(wasm) {
+    // The file_exists builtin lowers to the Win32 implementation on the
+    // wasm target (minc doc/BUG_wasm_file_exists_emits_kernel32_imports.md),
+    // which no host can satisfy. Probing with the open/close imports
+    // keeps the module's import set to the host surface. Drop this arm
+    // once the builtin lowers correctly.
+    private bool file_there(str path) {
+        u8* c = str_to_cstr(path);
+        i64 fd = open(c, 0);
+        free(c);
+        if fd == cast(i64, 0) - 1 { return false; }
+        close(fd);
+        return true;
+    }
+}
+else {
+    private bool file_there(str path) {
+        u8* c = str_to_cstr(path);
+        bool ok = file_exists(c);
+        free(c);
+        return ok;
+    }
 }
 
 // joined + suffix if that file exists (heap str), else {null, 0}.

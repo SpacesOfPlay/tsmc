@@ -33,7 +33,7 @@ when os(windows) {
     extern "ucrtbase.dll" f64 log1p(f64 x);
     extern "ucrtbase.dll" f64 expm1(f64 x);
 }
-when os(linux) {
+else when os(linux) {
     extern "libm.so.6" f64 sinh(f64 x);
     extern "libm.so.6" f64 cosh(f64 x);
     extern "libm.so.6" f64 tanh(f64 x);
@@ -43,7 +43,7 @@ when os(linux) {
     extern "libm.so.6" f64 log1p(f64 x);
     extern "libm.so.6" f64 expm1(f64 x);
 }
-when os(android) {
+else when os(android) {
     extern "libm.so" f64 sinh(f64 x);
     extern "libm.so" f64 cosh(f64 x);
     extern "libm.so" f64 tanh(f64 x);
@@ -53,7 +53,7 @@ when os(android) {
     extern "libm.so" f64 log1p(f64 x);
     extern "libm.so" f64 expm1(f64 x);
 }
-when os(macos) || os(ios) {
+else when os(macos) || os(ios) {
     extern "libSystem.B.dylib" f64 sinh(f64 x);
     extern "libSystem.B.dylib" f64 cosh(f64 x);
     extern "libSystem.B.dylib" f64 tanh(f64 x);
@@ -62,6 +62,24 @@ when os(macos) || os(ios) {
     extern "libSystem.B.dylib" f64 atanh(f64 x);
     extern "libSystem.B.dylib" f64 log1p(f64 x);
     extern "libSystem.B.dylib" f64 expm1(f64 x);
+}
+else when os(wasm) {
+    // No libm to link against: the standard identities over the exp /
+    // log / sqrt builtins. log1p/expm1 lose the small-x accuracy the
+    // libm versions have, which Math.log1p/expm1 inherit here.
+    private f64 sinh(f64 x) { return (exp(x) - exp(0.0 - x)) / 2.0; }
+    private f64 cosh(f64 x) { return (exp(x) + exp(0.0 - x)) / 2.0; }
+    private f64 tanh(f64 x) { return sinh(x) / cosh(x); }
+    private f64 asinh(f64 x) { return log(x + sqrt(x * x + 1.0)); }
+    private f64 acosh(f64 x) { return log(x + sqrt(x * x - 1.0)); }
+    private f64 atanh(f64 x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
+    private f64 log1p(f64 x) { return log(1.0 + x); }
+    private f64 expm1(f64 x) { return exp(x) - 1.0; }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's libm.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_math;
 }
 
 private VM* as_vm(void* p) {
@@ -5903,7 +5921,17 @@ when os(windows) {
         ignore FreeEnvironmentStringsA(block);
     }
 }
-else {
+else when os(wasm) {
+    // Sandbox: no process identity, no cwd, no environment. The
+    // monotonic counter is the host clock import (qpf is 1e9 there).
+    private str os_platform_name() { return "wasm"; }
+    private bool os_isatty(i32 fd) { return false; }
+    private i32 os_pid() { return 0; }
+    private Value os_cwd_str(VM* vm) { return new_str(vm, "/"); }
+    private u64 os_mono_ns() { return cast(u64, qpc()); }
+    private void os_env_install(VM* vm, JsObject* env) { }
+}
+else when os(macos) || os(ios) || os(linux) || os(android) {
     when os(macos) || os(ios) {
         private str os_platform_name() { return "darwin"; }
         private extern "libSystem.B.dylib" i32 getpid();
@@ -5913,6 +5941,16 @@ else {
         private extern "libSystem.B.dylib" i32 isatty(i32 fd);
         private u8** os_environ() { return *_NSGetEnviron(); }
         private i32 os_mono_clock() { return 6; }  // CLOCK_MONOTONIC (darwin)
+    }
+    else when os(android) {
+        private str os_platform_name() { return "android"; }
+        private extern "libc.so" i32 getpid();
+        private extern "libc.so" u8* getcwd(u8* buf, u64 size);
+        private extern "libc.so" i32 clock_gettime(i32 clk, ProcTimespec* ts);
+        private extern "libc.so" u8** environ;
+        private extern "libc.so" i32 isatty(i32 fd);
+        private u8** os_environ() { return environ; }
+        private i32 os_mono_clock() { return 1; }  // CLOCK_MONOTONIC (linux)
     }
     else {
         private str os_platform_name() { return "linux"; }
@@ -5952,8 +5990,14 @@ else {
         }
     }
 }
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_proc;
+}
 
 when arch(arm64) { private str os_arch_name() { return "arm64"; } }
+else when arch(wasm32) { private str os_arch_name() { return "wasm32"; } }
 else { private str os_arch_name() { return "x64"; } }
 
 // Writes a string verbatim (no trailing newline) to stdout or stderr,
@@ -7736,11 +7780,16 @@ when os(windows) {
     private u8 path_sep_ch() { return cast(u8, 92); }   // backslash
     private str path_delim_str() { return ";"; }
 }
-else {
+else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
     private bool path_is_sep(u8 c) { return c == '/'; }
     private str path_sep_str() { return "/"; }
     private u8 path_sep_ch() { return cast(u8, '/'); }
     private str path_delim_str() { return ":"; }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than assuming another platform's path conventions.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_path;
 }
 
 // Coerces arg[i] to a string and keeps it rooted for the caller (which
@@ -8103,7 +8152,19 @@ when os(windows) {
         ignore FindClose(h);
     }
 }
-else {
+else when os(wasm) {
+    // Sandbox: the host import surface is read-only (open/read/close),
+    // so mutations fail and directories are always empty. Callers
+    // surface these as the usual fs errors.
+    private bool fs_mkdir1(u8* p) { return false; }
+    private bool fs_rmdir1(u8* p) { return false; }
+    private bool fs_unlink1(u8* p) { return false; }
+    private bool fs_rename1(u8* a, u8* b) { return false; }
+    private bool fs_is_dir(u8* p) { return false; }
+    private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
+    private void fs_readdir_into(VM* vm, str dir, JsObject* arr) { }
+}
+else when os(macos) || os(ios) || os(linux) || os(android) {
     when os(macos) || os(ios) {
         private extern "libSystem.B.dylib" i32 mkdir(u8* path, u32 mode);
         private extern "libSystem.B.dylib" i32 unlink(u8* path);
@@ -8114,6 +8175,17 @@ else {
         private extern "libSystem.B.dylib" i32 closedir(void* dp);
         // struct dirent (Darwin 64-bit inode): d_name at offset 21.
         private u8* dirent_name(u8* de) { return de + 21; }
+    }
+    else when os(android) {
+        private extern "libc.so" i32 mkdir(u8* path, u32 mode);
+        private extern "libc.so" i32 unlink(u8* path);
+        private extern "libc.so" i32 rmdir(u8* path);
+        private extern "libc.so" i32 rename(u8* old, u8* nw);
+        private extern "libc.so" void* opendir(u8* path);
+        private extern "libc.so" u8* readdir(void* dp);
+        private extern "libc.so" i32 closedir(void* dp);
+        // struct dirent (Android/Linux): d_name at offset 19.
+        private u8* dirent_name(u8* de) { return de + 19; }
     }
     else {
         private extern "libc.so.6" i32 mkdir(u8* path, u32 mode);
@@ -8155,6 +8227,11 @@ else {
         }
         ignore closedir(dp);
     }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_fs;
 }
 
 private void fs_throw(VM* vm, str op, str path) {
@@ -8258,10 +8335,25 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     return value_undefined();
 }
 
+// See fs_exists1's wasm arm: the file_exists builtin is unusable there.
+when os(wasm) {
+    private bool fs_exists1(str path) {
+        u8* c = str_to_cstr(path);
+        i64 fd = open(c, 0);
+        free(c);
+        if fd == cast(i64, 0) - 1 { return false; }
+        close(fd);
+        return true;
+    }
+}
+else {
+    private bool fs_exists1(str path) { return file_exists(path); }
+}
+
 private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    bool ok = file_exists(path);
+    bool ok = fs_exists1(path);
     vm_pop(vm);
     return value_bool(ok);
 }
@@ -8597,7 +8689,21 @@ when os(windows) {
     private i32 os_uid() { return 0 - 1; }
     private i32 os_gid() { return 0 - 1; }
 }
-else {
+else when os(wasm) {
+    // Sandbox: no environment, no host identity. os.* reports the
+    // neutral values the accessors already use for "unknown".
+    private str os_type_str() { return "Wasm"; }
+    private str os_eol_str() { return "\n"; }
+    private i32 os_ncpu() { return 1; }
+    private bool os_hostname_into(u8* buf, i32 cap) { return false; }
+    private u8* os_home() { return null; }
+    private u8* os_tmp() { return null; }
+    private u8* os_user() { return null; }
+    private u8* os_shell() { return null; }
+    private i32 os_uid() { return 0 - 1; }
+    private i32 os_gid() { return 0 - 1; }
+}
+else when os(macos) || os(ios) || os(linux) || os(android) {
     when os(macos) || os(ios) {
         private extern "libSystem.B.dylib" u8* getenv(u8* name);
         private extern "libSystem.B.dylib" i32 gethostname(u8* buf, u64 len);
@@ -8606,6 +8712,15 @@ else {
         private extern "libSystem.B.dylib" i32 getgid();
         private str os_type_str() { return "Darwin"; }
         private i32 os_ncpu_name() { return 58; }   // _SC_NPROCESSORS_ONLN (Darwin)
+    }
+    else when os(android) {
+        private extern "libc.so" u8* getenv(u8* name);
+        private extern "libc.so" i32 gethostname(u8* buf, u64 len);
+        private extern "libc.so" i64 sysconf(i32 name);
+        private extern "libc.so" i32 getuid();
+        private extern "libc.so" i32 getgid();
+        private str os_type_str() { return "Linux"; }
+        private i32 os_ncpu_name() { return 84; }   // _SC_NPROCESSORS_ONLN (Linux)
     }
     else {
         private extern "libc.so.6" u8* getenv(u8* name);
@@ -8625,6 +8740,11 @@ else {
     private u8* os_shell() { return getenv("SHELL"); }
     private i32 os_uid() { return getuid(); }
     private i32 os_gid() { return getgid(); }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_os;
 }
 
 private Value os_cstr_or_empty(VM* vm, u8* c) {
@@ -9543,23 +9663,44 @@ when os(windows) {
     private extern "advapi32.dll" u8 SystemFunction036(void* buf, u32 len);
     private bool os_random(u8* buf, i32 n) { return SystemFunction036(cast(void*, buf), cast(u32, n)) != 0; }
 }
-else {
-    when os(macos) || os(ios) {
-        private extern "libSystem.B.dylib" void arc4random_buf(void* buf, u64 n);
-        private bool os_random(u8* buf, i32 n) { arc4random_buf(cast(void*, buf), cast(u64, n)); return true; }
-    }
-    else {
-        private extern "libc.so.6" i64 getrandom(void* buf, u64 len, u32 flags);
-        private bool os_random(u8* buf, i32 n) {
-            i32 got = 0;
-            while got < n {
-                i64 r = getrandom(cast(void*, buf + got), cast(u64, n - got), 0);
-                if r <= 0 { return got > 0; }
-                got += cast(i32, r);
-            }
-            return true;
+else when os(macos) || os(ios) {
+    private extern "libSystem.B.dylib" void arc4random_buf(void* buf, u64 n);
+    private bool os_random(u8* buf, i32 n) { arc4random_buf(cast(void*, buf), cast(u64, n)); return true; }
+}
+else when os(linux) {
+    private extern "libc.so.6" i64 getrandom(void* buf, u64 len, u32 flags);
+    private bool os_random(u8* buf, i32 n) {
+        i32 got = 0;
+        while got < n {
+            i64 r = getrandom(cast(void*, buf + got), cast(u64, n - got), 0);
+            if r <= 0 { return got > 0; }
+            got += cast(i32, r);
         }
+        return true;
     }
+}
+else when os(android) {
+    private extern "libc.so" i64 getrandom(void* buf, u64 len, u32 flags);
+    private bool os_random(u8* buf, i32 n) {
+        i32 got = 0;
+        while got < n {
+            i64 r = getrandom(cast(void*, buf + got), cast(u64, n - got), 0);
+            if r <= 0 { return got > 0; }
+            got += cast(i32, r);
+        }
+        return true;
+    }
+}
+else when os(wasm) {
+    // No entropy import in the host surface. Reporting unavailable makes
+    // crypto.randomBytes/randomUUID throw, which is the right outcome —
+    // a non-CSPRNG substitute here would be worse than an error.
+    private bool os_random(u8* buf, i32 n) { return false; }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_random;
 }
 
 private bool crypto_is_sha256(str a) {

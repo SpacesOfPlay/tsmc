@@ -3735,10 +3735,21 @@ when os(windows) {
         return cast(f64, ticks) / 10000.0 - 11644473600000.0;
     }
 }
-else {
+else when os(wasm) {
+    // The host clock import is the only time source, so it also defines
+    // the epoch: a host returning nanoseconds since 1970 makes Date
+    // absolute, any other origin makes it relative to that origin.
+    f64 vm_now_millis(VM* vm) {
+        return cast(f64, qpc()) / 1000000.0;
+    }
+}
+else when os(macos) || os(ios) || os(linux) || os(android) {
     private struct vm_timeval { i64 tv_sec; i64 tv_usec; }
     when os(macos) || os(ios) {
         private extern "libSystem.B.dylib" i32 gettimeofday(vm_timeval* tv, void* tz);
+    }
+    else when os(android) {
+        private extern "libc.so" i32 gettimeofday(vm_timeval* tv, void* tz);
     }
     else {
         private extern "libc.so.6" i32 gettimeofday(vm_timeval* tv, void* tz);
@@ -3750,6 +3761,11 @@ else {
         ignore gettimeofday(&tv, null);
         return cast(f64, tv.tv_sec) * 1000.0 + cast(f64, tv.tv_usec) / 1000.0;
     }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than letting it fall back to another platform's syscalls.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_clock;
 }
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.
