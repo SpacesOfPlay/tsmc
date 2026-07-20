@@ -41,3 +41,31 @@ recv/send/close and readiness reporting before any reactor or JS wiring.
 - `http`/`fetch` (M33).
 - IPv6, UDP, `unix:` sockets, Linux/macOS ports.
 - Threadpooled DNS (blocking resolve is the first cut).
+
+## Shipped
+
+All four increments landed:
+
+1. **`src/net_os.mc`** — Windows non-blocking Winsock + `WSAPoll` + DNS
+   (`test/unit/test_net_os.mc`).
+2. **Reactor poll** — `vm_run_event_loop` `WSAPoll`s live handles bounded
+   by the next timer, dispatching ready fds through a `ReactorHook`
+   (`test/unit/test_reactor_net.mc`).
+3. **`net` module** — `src/node_net.mc` (JS-source): `net.Socket` /
+   `net.Server` on `EventEmitter`, `connect`/`createConnection`,
+   `createServer`, `server.listen`, `'connect'`/`'data'`/`'end'`/
+   `'error'`/`'close'`/`'drain'`/`'connection'`/`'listening'`,
+   `socket.write`/`end` with a JS write-queue + backpressure, `.ref`/
+   `.unref`, `server.address()`/`close`. Native primitives (`__net_*` in
+   builtins.mc) do the I/O; the reactor hook calls `owner.__onReady`.
+4. **DNS** via `net_os_resolve4` (blocking at connect).
+
+Verified byte-identical to Node in `test/diff/net.js` (loopback echo) and
+clean under `--gc-stress`; a 200 KB round-trip exercises multi-recv and
+send backpressure. Full suite green (53 tests, 67 gc-stress scripts).
+
+Deviation: the native `__net_*` primitives are installed as
+non-enumerable globals the JS module calls, rather than a native module
+namespace — simplest bridge, and they don't appear on `globalThis` keys.
+`net` is registered as a JS-source core module (`builtin_name` +
+`builtin_js_source`), like `stream`/`assert`.

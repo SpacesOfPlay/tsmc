@@ -3505,6 +3505,10 @@ Value vm_handle_owner(VM* vm, i32 idx) {
     return value_undefined();
 }
 
+void vm_handle_set_owner(VM* vm, i32 idx, Value owner) {
+    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).owner = owner; }
+}
+
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
 
 // --- timers and the event loop -----------------------------------------------------
