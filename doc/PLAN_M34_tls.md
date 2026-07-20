@@ -12,7 +12,20 @@ non-blocking socket reactor. Unblocked as of the minc generic-param fix
    Ed25519 cert) with a live VM heap alongside, so any allocator/ABI
    clash between picotls's shims and the GC would surface. Green; picotls
    is safe to compile into tsmc.
-2. **Native TLS session + non-blocking pump.** A `src/tls_native.mc` that:
+2. **Native TLS session + non-blocking pump (done).** `src/tls_native.mc`:
+   client `ptls_context_t` built once (X25519, AES-128-GCM-SHA256), a
+   `TlsSession` wrapping a socket fd with in/out buffers, and `tls_pump` /
+   `tls_write` / `tls_read` driving `ptls_handshake`/`receive`/`send`
+   non-blocking. Validated by `test/tls/https_get.mc` (manual, network):
+   a real non-blocking HTTPS GET to example.com — X25519 + AES-128-GCM +
+   ECDSA-P256 cert verify (SPKI pin) → `HTTP/1.1 200 OK`, 829 bytes.
+   Key correctness points learned: completion is `ptls_handshake_is_complete`
+   (NOT the `ptls_handshake` return code, which is 0 after just
+   ServerHello); a non-0/514 `ptls_receive` code is a clean close_notify,
+   not an error (keep the decrypted plaintext). `tls_set_ecdsa_pin` is a
+   stopgap trust hook until §4.1 general trust.
+
+Original increment-2 scope, for reference — A `src/tls_native.mc` that:
    - builds the client `ptls_context_t` (X25519, the three standard
      ciphersuites, `random_bytes`/`get_time`) once,
    - wraps a socket handle with a `ptls_t*` + in/out `ptls_buffer_t` and a
