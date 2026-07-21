@@ -45,6 +45,17 @@ verbatim — refresh by re-copying the list above.
   certificate-chain signature verifier (`src/tls_verify.mc`) for
   RSASSA-PKCS1-v1_5. The padding/DigestInfo check is done in the caller.
 
+## Trusted root bundle (`ca_roots_data.mc`)
+
+`ca_roots_data.mc` is **generated**, not part of picotls: it is the Mozilla
+CA root set extracted via curl's `cacert.pem`
+(<https://curl.se/docs/caextract.html>), emitted as one DER blob plus an
+offset/length index by `tools/gen_ca_roots.sh`. Refresh periodically by
+re-running that tool. The extraction convention and format are curl's (the
+bundle is distributed under MPL-2.0); the certificates themselves belong to
+their issuing CAs. The lookup logic lives in the hand-written
+`src/ca_roots.mc`.
+
 ## Licensing
 
 picotls © Kazuho Oku et al. (MIT). cifra © Joseph Birr-Pixton

@@ -164,8 +164,20 @@ callback returns nonzero).
    rejected, for both RSA and ECDSA). The DER-cursor primitives in
    `tls_x509.mc` were made public for reuse; `mc_rsa_pub_modexp` is a
    documented LOCAL ADDITION to the vendored RSA bridge.
-3. **I3 — root store (D).** The generator tool + `ca_roots.mc` + a lookup
-   test (find a known root by subject DN).
+3. **I3 — root store (D). (done)** `tools/gen_ca_roots.sh` turns curl's
+   Mozilla `cacert.pem` into the generated `src/tls/ca_roots_data.mc` — 119
+   roots as one 127 KB DER blob plus parallel offset/length index arrays. The
+   hand-written `src/ca_roots.mc` exposes `ca_root_count` / `ca_root_get` /
+   `ca_root_find_by_subject` (iterate same-subject anchors; caller verifies the
+   signature). `test/unit/test_ca_roots.mc`: all 119 roots parse, lookup by
+   subject DN (positive, self round-trip for every root, negative), and — as a
+   scaled real-cert crypto check — all 76 RSA roots and the ECDSA-P256 roots
+   self-verify with the I2 code.
+   **Limitation surfaced here:** ~36 roots use P-384/P-521 keys, which the
+   vendored uECC (P-256 only) cannot verify; those chains fail closed. The
+   store still holds them for DN lookup. Broader curve support is a follow-up.
+   (The lookup lives in `src/ca_roots.mc`, not `src/tls/`, so its import of
+   `tls_x509.mc` deduplicates with the rest of the tree.)
 4. **I4 — path validation (E).** `tls_chain_verify` tying I1–I3 together;
    unit-tested against a full embedded real chain (positive) and negative
    chains (wrong host, expired via a pinned `now`, missing intermediate,
