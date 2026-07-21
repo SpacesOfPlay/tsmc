@@ -796,9 +796,46 @@ private Value nat_property_is_enumerable(void* vmp, Value callee, Value thisv, V
     return value_bool((pe.flags & PROP_ENUMERABLE) != 0);
 }
 
+// True if `target` is on o's prototype chain (or is o's own proto).
+private bool proto_chain_has(JsObject* o, JsObject* target) {
+    if target == null { return false; }
+    JsObject* c = o.proto;
+    while c != null {
+        if c == target { return true; }
+        c = c.proto;
+    }
+    return false;
+}
+
+// Object.prototype.toString -> "[object <tag>]" with the correct builtin tag
+// (Array/String/Number/.../Date/RegExp/Error), as many type-detection idioms
+// depend on (e.g. `Object.prototype.toString.call(x) === '[object Array]'`).
 private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    return new_str(vm, "[object Object]");
+    str tag = "Object";
+    if value_is_undefined(thisv) { tag = "Undefined"; }
+    else if value_is_null(thisv) { tag = "Null"; }
+    else if value_is_array(thisv) { tag = "Array"; }
+    else if value_is_string(thisv) { tag = "String"; }
+    else if value_is_number(thisv) { tag = "Number"; }
+    else if value_is_bool(thisv) { tag = "Boolean"; }
+    else if value_is_bigint(thisv) { tag = "BigInt"; }
+    else if value_is_symbol(thisv) { tag = "Symbol"; }
+    else if value_is_function(thisv) || value_is_native(thisv) { tag = "Function"; }
+    else if value_is_object(thisv) {
+        JsObject* o = value_as_object(thisv);
+        if proto_chain_has(o, vm.regexp_proto) { tag = "RegExp"; }
+        else if proto_chain_has(o, vm.date_proto) { tag = "Date"; }
+        else if proto_chain_has(o, vm.error_protos[ERR_ERROR]) { tag = "Error"; }
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "[object ");
+    str_buf_add(&sb, tag);
+    str_buf_add(&sb, "]");
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return r;
 }
 
 // --- Array ------------------------------------------------------------------
@@ -3890,11 +3927,19 @@ private Value nat_fn_apply(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     Value this_arg = arg_at(args, argc, 0);
     Value arr = arg_at(args, argc, 1);
-    if value_is_array(arr) {
-        JsObject* a = value_as_object(arr);
-        return vm_call_value(vm, thisv, this_arg, a.elems, a.elen);
+    // apply(thisArg) with no list -> call with zero args
+    if value_is_undefined(arr) || value_is_null(arr) {
+        return vm_call_value(vm, thisv, this_arg, args, 0);
     }
-    return vm_call_value(vm, thisv, this_arg, args, 0);
+    // any array-like list works (a real array, the arguments object, ...);
+    // this_arraylike returns a real array directly or materializes one
+    JsObject* a = this_arraylike(vm, arr);
+    if a == null { return value_undefined(); }   // not array-like: it threw
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    Value r = vm_call_value(vm, thisv, this_arg, a.elems, a.elen);
+    gc_root_reset(&vm.heap, rm);
+    return r;
 }
 
 // Entry for bound wrappers: state rides in the callee's env slots.
@@ -11665,10 +11710,11 @@ private Value nat_reflect_defineproperty(void* vmp, Value callee, Value thisv, V
 
 // Elements of an array-like args list into a heap buffer (caller frees).
 private i32 reflect_spread_args(VM* vm, Value listv, Value** out) {
-    i32 n = 0;
-    if value_is_array(listv) { n = value_as_object(listv).elen; }
+    JsObject* a = null;
+    if value_is_object(listv) { a = this_arraylike(vm, listv); }
+    i32 n = a != null ? a.elen : 0;
     Value* av = alloc<Value>(n > 0 ? n : 1);
-    for i32 i = 0; i < n; i++ { *(av + i) = js_array_get(value_as_object(listv), i); }
+    for i32 i = 0; i < n; i++ { *(av + i) = js_array_get(a, i); }
     *out = av;
     return n;
 }

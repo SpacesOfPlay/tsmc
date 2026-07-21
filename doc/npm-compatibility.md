@@ -32,6 +32,7 @@ Confirmed running with output identical to Node.
 | `immer@10.1.1` | immutable updates via Proxy (object drafts) |
 | `bignumber.js@9.1.2` | arbitrary-precision decimals |
 | `decimal.js@10.4.3` | arbitrary-precision decimals |
+| `chalk@4.1.2` | terminal string styling |
 
 ### IDs
 | package | notes |
@@ -95,7 +96,8 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 | `ansi-colors` | **`Proxy` / `Reflect`** invariant/edge behavior (core traps work; `immer` runs). |
 | `markdown-it` | A `linkify-it` schema-setup issue (it now clears the earlier array-like-receiver blocker, but has a further gap). |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
-| `chalk`, `marked`, `ramda` | A missing built-in method (surfaces as `not a function`); not yet pinned to a single cause. |
+| `marked` | Uses **private methods** (`this.#m()`) in class-field initializers. |
+| `ramda` | Mostly runs (sum/add/map work after the apply + toString fixes); `pipe`/`compose` still differ in ramda's arity machinery. |
 | `pino-std-serializers` | `Cannot convert a Symbol value to a string` in a hot path. |
 
 ## Will it work? Rules of thumb
