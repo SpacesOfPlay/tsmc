@@ -173,11 +173,24 @@ callback returns nonzero).
    subject DN (positive, self round-trip for every root, negative), and — as a
    scaled real-cert crypto check — all 76 RSA roots and the ECDSA-P256 roots
    self-verify with the I2 code.
-   **Limitation surfaced here:** ~36 roots use P-384/P-521 keys, which the
-   vendored uECC (P-256 only) cannot verify; those chains fail closed. The
-   store still holds them for DN lookup. Broader curve support is a follow-up.
    (The lookup lives in `src/ca_roots.mc`, not `src/tls/`, so its import of
    `tls_x509.mc` deduplicates with the rest of the tree.)
+
+   **P-384 addendum (done).** The initial sweep surfaced ~36 roots with
+   P-384/P-521 keys that the vendored uECC (P-256 only, fixed 4-word buffers)
+   cannot verify. `src/tls_p384.mc` closes the gap for P-384: a self-contained
+   ECDSA-P384 verifier — 6x64-bit limbs, generic Montgomery multiplication
+   (field prime and group order), Fermat inversion, Jacobian point math with
+   a = -3, Shamir double-and-add — verification-only, so clarity over
+   constant-time. `tls_verify.mc` now identifies the issuer curve by the
+   namedCurve OID (P-256 / P-384, OID and point length must agree), decodes
+   variable-width DER signatures, truncates digests per X9.62 (leftmost curve
+   bits), recognizes ecdsa-with-SHA512, and enforces RSA >= 2048. Validated
+   against all 35 real P-384 Mozilla roots plus a controlled openssl set
+   (`tools/gen_test_certs_p384.sh`: P-384 root; P-384/P-256 children signed
+   with SHA-384/SHA-512; a P-256 CA signing with SHA-384) with cross-curve
+   negatives and tamper tests. Store coverage is now every root except the
+   single P-521 key (fails closed).
 4. **I4 — path validation (E).** `tls_chain_verify` tying I1–I3 together;
    unit-tested against a full embedded real chain (positive) and negative
    chains (wrong host, expired via a pinned `now`, missing intermediate,

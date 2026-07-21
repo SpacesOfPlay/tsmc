@@ -15,6 +15,7 @@ const u16 X509_SIG_RSA_SHA1 = 4;      // 1.2.840.113549.1.1.5  (weak)
 const u16 X509_SIG_ECDSA_SHA256 = 5;  // 1.2.840.10045.4.3.2
 const u16 X509_SIG_ECDSA_SHA384 = 6;  // 1.2.840.10045.4.3.3
 const u16 X509_SIG_ECDSA_SHA1 = 7;    // 1.2.840.10045.4.1    (weak)
+const u16 X509_SIG_ECDSA_SHA512 = 8;  // 1.2.840.10045.4.3.4
 
 // keyUsage bits (BIT STRING, bit 0 = most significant of the first byte).
 const u16 X509_KU_DIGITAL_SIGNATURE = 0x8000;   // bit 0
@@ -150,6 +151,7 @@ u16 x509_oid_to_sig(u8* buf, u64 off, u64 len) {
             u8 last = buf[off+7];
             if last == cast(u8, 0x02) { return X509_SIG_ECDSA_SHA256; }
             if last == cast(u8, 0x03) { return X509_SIG_ECDSA_SHA384; }
+            if last == cast(u8, 0x04) { return X509_SIG_ECDSA_SHA512; }
         }
     } else if len == cast(u64, 7) {
         // ecdsa-with-SHA1: 2a 86 48 ce 3d 04 01

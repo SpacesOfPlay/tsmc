@@ -3,11 +3,10 @@
 // only the first step: the caller must still verify that the anchor's key
 // signed the chain (never trust on DN alone).
 //
-// The store holds every Mozilla root (for DN lookup), but signature
-// verification supports only RSA and ECDSA-P256 (the vendored uECC is P-256
-// only). A chain anchored at, or passing through, a P-384/P-521 key therefore
-// fails closed rather than being trusted. Broader curve support is a
-// follow-up; most public CAs chain via RSA or P-256.
+// The store holds every Mozilla root (for DN lookup). Signature verification
+// supports RSA and ECDSA over P-256 and P-384, which covers every root in
+// the current bundle except one P-521 key; a chain anchored at or passing
+// through a P-521 key fails closed rather than being trusted.
 
 import "tls_x509.mc";
 import "tls/ca_roots_data.mc";

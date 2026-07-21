@@ -1,11 +1,10 @@
 // test_ca_roots.mc — trusted root store: the generated Mozilla bundle parses,
-// looks up by subject DN, and (as a real-world crypto check) every RSA root
-// and every ECDSA-P256 root self-verifies with the I2 signature code.
-// Exit 0 = pass. Compiles the vendored picotls crypto (heavy build).
-//
-// P-384/P-521 roots are present for DN lookup but their signatures are not
-// verifiable (uECC here is P-256 only); such chains fail closed. See
-// src/ca_roots.mc.
+// looks up by subject DN, and (as a real-world crypto check) every root with
+// a supported algorithm self-verifies: RSA and ECDSA over P-256 and P-384.
+// The only expected failure is the single P-521-keyed root (unsupported
+// curve, fails closed); RSA-SHA1 roots are skipped (SHA-1 refused; a trust
+// anchor's own self-signature is never required anyway). Exit 0 = pass.
+// Compiles the vendored picotls crypto (heavy build).
 
 import "../helpers/check.mc";
 import "../../src/tls_x509.mc";
@@ -15,12 +14,12 @@ import "../../src/ca_roots.mc";
 i32 main() {
     check_eq(ca_root_count(), 119, "root count (pins the current bundle)");
 
-    // Every real Mozilla root parses; every RSA and ECDSA-P256 root
-    // self-verifies (validates the I1 parser and I2 crypto at scale).
+    // Every real Mozilla root parses; every supported-algorithm root
+    // self-verifies (validates the parser and all signature paths at scale).
     i32 parsed = 0;
-    i32 rsa_self = 0;
-    i32 rsa_fail = 0;
-    i32 ec256_self = 0;
+    i32 sha1 = 0;
+    i32 self_ok = 0;
+    i32 self_fail = 0;
     for i32 i = 0; i < ca_root_count(); i++ {
         u8* der;
         u64 dl;
@@ -29,16 +28,13 @@ i32 main() {
         if !x509_parse(der, dl, &r) { continue; }
         parsed++;
         u16 a = r.sig_alg_id;
-        if a == X509_SIG_RSA_SHA256 || a == X509_SIG_RSA_SHA384 || a == X509_SIG_RSA_SHA512 {
-            if x509_verify_signature(&r, &r) { rsa_self++; } else { rsa_fail++; }
-        } else if a == X509_SIG_ECDSA_SHA256 {
-            if x509_verify_signature(&r, &r) { ec256_self++; }   // true only for P-256 keys
-        }
+        if a == X509_SIG_RSA_SHA1 { sha1++; continue; }
+        if x509_verify_signature(&r, &r) { self_ok++; } else { self_fail++; }
     }
     check_eq(parsed, ca_root_count(), "every root parses");
-    check_eq(rsa_fail, 0, "no RSA root fails self-verification");
-    check(rsa_self >= 50, "the RSA roots self-verify at scale");
-    check(ec256_self >= 1, "a real ECDSA-P256 root self-verifies");
+    check_eq(sha1, 4, "SHA-1 self-signed roots (skipped)");
+    check_eq(self_ok, 114, "all RSA + P-256 + P-384 roots self-verify");
+    check_eq(self_fail, 1, "only the P-521 root fails closed");
 
     // Lookup: a root is found by its own subject DN, and the hit matches.
     u8* d0;

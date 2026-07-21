@@ -1,9 +1,10 @@
 // tls_verify.mc -- certificate signature verification for CA-chain trust.
 // Given a parsed child and its issuer, checks that the child's
 // signatureAlgorithm signature over its tbsCertificate verifies under the
-// issuer's public key. Supports RSASSA-PKCS1-v1_5 and ECDSA-P256, the two
-// algorithms real chains use. It reuses the vendored crypto (SHA-2, the RSA
-// public-key operation, and uECC) but does the X.509-specific work -- key
+// issuer's public key. Supports RSASSA-PKCS1-v1_5 (>= 2048-bit) and ECDSA
+// over P-256 and P-384, the algorithms real chains use. It reuses the
+// vendored crypto (SHA-2, the RSA public-key operation, uECC for P-256) plus
+// the local P-384 implementation, but does the X.509-specific work -- key
 // extraction from the issuer SPKI, DER signature decoding, and the PKCS#1
 // v1.5 encode-then-compare -- here, where it is unit-tested in isolation.
 //
@@ -11,6 +12,7 @@
 // the path validator's responsibility.
 
 import "tls_x509.mc";
+import "tls_p384.mc";
 import "tls/picotls.mc";
 
 // DigestInfo DER prefixes (AlgorithmIdentifier + NULL) that precede the raw
@@ -88,30 +90,63 @@ i32 spki_rsa_pubkey(X509Cert* c, u8* mod_out, i32 mod_cap, u64* exp_out) {
     return cast(i32, mlen);
 }
 
-// Extract the 64-byte uncompressed P-256 point (X||Y) from an issuer SPKI.
-bool spki_ec_point(X509Cert* c, u8* xy_out_64) {
+// namedCurve identifiers.
+const i32 EC_CURVE_NONE = 0;
+const i32 EC_CURVE_P256 = 1;   // 1.2.840.10045.3.1.7, 64-byte X||Y
+const i32 EC_CURVE_P384 = 2;   // 1.3.132.0.34, 96-byte X||Y
+
+// Extract the uncompressed EC point from an issuer SPKI into xy_out (sized
+// for 96 bytes) and identify the named curve. The curve OID and the point
+// length must agree — a mismatch is treated as malformed, never guessed.
+i32 spki_ec_point(X509Cert* c, u8* xy_out) {
     DerCursor top = DerCursor{ .buf = c.buf, .pos = c.spki.off, .end = c.spki.off + c.spki.len };
     DerTlv spki;
-    if !der_read_tlv(&top, &spki) { return false; }
-    if spki.tag != cast(u8, 0x30) { return false; }
+    if !der_read_tlv(&top, &spki) { return EC_CURVE_NONE; }
+    if spki.tag != cast(u8, 0x30) { return EC_CURVE_NONE; }
     DerCursor sc = der_enter(c.buf, &spki);
     DerTlv alg;
-    if !der_read_tlv(&sc, &alg) { return false; }
-    if alg.tag != cast(u8, 0x30) { return false; }
+    if !der_read_tlv(&sc, &alg) { return EC_CURVE_NONE; }
+    if alg.tag != cast(u8, 0x30) { return EC_CURVE_NONE; }
+    // AlgorithmIdentifier: OID id-ecPublicKey, then the namedCurve OID
+    DerCursor ac = der_enter(c.buf, &alg);
+    DerTlv keyoid;
+    if !der_read_tlv(&ac, &keyoid) { return EC_CURVE_NONE; }
+    if keyoid.tag != cast(u8, 0x06) { return EC_CURVE_NONE; }
+    DerTlv curveoid;
+    if !der_read_tlv(&ac, &curveoid) { return EC_CURVE_NONE; }
+    if curveoid.tag != cast(u8, 0x06) { return EC_CURVE_NONE; }
+    i32 curve = EC_CURVE_NONE;
+    if curveoid.len == cast(u64, 8) {
+        // 1.2.840.10045.3.1.7 (prime256v1)
+        u8[8] p256 = { 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        bool m = true;
+        for u64 i = 0; i < 8; i++ { if c.buf[curveoid.content + i] != p256[i] { m = false; break; } }
+        if m { curve = EC_CURVE_P256; }
+    } else if curveoid.len == cast(u64, 5) {
+        // 1.3.132.0.34 (secp384r1)
+        u8[5] p384 = { 0x2b, 0x81, 0x04, 0x00, 0x22 };
+        bool m = true;
+        for u64 i = 0; i < 5; i++ { if c.buf[curveoid.content + i] != p384[i] { m = false; break; } }
+        if m { curve = EC_CURVE_P384; }
+    }
+    if curve == EC_CURVE_NONE { return EC_CURVE_NONE; }
+    i32 ptlen = curve == EC_CURVE_P256 ? 64 : 96;
+
     DerTlv bs;
-    if !der_read_tlv(&sc, &bs) { return false; }
-    if bs.tag != cast(u8, 0x03) { return false; }
-    if bs.len != cast(u64, 66) { return false; }           // 1 unused-bits + 0x04 + 64
-    if c.buf[bs.content] != cast(u8, 0) { return false; }
-    if c.buf[bs.content + 1] != cast(u8, 0x04) { return false; }   // uncompressed point
-    for u64 i = 0; i < 64; i++ { xy_out_64[i] = c.buf[bs.content + 2 + i]; }
-    return true;
+    if !der_read_tlv(&sc, &bs) { return EC_CURVE_NONE; }
+    if bs.tag != cast(u8, 0x03) { return EC_CURVE_NONE; }
+    if bs.len != cast(u64, ptlen + 2) { return EC_CURVE_NONE; }  // unused-bits + 0x04 + X||Y
+    if c.buf[bs.content] != cast(u8, 0) { return EC_CURVE_NONE; }
+    if c.buf[bs.content + 1] != cast(u8, 0x04) { return EC_CURVE_NONE; }  // uncompressed
+    for i32 i = 0; i < ptlen; i++ { xy_out[i] = c.buf[bs.content + 2 + cast(u64, i)]; }
+    return curve;
 }
 
-// Decode a DER ECDSA-Sig-Value SEQUENCE { INTEGER r, INTEGER s } into a flat
-// 64-byte r||s, each right-aligned in its 32-byte half. False on malformation.
-bool ecdsa_sig_to_raw(u8* buf, DerRange sig, u8* raw_out_64) {
-    for i32 i = 0; i < 64; i++ { raw_out_64[i] = cast(u8, 0); }
+// Decode a DER ECDSA-Sig-Value SEQUENCE { INTEGER r, INTEGER s } into flat
+// r||s, each right-aligned in a csize-byte half (csize 32 or 48). False on
+// malformation.
+bool ecdsa_sig_to_raw(u8* buf, DerRange sig, i32 csize, u8* raw_out) {
+    for i32 i = 0; i < 2 * csize; i++ { raw_out[i] = cast(u8, 0); }
     DerCursor top = DerCursor{ .buf = buf, .pos = sig.off, .end = sig.off + sig.len };
     DerTlv seq;
     if !der_read_tlv(&top, &seq) { return false; }
@@ -123,10 +158,10 @@ bool ecdsa_sig_to_raw(u8* buf, DerRange sig, u8* raw_out_64) {
         if intv.tag != cast(u8, 0x02) { return false; }
         u64 src = intv.content;
         u64 rem = intv.len;
-        while rem > cast(u64, 32) && buf[src] == cast(u8, 0) { src = src + 1; rem = rem - 1; }
-        if rem == cast(u64, 0) || rem > cast(u64, 32) { return false; }
-        u64 base = cast(u64, which) * 32 + (cast(u64, 32) - rem);
-        for u64 i = 0; i < rem; i++ { raw_out_64[base + i] = buf[src + i]; }
+        while rem > cast(u64, csize) && buf[src] == cast(u8, 0) { src = src + 1; rem = rem - 1; }
+        if rem == cast(u64, 0) || rem > cast(u64, csize) { return false; }
+        u64 base = cast(u64, which * csize) + (cast(u64, csize) - rem);
+        for u64 i = 0; i < rem; i++ { raw_out[base + i] = buf[src + i]; }
     }
     return true;
 }
@@ -160,6 +195,7 @@ bool rsa_pkcs1v15_verify(X509Cert* parent, u8* tbs_hash, i32 hlen, u8* sig, i32 
     u64 e = 0;
     i32 klen = spki_rsa_pubkey(parent, &modbuf[0], 512, &e);
     if klen < 0 { return false; }
+    if klen < 256 { return false; }            // require >= 2048-bit RSA
     if siglen != klen { return false; }        // signature length must equal the modulus
     u8[512] em;
     if !mc_rsa_pub_modexp(&modbuf[0], klen, e, sig, siglen, &em[0]) { return false; }
@@ -170,15 +206,25 @@ bool rsa_pkcs1v15_verify(X509Cert* parent, u8* tbs_hash, i32 hlen, u8* sig, i32 
     return diff == 0;
 }
 
-// ECDSA-P256 verify over the tbs hash.
-bool ecdsa_p256_verify(X509Cert* parent, u8* tbs_hash, i32 hlen, u8* buf, DerRange sig) {
-    u8[64] pub;
-    if !spki_ec_point(parent, &pub[0]) { return false; }
-    u8[64] raw;
-    if !ecdsa_sig_to_raw(buf, sig, &raw[0]) { return false; }
-    uECC_Curve curve = uECC_secp256r1();
-    i32 ok = uECC_verify(&pub[0], tbs_hash, cast(u32, hlen), &raw[0], curve);
-    return ok == 1;
+// ECDSA verify over the tbs hash: extract the issuer's EC point, identify
+// the curve, and dispatch. The digest is truncated to the leftmost curve-
+// size bytes when longer (X9.62); P-384 truncates internally.
+bool ecdsa_cert_verify(X509Cert* parent, u8* tbs_hash, i32 hlen, u8* buf, DerRange sig) {
+    u8[96] pub;
+    i32 curve = spki_ec_point(parent, &pub[0]);
+    if curve == EC_CURVE_P256 {
+        u8[64] raw;
+        if !ecdsa_sig_to_raw(buf, sig, 32, &raw[0]) { return false; }
+        i32 hl = hlen < 32 ? hlen : 32;
+        i32 ok = uECC_verify(&pub[0], tbs_hash, cast(u32, hl), &raw[0], uECC_secp256r1());
+        return ok == 1;
+    }
+    if curve == EC_CURVE_P384 {
+        u8[96] raw;
+        if !ecdsa_sig_to_raw(buf, sig, 48, &raw[0]) { return false; }
+        return p384_ecdsa_verify(&pub[0], tbs_hash, hlen, &raw[0]);
+    }
+    return false;
 }
 
 }  // private
@@ -199,6 +245,7 @@ bool x509_verify_signature(X509Cert* child, X509Cert* parent) {
     else if alg == X509_SIG_RSA_SHA512 { hlen = 64; is_rsa = true; }
     else if alg == X509_SIG_ECDSA_SHA256 { hlen = 32; is_ec = true; }
     else if alg == X509_SIG_ECDSA_SHA384 { hlen = 48; is_ec = true; }
+    else if alg == X509_SIG_ECDSA_SHA512 { hlen = 64; is_ec = true; }
     else { return false; }                             // SHA-1 / unknown: refuse
 
     u8[64] digest;
@@ -209,7 +256,7 @@ bool x509_verify_signature(X509Cert* child, X509Cert* parent) {
                                    child.buf + child.sig_val.off, cast(i32, child.sig_val.len));
     }
     if is_ec {
-        return ecdsa_p256_verify(parent, &digest[0], hlen, child.buf, child.sig_val);
+        return ecdsa_cert_verify(parent, &digest[0], hlen, child.buf, child.sig_val);
     }
     return false;
 }
