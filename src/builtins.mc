@@ -867,7 +867,12 @@ private Value nat_array_ctor(void* vmp, Value callee, Value thisv, Value* args, 
 }
 
 private Value nat_array_isarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return value_bool(value_is_array(arg_at(args, argc, 0)));
+    // Array.isArray pierces proxies: true iff the (transitive) target is an array
+    Value v = arg_at(args, argc, 0);
+    while value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0 {
+        v = cast(JsProxy*, value_as_object(v)).target;
+    }
+    return value_bool(value_is_array(v));
 }
 
 private Value nat_array_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -11658,6 +11663,55 @@ private Value nat_reflect_defineproperty(void* vmp, Value callee, Value thisv, V
     return value_bool(!vm.has_pending);
 }
 
+// Elements of an array-like args list into a heap buffer (caller frees).
+private i32 reflect_spread_args(VM* vm, Value listv, Value** out) {
+    i32 n = 0;
+    if value_is_array(listv) { n = value_as_object(listv).elen; }
+    Value* av = alloc<Value>(n > 0 ? n : 1);
+    for i32 i = 0; i < n; i++ { *(av + i) = js_array_get(value_as_object(listv), i); }
+    *out = av;
+    return n;
+}
+
+private Value nat_reflect_apply(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value target = arg_at(args, argc, 0);
+    if !value_is_callable(target) {
+        vm_throw_error(vm, ERR_TYPE, "Reflect.apply target is not a function");
+        return value_undefined();
+    }
+    Value thisArg = arg_at(args, argc, 1);
+    Value* av;
+    i32 n = reflect_spread_args(vm, arg_at(args, argc, 2), &av);
+    Value r = vm_call_value(vm, target, thisArg, av, n);
+    free(av);
+    return r;
+}
+
+private Value nat_reflect_construct(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value target = arg_at(args, argc, 0);
+    if !value_is_callable(target) {
+        vm_throw_error(vm, ERR_TYPE, "Reflect.construct target is not a constructor");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* proto = vm.object_proto;
+    Value pv;
+    if vm_get_prop_value(vm, target, vm.atom_prototype, &pv) && value_is_object(pv) {
+        proto = value_as_object(pv);
+    }
+    JsObject* inst = js_new_object(&vm.heap, proto);
+    Value instv = value_cell(&inst.head);
+    gc_root(&vm.heap, instv);
+    Value* av;
+    i32 n = reflect_spread_args(vm, arg_at(args, argc, 1), &av);
+    Value res = vm_call_value(vm, target, instv, av, n);
+    free(av);
+    gc_root_reset(&vm.heap, rm);
+    return value_is_reference(res) ? res : instv;
+}
+
 private void install_proxy_reflect(VM* vm) {
     JsNative* proxy_ctor = def_global_fn(vm, "Proxy", &nat_proxy_ctor);
     def_static(vm, proxy_ctor, "revocable", &nat_proxy_revocable);
@@ -11672,6 +11726,8 @@ private void install_proxy_reflect(VM* vm) {
     def_method(vm, reflect, "ownKeys", &nat_reflect_ownkeys);
     def_method(vm, reflect, "getOwnPropertyDescriptor", &nat_reflect_getownpropdesc);
     def_method(vm, reflect, "defineProperty", &nat_reflect_defineproperty);
+    def_method(vm, reflect, "apply", &nat_reflect_apply);
+    def_method(vm, reflect, "construct", &nat_reflect_construct);
     vm_set_global(vm, "Reflect", value_cell(&reflect.head));
     gc_root_reset(&vm.heap, rm);
 }

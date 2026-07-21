@@ -1059,6 +1059,55 @@ Value proxy_trap_fn(VM* vm, JsProxy* p, str name) {
     return t;
 }
 
+// Build a JS array from raw call arguments (for the apply/construct traps).
+private Value args_to_array(VM* vm, Value* argstart, i32 argc) {
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    for i32 i = 0; i < argc; i++ { js_array_set(arr, i, *(argstart + i)); }
+    return value_cell(&arr.head);
+}
+
+// Calling a callable-target proxy: the apply trap (target, thisArg, argsArray),
+// or a plain call of the target when absent.
+Value proxy_apply(VM* vm, JsProxy* p, Value thisv, Value* argstart, i32 argc) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "apply", &trap);
+    if tr < 0 { return value_undefined(); }
+    if tr == 0 { return vm_call_value(vm, p.target, thisv, argstart, argc); }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value arr = args_to_array(vm, argstart, argc);
+    gc_root(&vm.heap, arr);
+    noinit Value[3] ca;
+    ca[0] = p.target;
+    ca[1] = thisv;
+    ca[2] = arr;
+    Value r = vm_call_value(vm, trap, p.handler, &ca[0], 3);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// `new` on a callable-target proxy: the construct trap (target, argsArray,
+// newTarget). A default construct (no trap) needs a C-level `new` the VM
+// doesn't expose, so it is unsupported here.
+Value proxy_construct(VM* vm, JsProxy* p, Value* argstart, i32 argc, Value new_target) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "construct", &trap);
+    if tr < 0 { return value_undefined(); }
+    if tr == 0 {
+        vm_throw_error(vm, ERR_TYPE, "proxy construct without a trap is not supported");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value arr = args_to_array(vm, argstart, argc);
+    gc_root(&vm.heap, arr);
+    noinit Value[3] ca;
+    ca[0] = p.target;
+    ca[1] = arr;
+    ca[2] = new_target;
+    Value r = vm_call_value(vm, trap, p.handler, &ca[0], 3);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
 // ownKeys: the handler trap result (an array of keys), or the target's own
 // keys when absent. The result may contain string and symbol keys.
 JsObject* proxy_own_keys(VM* vm, JsProxy* p) {
@@ -2374,6 +2423,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 else if value_is_symbol(v) { s = "symbol"; }
                 else if value_is_bigint(v) { s = "bigint"; }
                 else if value_is_function(v) || value_is_native(v) { s = "function"; }
+                else if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0
+                        && value_is_callable(v) { s = "function"; }
                 GcString* g = gc_new_string(&vm.heap, s);
                 vm.sp--;
                 vpush(vm, value_cell(&g.head));
@@ -2648,6 +2699,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             code = t.code;
                             ip = 0;
                         }
+                    } else if value_is_object(fnv)
+                              && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
+                        // a callable-target proxy: route through apply/construct
+                        JsProxy* p = cast(JsProxy*, value_as_object(fnv));
+                        Value res;
+                        if op == OP_NEW {
+                            res = proxy_construct(vm, p, vm.stack + vm.sp - argc, argc, fnv);
+                        } else {
+                            res = proxy_apply(vm, p, thisv, vm.stack + vm.sp - argc, argc);
+                        }
+                        vm.sp -= argc + 2;
+                        if !vm.has_pending { vpush(vm, res); }
                     } else {
                         vm_throw_error(vm, ERR_TYPE, "not a function");
                     }

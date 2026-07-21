@@ -212,11 +212,24 @@ load.
    gap) was added. **Payoff reached: immer works** — `produce` with nested
    object mutation, structural sharing, and JSON output all match Node.
    `test/diff/proxy.js` covers the enumeration/descriptor/revocable surface.
-3. **I3 — arrays + callable + proto + revocable.** `value_is_real_array`
-   fast-path split + `Array.isArray` piercing + Array natives on proxies
-   (rides I0); `apply`/`construct`; `getPrototypeOf`/`setPrototypeOf`/
-   `isExtensible`/`preventExtensions`; `Proxy.revocable`. **Payoff
-   checkpoint: immer array drafts, Vue-reactivity-style snippets.**
+3. **I3 — callable proxies + Array.isArray. (done, reduced scope)** The
+   `apply` and `construct` traps are wired into the `OP_CALL`/`OP_NEW`
+   dispatch (a callable-target proxy routes through them); `value_is_callable`
+   and `typeof` pierce to the target so a function-target proxy is callable
+   and reports `'function'`. `Array.isArray` pierces proxies (transitively).
+   `Reflect.apply`/`construct` added (the traps default through them).
+   `Proxy.revocable` already landed in I2. `test/diff/proxy_call.js` matches
+   Node (apply/construct + Reflect defaults, `this` threading, `instanceof`,
+   Array.isArray piercing over proxy-of-array incl. reads/iteration, callable
+   vs non-callable, direct Reflect.apply/construct).
+   **Deliberately deferred (own follow-up):** array-target *write* support —
+   mutating Array methods (`push`/`splice`/…) on a proxy receiver need the
+   array-like write-back rework, and **immer array drafts** fail deeper in
+   immer's own array-target machinery (the `target=[state]` + arrayTraps
+   pattern), so they remain unsupported; immer *object* drafts (the I2
+   payoff) work. Also still deferred: the `getPrototypeOf`/`setPrototypeOf`/
+   `isExtensible`/`preventExtensions` traps (low-value; the snapshot proto
+   covers the common `Object.getPrototypeOf` case) and invariant enforcement.
 4. **I4 — payoff + docs.** Run immer (objects + arrays) and a mobx/Vue
    snippet; fold deterministic cases into the diff suite; update
    `doc/npm-compatibility.md` + the `npm-package-compat` memory.

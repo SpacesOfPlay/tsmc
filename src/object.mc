@@ -566,7 +566,14 @@ bool value_is_string(Value v)  { return value_is_kind(v, GC_STRING); }
 bool value_is_object(Value v)  { return value_is_kind(v, GC_OBJECT); }
 bool value_is_function(Value v){ return value_is_kind(v, GC_FUNCTION); }
 bool value_is_native(Value v)  { return value_is_kind(v, GC_NATIVE); }
-bool value_is_callable(Value v){ return value_is_function(v) || value_is_native(v); }
+bool value_is_callable(Value v){
+    if value_is_function(v) || value_is_native(v) { return true; }
+    // a proxy is callable iff its target is (callable-target proxies)
+    if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0 {
+        return value_is_callable(cast(JsProxy*, value_as_object(v)).target);
+    }
+    return false;
+}
 
 bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
 bool value_is_symbol(Value v)   { return value_is_kind(v, GC_SYMBOL); }
