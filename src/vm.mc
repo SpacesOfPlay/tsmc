@@ -1908,6 +1908,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_THIS: { vpush(vm, fr.this_val); }
             case OP_ARGUMENTS: { vpush(vm, fr.arguments_obj); }
+            case OP_CURFUNC: {
+                if fr.fun != null { vpush(vm, value_cell(&fr.fun.head)); }
+                else { vpush(vm, value_undefined()); }
+            }
             case OP_GETLOCAL: {
                 vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;

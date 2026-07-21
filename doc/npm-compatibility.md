@@ -11,7 +11,7 @@ snapshot, not a guarantee — see [Reproducing](#reproducing) to re-run it.
 > `node:` core modules work. It's **which language/global corners a package
 > touches**. The rules of thumb below predict this well.
 
-Last run: 2026-07-21, against a local dev build of `tsmc`.
+Last run: 2026-07-22, against a local dev build of `tsmc`.
 
 ## Works
 
@@ -27,6 +27,8 @@ Confirmed running with output identical to Node.
 | `clsx@2.1.1` | conditional class strings |
 | `escape-string-regexp@4.0.0` | regex metacharacter escaping |
 | `eventemitter3@5.0.1` | event emitter |
+| `fast-deep-equal@3.1.3` | recursive deep equality |
+| `fast-json-stable-stringify@2.1.0` | stable JSON serialization |
 
 ### IDs
 | package | notes |
@@ -88,7 +90,6 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
 | `immer`, `ansi-colors` | **`Proxy` / `Reflect`** — not implemented. |
-| `fast-deep-equal`, `fast-json-stable-stringify` | **Named function-expression self-reference** — `module.exports = function equal(){…equal()…}`; the inner name isn't bound. Fixable language gap. |
 | `markdown-it` | **Array methods on an array-like `this`** — `Array.prototype.slice.call(x)` rejects a non-array receiver. |
 | `bignumber.js`, `decimal.js` | **Parser** — a syntax the parser does not yet accept. |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |

@@ -14,6 +14,7 @@ enum Op {
     OP_POP, OP_DUP, OP_DUP2,
     OP_THIS,
     OP_ARGUMENTS,    // pushes this frame's arguments object
+    OP_CURFUNC,      // pushes the currently-executing function (named fn expr)
 
     OP_GETLOCAL,     // u16 slot
     OP_SETLOCAL,     // u16 slot; keeps value on stack

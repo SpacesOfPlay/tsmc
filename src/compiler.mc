@@ -1337,7 +1337,7 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_FUNCTION {
-        compile_function(co, n);
+        compile_function(co, n, true);
         return;
     }
     if k == N_CLASS {
@@ -1395,7 +1395,7 @@ private void compile_expr(Compiler* co, Node* n) {
 
 // Compiles f into a template. `fields` (class members) inject
 // this-assignments into the body after a leading super() call.
-private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields) {
+private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields, bool self_name) {
     FScope fs;
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
     fs.is_gen = (f.flags & NF_GENERATOR) != 0;
@@ -1451,6 +1451,23 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         CBind pb = vec_get(&fs.binds, i);
         ch_op_u16(&fs.ch, pb.is_cell ? OP_GETCELL : OP_GETLOCAL, pb.slot);
         compile_destructure(co, prm.a, true);
+    }
+    // a named function EXPRESSION binds its own name inside its body (for
+    // recursion), referring to the function itself; the name does not leak to
+    // the enclosing scope. Skipped if a parameter shadows it. The binding is
+    // declared non-const: the spec makes it immutable (assignment is a no-op
+    // in sloppy mode), but rejecting a write at compile time would break a
+    // whole module, so a stray write is tolerated as a plain reassignment.
+    if self_name && f.name.len > 0 && (f.flags & NF_ARROW) == 0
+       && find_local(&fs, f.name) < 0 {
+        i32 bi = declare(co, f.name, false, false);
+        CBind b = vec_get(&fs.binds, bi);
+        ch_op(&fs.ch, OP_CURFUNC);
+        ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
+        ch_op(&fs.ch, OP_POP);
+        if b.is_cell {
+            ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
+        }
     }
     // implicit `this` binding for arrows below
     if !fs.is_arrow && strmap_get<i32>(&fs.inner, "this") != null {
@@ -1510,8 +1527,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     return t;
 }
 
-private void compile_function(Compiler* co, Node* f) {
-    FnTemplate* t = compile_function_tmpl(co, f, null, 0);
+private void compile_function(Compiler* co, Node* f, bool self_name) {
+    FnTemplate* t = compile_function_tmpl(co, f, null, 0, self_name);
     vec_push(&co.cur.ch.subs, t);
     ch_op_u16(&co.cur.ch, OP_CLOSURE, co.cur.ch.subs.len - 1);
 }
@@ -1609,7 +1626,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     } else {
         ctor_fn = build_default_ctor(co, derived);
     }
-    FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len);
+    FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
     if c.name.len > 0 { tmpl_set_name(ct, c.name); }
     vec_push(&ch.subs, ct);
     ch_op_u16(ch, OP_CLOSURE, ch.subs.len - 1);
@@ -1661,16 +1678,16 @@ private void compile_class_expr(Compiler* co, Node* c) {
                     continue;
                 }
                 compile_expr(co, m.a);
-                compile_function(co, m.b);
+                compile_function(co, m.b, false);
                 ch_op(ch, OP_SETINDEX);
                 ch_op(ch, OP_POP);
             } else if is_acc {
-                compile_function(co, m.b);
+                compile_function(co, m.b, false);
                 i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
                 ch_op_u16(ch, aop, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
             } else {
-                compile_function(co, m.b);
+                compile_function(co, m.b, false);
                 ch_op_u16(ch, OP_DEFMETHOD, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
             }
@@ -1792,7 +1809,7 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
         Node* s = *(list.items + i);
         if s.kind == N_FUNCTION && s.name.len > 0 {
             i32 li = find_local(fs, s.name);
-            compile_function(co, s);
+            compile_function(co, s, false);
             emit_init_binding(co, li);
         }
     }
@@ -2381,7 +2398,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         return;
     }
     if k == N_FUNCTION {
-        compile_function(co, n);
+        compile_function(co, n, true);
         ch_op(ch, OP_POP);
         return;
     }
@@ -2635,7 +2652,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
         Node* d = exported && s.a != null ? s.a : s;
         if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
             i32 li = find_local(&fs, d.name);
-            compile_function(co, d);
+            compile_function(co, d, false);
             emit_init_binding(co, li);
             if exported && !is_default {
                 mirror_export(co, ns_name, d.name, d.name);

@@ -24,6 +24,8 @@ t('classnames', () => require('classnames')('a', { b: true }));
 t('clsx', () => require('clsx')('a', { b: true }));
 t('escape-string-regexp', () => require('escape-string-regexp')('a.b*c'));
 t('eventemitter3', () => { const E = require('eventemitter3'); const e = new E(); let v = 0; e.on('x', n => v = n); e.emit('x', 9); return v; });
+t('fast-deep-equal', () => require('fast-deep-equal')({ a: [1, 2] }, { a: [1, 2] }));
+t('fast-json-stable-stringify', () => require('fast-json-stable-stringify')({ b: 2, a: 1 }));
 
 // ids
 t('uuid', () => require('uuid').v4().length);
@@ -64,7 +66,6 @@ t('colorette', () => require('colorette').blue('x').length);
 t('lodash', () => require('lodash').chunk([1, 2, 3], 2).length);       // new Function
 t('qs', () => require('qs').stringify({ a: 1 }));                      // eval
 t('immer', () => require('immer').produce({ a: 1 }, d => { d.a = 2; }).a);  // Proxy/Reflect
-t('fast-deep-equal', () => require('fast-deep-equal')({ a: 1 }, { a: 1 }));  // named fn expr self-ref
 t('markdown-it', () => require('markdown-it')().render('# h'));       // slice.call on array-like
 t('bignumber.js', () => new (require('bignumber.js'))('0.1').toString());  // parser
 t('camelcase', () => require('camelcase')('foo-bar'));               // regex \p{} -> wrong output
