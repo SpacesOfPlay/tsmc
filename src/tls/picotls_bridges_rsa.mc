@@ -303,6 +303,26 @@ bool rsa_pss_verify(u8* n_bytes, i32 klen, u64 e, u8* sig, i32 siglen, u8* mhash
     return emsa_pss_verify(hlen, mhash, &em[0], emlen, embits);
 }
 
+// LOCAL ADDITION (tsmc) — generic RSA public-key operation for certificate
+// signature verification: out_be = in_be^e mod n_be, big-endian, out is klen
+// bytes. Rejects in >= n. The padding/DigestInfo check is done by the caller
+// (encode-then-compare in tls_verify.mc). Re-apply on re-export (see
+// src/tls/THIRD_PARTY.md).
+bool mc_rsa_pub_modexp(u8* n_be, i32 klen, u64 e, u8* in_be, i32 in_len, u8* out_be) {
+    if klen <= 0 || klen > 512 { return false; }
+    if in_len > klen { return false; }
+    i32 nw = (klen + 7) / 8;
+    u64[64] n;
+    u64[64] s;
+    u64[64] m;
+    rbn_from_be(&n[0], n_be, klen, nw);
+    rbn_from_be(&s[0], in_be, in_len, nw);
+    if rbn_cmp(&s[0], &n[0], nw) >= 0 { return false; }
+    rbn_powm(&m[0], &s[0], e, &n[0], nw);
+    rbn_to_be(out_be, klen, &m[0], nw);
+    return true;
+}
+
 // --- DER / SPKI parsing ---
 
 private {

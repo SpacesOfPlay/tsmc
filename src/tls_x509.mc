@@ -66,7 +66,7 @@ struct DerTlv {
     u64 len;
 }
 
-private {
+// --- DER cursor primitives (public: reused by signature verification) ------
 
 // Peek the next tag byte without consuming it. Returns -1 at end.
 i32 der_peek_tag(DerCursor* c) {
@@ -121,6 +121,10 @@ bool der_read_tlv(DerCursor* c, DerTlv* out) {
 DerCursor der_enter(u8* buf, DerTlv* t) {
     return DerCursor{ .buf = buf, .pos = t.content, .end = t.content + t.len };
 }
+
+// --- internal parse helpers ------------------------------------------------
+
+private {
 
 // --- signatureAlgorithm OID -> id ------------------------------------------
 

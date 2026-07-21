@@ -148,9 +148,22 @@ callback returns nonzero).
    hostname accept/reject (wildcard, embedded-NUL, partial-wildcard), and
    malformed-input rejection. Validity seconds match openssl exactly.
    Deterministic, no network.
-2. **I2 — signature verify (B, C).** RSA-PKCS1v1.5 + ECDSA cert-sig verify,
-   unit-tested by verifying a real intermediate's signature under its
-   root's key (embedded certs), plus tamper tests (flip a TBS byte → fail).
+2. **I2 — signature verify (B, C). (done)** `src/tls_verify.mc` —
+   `x509_verify_signature(child, parent)` hashes the child tbsCertificate and
+   verifies the signature under the parent's SPKI key. RSA path is
+   RSASSA-PKCS1-v1_5 by **encode-then-compare**: recover m = sig^e mod n (via
+   the one added vendored primitive `mc_rsa_pub_modexp`), rebuild the full
+   `00 01 FF.. 00 || DigestInfo || H` block and compare byte-for-byte. ECDSA
+   path decodes the DER Sig-Value to raw r||s and calls uECC over the P-256
+   point pulled from the issuer SPKI. Enforces inner==outer signatureAlgorithm
+   agreement and rejects SHA-1 / unknown algorithms. Key extraction, DER-sig
+   decode and PKCS#1 build live here (unit-tested), not in the vendored crypto.
+   `test/unit/test_tls_verify.mc` (16 checks): RSA positives (root self-sig,
+   inter under root), ECDSA positives (both leaves under inter), wrong-issuer
+   negatives, and tamper tests (flipped TBS byte and flipped signature byte →
+   rejected, for both RSA and ECDSA). The DER-cursor primitives in
+   `tls_x509.mc` were made public for reuse; `mc_rsa_pub_modexp` is a
+   documented LOCAL ADDITION to the vendored RSA bridge.
 3. **I3 — root store (D).** The generator tool + `ca_roots.mc` + a lookup
    test (find a known root by subject DN).
 4. **I4 — path validation (E).** `tls_chain_verify` tying I1–I3 together;

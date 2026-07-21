@@ -30,15 +30,20 @@ The upstream `net.mc`, `thread.mc`, and `pico_https.mc` (blocking sockets
 sockets and event loop and drives TLS purely through the in-memory buffer
 API (`ptls_handshake`/`ptls_receive`/`ptls_send`).
 
-Files other than `picotls.mc` are copied verbatim **except** for two local
-additions (marked `LOCAL ADDITION (tsmc)`): `ecdsa_p256_accept_verify_cert_cb`
-in `picotls_bridges_p256.mc` and `rsa_pss_accept_verify_cert_cb` in
-`picotls_bridges_rsa.mc`. These are the pinned verify callbacks minus the
-SPKI-pin comparison (accept any cert, still verify the handshake signature),
-needed because the underlying `mc_*`/`*_pl_verify_sign` helpers are file-
-private. **Re-apply both after re-exporting picotls-minc** (or add them
-upstream). Everything else is verbatim — refresh by re-copying the list
-above.
+Files other than `picotls.mc` are copied verbatim **except** for the local
+additions marked `LOCAL ADDITION (tsmc)`. **Re-apply all of them after
+re-exporting picotls-minc** (or add them upstream); everything else is
+verbatim — refresh by re-copying the list above.
+
+- `ecdsa_p256_accept_verify_cert_cb` (`picotls_bridges_p256.mc`) and
+  `rsa_pss_accept_verify_cert_cb` (`picotls_bridges_rsa.mc`): the pinned
+  verify callbacks minus the SPKI-pin comparison (accept any cert, still
+  verify the handshake signature), needed because the underlying
+  `mc_*`/`*_pl_verify_sign` helpers are file-private.
+- `mc_rsa_pub_modexp` (`picotls_bridges_rsa.mc`): a generic public
+  `in^e mod n` primitive over the file-private bignum, used by the
+  certificate-chain signature verifier (`src/tls_verify.mc`) for
+  RSASSA-PKCS1-v1_5. The padding/DigestInfo check is done in the caller.
 
 ## Licensing
 
