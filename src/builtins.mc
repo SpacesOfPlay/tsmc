@@ -694,6 +694,40 @@ private JsObject* this_array(VM* vm, Value thisv) {
     return null;
 }
 
+// Like this_array, but for the non-mutating methods: accepts any array-like
+// receiver (an object with a numeric `length`) by materializing a real array
+// from `length` + indexed reads. Real arrays are returned directly, so the
+// common case is unchanged. Reads go through vm_get_prop_value, so the
+// arguments object and `Array.prototype.slice.call(x)` work (and later a
+// proxy's element reads trap). Only used by methods that do not mutate the
+// receiver — mutating methods keep the strict this_array. Returns null (and
+// throws) if the receiver is neither an array nor array-like.
+private JsObject* this_arraylike(VM* vm, Value thisv) {
+    if value_is_array(thisv) { return value_as_object(thisv); }
+    if value_is_object(thisv) {
+        Value lv;
+        if vm_get_prop_value(vm, thisv, vm.atom_length, &lv) {
+            f64 lf = js_to_number(lv);
+            if lf >= 0.0 {
+                i32 len = cast(i32, lf);
+                i32 rm = gc_root_mark(&vm.heap);
+                JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+                gc_root(&vm.heap, value_cell(&a.head));
+                for i32 i = 0; i < len; i++ {
+                    Value ev;
+                    if !vm_get_prop_value(vm, thisv, index_atom(vm, i), &ev) { ev = value_undefined(); }
+                    if vm.has_pending { gc_root_reset(&vm.heap, rm); return null; }
+                    js_array_set(a, i, ev);
+                }
+                gc_root_reset(&vm.heap, rm);
+                return a;
+            }
+        }
+    }
+    vm_throw_error(vm, ERR_TYPE, "receiver is not an array");
+    return null;
+}
+
 private Value nat_array_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
@@ -921,7 +955,7 @@ private Value nat_arr_copywithin(void* vmp, Value callee, Value thisv, Value* ar
 
 private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, a.elen);
     i32 end = a.elen;
@@ -981,6 +1015,8 @@ private Value nat_arr_splice(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    // concat does not spread a non-array `this` (IsConcatSpreadable), so it
+    // keeps the strict receiver rather than materializing an array-like.
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
@@ -1011,7 +1047,7 @@ private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_arr_join(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     str sep = ",";
     i32 rm = gc_root_mark(&vm.heap);
@@ -1039,7 +1075,7 @@ private Value nat_arr_join(void* vmp, Value callee, Value thisv, Value* args, i3
 
 private Value nat_arr_indexof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value needle = arg_at(args, argc, 0);
     i32 start_at = argc > 1 ? rel_index(to_int_arg(*(args + 1)), a.elen) : 0;
@@ -1052,7 +1088,7 @@ private Value nat_arr_indexof(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_arr_includes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value needle = arg_at(args, argc, 0);
     for i32 i = 0; i < a.elen; i++ {
@@ -1080,7 +1116,7 @@ const i32 IT_FINDINDEX = 6;
 
 private Value nat_arr_lastindexof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value needle = arg_at(args, argc, 0);
     i32 start = a.elen - 1;
@@ -1107,7 +1143,7 @@ private JsObject* arr_dense_copy(VM* vm, JsObject* a) {
 
 private Value nat_arr_toreversed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
@@ -1121,7 +1157,7 @@ private Value nat_arr_toreversed(void* vmp, Value callee, Value thisv, Value* ar
 
 private Value nat_arr_with(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     i32 idx = to_int_arg(arg_at(args, argc, 0));
     if idx < 0 { idx += a.elen; }
@@ -1140,7 +1176,7 @@ private Value nat_arr_with(void* vmp, Value callee, Value thisv, Value* args, i3
 }
 
 private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) {
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
@@ -1228,7 +1264,7 @@ private Value nat_arr_findindex(void* vmp, Value callee, Value thisv, Value* arg
 
 private Value nat_arr_reduce(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
@@ -1264,7 +1300,7 @@ private Value nat_arr_reduce(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
@@ -1299,7 +1335,7 @@ private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* a
 
 private Value nat_arr_at(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     i32 i = to_int_arg(arg_at(args, argc, 0));
     if i < 0 { i += a.elen; }
@@ -1309,7 +1345,7 @@ private Value nat_arr_at(void* vmp, Value callee, Value thisv, Value* args, i32 
 
 private Value nat_arr_findlast(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
@@ -1340,7 +1376,7 @@ private void flatten_into(VM* vm, JsObject* src, JsObject* dst, i32 depth) {
 
 private Value nat_arr_flat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     i32 depth = argc > 0 && !value_is_undefined(*(args)) ? to_int_arg(*(args)) : 1;
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
@@ -1353,7 +1389,7 @@ private Value nat_arr_flat(void* vmp, Value callee, Value thisv, Value* args, i3
 
 private Value nat_arr_flatmap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
@@ -1448,7 +1484,7 @@ private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i3
 
 private Value nat_arr_tosorted(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* a = this_array(vm, thisv);
+    JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     i32 rm = gc_root_mark(&vm.heap);
     JsObject* r = arr_dense_copy(vm, a);

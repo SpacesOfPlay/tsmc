@@ -166,11 +166,20 @@ load.
 ## 7. Increments
 
 0. **I0 — array-like receivers for Array natives (independent
-   prerequisite).** Make `this_array`-style natives operate on array-likes
-   via length + indexed access. Immediately fixes `markdown-it` and
-   `Array.prototype.slice.call(arguments)` on its own; later lets Array
-   natives run against proxies through the trapping generic path. Lands as
-   its own commit with its own diff tests, before any Proxy code.
+   prerequisite). (done)** A new `this_arraylike` materializes a real array
+   from any array-like receiver (numeric `length` + indexed reads via
+   `vm_get_prop_value`, so it also traps proxy element reads later); the 16
+   non-mutating Array natives use it, while the 9 mutating natives keep the
+   strict `this_array` (a non-array receiver is refused loudly, never
+   silently mis-mutated). `concat` keeps strict too (IsConcatSpreadable: a
+   non-array `this` is one element, not spread). Real arrays take the
+   unchanged fast path. `Array.prototype.slice/map/reduce/…​.call(arguments)`
+   and plain array-likes now work (`test/diff/arraylike_receiver.js` matches
+   Node); this closes the `slice.call(arguments)` follow-up from the
+   `arguments` milestone. `markdown-it` advances past its slice.call blocker
+   but then hits a separate `linkify-it` issue, so it remains unlisted.
+   Mutating-on-array-like (`push.call(arrayLike)`) write-back is still out of
+   scope.
 1. **I1 — core + Reflect basics.** `JsProxy` + GC + constructor +
    proto-snapshot + `typeof`/`value_is_callable` piercing; `get`/`set`/
    `has`/`deleteProperty` traps at their four sites; `Reflect.get`/`set`/

@@ -90,7 +90,7 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
 | `immer`, `ansi-colors` | **`Proxy` / `Reflect`** — not implemented. |
-| `markdown-it` | **Array methods on an array-like `this`** — `Array.prototype.slice.call(x)` rejects a non-array receiver. |
+| `markdown-it` | A `linkify-it` schema-setup issue (it now clears the earlier array-like-receiver blocker, but has a further gap). |
 | `bignumber.js`, `decimal.js` | **Parser** — a syntax the parser does not yet accept. |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
 | `chalk`, `marked`, `ramda` | A missing built-in method (surfaces as `not a function`); not yet pinned to a single cause. |
