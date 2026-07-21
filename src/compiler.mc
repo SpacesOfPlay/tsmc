@@ -63,6 +63,7 @@ struct FScope {
     bool has_rest;
     bool is_gen;
     bool is_async;
+    bool needs_arguments;   // references `arguments`; build it at call time
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
@@ -144,6 +145,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.has_rest = false;
     fs.is_gen = false;
     fs.is_async = false;
+    fs.needs_arguments = false;
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -428,6 +430,17 @@ private void hoist_vars(Compiler* co, Node* n) {
 
 private void emit_load_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
+    // `arguments` in an ordinary function is that function's OWN arguments
+    // object, never a capture of an enclosing function's — so resolve it
+    // before the local/upvalue walk, unless a real local/param shadows it.
+    // Arrows fall through to the walk and capture the enclosing function's
+    // `arguments` local as an upvalue (lexical, like `this`).
+    if str_equal(n.name, "arguments") && !fs.is_arrow && fs.parent != null
+       && find_local(fs, "arguments") < 0 {
+        ch_op(&fs.ch, OP_ARGUMENTS);
+        fs.needs_arguments = true;
+        return;
+    }
     i32 li = find_local(fs, n.name);
     if li >= 0 {
         CBind b = vec_get(&fs.binds, li);
@@ -1243,7 +1256,13 @@ private void compile_expr(Compiler* co, Node* n) {
                 // global, so it must go through the normal expression path.
                 bool is_import = co.in_module
                     && strmap_get<ModImport>(&co.mod_imports, n.a.name) != null;
-                if !is_import && find_local(fs, n.a.name) < 0 && resolve_upval(fs, n.a.name) < 0 {
+                // Own `arguments` must go through the expression path so it
+                // loads the arguments object, not a soft-undefined global.
+                bool is_own_args = str_equal(n.a.name, "arguments")
+                    && !fs.is_arrow && fs.parent != null
+                    && find_local(fs, "arguments") < 0;
+                if !is_import && !is_own_args
+                   && find_local(fs, n.a.name) < 0 && resolve_upval(fs, n.a.name) < 0 {
                     ch_op_u16(ch, OP_GETGLOBAL_SOFT, name_const(co, n.a.name));
                     ch_op(ch, OP_TYPEOF);
                     return;
@@ -1444,6 +1463,20 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
         }
     }
+    // implicit `arguments` binding, so nested arrows capture it lexically.
+    // Skip if a parameter/local already named `arguments` shadows it.
+    if !fs.is_arrow && strmap_get<i32>(&fs.inner, "arguments") != null
+       && find_local(&fs, "arguments") < 0 {
+        i32 bi = declare(co, "arguments", true, false);
+        CBind b = vec_get(&fs.binds, bi);
+        ch_op(&fs.ch, OP_ARGUMENTS);
+        ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
+        ch_op(&fs.ch, OP_POP);
+        if b.is_cell {
+            ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
+        }
+        fs.needs_arguments = true;
+    }
 
     if f.a != null && f.a.kind == N_BLOCK {
         hoist_vars(co, f.a);
@@ -1460,6 +1493,7 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
 
     FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
         fs.is_gen, fs.is_async);
+    t.needs_arguments = fs.needs_arguments;
     t.src_name = co.src_name;
     // Function.length: count leading params up to the first with a
     // default value or the rest parameter.

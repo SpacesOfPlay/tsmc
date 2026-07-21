@@ -301,6 +301,7 @@ struct JsGenerator {
     GcCell head;
     JsFunction* fun;
     Value this_val;
+    Value arguments_obj;   // the body's `arguments`, or undefined
     i32 state;           // GEN_*
     i32 resume_ip;
     Value* saved;        // slots + operand stack at suspension
@@ -363,6 +364,7 @@ void js_trace(GcHeap* h, GcCell* c) {
         JsGenerator* g = cast(JsGenerator*, c);
         if g.fun != null { gc_mark_cell(h, &g.fun.head); }
         gc_mark_value(h, g.this_val);
+        gc_mark_value(h, g.arguments_obj);
         for i32 i = 0; i < g.saved_len; i++ {
             gc_mark_value(h, *(g.saved + i));
         }
@@ -486,6 +488,7 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
     JsGenerator* g = cast(JsGenerator*, gc_alloc(h, GC_GENERATOR, sizeof(JsGenerator)));
     g.fun = fun;
     g.this_val = this_val;
+    g.arguments_obj = value_undefined();
     g.state = GEN_START;
     return g;
 }

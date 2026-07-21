@@ -4029,6 +4029,26 @@ private Value nat_symbol_key_for(void* vmp, Value callee, Value thisv, Value* ar
 
 // --- array / string iterators ------------------------------------------------------
 
+// The interned decimal-string key for a small array index.
+private u32 index_atom(VM* vm, i32 i) {
+    u8[16] buf;
+    i32 n = 0;
+    if i <= 0 {
+        buf[0] = cast(u8, 48);   // '0'
+        n = 1;
+    } else {
+        i32 v = i;
+        while v > 0 { buf[n] = cast(u8, 48 + v % 10); n++; v = v / 10; }
+        i32 a = 0;
+        i32 b = n - 1;
+        while a < b { u8 t = buf[a]; buf[a] = buf[b]; buf[b] = t; a++; b--; }
+    }
+    str s;
+    s.data = &buf[0];
+    s.len = n;
+    return atom_intern(&vm.atoms, s);
+}
+
 private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsNative* me = value_as_native(callee);
@@ -4039,6 +4059,11 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
     i32 len = 0;
     if value_is_array(src) { len = value_as_object(src).elen; }
     else if value_is_string(src) { len = value_as_string(src).len; }
+    else if value_is_object(src) {
+        // generic array-like (e.g. the arguments object): read `length`
+        Value lv;
+        if vm_get_prop_value(vm, src, vm.atom_length, &lv) { len = cast(i32, js_to_number(lv)); }
+    }
     if i >= len {
         js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
         js_set_prop(r, vm_atom(vm, "value"), value_undefined());
@@ -4048,7 +4073,7 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
         Value elem;
         if value_is_array(src) {
             elem = js_array_get(value_as_object(src), i);
-        } else {
+        } else if value_is_string(src) {
             // strings iterate by code point; `i` is a byte offset
             str view = gc_string_view(value_as_string(src));
             i32 n;
@@ -4058,6 +4083,10 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
             one.data = view.data + i;
             one.len = n;
             elem = new_str(vm, one);
+        } else {
+            // generic array-like: read the i-th indexed property (env1 already i+1)
+            Value ev;
+            elem = vm_get_prop_value(vm, src, index_atom(vm, i), &ev) ? ev : value_undefined();
         }
         Value outv = elem;
         if kind == 1 {
@@ -4096,6 +4125,25 @@ private Value make_index_iterator(VM* vm, Value src, i32 kind) {
     js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
+}
+
+// Build the `arguments` object: an array-like plain object (Object.prototype
+// proto, so not an Array and without Array methods) with own enumerable
+// indices, a non-enumerable `length`, and a values iterator. Unmapped — a
+// snapshot of the argument values. Installed as the VM's ArgumentsBuilder.
+Value build_arguments_object(VM* vm, Value* argstart, i32 argc) {
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&o.head));
+    for i32 i = 0; i < argc; i++ {
+        js_set_prop(o, index_atom(vm, i), *(argstart + i));
+    }
+    props_set_desc(&o.props, vm.atom_length, value_int(argc),
+        PROP_WRITABLE | PROP_CONFIGURABLE);   // length: own, non-enumerable
+    JsNative* si = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
+    props_set_desc(&o.props, vm_sym_iterator_id(vm), value_cell(&si.head), METHOD_ATTRS);
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&o.head);
 }
 
 private Value nat_arr_symiter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -11550,6 +11598,9 @@ void builtins_install(VM* vm) {
         js_set_prop(ep, vm.atom_message, em);
         def_method(vm, ep, "toString", &nat_error_tostring);
     }
+
+    // the `arguments` object builder (called from the VM's call sites)
+    vm_set_arguments_builder(vm, &build_arguments_object);
 
     // globals
     ignore def_global_fn(vm, "structuredClone", &nat_structured_clone);

@@ -1,5 +1,17 @@
 # PLAN — the `arguments` object
 
+**Status: implemented (I1–I3 done).** `arguments` works in ordinary
+functions, is captured lexically by arrows, and is correct across
+apply/call/bind, generators, and async functions. It is an unmapped
+array-like object (`Object.prototype` proto, non-enumerable `length`,
+iterable). `test/diff/arguments.js` matches Node byte-for-byte; the npm
+matrix confirms it unblocked js-yaml and validator. Not done (own
+follow-up, and the reason `Array.prototype.slice.call(arguments)` still
+fails): tsmc's Array methods reject non-array `this`, so the legacy
+`.call(arguments)` idiom needs array-like-receiver support — modern
+`[...arguments]` / `Array.from(arguments)` work today. Also unchanged:
+sloppy-mode mapped arguments and module-top-level `arguments`.
+
 Implements the `arguments` object inside ordinary (non-arrow) functions.
 Currently a bare `arguments` compiles to a global load and throws
 `arguments is not defined`, which blocks a large class of transpiled npm

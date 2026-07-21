@@ -43,6 +43,7 @@ struct Frame {
     i32 cur_ip;         // this frame's active site (call/throw), for stacks
     i32 base;
     Value this_val;
+    Value arguments_obj;  // the `arguments` object, or undefined if unused
     bool is_ctor;
     JsGenerator* gen;   // non-null while running a generator/async body
 }
@@ -90,6 +91,10 @@ struct IoHandle {
 // The `net` module installs the implementation, keeping vm.mc free of any
 // dependency on builtins.
 type ReactorHook = fn(VM*, i32, i16): void;
+
+// Builds the `arguments` object from a call's argument values, installed by
+// builtins so vm.mc's call sites stay free of the object/iterator builtins.
+type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 
 struct VM {
     GcHeap heap;
@@ -167,6 +172,7 @@ struct VM {
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
     ReactorHook reactor_hook;   // net module's ready-handle dispatcher, or null
+    ArgumentsBuilder arguments_builder;   // builds `arguments`, or null
     Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
     Value sym_iterator;      // well-known Symbol.iterator
     u32 sym_iterator_id;
@@ -273,6 +279,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         Frame* fr = vm.frames + i;
         if fr.fun != null { gc_mark_cell(h, &fr.fun.head); }
         gc_mark_value(h, fr.this_val);
+        gc_mark_value(h, fr.arguments_obj);
     }
     for i32 i = 0; i < vm.globals.cap; i++ {
         IntSlot<Value>* sl = vm.globals.slots + i;
@@ -1688,6 +1695,7 @@ void vm_init(VM* vm) {
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
     vm.reactor_hook = null;
+    vm.arguments_builder = null;
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -1899,6 +1907,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, vpeek(vm, 1));
             }
             case OP_THIS: { vpush(vm, fr.this_val); }
+            case OP_ARGUMENTS: { vpush(vm, fr.arguments_obj); }
             case OP_GETLOCAL: {
                 vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;
@@ -2440,6 +2449,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
                             vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
                         } else {
+                            i32 arm = gc_root_mark(&vm.heap);
+                            Value argobj = value_undefined();
+                            if ft.needs_arguments {
+                                argobj = vm_build_arguments(vm, vm.stack + vm.sp - argc, argc);
+                                gc_root(&vm.heap, argobj);
+                            }
                             normalize_args(vm, ft, argc);
                             i32 base = vm.sp - ft.n_params;
                             for i32 i = ft.n_params; i < ft.n_slots; i++ {
@@ -2452,9 +2467,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.cur_ip = 0;
                             nf.base = base;
                             nf.this_val = thisv;
+                            nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
                             nf.gen = null;
                             vm.fp++;
+                            gc_root_reset(&vm.heap, arm);
                             fr = nf;
                             t = ft;
                             code = t.code;
@@ -3044,6 +3061,7 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.cur_ip = 0;
     fr.base = base;
     fr.this_val = value_undefined();
+    fr.arguments_obj = value_undefined();
     fr.is_ctor = false;
     fr.gen = null;
     vm.fp++;
@@ -3192,9 +3210,16 @@ bool vm_iter_next(VM* vm, Value iter, Value* val, bool* done) {
 // Consumes [fn, this, args...] from the stack; returns the generator.
 private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
     FnTemplate* ft = f.tmpl;
+    i32 arm = gc_root_mark(&vm.heap);
+    Value argobj = value_undefined();
+    if ft.needs_arguments {
+        argobj = vm_build_arguments(vm, vm.stack + vm.sp - argc, argc);
+        gc_root(&vm.heap, argobj);
+    }
     normalize_args(vm, ft, argc);
     Value thisv = vpeek(vm, ft.n_params);
     JsGenerator* g = js_new_generator(&vm.heap, f, thisv);
+    g.arguments_obj = argobj;
     i32 n = ft.n_slots;
     g.saved = alloc<Value>(n > 0 ? n : 1);
     for i32 i = 0; i < ft.n_params; i++ {
@@ -3206,6 +3231,7 @@ private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
     g.saved_len = n;
     g.resume_ip = 0;
     vm.sp -= ft.n_params + 2;
+    gc_root_reset(&vm.heap, arm);
     return value_cell(&g.head);
 }
 
@@ -3247,6 +3273,7 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     nf.cur_ip = g.resume_ip;
     nf.base = base;
     nf.this_val = g.this_val;
+    nf.arguments_obj = g.arguments_obj;
     nf.is_ctor = false;
     nf.gen = g;
     vm.fp++;
@@ -3540,6 +3567,15 @@ void* vm_handle_ext(VM* vm, i32 idx) {
 }
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
+void vm_set_arguments_builder(VM* vm, ArgumentsBuilder b) { vm.arguments_builder = b; }
+
+// Build the arguments object for a call whose template needs it. Args live at
+// [argstart, argstart+argc); the result is left GC-reachable by the caller
+// storing it in the new frame. Returns undefined if no builder is installed.
+Value vm_build_arguments(VM* vm, Value* argstart, i32 argc) {
+    if vm.arguments_builder == null { return value_undefined(); }
+    return vm.arguments_builder(vm, argstart, argc);
+}
 
 // --- timers and the event loop -----------------------------------------------------
 
@@ -3763,6 +3799,12 @@ Value vm_call_stack(VM* vm, i32 argc) {
         vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
         return value_undefined();
     }
+    i32 arm = gc_root_mark(&vm.heap);
+    Value argobj = value_undefined();
+    if ft.needs_arguments {
+        argobj = vm_build_arguments(vm, vm.stack + vm.sp - argc, argc);
+        gc_root(&vm.heap, argobj);
+    }
     normalize_args(vm, ft, argc);
     i32 base = vm.sp - ft.n_params;
     for i32 i = ft.n_params; i < ft.n_slots; i++ {
@@ -3775,9 +3817,11 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.cur_ip = 0;
     nf.base = base;
     nf.this_val = thisv;
+    nf.arguments_obj = argobj;
     nf.is_ctor = false;
     nf.gen = null;
     vm.fp++;
+    gc_root_reset(&vm.heap, arm);
     // this re-entry runs on the native C stack; guard its depth
     if vm.exec_depth >= VM_EXEC_DEPTH_MAX {
         vm.fp--;

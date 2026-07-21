@@ -13,6 +13,7 @@ enum Op {
     OP_HOLE,         // pushes an array-hole sentinel (elisions)
     OP_POP, OP_DUP, OP_DUP2,
     OP_THIS,
+    OP_ARGUMENTS,    // pushes this frame's arguments object
 
     OP_GETLOCAL,     // u16 slot
     OP_SETLOCAL,     // u16 slot; keeps value on stack
@@ -99,6 +100,7 @@ struct FnTemplate {
     bool has_rest;       // last param collects surplus arguments
     bool is_gen;         // calls build a generator object
     bool is_async;       // calls build generator state + promise
+    bool needs_arguments; // references `arguments`; build it at call time
     u8* code;
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook
