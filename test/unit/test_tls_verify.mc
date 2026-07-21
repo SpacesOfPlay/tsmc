@@ -91,16 +91,18 @@ i32 main() {
     check(!x509_verify_signature(&p256_s384, &p384_root), "p256_s384 not under p384_root");
     check(!x509_verify_signature(&p384_root, &root), "p384_root not under the RSA root");
 
-    // tamper: flipped TBS byte and flipped signature byte (P-384 path)
-    u8[509] pb;
-    for i32 i = 0; i < 509; i++ { pb[i] = X509_P384_LEAF[i]; }
+    // tamper: flipped TBS byte and flipped signature byte (P-384 path).
+    // Copy by the generated length so fixture regeneration cannot break this.
+    u8[1024] pb;
+    i32 plen = X509_P384_LEAF_LEN;
+    for i32 i = 0; i < plen; i++ { pb[i] = X509_P384_LEAF[i]; }
     pb[150] = cast(u8, cast(i32, pb[150]) ^ 0xff);
     X509Cert pi;
-    bool pp = x509_parse(&pb[0], cast(u64, 509), &pi);
+    bool pp = x509_parse(&pb[0], cast(u64, plen), &pi);
     check(!pp || !x509_verify_signature(&pi, &p384_root), "tampered p384_leaf TBS rejected");
-    for i32 i = 0; i < 509; i++ { pb[i] = X509_P384_LEAF[i]; }
-    pb[505] = cast(u8, cast(i32, pb[505]) ^ 0xff);
-    bool sp2 = x509_parse(&pb[0], cast(u64, 509), &pi);
+    for i32 i = 0; i < plen; i++ { pb[i] = X509_P384_LEAF[i]; }
+    pb[plen - 4] = cast(u8, cast(i32, pb[plen - 4]) ^ 0xff);
+    bool sp2 = x509_parse(&pb[0], cast(u64, plen), &pi);
     check(!sp2 || !x509_verify_signature(&pi, &p384_root), "tampered p384_leaf sig rejected");
 
     // degenerate signatures must be rejected outright

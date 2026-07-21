@@ -191,10 +191,32 @@ callback returns nonzero).
    with SHA-384/SHA-512; a P-256 CA signing with SHA-384) with cross-curve
    negatives and tamper tests. Store coverage is now every root except the
    single P-521 key (fails closed).
-4. **I4 — path validation (E).** `tls_chain_verify` tying I1–I3 together;
-   unit-tested against a full embedded real chain (positive) and negative
-   chains (wrong host, expired via a pinned `now`, missing intermediate,
-   tampered sig, self-signed-not-in-store, non-CA intermediate).
+4. **I4 — path validation (E). (done)** `src/tls_chain.mc` —
+   `tls_chain_verify(ders, lens, n, host, host_len, now, extra_root, ...)`
+   returning a specific `X509_V_*` code (plus `tls_chain_err_str`). Walks the
+   presented chain leaf-first: per-cert validity, then for intermediates
+   basicConstraints cA=TRUE / pathLenConstraint / keyCertSign, then tries to
+   anchor the cert (extra root first, then every same-DN store candidate) and
+   otherwise requires exact-DER linkage + a verified signature to the next
+   presented cert. `anchor_signs` demands DN equality **and** a verified
+   signature **and** anchor validity/pathlen — the anchor's own
+   basicConstraints/self-sig are not checked (trusted a priori; v1 roots).
+   Hostname (SAN-only) + leaf keyUsage checked up front. A server-appended
+   root cert is naturally ignored (the chain anchors one step earlier). Chain
+   cap 8. `extra_root` doubles as the future Node `ca:` option.
+   `test/unit/test_tls_chain.mc` (31 checks): controlled positives (incl.
+   wildcard, appended root, leaf-direct-from-anchor, P-384 chain) and every
+   failure mode — wrong host, expired / not-yet-valid via pinned `now`,
+   missing intermediate, untrusted root, broken linkage, tampered signature,
+   **CA:FALSE intermediate signing a victim** (rogue fixture), **pathlen:0
+   violated two levels down**, and an **evil-twin anchor** (same subject DN
+   as the trusted root, different key — with a DN-collision guard assertion
+   so the test can't rot). A trust-on-DN-only mutant of `anchor_signs` is
+   confirmed killed by the evil-twin test. Plus a captured 4-cert production
+   chain (`tools/gen_test_certs_real.sh`, clock pinned to capture time)
+   validated **against the bundled Mozilla store** exactly as served —
+   3-hop walk over P-256+P-384, SHA-256+SHA-384 — with wrong-host,
+   truncated-chain, and clock-skew negatives.
 5. **I5 — wire into TLS.** `tls_chain_verify_cb` + SNI threading; make it
    default; add `rejectUnauthorized`/insecure opt-out. Manual real-server
    validation (example.com/google/github succeed; a known-bad host like

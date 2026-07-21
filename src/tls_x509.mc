@@ -19,6 +19,7 @@ const u16 X509_SIG_ECDSA_SHA512 = 8;  // 1.2.840.10045.4.3.4
 
 // keyUsage bits (BIT STRING, bit 0 = most significant of the first byte).
 const u16 X509_KU_DIGITAL_SIGNATURE = 0x8000;   // bit 0
+const u16 X509_KU_KEY_ENCIPHERMENT = 0x2000;    // bit 2
 const u16 X509_KU_KEY_CERT_SIGN = 0x0400;       // bit 5
 
 // --- parsed certificate ----------------------------------------------------

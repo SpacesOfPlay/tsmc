@@ -9,6 +9,17 @@
 #   p256_ca         self-signed P-256 CA, ecdsa-with-SHA384 (SHA-384 by a
 #   p256s384_leaf   P-256 key, signed by p256_ca with SHA-384   P-256 key)
 #
+# plus path-validation attack fixtures (test/unit/test_tls_chain.mc):
+#
+#   rogue           CA:FALSE end-entity, signed by p384_root
+#   victim          signed by rogue's key (a chain through it must fail)
+#   mid_ca          CA:TRUE pathlen:0, signed by p384_root
+#   sub_ca          CA:TRUE, signed by mid_ca (violates mid_ca's pathlen)
+#   deep_leaf       signed by sub_ca
+#   evil_leaf       signed by an "evil twin" CA carrying the SAME subject DN
+#                   as the RSA test root of gen_test_certs.sh but a fresh
+#                   key — an anchor matched by DN alone must still be refused
+#
 # Kept separate from tools/gen_test_certs.sh so regenerating this set never
 # shifts the date pins in test/unit/test_x509.mc. No dates are asserted for
 # these. Requires openssl and node.
@@ -57,7 +68,63 @@ openssl req -new -key p256s384_leaf.key -sha256 -out p256s384_leaf.csr \
 openssl x509 -req -in p256s384_leaf.csr -CA p256_ca.pem -CAkey p256_ca.key \
   -CAcreateserial -sha384 -days 800 -out p256s384_leaf.pem -extfile leaf.ext
 
-for c in p384_root p384_leaf p384_mixed p384s512_leaf p256_ca p256s384_leaf; do
+# --- path-validation attack fixtures ---
+
+# rogue: an end-entity (CA:FALSE, no keyCertSign) that then signs "victim".
+# A validator that skips basicConstraints would accept victim's chain.
+openssl ecparam -name prime256v1 -genkey -noout -out rogue.key
+openssl req -new -key rogue.key -sha256 -out rogue.csr \
+  -subj "/C=US/O=tsmc test/CN=rogue.example.test"
+printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:rogue.example.test\n" > rogue.ext
+openssl x509 -req -in rogue.csr -CA p384_root.pem -CAkey p384_root.key \
+  -CAcreateserial -sha384 -days 800 -out rogue.pem -extfile rogue.ext
+
+openssl ecparam -name prime256v1 -genkey -noout -out victim.key
+openssl req -new -key victim.key -sha256 -out victim.csr \
+  -subj "/C=US/O=tsmc test/CN=victim.example.test"
+printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:victim.example.test\n" > victim.ext
+openssl x509 -req -in victim.csr -CA rogue.pem -CAkey rogue.key \
+  -CAcreateserial -sha256 -days 800 -out victim.pem -extfile victim.ext
+
+# mid_ca (pathlen:0) -> sub_ca -> deep_leaf: a valid-looking chain that
+# violates mid_ca's pathLenConstraint.
+openssl ecparam -name prime256v1 -genkey -noout -out mid_ca.key
+openssl req -new -key mid_ca.key -sha256 -out mid_ca.csr \
+  -subj "/C=US/O=tsmc test/CN=tsmc Test Mid CA pathlen0"
+printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n" > mid_ca.ext
+openssl x509 -req -in mid_ca.csr -CA p384_root.pem -CAkey p384_root.key \
+  -CAcreateserial -sha384 -days 3650 -out mid_ca.pem -extfile mid_ca.ext
+
+openssl ecparam -name prime256v1 -genkey -noout -out sub_ca.key
+openssl req -new -key sub_ca.key -sha256 -out sub_ca.csr \
+  -subj "/C=US/O=tsmc test/CN=tsmc Test Sub CA"
+printf "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n" > sub_ca.ext
+openssl x509 -req -in sub_ca.csr -CA mid_ca.pem -CAkey mid_ca.key \
+  -CAcreateserial -sha256 -days 3650 -out sub_ca.pem -extfile sub_ca.ext
+
+openssl ecparam -name prime256v1 -genkey -noout -out deep_leaf.key
+openssl req -new -key deep_leaf.key -sha256 -out deep_leaf.csr \
+  -subj "/C=US/O=tsmc test/CN=deep.example.test"
+printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:deep.example.test\n" > deep_leaf.ext
+openssl x509 -req -in deep_leaf.csr -CA sub_ca.pem -CAkey sub_ca.key \
+  -CAcreateserial -sha256 -days 800 -out deep_leaf.pem -extfile deep_leaf.ext
+
+# evil twin: fresh key, subject DN byte-identical to the RSA test root
+# ("tsmc Test Root CA R1" — same openssl, same string-type encoding).
+openssl ecparam -name prime256v1 -genkey -noout -out evil_root.key
+openssl req -x509 -new -key evil_root.key -sha256 -days 7300 -out evil_root.pem \
+  -subj "/C=US/O=tsmc test/CN=tsmc Test Root CA R1" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl ecparam -name prime256v1 -genkey -noout -out evil_leaf.key
+openssl req -new -key evil_leaf.key -sha256 -out evil_leaf.csr \
+  -subj "/C=US/O=tsmc test/CN=evil-twin.example.test"
+printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:evil-twin.example.test\n" > evil_leaf.ext
+openssl x509 -req -in evil_leaf.csr -CA evil_root.pem -CAkey evil_root.key \
+  -CAcreateserial -sha256 -days 800 -out evil_leaf.pem -extfile evil_leaf.ext
+
+for c in p384_root p384_leaf p384_mixed p384s512_leaf p256_ca p256s384_leaf \
+         rogue victim mid_ca sub_ca deep_leaf evil_leaf; do
   openssl x509 -in $c.pem -outform DER -out $c.der
 done
 
@@ -70,6 +137,12 @@ const items = [
   ["X509_P384_S512_LEAF","p384s512_leaf.der"],
   ["X509_P256_CA","p256_ca.der"],
   ["X509_P256_S384_LEAF","p256s384_leaf.der"],
+  ["X509_ROGUE","rogue.der"],
+  ["X509_VICTIM","victim.der"],
+  ["X509_MID_CA","mid_ca.der"],
+  ["X509_SUB_CA","sub_ca.der"],
+  ["X509_DEEP_LEAF","deep_leaf.der"],
+  ["X509_EVIL_LEAF","evil_leaf.der"],
 ];
 let out = "// x509_fixtures_p384.mc -- embedded DER test certificates for the\n";
 out += "// P-384 / mixed-curve signature tests. Regenerate with\n";
