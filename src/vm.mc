@@ -115,7 +115,7 @@ struct VM {
     JsObject* number_proto;
     JsObject* boolean_proto;
     JsObject* function_proto;
-    JsObject*[5] error_protos;   // indexed by ERR_*
+    JsObject*[7] error_protos;   // indexed by ERR_* (size = ERR_KIND_COUNT)
     u64 rng;
     JsObject* generator_proto;
     JsObject* promise_proto;
@@ -126,6 +126,7 @@ struct VM {
     JsObject* weakset_proto;
     JsObject* date_proto;
     JsObject* symbol_proto;
+    JsObject* symbol_registry;   // Symbol.for/keyFor: string key -> symbol
     JsObject* bigint_proto;
     JsObject* buffer_proto;
     JsObject* textenc_proto;
@@ -186,12 +187,17 @@ const i32 ERR_TYPE = 1;
 const i32 ERR_RANGE = 2;
 const i32 ERR_REF = 3;
 const i32 ERR_SYNTAX = 4;
+const i32 ERR_EVAL = 5;
+const i32 ERR_URI = 6;
+const i32 ERR_KIND_COUNT = 7;   // must match the error_protos array size
 
 str vm_error_kind_name(i32 kind) {
     if kind == ERR_TYPE { return "TypeError"; }
     if kind == ERR_RANGE { return "RangeError"; }
     if kind == ERR_REF { return "ReferenceError"; }
     if kind == ERR_SYNTAX { return "SyntaxError"; }
+    if kind == ERR_EVAL { return "EvalError"; }
+    if kind == ERR_URI { return "URIError"; }
     return "Error";
 }
 
@@ -281,7 +287,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
-    for i32 i = 0; i < 5; i++ {
+    for i32 i = 0; i < ERR_KIND_COUNT; i++ {
         if vm.error_protos[i] != null { gc_mark_cell(h, &vm.error_protos[i].head); }
     }
     if vm.generator_proto != null { gc_mark_cell(h, &vm.generator_proto.head); }
@@ -291,6 +297,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.weakmap_proto != null { gc_mark_cell(h, &vm.weakmap_proto.head); }
     if vm.weakset_proto != null { gc_mark_cell(h, &vm.weakset_proto.head); }
     if vm.symbol_proto != null { gc_mark_cell(h, &vm.symbol_proto.head); }
+    if vm.symbol_registry != null { gc_mark_cell(h, &vm.symbol_registry.head); }
     if vm.bigint_proto != null { gc_mark_cell(h, &vm.bigint_proto.head); }
     if vm.set_proto != null { gc_mark_cell(h, &vm.set_proto.head); }
     if vm.date_proto != null { gc_mark_cell(h, &vm.date_proto.head); }
@@ -1630,7 +1637,7 @@ void vm_init(VM* vm) {
     vm.number_proto = null;
     vm.boolean_proto = null;
     vm.function_proto = null;
-    for i32 i = 0; i < 5; i++ {
+    for i32 i = 0; i < ERR_KIND_COUNT; i++ {
         vm.error_protos[i] = null;
     }
     vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
@@ -1643,6 +1650,7 @@ void vm_init(VM* vm) {
     vm.weakset_proto = null;
     vm.date_proto = null;
     vm.symbol_proto = null;
+    vm.symbol_registry = null;
     vm.bigint_proto = null;
     vm.buffer_proto = null;
     vm.ta_proto = null;
@@ -1972,13 +1980,24 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value* g = intmap_get<Value>(&vm.globals, a);
                 if g != null {
                     vpush(vm, *g);
-                } else if op == OP_GETGLOBAL_SOFT {
-                    vpush(vm, value_undefined());
                 } else {
-                    str nm = atom_name(&vm.atoms, a);
-                    string msg = format("{} is not defined", nm);
-                    vm_throw_error(vm, ERR_REF, msg);
-                    free(msg);
+                    // Free identifiers resolve against the global object, which
+                    // inherits Object.prototype, so bare `toString` /
+                    // `hasOwnProperty` / `valueOf` (and `typeof` of them) work
+                    // as in Node. Only the intmap-miss path pays this lookup.
+                    Value gv;
+                    if vm.object_proto != null
+                       && vm_get_prop_value(vm, value_cell(&vm.object_proto.head), a, &gv)
+                       && !value_is_undefined(gv) {
+                        vpush(vm, gv);
+                    } else if op == OP_GETGLOBAL_SOFT {
+                        vpush(vm, value_undefined());
+                    } else {
+                        str nm = atom_name(&vm.atoms, a);
+                        string msg = format("{} is not defined", nm);
+                        vm_throw_error(vm, ERR_REF, msg);
+                        free(msg);
+                    }
                 }
             }
             case OP_SETGLOBAL: {

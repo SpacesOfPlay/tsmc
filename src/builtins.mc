@@ -561,6 +561,35 @@ private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Va
     return value_cell(&d.head);
 }
 
+// Object.getOwnPropertyDescriptors(obj): a map of every own string key to its
+// property descriptor, reusing the singular logic. Symbol-keyed properties are
+// not included (matches getOwnPropertyNames enumeration).
+private Value nat_object_getownpropdescs(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* result = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&result.head));
+    Value names = nat_object_getownnames(vmp, callee, thisv, args, argc);
+    gc_root(&vm.heap, names);
+    if value_is_object(names) {
+        JsObject* arr = value_as_object(names);
+        i32 n = arr.elen;
+        for i32 i = 0; i < n; i++ {
+            Value kv = js_array_get(arr, i);
+            noinit Value[2] dargs;
+            dargs[0] = ov;
+            dargs[1] = kv;
+            Value desc = nat_object_getownpropdesc(vmp, callee, thisv, &dargs[0], 2);
+            if value_is_object(desc) {
+                js_set_prop(result, atom_intern(&vm.atoms, sview(kv)), desc);
+            }
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&result.head);
+}
+
 // Clears the given attribute bits from every own property.
 private void object_lock_props(JsObject* o, u8 clear) {
     for i32 i = 0; i < o.props.len; i++ {
@@ -3833,6 +3862,12 @@ private Value nat_referror_ctor(void* vmp, Value callee, Value thisv, Value* arg
 private Value nat_syntaxerror_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return error_ctor_impl(as_vm(vmp), thisv, args, argc, ERR_SYNTAX);
 }
+private Value nat_evalerror_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return error_ctor_impl(as_vm(vmp), thisv, args, argc, ERR_EVAL);
+}
+private Value nat_urierror_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return error_ctor_impl(as_vm(vmp), thisv, args, argc, ERR_URI);
+}
 
 private Value nat_error_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -3946,6 +3981,50 @@ private Value nat_symbol_valueof(void* vmp, Value callee, Value thisv, Value* ar
 private Value nat_symbol_description(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     if !value_is_symbol(thisv) { return value_undefined(); }
     return value_as_symbol(thisv).desc;
+}
+
+// Symbol.for(key): the shared registered symbol for `key` (stringified),
+// created on first use so Symbol.for(k) === Symbol.for(k).
+private Value nat_symbol_for(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value kv = js_to_string_value(vm, arg_at(args, argc, 0));
+    if vm.symbol_registry == null {
+        vm.symbol_registry = js_new_object(&vm.heap, null);
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, kv);
+    u32 a = atom_intern(&vm.atoms, sview(kv));
+    Value existing;
+    if js_get_prop(vm.symbol_registry, a, &existing) {
+        gc_root_reset(&vm.heap, rm);
+        return existing;
+    }
+    Value sym = vm_new_symbol(vm, kv);
+    gc_root(&vm.heap, sym);
+    js_set_prop(vm.symbol_registry, a, sym);
+    gc_root_reset(&vm.heap, rm);
+    return sym;
+}
+
+// Symbol.keyFor(sym): the registry key if `sym` came from Symbol.for, else
+// undefined. Reverse-scans the registry by symbol identity.
+private Value nat_symbol_key_for(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value sv = arg_at(args, argc, 0);
+    if !value_is_symbol(sv) {
+        vm_throw_error(vm, ERR_TYPE, "Symbol.keyFor requires a symbol argument");
+        return value_undefined();
+    }
+    if vm.symbol_registry == null { return value_undefined(); }
+    u32 id = value_as_symbol(sv).id;
+    JsObject* reg = vm.symbol_registry;
+    for i32 i = 0; i < reg.props.len; i++ {
+        Value pv = (reg.props.items + i).val;
+        if value_is_symbol(pv) && value_as_symbol(pv).id == id {
+            return value_as_symbol(sv).desc;   // desc holds the registry key
+        }
+    }
+    return value_undefined();
 }
 
 // --- array / string iterators ------------------------------------------------------
@@ -10095,6 +10174,41 @@ private Value nat_crypto_random_bytes(void* vmp, Value callee, Value thisv, Valu
     return r;
 }
 
+// crypto.randomFillSync(buf[, offset[, size]]): fill buf in place with random
+// bytes and return it. Accepts a Buffer (array-backed) or a typed array.
+private Value nat_crypto_random_fill_sync(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value bufv = arg_at(args, argc, 0);
+    if !value_is_object(bufv) {
+        vm_throw_error(vm, ERR_TYPE, "randomFillSync: argument must be a Buffer or TypedArray");
+        return value_undefined();
+    }
+    JsObject* o = value_as_object(bufv);
+    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
+    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    i32 off = value_is_undefined(arg_at(args, argc, 1)) ? 0 : to_int_arg(arg_at(args, argc, 1));
+    if off < 0 { off = 0; }
+    if off > len { off = len; }
+    i32 size = value_is_undefined(arg_at(args, argc, 2)) ? len - off : to_int_arg(arg_at(args, argc, 2));
+    if size < 0 { size = 0; }
+    if off + size > len { size = len - off; }
+    if size > 0 {
+        u8* rnd = alloc<u8>(size);
+        if !os_random(rnd, size) {
+            free(rnd);
+            vm_throw_error(vm, ERR_ERROR, "randomFillSync: no secure random source");
+            return value_undefined();
+        }
+        for i32 i = 0; i < size; i++ {
+            i32 bv = cast(i32, rnd[i]);
+            if is_ta { vm_ta_set(vm, o, off + i, value_int(bv)); }
+            else { js_array_set(o, off + i, value_number(cast(f64, bv))); }
+        }
+        free(rnd);
+    }
+    return bufv;
+}
+
 private Value nat_crypto_random_uuid(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     u8[16] b;
@@ -10127,6 +10241,7 @@ private JsObject* build_crypto_module(VM* vm) {
     JsObject* ns = new_node_module(vm, &mod);
     def_node_export(vm, mod, ns, "createHash", &nat_crypto_create_hash);
     def_node_export(vm, mod, ns, "randomBytes", &nat_crypto_random_bytes);
+    def_node_export(vm, mod, ns, "randomFillSync", &nat_crypto_random_fill_sync);
     def_node_export(vm, mod, ns, "randomUUID", &nat_crypto_random_uuid);
     return ns;
 }
@@ -11205,7 +11320,7 @@ void builtins_install(VM* vm) {
     vm.boolean_proto = js_new_object(&vm.heap, vm.object_proto);
     vm.function_proto = js_new_object(&vm.heap, vm.object_proto);
     vm.error_protos[ERR_ERROR] = js_new_object(&vm.heap, vm.object_proto);
-    for i32 i = 1; i < 5; i++ {
+    for i32 i = 1; i < ERR_KIND_COUNT; i++ {
         vm.error_protos[i] = js_new_object(&vm.heap, vm.error_protos[ERR_ERROR]);
     }
 
@@ -11224,6 +11339,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "defineProperty", &nat_object_defineproperty);
     def_static(vm, object_ctor, "defineProperties", &nat_object_defineproperties);
     def_static(vm, object_ctor, "getOwnPropertyDescriptor", &nat_object_getownpropdesc);
+    def_static(vm, object_ctor, "getOwnPropertyDescriptors", &nat_object_getownpropdescs);
     def_static(vm, object_ctor, "is", &nat_object_is);
     def_static(vm, object_ctor, "hasOwn", &nat_object_hasown);
     def_static(vm, object_ctor, "freeze", &nat_object_freeze);
@@ -11422,7 +11538,11 @@ void builtins_install(VM* vm) {
     props_set_desc(&fe_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_REF].head), 0);
     JsNative* se_ctor = def_global_fn(vm, "SyntaxError", &nat_syntaxerror_ctor);
     props_set_desc(&se_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_SYNTAX].head), 0);
-    for i32 i = 0; i < 5; i++ {
+    JsNative* ee_ctor = def_global_fn(vm, "EvalError", &nat_evalerror_ctor);
+    props_set_desc(&ee_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_EVAL].head), 0);
+    JsNative* ue_ctor = def_global_fn(vm, "URIError", &nat_urierror_ctor);
+    props_set_desc(&ue_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_URI].head), 0);
+    for i32 i = 0; i < ERR_KIND_COUNT; i++ {
         JsObject* ep = vm.error_protos[i];
         Value nm = new_str(vm, vm_error_kind_name(i));
         js_set_prop(ep, vm.atom_name, nm);
@@ -11446,6 +11566,8 @@ void builtins_install(VM* vm) {
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
     props_set(&symbol_ctor.props, bi_atom(vm, "toPrimitive"), vm.sym_to_primitive);
+    def_static(vm, symbol_ctor, "for", &nat_symbol_for);
+    def_static(vm, symbol_ctor, "keyFor", &nat_symbol_key_for);
     vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
     props_set_desc(&symbol_ctor.props, vm.atom_prototype, value_cell(&vm.symbol_proto.head), 0);
     def_method(vm, vm.symbol_proto, "toString", &nat_symbol_tostring);

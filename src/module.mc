@@ -307,7 +307,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "buffer") || str_equal(s, "timers")
         || str_equal(s, "net") || str_equal(s, "http")
         || str_equal(s, "tls") || str_equal(s, "https")
-        || str_equal(s, "_fetch")
+        || str_equal(s, "tty") || str_equal(s, "_fetch")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -964,7 +964,21 @@ private str node_timers_promises_source() {
         ;
 }
 
+// Minimal `tty`: tsmc has no interactive terminal detection, so isatty is
+// always false (matching a piped/redirected stdio, which is how tsmc runs).
+// Enough for the color-support probes in chalk / supports-color.
+private str node_tty_source() {
+    return
+        "'use strict';\n"
+        "exports.isatty = function () { return false; };\n"
+        "function TTY() {}\n"
+        "exports.ReadStream = TTY;\n"
+        "exports.WriteStream = TTY;\n"
+        ;
+}
+
 private str builtin_js_source(str name) {
+    if str_equal(name, "tty") { return node_tty_source(); }
     if str_equal(name, "stream") { return node_stream_source(); }
     if str_equal(name, "assert") { return node_assert_source(); }
     if str_equal(name, "net") { return node_net_source(); }
@@ -1276,12 +1290,23 @@ i32 module_run_entry(VM* vm, str src, str path) {
     str dname = dir;
     if dname.len > 1 { dname.len = dname.len - 1; }  // drop trailing separator
     builtins_set_entry(vm, fclean, dname);
-    free(fname.data);
 
+    // Resolve the entry against its absolute path (as Node does): module
+    // resolution derives its base directory from this path, and a bare or
+    // relative entry ("app.js") yields an empty base dir that breaks
+    // node_modules lookups — worse as dependency depth grows. Absolute
+    // invocations (the test suite) keep their original path unchanged.
+    str resolve_path = path;
+    if !spec_is_absolute(path) { resolve_path = fclean; }
+
+    i32 rc;
     if has_module_syntax(src) {
-        return module_run(vm, path);
+        rc = module_run(vm, resolve_path);
+    } else {
+        // plain script: expose a CommonJS `require` bound to the entry file
+        vm_set_global(vm, "require", make_require_fn(vm, resolve_path));
+        rc = vm_run_source(vm, src, resolve_path);
     }
-    // plain script: expose a CommonJS `require` bound to the entry file
-    vm_set_global(vm, "require", make_require_fn(vm, path));
-    return vm_run_source(vm, src, path);
+    free(fname.data);
+    return rc;
 }
