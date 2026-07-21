@@ -29,7 +29,11 @@ class TLSSocket extends EventEmitter {
   __onReady(revents) {
     if (this.destroyed) return;
     const st = __tls_pump(this._id);
-    if (st & T_ERR) { this._fail('TLS error'); return; }
+    if (st & T_ERR) {
+      const why = __tls_verify_error(this._id);
+      this._fail(why ? 'certificate verify failed: ' + why : 'TLS error');
+      return;
+    }
     if (this._connecting && __tls_established(this._id)) {
       this._connecting = false;
       this.emit('secureConnect');
@@ -91,8 +95,14 @@ function connect(opts, cb) {
   const s = new TLSSocket();
   const host = opts.host || opts.hostname || '127.0.0.1';
   const sni = opts.servername || host;
+  // Secure by default: the chain is validated against the bundled roots and
+  // the SNI hostname. rejectUnauthorized:false (or the Node env switch)
+  // skips that but still verifies the handshake signature.
+  const envOff = typeof process !== 'undefined' && process.env &&
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0';
+  const insecure = opts.rejectUnauthorized === false || envOff;
   if (typeof cb === 'function') s.on('secureConnect', cb);
-  s._id = __tls_connect(host, opts.port || 443, sni);
+  s._id = __tls_connect(host, opts.port || 443, sni, insecure);
   if (s._id < 0) {
     queueMicrotask(() => s._fail('TLS connect failed'));
     return s;
@@ -104,7 +114,7 @@ function connect(opts, cb) {
 module.exports = {
   TLSSocket: TLSSocket,
   connect: connect,
-  // stopgap SPKI-pin trust (ECDSA-P256) until general cert validation
+  // SPKI-pin trust (ECDSA-P256): replaces CA validation with a key pin
   setEcdsaPin: function (hex) { __tls_pin_ecdsa(hex); },
 };
 ";

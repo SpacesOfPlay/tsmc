@@ -27,10 +27,9 @@ private u8[19] DI_SHA512 = {
     0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
     0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 };
 
-private {
-
 // SHA-2 of input into out. hlen selects 32=SHA-256, 48=SHA-384, 64=SHA-512.
-void sha2(i32 hlen, u8* input, u64 len, u8* out) {
+// Public: the TLS handshake verifier hashes with the same dispatch.
+void x509_sha2(i32 hlen, u8* input, u64 len, u8* out) {
     if hlen == 48 {
         cf_sha512_context st;
         cf_sha384_init(&st);
@@ -50,8 +49,8 @@ void sha2(i32 hlen, u8* input, u64 len, u8* out) {
 }
 
 // Extract the RSA modulus (big-endian, any leading zero stripped) and public
-// exponent from an issuer's SubjectPublicKeyInfo. Returns the modulus byte
-// length, or -1 on any malformation. mod_out must hold at least mod_cap bytes.
+// exponent from a SubjectPublicKeyInfo. Returns the modulus byte length, or
+// -1 on any malformation. mod_out must hold at least mod_cap bytes.
 i32 spki_rsa_pubkey(X509Cert* c, u8* mod_out, i32 mod_cap, u64* exp_out) {
     DerCursor top = DerCursor{ .buf = c.buf, .pos = c.spki.off, .end = c.spki.off + c.spki.len };
     DerTlv spki;
@@ -166,6 +165,8 @@ bool ecdsa_sig_to_raw(u8* buf, DerRange sig, i32 csize, u8* raw_out) {
     return true;
 }
 
+private {
+
 // Build an EMSA-PKCS1-v1_5 block of length emlen for the given hash:
 // 0x00 || 0x01 || 0xFF..(>=8).. || 0x00 || DigestInfo || H.
 bool build_pkcs1v15(i32 hlen, u8* hash, u8* em, i32 emlen) {
@@ -249,7 +250,7 @@ bool x509_verify_signature(X509Cert* child, X509Cert* parent) {
     else { return false; }                             // SHA-1 / unknown: refuse
 
     u8[64] digest;
-    sha2(hlen, child.buf + child.tbs.off, child.tbs.len, &digest[0]);
+    x509_sha2(hlen, child.buf + child.tbs.off, child.tbs.len, &digest[0]);
 
     if is_rsa {
         return rsa_pkcs1v15_verify(parent, &digest[0], hlen,

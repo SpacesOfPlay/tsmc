@@ -1,14 +1,23 @@
-// os_time.mc — monotonic clock and a blocking wait.
+// os_time.mc — monotonic clock, wall clock, and a blocking wait.
 //
 // These sit below the builtins layer so the VM reactor
 // (src/vm.mc) can sleep until the next timer is due without depending on
-// builtins. `vm_clock_ns` is a monotonic nanosecond counter; `vm_wait_ms`
-// blocks the calling thread for the given milliseconds.
+// builtins. `vm_clock_ns` is a monotonic nanosecond counter; `os_wall_ms`
+// is real time (unix epoch milliseconds — used for certificate validity);
+// `vm_wait_ms` blocks the calling thread for the given milliseconds.
 
 when os(windows) {
     private extern "kernel32.dll" i32 QueryPerformanceCounter(i64* p);
     private extern "kernel32.dll" i32 QueryPerformanceFrequency(i64* p);
     private extern "kernel32.dll" void Sleep(u32 ms);
+    private extern "kernel32.dll" void GetSystemTimeAsFileTime(u64* p);
+
+    i64 os_wall_ms() {
+        u64 ft = 0;
+        GetSystemTimeAsFileTime(&ft);
+        // FILETIME: 100ns ticks since 1601-01-01; epoch delta in ms.
+        return cast(i64, ft) / 10000 - 11644473600000;
+    }
 
     u64 vm_clock_ns() {
         i64 freq = 0;
@@ -30,9 +39,11 @@ when os(windows) {
 }
 else when os(wasm) {
     // Sandbox: the monotonic counter is the host clock import (qpf is 1e9
-    // there); there is no thread to block, so the wait is a no-op.
+    // there); a host returning nanoseconds since 1970 also serves as the
+    // wall clock. There is no thread to block, so the wait is a no-op.
     void vm_wait_ms(i64 ms) { }
     u64 vm_clock_ns() { return cast(u64, qpc()); }
+    i64 os_wall_ms() { return cast(i64, qpc()) / 1000000; }
 }
 else when os(macos) || os(ios) || os(linux) || os(android) {
     struct OsTimespec { i64 tv_sec; i64 tv_nsec; }
@@ -59,6 +70,14 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         ts.tv_nsec = 0;
         ignore clock_gettime(os_mono_clock(), &ts);
         return cast(u64, ts.tv_sec) * 1000000000 + cast(u64, ts.tv_nsec);
+    }
+
+    i64 os_wall_ms() {
+        OsTimespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+        ignore clock_gettime(0, &ts);   // CLOCK_REALTIME
+        return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     }
 
     void vm_wait_ms(i64 ms) {

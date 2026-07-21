@@ -67,9 +67,12 @@ Original increment-2 scope, for reference — A `src/tls_native.mc` that:
    `src/tls/THIRD_PARTY.md`). Verified against example.com/google
    (ECDSA) and api.github.com (RSA).
 
-**Security note:** https is convenient-but-insecure by default (no chain
-validation → MITM possible). Real security needs the CA-bundle milestone;
-until then, pin for anything sensitive.
+**Security note:** as of M35 (doc/PLAN_M35_ca_trust.md) https is **secure
+by default** — the server chain is validated against the bundled Mozilla
+root store and matched to the SNI hostname, and the handshake signature is
+checked against the leaf key. `tls.connect({ rejectUnauthorized:false })`
+or `NODE_TLS_REJECT_UNAUTHORIZED=0` opts out (handshake signature still
+checked); `tls.setEcdsaPin` pins instead of using the CA store.
 
 ## Known issues to handle before increment 2
 

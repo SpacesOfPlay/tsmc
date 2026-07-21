@@ -1,17 +1,11 @@
 // Manual (network-dependent) driver: non-blocking HTTPS GET to a real
-// server through the TLS session pump. Prints the response status line.
-// Run: build with minc against src/tls_native.mc; not part of the gated
-// suite. Host via arg is not wired; edit HOST below.
+// server through the TLS session pump, with the default CA-chain +
+// hostname validation. Prints the response status line. Run: build with
+// minc against src/tls_native.mc; not part of the gated suite. Host via
+// arg is not wired; edit HOST below.
 
 import "../../src/tls_native.mc";
 import "../../src/net_os.mc";
-
-private i32 hexval(u8 c) {
-    if c >= cast(u8, 48) && c <= cast(u8, 57) { return cast(i32, c) - 48; }
-    if c >= cast(u8, 97) && c <= cast(u8, 102) { return cast(i32, c) - 97 + 10; }
-    if c >= cast(u8, 65) && c <= cast(u8, 70) { return cast(i32, c) - 65 + 10; }
-    return 0;
-}
 
 i32 main() {
     u8* host = cast(u8*, "example.com");
@@ -21,16 +15,7 @@ i32 main() {
     i64 fd = net_os_connect_start(ip, cast(u16, 443));
     if fd == -1 { print("connect failed\n"); return 1; }
 
-    // example.com ECDSA SPKI pin (from picotls-minc example 10; may drift)
-    u8* pinhex = cast(u8*, "b5d8f3ee8e63dbb30037ab85336fe928630649b4b204c4a2494d6be6ac382433");
-    u8[32] pin;
-    for i32 i = 0; i < 32; i++ {
-        i32 hi = hexval(*(pinhex + i * 2));
-        i32 lo = hexval(*(pinhex + i * 2 + 1));
-        pin[i] = cast(u8, (hi << 4) | lo);
-    }
-    tls_set_ecdsa_pin(&pin[0]);
-    TlsSession* s = tls_session_new(host);
+    TlsSession* s = tls_session_new(host, false);
     if s == null { print("session alloc failed\n"); return 1; }
 
     bool connected = false;

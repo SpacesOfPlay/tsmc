@@ -22,6 +22,7 @@ import deflate;
 import inflate;
 import net_os;
 import tls_native;
+import tls_chain;
 
 // Platform math not covered by the math module: hyperbolic functions
 // and the accurate log1p/expm1, used by the extra Math.* methods.
@@ -7849,7 +7850,8 @@ private Value nat_tls_connect(void* vmp, Value callee, Value thisv, Value* args,
         for i32 i = 0; i < n; i++ { sni[i] = *(h.data + i); }
         sni[n] = 0;
     }
-    TlsSession* s = tls_session_new(has_sni ? &sni[0] : null);
+    bool insecure = js_truthy(arg_at(args, argc, 3));
+    TlsSession* s = tls_session_new(has_sni ? &sni[0] : null, insecure);
     if s == null { net_os_close(fd); return value_int(-1); }
     i32 id = vm_handle_add(vm, fd, 0, value_undefined());
     vm_handle_set_interest(vm, id, cast(i16, NET_POLLIN | NET_POLLOUT));
@@ -7922,6 +7924,17 @@ private Value nat_tls_established(void* vmp, Value callee, Value thisv, Value* a
     return value_bool(s != null && tls_established(s));
 }
 
+// Human-readable reason when the handshake failed on certificate
+// validation; null for transport-level failures.
+private Value nat_tls_verify_error(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
+    if s == null { return value_null(); }
+    i32 code = tls_chain_error(s);
+    if code == 0 { return value_null(); }
+    return new_str(vm, tls_chain_err_str(code));
+}
+
 private void net_install(VM* vm) {
     ignore net_os_init();
     vm_set_reactor_hook(vm, &net_reactor_dispatch);
@@ -7931,6 +7944,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_write", &nat_tls_write);
     ignore def_global_fn(vm, "__tls_close", &nat_tls_close);
     ignore def_global_fn(vm, "__tls_established", &nat_tls_established);
+    ignore def_global_fn(vm, "__tls_verify_error", &nat_tls_verify_error);
     ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);
     ignore def_global_fn(vm, "__net_listen", &nat_net_listen);

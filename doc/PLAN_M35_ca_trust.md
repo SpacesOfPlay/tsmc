@@ -217,11 +217,21 @@ callback returns nonzero).
    validated **against the bundled Mozilla store** exactly as served —
    3-hop walk over P-256+P-384, SHA-256+SHA-384 — with wrong-host,
    truncated-chain, and clock-skew negatives.
-5. **I5 — wire into TLS.** `tls_chain_verify_cb` + SNI threading; make it
-   default; add `rejectUnauthorized`/insecure opt-out. Manual real-server
-   validation (example.com/google/github succeed; a known-bad host like
-   `expired.badssl.com`/`wrong.host.badssl.com`/`self-signed.badssl.com`
-   is refused).
+5. **I5 — wire into TLS. (done)** `tls_native.mc` builds two shared
+   contexts: the default installs `tls_chain_verify_cb` (validate the
+   presented chain against the bundled store + the SNI hostname at the real
+   wall clock via a new `os_wall_ms`, then arm the CertificateVerify check
+   against the leaf key), and an insecure context whose verifier only checks
+   the handshake signature. `CertificateVerify` now advertises and handles
+   ECDSA-P256/P-384 + RSA-PSS. `tls_session_new(sni, insecure)`; the failing
+   session captures the specific `X509_V_*` reason (surfaced as
+   `__tls_verify_error`). `node_tls.mc` makes secure the default and adds the
+   opt-outs: `tls.connect({ rejectUnauthorized:false })` and
+   `NODE_TLS_REJECT_UNAUTHORIZED=0`. Live-verified: example.com / google /
+   github succeed; a wrong SNI is refused with "hostname mismatch";
+   expired / wrong-host / self-signed / untrusted-root badssl hosts are
+   refused; both opt-outs let a hostname-mismatched 1.3 host through. Gated
+   suite (58) and node diff both green.
 6. **I6 — gated tests + docs.** Fold the deterministic positive/negative
    cases into the suite; update DESIGN §4.1, PLAN, THIRD_PARTY, and the
    security note (remove "insecure by default").

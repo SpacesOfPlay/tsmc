@@ -3,12 +3,21 @@
 // it: inbound ciphertext -> ptls_handshake/ptls_receive -> plaintext;
 // outbound plaintext -> ptls_send -> ciphertext queued to the socket.
 //
-// First cut: X25519 + AES-128-GCM-SHA256 (the TLS 1.3 mandatory suite, so
-// it interoperates with essentially every server), no certificate
-// verification yet (accepts any cert). See doc/PLAN_M34_tls.md.
+// X25519 + AES-128-GCM-SHA256 (the TLS 1.3 mandatory suite, so it
+// interoperates with essentially every server). Trust is secure by
+// default: the presented chain is validated against the bundled root
+// store and the SNI hostname (src/tls_chain.mc), and the handshake
+// CertificateVerify is checked against the leaf key. Insecure mode
+// (rejectUnauthorized:false) skips chain+hostname but still verifies the
+// handshake signature. See doc/PLAN_M34_tls.md and doc/PLAN_M35_ca_trust.md.
 
 import "tls/picotls.mc";
+import "tls_x509.mc";
+import "tls_verify.mc";
+import "tls_p384.mc";
+import "tls_chain.mc";
 import net_os;
+import os_time;
 
 // tls_pump result bits.
 const i32 TLS_HANDSHAKE_DONE = 1;
@@ -17,37 +26,153 @@ const i32 TLS_EOF = 4;
 const i32 TLS_ERR = 8;
 const i32 TLS_WANT_WRITE = 16;
 
-// --- shared client context (built once; must outlive every session) ---
+// --- shared client contexts (built once; must outlive every session) ---
 
 private ptls_key_exchange_algorithm_t g_x25519;
 private ptls_aead_algorithm_t g_aes128;
 private ptls_cipher_suite_t g_cs128;
 private ptls_key_exchange_algorithm_t*[2] g_keyex;
 private ptls_cipher_suite_t*[2] g_cslist;
-private ptls_context_t g_ctx;
-private ptls_verify_certificate_t g_accept_verify;
-// signature schemes to advertise: ECDSA-P256 + RSA-PSS (SHA-256/384/512).
-private u16[5] g_accept_algos = { 0x0403, 0x0804, 0x0805, 0x0806, 0xffff };
+private ptls_context_t g_ctx;            // secure default: chain validation
+private ptls_context_t g_ctx_insecure;   // opt-in: rejectUnauthorized false
+private ptls_verify_certificate_t g_chain_verify;
+private ptls_verify_certificate_t g_insecure_verify;
+// signature schemes for CertificateVerify: ECDSA-P256/P-384 + RSA-PSS.
+private u16[6] g_leaf_algos = { 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0xffff };
 private bool g_inited = false;
 
-// Default verifier: parse the leaf cert, extract its public key (ECDSA-P256
-// or RSA), and verify the handshake CertificateVerify signature against it —
-// but do NOT validate the certificate chain or hostname. This authenticates
-// that the peer holds the presented cert's private key while accepting any
-// cert (an "insecure skip verify"). Full CA-chain trust is a later
-// milestone (DESIGN 4.1); tls_set_ecdsa_pin adds SPKI pinning on top.
-private i32 tls_accept_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
-                                 u8* server_name, verify_sign_fn* out_verify_sign,
-                                 void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
-    // try P-256, then RSA (the bridge callbacks extract the pubkey and arm
-    // verify_sign; they only touch the leaf cert's key, not the chain)
-    if ecdsa_p256_accept_verify_cert_cb(self, tls, server_name, out_verify_sign, out_verify_data, certs, num_certs) == 0 {
-        return 0;
+// Real wall clock for the TLS stack (certificate validity needs actual time).
+private u64 tls_wall_time_cb(st_ptls_get_time_t* self) {
+    return cast(u64, os_wall_ms());
+}
+private st_ptls_get_time_t g_tls_time = st_ptls_get_time_t{ .cb = tls_wall_time_cb };
+
+// --- CertificateVerify: prove the peer holds the leaf cert's key -----------
+
+private const i32 LEAF_KEY_P256 = 1;
+private const i32 LEAF_KEY_P384 = 2;
+private const i32 LEAF_KEY_RSA = 3;
+
+private struct leaf_verify_ctx_t {
+    i32 kind;
+    u8[96] ec_xy;
+    u8[512] rsa_mod;
+    i32 rsa_mod_len;
+    u64 rsa_exp;
+}
+
+// Verify the CertificateVerify signature against the armed leaf key.
+// Single-use: frees the ctx on every path.
+private i32 tls_leaf_verify_sign(void* verify_ctx, u16 algo,
+                                 ptls_iovec_t data, ptls_iovec_t sig) {
+    leaf_verify_ctx_t* ctx = cast(leaf_verify_ctx_t*, verify_ctx);
+    bool ok = false;
+    if ctx.kind == LEAF_KEY_P256 && algo == cast(u16, 0x0403) {
+        u8[32] digest;
+        x509_sha2(32, data.base, data.len, &digest[0]);
+        u8[64] raw;
+        DerRange r = DerRange{ .off = 0, .len = sig.len };
+        if ecdsa_sig_to_raw(sig.base, r, 32, &raw[0]) {
+            ok = uECC_verify(&ctx.ec_xy[0], &digest[0], cast(u32, 32), &raw[0],
+                             uECC_secp256r1()) == 1;
+        }
+    } else if ctx.kind == LEAF_KEY_P384 && algo == cast(u16, 0x0503) {
+        u8[48] digest;
+        x509_sha2(48, data.base, data.len, &digest[0]);
+        u8[96] raw;
+        DerRange r = DerRange{ .off = 0, .len = sig.len };
+        if ecdsa_sig_to_raw(sig.base, r, 48, &raw[0]) {
+            ok = p384_ecdsa_verify(&ctx.ec_xy[0], &digest[0], 48, &raw[0]);
+        }
+    } else if ctx.kind == LEAF_KEY_RSA {
+        i32 hlen = 0;
+        if algo == cast(u16, 0x0804) { hlen = 32; }
+        else if algo == cast(u16, 0x0805) { hlen = 48; }
+        else if algo == cast(u16, 0x0806) { hlen = 64; }
+        if hlen != 0 {
+            u8[64] digest;
+            x509_sha2(hlen, data.base, data.len, &digest[0]);
+            ok = rsa_pss_verify(&ctx.rsa_mod[0], ctx.rsa_mod_len, ctx.rsa_exp,
+                                sig.base, cast(i32, sig.len), &digest[0], hlen);
+        }
     }
-    if rsa_pss_accept_verify_cert_cb(self, tls, server_name, out_verify_sign, out_verify_data, certs, num_certs) == 0 {
-        return 0;
+    free(verify_ctx);
+    return ok ? 0 : 0 - 1;
+}
+
+// Extract the leaf's public key and arm tls_leaf_verify_sign for it.
+private i32 tls_arm_leaf(X509Cert* leaf, verify_sign_fn* out_verify_sign,
+                         void** out_verify_data) {
+    leaf_verify_ctx_t* ctx = new(leaf_verify_ctx_t);
+    i32 curve = spki_ec_point(leaf, &ctx.ec_xy[0]);
+    if curve == EC_CURVE_P256 { ctx.kind = LEAF_KEY_P256; }
+    else if curve == EC_CURVE_P384 { ctx.kind = LEAF_KEY_P384; }
+    else {
+        i32 klen = spki_rsa_pubkey(leaf, &ctx.rsa_mod[0], 512, &ctx.rsa_exp);
+        if klen < 0 { free(cast(void*, ctx)); return 0 - 1; }
+        ctx.rsa_mod_len = klen;
+        ctx.kind = LEAF_KEY_RSA;
     }
-    return 0 - 1;
+    *out_verify_sign = tls_leaf_verify_sign;
+    *out_verify_data = cast(void*, ctx);
+    return 0;
+}
+
+// --- trust callbacks --------------------------------------------------------
+
+// Last chain-validation failure; tls_pump moves it into the failing session
+// (the reactor is single-threaded, so the handoff is synchronous).
+private i32 g_last_chain_err = 0;
+
+// Secure default: validate the presented chain against the bundled root
+// store and the SNI hostname at the real wall clock, then arm the
+// CertificateVerify check for the leaf key.
+private i32 tls_chain_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
+                                u8* server_name, verify_sign_fn* out_verify_sign,
+                                void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
+    if num_certs == cast(u64, 0) {
+        g_last_chain_err = X509_V_ERR_EMPTY;
+        return 0 - 1;
+    }
+    if num_certs > cast(u64, TLS_CHAIN_MAX) {
+        g_last_chain_err = X509_V_ERR_TOO_LONG;
+        return 0 - 1;
+    }
+    i32 n = cast(i32, num_certs);
+    u8*[8] ders;
+    u64[8] lens;
+    for i32 i = 0; i < n; i++ {
+        ders[i] = certs[i].base;
+        lens[i] = certs[i].len;
+    }
+    i32 hostlen = 0;
+    if server_name != null {
+        while *(server_name + hostlen) != cast(u8, 0) { hostlen++; }
+    }
+    i64 now = os_wall_ms() / 1000;
+    i32 rc = tls_chain_verify(&ders[0], &lens[0], n, server_name, hostlen, now, null, 0);
+    if rc != X509_V_OK {
+        g_last_chain_err = rc;
+        return 0 - 1;
+    }
+    X509Cert leaf;
+    if !x509_parse(certs[0].base, certs[0].len, &leaf)
+       || tls_arm_leaf(&leaf, out_verify_sign, out_verify_data) != 0 {
+        g_last_chain_err = X509_V_ERR_PARSE;
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// Opt-in insecure mode: skip chain and hostname validation, but still verify
+// the CertificateVerify signature against the presented leaf key.
+private i32 tls_insecure_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
+                                   u8* server_name, verify_sign_fn* out_verify_sign,
+                                   void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
+    if num_certs == cast(u64, 0) { return 0 - 1; }
+    X509Cert leaf;
+    if !x509_parse(certs[0].base, certs[0].len, &leaf) { return 0 - 1; }
+    return tls_arm_leaf(&leaf, out_verify_sign, out_verify_data);
 }
 
 private void tls_ctx_init() {
@@ -86,14 +211,19 @@ private void tls_ctx_init() {
     g_cslist[1] = null;
     g_ctx = ptls_context_t{};
     g_ctx.random_bytes = mc_csprng_bytes;
-    g_ctx.get_time = &mc_picotls_get_time;
+    g_ctx.get_time = &g_tls_time;
     g_ctx.key_exchanges = &g_keyex[0];
     g_ctx.cipher_suites = &g_cslist[0];
-    // Default: accept any cert but verify the handshake signature (see
-    // tls_accept_verify_cb). tls_set_ecdsa_pin tightens this to a pin.
-    g_accept_verify.cb = tls_accept_verify_cb;
-    g_accept_verify.algos = &g_accept_algos[0];
-    g_ctx.verify_certificate = &g_accept_verify;
+    // Secure by default: CA-chain + hostname validation, then the
+    // CertificateVerify check. tls_set_ecdsa_pin replaces this with a pin.
+    g_chain_verify.cb = tls_chain_verify_cb;
+    g_chain_verify.algos = &g_leaf_algos[0];
+    g_ctx.verify_certificate = &g_chain_verify;
+    // The insecure context differs only in its verifier.
+    g_ctx_insecure = g_ctx;
+    g_insecure_verify.cb = tls_insecure_verify_cb;
+    g_insecure_verify.algos = &g_leaf_algos[0];
+    g_ctx_insecure.verify_certificate = &g_insecure_verify;
     g_inited = true;
 }
 
@@ -122,6 +252,7 @@ struct TlsSession {
     u8[8192] recv_small;
     u8[16384] cipher_in;      // inbound ciphertext awaiting decrypt
     i32 cipher_in_len;
+    i32 chain_err;            // X509_V_* when the failure was cert validation
     bool checked_connect;     // confirmed the non-blocking TCP connect
     bool started;
     bool established;
@@ -129,10 +260,10 @@ struct TlsSession {
     bool eof;
 }
 
-TlsSession* tls_session_new(u8* sni) {
+TlsSession* tls_session_new(u8* sni, bool insecure) {
     tls_ctx_init();
     TlsSession* s = alloc<TlsSession>(1);
-    s.tls = ptls_new(&g_ctx, 0);
+    s.tls = ptls_new(insecure ? &g_ctx_insecure : &g_ctx, 0);
     if s.tls == null { free(s); return null; }
     if sni != null {
         i32 slen = 0;
@@ -143,6 +274,7 @@ TlsSession* tls_session_new(u8* sni) {
     ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
     s.send_off = 0;
     s.cipher_in_len = 0;
+    s.chain_err = 0;
     s.checked_connect = false;
     s.started = false;
     s.established = false;
@@ -175,7 +307,12 @@ private i32 tls_feed(TlsSession* s) {
         void* input = cast(void*, &s.cipher_in[0]);
         if !s.established {
             i32 r = ptls_handshake(s.tls, &s.sendbuf, input, &consumed, null);
-            if r != 0 && r != 514 { s.failed = true; return flags | TLS_ERR; }
+            if r != 0 && r != 514 {
+                s.failed = true;
+                // certificate rejections carry a specific reason
+                if g_last_chain_err != 0 { s.chain_err = g_last_chain_err; g_last_chain_err = 0; }
+                return flags | TLS_ERR;
+            }
             tls_shift(s, cast(i32, consumed));
             // r==0 means the step succeeded, NOT that the handshake is done;
             // completion is signalled only by ptls_handshake_is_complete.
@@ -280,3 +417,6 @@ i32 tls_read(TlsSession* s, u8* out, i32 max) {
 
 bool tls_established(TlsSession* s) { return s.established; }
 bool tls_failed(TlsSession* s) { return s.failed; }
+
+// X509_V_* code when the failure was certificate validation, else 0.
+i32 tls_chain_error(TlsSession* s) { return s.chain_err; }

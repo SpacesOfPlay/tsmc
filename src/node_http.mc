@@ -217,7 +217,9 @@ class ClientRequest extends EventEmitter {
     if (typeof cb === 'function') this.on('response', cb);
     if (options._tls) {
       const tls = require('tls');
-      this.socket = tls.connect({ port: this.port, host: this.host, servername: options.servername || this.host });
+      this.socket = tls.connect({ port: this.port, host: this.host,
+        servername: options.servername || this.host,
+        rejectUnauthorized: options.rejectUnauthorized });
     } else {
       this.socket = net.connect(this.port, this.host);
     }
