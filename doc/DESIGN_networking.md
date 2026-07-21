@@ -156,6 +156,23 @@ HTTP layers land and are testable, and schedule the CA-chain verifier
 (a) as the milestone that makes HTTPS trustworthy — treating the
 transminc re-export as an explicit dependency/risk, not a surprise.
 
+**Resolved (M35, doc/PLAN_M35_ca_trust.md).** Option (a) shipped and
+HTTPS is now secure by default. The flagged transminc dependency did
+**not** materialize: rather than reach picotls's cert-parsing internals,
+tsmc has its own defensive X.509 parser (`src/tls_x509.mc`) and path
+validator (`src/tls_chain.mc`), and the only addition to the vendored
+crypto was one generic `in^e mod n` wrapper (`mc_rsa_pub_modexp`) over
+the existing bignum. The signature primitives were reused from the
+bridges (RSA-PKCS1-v1_5 built in `tls_verify.mc`, ECDSA-P256 via uECC)
+and extended with a self-contained ECDSA-P384 (`src/tls_p384.mc`), since
+the vendored uECC is P-256 only. Trust anchors come from a generated
+Mozilla bundle (`src/tls/ca_roots_data.mc`). The `verify_certificate`
+callback validates the chain to a store root, checks validity and the
+SAN hostname, and arms the CertificateVerify check; `rejectUnauthorized:
+false` / `NODE_TLS_REJECT_UNAUTHORIZED=0` opt out. Out of scope, still:
+revocation (OCSP/CRL), name/policy constraints, an updatable store, and
+P-521 chains (one Mozilla root; it fails closed).
+
 ### 4.2 Vendored, but not yet co-compilable — the generic-param blocker
 
 The TLS core is vendored into `src/tls/` (subset only; see
@@ -196,19 +213,23 @@ tsmc's GC is single-threaded and a threadpool is its own hazard.
 
 ## 6. Suggested staging (each lands green + `--gc-stress`)
 
-1. **Reactor.** Convert `vm_run_event_loop` to a real poll loop with the
-   handle table, real-clock timer integration, and ref-counting. No new
+Stages 1–4 shipped as M31–M35; stage 5 (servers) is the open one.
+
+1. **Reactor.** (M31) Convert `vm_run_event_loop` to a real poll loop with
+   the handle table, real-clock timer integration, and ref-counting. No new
    JS surface yet; existing timer/promise tests must stay byte-identical.
    *Highest-risk stage — it touches the loop everything else depends on.*
-2. **`net` client + DNS.** `net.Socket`, `net.connect`, `getaddrinfo`;
-   an echo-client diff test against a local listener.
-3. **`http`/`https` client + `fetch`** over plaintext + TLS handles,
-   with trust in the option-(b) posture. Loopback HTTP diff tests.
-4. **CA-chain certificate verification** (§4.1) — makes real-world
-   `fetch('https://…')` trustworthy. Depends on the transminc re-export.
+2. **`net` client + DNS.** (M32) `net.Socket`, `net.connect`,
+   `getaddrinfo`; an echo-client diff test against a local listener.
+3. **`http`/`https` client + `fetch`** (M33/M34) over plaintext + TLS
+   handles. Loopback HTTP diff tests.
+4. **CA-chain certificate verification** (M35, §4.1) — makes real-world
+   `fetch('https://…')` trustworthy. Secure by default; no transminc
+   re-export was needed after all.
 5. **Servers.** `net.Server` + `http.createServer` (accept loop in the
-   reactor), then TLS server via picotls server mode
-   (`examples/05_https_server.mc`).
+   reactor), then TLS server via picotls server mode. `net.Server` /
+   `http.createServer` already landed in M32/M33 (see `node_net.mc` /
+   `node_http.mc`); the TLS server side is the remaining piece.
 
 ## 7. Risks / open items
 

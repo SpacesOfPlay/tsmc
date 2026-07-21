@@ -1,5 +1,13 @@
 # PLAN M35 — CA-bundle certificate chain validation (secure TLS trust)
 
+**Status: complete.** All six increments landed (I1–I6 below).
+`https`/`fetch` are secure by default, validated live against real and
+badssl hosts and against the bundled Mozilla store; the gated suite (58
+tests, 70 gc-stress) and node diff are green. Trust covers RSA and ECDSA
+P-256/P-384; the lone P-521 Mozilla root fails closed. Out of scope
+(follow-ups): revocation (OCSP/CRL), name/policy constraints, an
+updatable store, TLS 1.2, and a picotls TLS **server** path.
+
 Makes `https`/`fetch` **secure by default**: validate the server's
 certificate chain to a bundled trusted root, check validity dates, and
 match the hostname — instead of the M34 "accept any cert but verify the
@@ -232,9 +240,15 @@ callback returns nonzero).
    expired / wrong-host / self-signed / untrusted-root badssl hosts are
    refused; both opt-outs let a hostname-mismatched 1.3 host through. Gated
    suite (58) and node diff both green.
-6. **I6 — gated tests + docs.** Fold the deterministic positive/negative
-   cases into the suite; update DESIGN §4.1, PLAN, THIRD_PARTY, and the
-   security note (remove "insecure by default").
+6. **I6 — gated tests + docs. (done)** The deterministic positive/negative
+   cases already landed with I1–I4 (`test_x509`, `test_tls_verify`,
+   `test_ca_roots`, `test_tls_chain`) and run in the gated suite; the live
+   badssl/real-host checks are manual (`test/tls/badssl.js`,
+   `test/tls/https_fetch.js`). Docs swept: DESIGN §4.1 marked resolved (and
+   the transminc dependency it predicted did not materialize), DESIGN §6
+   staging annotated with the shipped milestones, the M34 security note
+   flipped from insecure-by-default, THIRD_PARTY updated (CA bundle +
+   `mc_rsa_pub_modexp`), and this plan's status banner set to complete.
 
 ## 6. Testing strategy
 
