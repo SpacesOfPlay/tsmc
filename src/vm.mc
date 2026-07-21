@@ -953,7 +953,17 @@ Value atom_to_key(VM* vm, u32 a) {
 // Look up a named trap on a proxy handler. Returns 1 with *out set (a
 // callable trap), 0 (absent — the caller performs the default on the
 // target), or -1 (present but not callable — a TypeError was thrown).
+// True (and throws) if the proxy has been revoked.
+private bool proxy_revoked(VM* vm, JsProxy* p) {
+    if (p.obj_flags & OBJF_PROXY_REVOKED) != 0 {
+        vm_throw_error(vm, ERR_TYPE, "Cannot perform operation on a proxy that has been revoked");
+        return true;
+    }
+    return false;
+}
+
 private i32 proxy_trap(VM* vm, JsProxy* p, str name, Value* out) {
+    if proxy_revoked(vm, p) { return 0 - 1; }
     Value t;
     if !vm_get_prop_value(vm, p.handler, atom_intern(&vm.atoms, name), &t) { return 0; }
     if value_is_undefined(t) || value_is_null(t) { return 0; }
@@ -1036,6 +1046,32 @@ bool proxy_delete(VM* vm, JsProxy* p, u32 a) {
     Value r = vm_call_value(vm, trap, p.handler, &cargs[0], 2);
     gc_root_reset(&vm.heap, rm);
     return js_truthy(r);
+}
+
+// The named handler trap if present and callable, else undefined (no throw).
+// For builtins implementing the descriptor/defineProperty/ownKeys traps.
+Value proxy_trap_fn(VM* vm, JsProxy* p, str name) {
+    if proxy_revoked(vm, p) { return value_undefined(); }
+    Value t;
+    if !vm_get_prop_value(vm, p.handler, atom_intern(&vm.atoms, name), &t) { return value_undefined(); }
+    if value_is_undefined(t) || value_is_null(t) { return value_undefined(); }
+    if !value_is_callable(t) { return value_undefined(); }
+    return t;
+}
+
+// ownKeys: the handler trap result (an array of keys), or the target's own
+// keys when absent. The result may contain string and symbol keys.
+JsObject* proxy_own_keys(VM* vm, JsProxy* p) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "ownKeys", &trap);
+    if tr < 0 { return js_new_array(&vm.heap, vm.array_proto); }
+    if tr == 0 { return vm_own_keys(vm, p.target); }
+    noinit Value[1] cargs;
+    cargs[0] = p.target;
+    Value r = vm_call_value(vm, trap, p.handler, &cargs[0], 1);
+    if vm.has_pending { return js_new_array(&vm.heap, vm.array_proto); }
+    if value_is_array(r) { return value_as_object(r); }
+    return js_new_array(&vm.heap, vm.array_proto);
 }
 
 private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
@@ -2950,7 +2986,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_object(dstv) && value_is_object(src) {
                     JsObject* d = value_as_object(dstv);
                     JsObject* s = value_as_object(src);
-                    if (s.obj_flags & OBJF_ARRAY) != 0 {
+                    if (s.obj_flags & OBJF_PROXY) != 0 {
+                        // spread a proxy through its ownKeys + get traps
+                        JsObject* keys = vm_own_keys(vm, src);
+                        vpush(vm, value_cell(&keys.head));
+                        for i32 i = 0; i < keys.elen; i++ {
+                            Value kv = js_array_get(keys, i);
+                            u32 pk = key_to_atom(vm, kv);
+                            Value pv;
+                            ignore vm_get_prop_value(vm, src, pk, &pv);
+                            js_set_prop(d, pk, pv);
+                        }
+                        vm.sp--;
+                    } else if (s.obj_flags & OBJF_ARRAY) != 0 {
                         for i32 i = 0; i < s.elen; i++ {
                             string ks = format("{}", i);
                             u32 a2 = atom_intern(&vm.atoms, ks);
@@ -3256,6 +3304,21 @@ private void normalize_args(VM* vm, FnTemplate* ft, i32 argc) {
 // Own enumerable keys as an array of strings; strings enumerate their
 // indices. Result is unrooted — consume before the next allocation.
 JsObject* vm_own_keys(VM* vm, Value objv) {
+    if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_PROXY) != 0 {
+        // route through the ownKeys trap, keeping only string keys (for-in and
+        // Object.keys ignore symbols)
+        JsObject* raw = proxy_own_keys(vm, cast(JsProxy*, value_as_object(objv)));
+        vpush(vm, value_cell(&raw.head));
+        JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+        vpush(vm, value_cell(&out.head));
+        i32 m = 0;
+        for i32 i = 0; i < raw.elen; i++ {
+            Value k = js_array_get(raw, i);
+            if value_is_string(k) { js_array_set(out, m, k); m++; }
+        }
+        vm.sp -= 2;
+        return out;
+    }
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&arr.head));
     i32 n = 0;

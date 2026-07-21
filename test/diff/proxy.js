@@ -48,3 +48,34 @@ console.log(typeof p, Reflect.getPrototypeOf(p) === Object.prototype);
 // a non-object handler / target is a TypeError
 try { new Proxy(42, {}); } catch (e) { console.log(e.constructor.name); }
 try { new Proxy({}, null); } catch (e) { console.log(e.constructor.name); }
+
+// --- enumeration + descriptor traps (I2) ---
+const seen = [];
+const e = new Proxy({ a: 1, b: 2, c: 3 }, {
+  ownKeys(t) { seen.push('ownKeys'); return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, k) { seen.push('gopd'); return Reflect.getOwnPropertyDescriptor(t, k); },
+  get(t, k, r) { return Reflect.get(t, k, r); },
+});
+console.log(Object.keys(e).join(','));
+console.log(Object.values(e).join(','));
+console.log(JSON.stringify(Object.entries(e)));
+console.log(JSON.stringify({ ...e }));
+console.log(JSON.stringify(e));
+console.log(JSON.stringify(Object.assign({}, e)));
+let fk = ''; for (const k in e) fk += k;
+console.log(fk);
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(e, 'b')));
+console.log(Reflect.ownKeys(e).join(','), seen.includes('ownKeys'));
+console.log(Object.prototype.propertyIsEnumerable.call(e, 'a'));
+
+// defineProperty trap
+const dl = [];
+const d = new Proxy({}, { defineProperty(t, k, desc) { dl.push(String(k)); return Reflect.defineProperty(t, k, desc); } });
+Object.defineProperty(d, 'x', { value: 7, enumerable: true, configurable: true });
+console.log(d.x, dl.join(','));
+
+// Proxy.revocable: after revoke, operations throw
+const { proxy: rp, revoke } = Proxy.revocable({ v: 1 }, {});
+console.log(rp.v);
+revoke();
+try { rp.v; console.log('no throw'); } catch (err) { console.log(err.constructor.name); }

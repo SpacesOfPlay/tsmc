@@ -197,11 +197,21 @@ load.
    and a pre-existing gap where `arr["1"]` (string-numeric key) skipped the
    element part — now fixed in `get_prop_atom`/`set_prop_atom` for all paths.
    A missing GC root on the `Reflect` object under `--gc-stress` was fixed.
-2. **I2 — enumeration + descriptors + the bypass audit.** `ownKeys` wiring
-   (`vm_own_keys` + `Object.keys`/`getOwnPropertyNames`),
-   `getOwnPropertyDescriptor`, `defineProperty`; work through the §3
-   direct-`props` audit list; `Reflect` counterparts. **Payoff checkpoint:
-   immer object drafts.**
+2. **I2 — enumeration + descriptors + the bypass audit. (done)** The
+   `ownKeys` trap is wired at `vm_own_keys` (the choke point for for-in,
+   `Object.keys`, spread, `JSON.stringify`) plus `Reflect.ownKeys`; the
+   `getOwnPropertyDescriptor` and `defineProperty` traps are wired at the
+   `Object.*` natives and `Reflect`. The direct-`props` bypass audit was
+   worked through — a proxy branch (route through the ownKeys + get traps)
+   was added to every consumer that read `.props` directly: `Object.assign`,
+   `Object.values`/`entries`, **`OP_OBJ_SPREAD`** (object spread), and
+   **`JSON.stringify`** (the last two were not on the original audit list —
+   found by testing, exactly the silent-bypass the plan warned about).
+   `Proxy.revocable` (planned for I3) was pulled forward because immer needs
+   it, and `Object.prototype.propertyIsEnumerable` (a general pre-existing
+   gap) was added. **Payoff reached: immer works** — `produce` with nested
+   object mutation, structural sharing, and JSON output all match Node.
+   `test/diff/proxy.js` covers the enumeration/descriptor/revocable surface.
 3. **I3 — arrays + callable + proto + revocable.** `value_is_real_array`
    fast-path split + `Array.isArray` piercing + Array natives on proxies
    (rides I0); `apply`/`construct`; `getPrototypeOf`/`setPrototypeOf`/

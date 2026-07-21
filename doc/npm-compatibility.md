@@ -29,6 +29,7 @@ Confirmed running with output identical to Node.
 | `eventemitter3@5.0.1` | event emitter |
 | `fast-deep-equal@3.1.3` | recursive deep equality |
 | `fast-json-stable-stringify@2.1.0` | stable JSON serialization |
+| `immer@10.1.1` | immutable updates via Proxy (object drafts) |
 
 ### IDs
 | package | notes |
@@ -89,7 +90,7 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 | package(s) | blocker |
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
-| `immer`, `ansi-colors` | **`Proxy` / `Reflect`** — not implemented. |
+| `ansi-colors` | **`Proxy` / `Reflect`** invariant/edge behavior (core traps work; `immer` runs). |
 | `markdown-it` | A `linkify-it` schema-setup issue (it now clears the earlier array-like-receiver blocker, but has a further gap). |
 | `bignumber.js`, `decimal.js` | **Parser** — a syntax the parser does not yet accept. |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |

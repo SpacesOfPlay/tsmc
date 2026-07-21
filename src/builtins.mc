@@ -156,12 +156,31 @@ private Value nat_object_keys(void* vmp, Value callee, Value thisv, Value* args,
     return value_cell(&arr.head);
 }
 
+// Enumerable string keys of a proxy (via the ownKeys trap) paired with their
+// trapped values — the shared path for Object.values/entries/assign so a
+// proxy source is never read as its (empty) own props.
+private JsObject* proxy_enum_keys(VM* vm, Value ov) {
+    return vm_own_keys(vm, ov);
+}
+
 private Value nat_object_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&arr.head));
     Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_PROXY) != 0 {
+        JsObject* keys = proxy_enum_keys(vm, ov);
+        gc_root(&vm.heap, value_cell(&keys.head));
+        for i32 i = 0; i < keys.elen; i++ {
+            Value kv = js_array_get(keys, i);
+            Value pv;
+            ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, sview(kv)), &pv);
+            js_array_set(arr, i, pv);
+        }
+        gc_root_reset(&vm.heap, rm);
+        return value_cell(&arr.head);
+    }
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
         i32 n = 0;
@@ -201,6 +220,21 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&arr.head));
     Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_PROXY) != 0 {
+        JsObject* keys = proxy_enum_keys(vm, ov);
+        gc_root(&vm.heap, value_cell(&keys.head));
+        for i32 i = 0; i < keys.elen; i++ {
+            Value kv = js_array_get(keys, i);
+            Value pv;
+            ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, sview(kv)), &pv);
+            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+            js_array_set(arr, i, value_cell(&pair.head));
+            js_array_set(pair, 0, kv);
+            js_array_set(pair, 1, pv);
+        }
+        gc_root_reset(&vm.heap, rm);
+        return value_cell(&arr.head);
+    }
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
         i32 n = 0;
@@ -264,6 +298,21 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
         if !value_is_object(sv2) { continue; }
         JsObject* src = value_as_object(sv2);
         if src == t { continue; }
+        if (src.obj_flags & OBJF_PROXY) != 0 {
+            // a proxy source: copy its enumerable keys through the get trap
+            JsObject* keys = proxy_enum_keys(vm, sv2);
+            i32 krm = gc_root_mark(&vm.heap);
+            gc_root(&vm.heap, value_cell(&keys.head));
+            for i32 i = 0; i < keys.elen; i++ {
+                Value kv = js_array_get(keys, i);
+                u32 pk = atom_intern(&vm.atoms, sview(kv));
+                Value pv;
+                ignore vm_get_prop_value(vm, sv2, pk, &pv);
+                js_set_prop(t, pk, pv);
+            }
+            gc_root_reset(&vm.heap, krm);
+            continue;
+        }
         if (src.obj_flags & OBJF_ARRAY) != 0 && (t.obj_flags & OBJF_ARRAY) != 0 {
             for i32 i = 0; i < src.elen; i++ {
                 js_array_set(t, i, js_array_get(src, i));
@@ -390,6 +439,27 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
         return value_undefined();
     }
     JsObject* o = value_as_object(ov);
+    if (o.obj_flags & OBJF_PROXY) != 0 {
+        JsProxy* p = cast(JsProxy*, o);
+        Value trap = proxy_trap_fn(vm, p, "defineProperty");
+        if value_is_callable(trap) {
+            i32 rmp = gc_root_mark(&vm.heap);
+            noinit Value[3] ca;
+            ca[0] = p.target;
+            ca[1] = arg_at(args, argc, 1);
+            ca[2] = arg_at(args, argc, 2);
+            ignore vm_call_value(vm, trap, p.handler, &ca[0], 3);
+            gc_root_reset(&vm.heap, rmp);
+            return ov;
+        }
+        // default: defineProperty(target, key, desc)
+        noinit Value[3] ca;
+        ca[0] = p.target;
+        ca[1] = arg_at(args, argc, 1);
+        ca[2] = arg_at(args, argc, 2);
+        ignore nat_object_defineproperty(vmp, callee, thisv, &ca[0], 3);
+        return ov;
+    }
     i32 rm = gc_root_mark(&vm.heap);
     Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
     gc_root(&vm.heap, kv);
@@ -497,6 +567,23 @@ private bool fn_own_synth(VM* vm, Value ov, u32 key, Value* out) {
 private Value nat_object_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_PROXY) != 0 {
+        JsProxy* p = cast(JsProxy*, value_as_object(ov));
+        Value keyv = arg_at(args, argc, 1);
+        Value trap = proxy_trap_fn(vm, p, "getOwnPropertyDescriptor");
+        noinit Value[2] ca;
+        ca[0] = p.target;
+        if value_is_callable(trap) {
+            i32 rmp = gc_root_mark(&vm.heap);
+            ca[1] = keyv;
+            Value d = vm_call_value(vm, trap, p.handler, &ca[0], 2);
+            gc_root_reset(&vm.heap, rmp);
+            return d;
+        }
+        // default: getOwnPropertyDescriptor(target, key)
+        ca[1] = keyv;
+        return nat_object_getownpropdesc(vmp, callee, thisv, &ca[0], 2);
+    }
     PropList* props = value_props(ov);
     if props == null { return value_undefined(); }
     i32 rm = gc_root_mark(&vm.heap);
@@ -679,6 +766,34 @@ private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32
     if props_get(props, a) != null { return value_bool(true); }
     Value fv;
     return value_bool(fn_own_synth(vm, thisv, a, &fv));
+}
+
+// Object.prototype.propertyIsEnumerable: own AND enumerable.
+private Value nat_property_is_enumerable(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value kv = arg_at(args, argc, 0);
+    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_PROXY) != 0 {
+        noinit Value[2] ca;
+        ca[0] = thisv;
+        ca[1] = kv;
+        Value d = nat_object_getownpropdesc(vmp, callee, thisv, &ca[0], 2);
+        if !value_is_object(d) { return value_bool(false); }
+        Value en;
+        ignore vm_get_prop_value(vm, d, bi_atom(vm, "enumerable"), &en);
+        return value_bool(js_truthy(en));
+    }
+    str sk;
+    u32 a = reflect_key(vm, kv, &sk);
+    if vm.has_pending { return value_bool(false); }
+    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_ARRAY) != 0 {
+        i32 idx = ta_atom_index(vm, a);
+        if idx >= 0 { return value_bool(js_array_has(value_as_object(thisv), idx)); }
+    }
+    PropList* props = value_props(thisv);
+    if props == null { return value_bool(false); }
+    Prop* pe = props_entry(props, a);
+    if pe == null { return value_bool(false); }
+    return value_bool((pe.flags & PROP_ENUMERABLE) != 0);
 }
 
 private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -3307,12 +3422,21 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
     } else {
         str_buf_add(sb, "{");
         bool first = true;
+        // a proxy enumerates via its ownKeys + get traps, not its own props
+        i32 pkrm = gc_root_mark(&vm.heap);
+        JsObject* pkeys = null;
+        if (o.obj_flags & OBJF_PROXY) != 0 && ctx.allow == null {
+            pkeys = vm_own_keys(vm, v);
+            gc_root(&vm.heap, value_cell(&pkeys.head));
+        }
         // array replacer restricts (and orders) keys; otherwise own order
-        i32 count = ctx.allow != null ? ctx.allow.len : o.props.len;
+        i32 count = ctx.allow != null ? ctx.allow.len : (pkeys != null ? pkeys.elen : o.props.len);
         for i32 i = 0; i < count; i++ {
             u32 key = 0;
             if ctx.allow != null {
                 key = vec_get(ctx.allow, i);
+            } else if pkeys != null {
+                key = atom_intern(&vm.atoms, sview(js_array_get(pkeys, i)));
             } else {
                 key = (o.props.items + i).key;
                 if !prop_enumerable(vm, o.props.items + i) { continue; }
@@ -3350,6 +3474,7 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
             str_buf_free(&sub);
             first = false;
         }
+        gc_root_reset(&vm.heap, pkrm);
         if !first { json_indent_into(sb, gap, depth); }
         str_buf_add(sb, "}");
     }
@@ -11415,6 +11540,41 @@ private Value nat_proxy_ctor(void* vmp, Value callee, Value thisv, Value* args, 
     return value_cell(&p.head);
 }
 
+// revoke() marks its captured proxy revoked; every later operation throws.
+private Value nat_proxy_revoke(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value pv = value_as_native(callee).env0;
+    if value_is_object(pv) {
+        JsObject* o = value_as_object(pv);
+        if (o.obj_flags & OBJF_PROXY) != 0 { o.obj_flags = o.obj_flags | OBJF_PROXY_REVOKED; }
+    }
+    return value_undefined();
+}
+
+// Proxy.revocable(target, handler) -> { proxy, revoke }.
+private Value nat_proxy_revocable(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value target = arg_at(args, argc, 0);
+    Value handler = arg_at(args, argc, 1);
+    if (!value_is_object(target) && !value_is_callable(target)) || !value_is_object(handler) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot create proxy with a non-object as target or handler");
+        return value_undefined();
+    }
+    JsObject* proto = null;
+    if value_is_object(target) { proto = value_as_object(target).proto; }
+    JsProxy* p = js_new_proxy(&vm.heap, proto, target, handler);
+    Value pv = value_cell(&p.head);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, pv);
+    JsNative* revoke = js_new_native(&vm.heap, &nat_proxy_revoke, "revoke");
+    revoke.env0 = pv;
+    JsObject* result = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&result.head));
+    js_set_prop(result, bi_atom(vm, "proxy"), pv);
+    js_set_prop(result, bi_atom(vm, "revoke"), value_cell(&revoke.head));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&result.head);
+}
+
 private bool reflect_target(VM* vm, Value* args, i32 argc, str who, JsObject** out) {
     Value target = arg_at(args, argc, 0);
     if !value_is_object(target) {
@@ -11478,12 +11638,29 @@ private Value nat_reflect_ownkeys(void* vmp, Value callee, Value thisv, Value* a
     VM* vm = as_vm(vmp);
     JsObject* o;
     if !reflect_target(vm, args, argc, "Reflect.ownKeys called on non-object", &o) { return value_undefined(); }
-    JsObject* arr = vm_own_keys(vm, value_cell(&o.head));
+    // for a proxy, the raw ownKeys trap result (strings + symbols); otherwise
+    // the object's own keys
+    JsObject* arr = (o.obj_flags & OBJF_PROXY) != 0
+        ? proxy_own_keys(vm, cast(JsProxy*, o))
+        : vm_own_keys(vm, value_cell(&o.head));
     return value_cell(&arr.head);
 }
 
+private Value nat_reflect_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return nat_object_getownpropdesc(vmp, callee, thisv, args, argc);
+}
+
+private Value nat_reflect_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.defineProperty called on non-object", &o) { return value_undefined(); }
+    ignore nat_object_defineproperty(vmp, callee, thisv, args, argc);
+    return value_bool(!vm.has_pending);
+}
+
 private void install_proxy_reflect(VM* vm) {
-    ignore def_global_fn(vm, "Proxy", &nat_proxy_ctor);
+    JsNative* proxy_ctor = def_global_fn(vm, "Proxy", &nat_proxy_ctor);
+    def_static(vm, proxy_ctor, "revocable", &nat_proxy_revocable);
     JsObject* reflect = js_new_object(&vm.heap, vm.object_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&reflect.head));   // keep alive across def_method allocs
@@ -11493,6 +11670,8 @@ private void install_proxy_reflect(VM* vm) {
     def_method(vm, reflect, "deleteProperty", &nat_reflect_delete);
     def_method(vm, reflect, "getPrototypeOf", &nat_reflect_getprototypeof);
     def_method(vm, reflect, "ownKeys", &nat_reflect_ownkeys);
+    def_method(vm, reflect, "getOwnPropertyDescriptor", &nat_reflect_getownpropdesc);
+    def_method(vm, reflect, "defineProperty", &nat_reflect_defineproperty);
     vm_set_global(vm, "Reflect", value_cell(&reflect.head));
     gc_root_reset(&vm.heap, rm);
 }
@@ -11535,6 +11714,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "preventExtensions", &nat_object_preventext);
     def_static(vm, object_ctor, "isExtensible", &nat_object_isextensible);
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
+    def_method(vm, vm.object_proto, "propertyIsEnumerable", &nat_property_is_enumerable);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
 
     // Array
