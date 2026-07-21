@@ -11395,6 +11395,108 @@ private void usp_install(VM* vm) {
     def_accessor(vm, vm.usp_proto, "size", &nat_usp_size);
 }
 
+// --- Proxy + Reflect --------------------------------------------------------
+
+private Value nat_proxy_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value target = arg_at(args, argc, 0);
+    Value handler = arg_at(args, argc, 1);
+    if !value_is_object(target) && !value_is_callable(target) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot create proxy with a non-object as target");
+        return value_undefined();
+    }
+    if !value_is_object(handler) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot create proxy with a non-object as handler");
+        return value_undefined();
+    }
+    JsObject* proto = null;
+    if value_is_object(target) { proto = value_as_object(target).proto; }
+    JsProxy* p = js_new_proxy(&vm.heap, proto, target, handler);
+    return value_cell(&p.head);
+}
+
+private bool reflect_target(VM* vm, Value* args, i32 argc, str who, JsObject** out) {
+    Value target = arg_at(args, argc, 0);
+    if !value_is_object(target) {
+        vm_throw_error(vm, ERR_TYPE, who);
+        return false;
+    }
+    *out = value_as_object(target);
+    return true;
+}
+
+private Value nat_reflect_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.get called on non-object", &o) { return value_undefined(); }
+    str sk;
+    u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    Value out;
+    ignore vm_get_prop_value(vm, value_cell(&o.head), a, &out);
+    return out;
+}
+
+private Value nat_reflect_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.set called on non-object", &o) { return value_undefined(); }
+    str sk;
+    u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    bool ok = vm_set_prop_value(vm, value_cell(&o.head), a, arg_at(args, argc, 2));
+    return value_bool(ok);
+}
+
+private Value nat_reflect_has(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.has called on non-object", &o) { return value_undefined(); }
+    str sk;
+    u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    bool r = (o.obj_flags & OBJF_PROXY) != 0 ? proxy_has(vm, cast(JsProxy*, o), a) : js_has_prop(o, a);
+    return value_bool(r);
+}
+
+private Value nat_reflect_delete(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.deleteProperty called on non-object", &o) { return value_undefined(); }
+    str sk;
+    u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    bool r = (o.obj_flags & OBJF_PROXY) != 0 ? proxy_delete(vm, cast(JsProxy*, o), a) : js_delete_prop(o, a);
+    return value_bool(r);
+}
+
+private Value nat_reflect_getprototypeof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.getPrototypeOf called on non-object", &o) { return value_undefined(); }
+    if o.proto == null { return value_null(); }
+    return value_cell(&o.proto.head);
+}
+
+private Value nat_reflect_ownkeys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o;
+    if !reflect_target(vm, args, argc, "Reflect.ownKeys called on non-object", &o) { return value_undefined(); }
+    JsObject* arr = vm_own_keys(vm, value_cell(&o.head));
+    return value_cell(&arr.head);
+}
+
+private void install_proxy_reflect(VM* vm) {
+    ignore def_global_fn(vm, "Proxy", &nat_proxy_ctor);
+    JsObject* reflect = js_new_object(&vm.heap, vm.object_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&reflect.head));   // keep alive across def_method allocs
+    def_method(vm, reflect, "get", &nat_reflect_get);
+    def_method(vm, reflect, "set", &nat_reflect_set);
+    def_method(vm, reflect, "has", &nat_reflect_has);
+    def_method(vm, reflect, "deleteProperty", &nat_reflect_delete);
+    def_method(vm, reflect, "getPrototypeOf", &nat_reflect_getprototypeof);
+    def_method(vm, reflect, "ownKeys", &nat_reflect_ownkeys);
+    vm_set_global(vm, "Reflect", value_cell(&reflect.head));
+    gc_root_reset(&vm.heap, rm);
+}
+
 void builtins_install(VM* vm) {
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
@@ -11637,6 +11739,8 @@ void builtins_install(VM* vm) {
 
     // the `arguments` object builder (called from the VM's call sites)
     vm_set_arguments_builder(vm, &build_arguments_object);
+
+    install_proxy_reflect(vm);
 
     // globals
     ignore def_global_fn(vm, "structuredClone", &nat_structured_clone);

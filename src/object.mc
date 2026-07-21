@@ -34,6 +34,7 @@ const i32 GEN_DONE = 3;
 const i32 OBJF_ARRAY = 1;
 const i32 OBJF_NONEXT = 2;   // not extensible (Object.preventExtensions)
 const i32 OBJF_TYPEDARRAY = 4;   // a TypedArray view (element access reads bytes)
+const i32 OBJF_PROXY = 8;    // a Proxy: fundamental ops route through the handler
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.
@@ -192,6 +193,23 @@ struct JsObject {
     i32 ecap;
 }
 
+// A Proxy. The leading fields are byte-identical to JsObject so value_is_object
+// / value_as_object work unchanged; the kind is GC_OBJECT with OBJF_PROXY set,
+// and the fundamental operations detect the flag and route through `handler`.
+// `proto` is a snapshot of the target's prototype at construction (untrapped
+// proto walks then behave like the target). The props/elems are unused.
+struct JsProxy {
+    GcCell head;
+    i32 obj_flags;
+    JsObject* proto;
+    PropList props;
+    Value* elems;
+    i32 elen;
+    i32 ecap;
+    Value target;
+    Value handler;
+}
+
 // A raw byte buffer (the backing store of an ArrayBuffer). Bytes live
 // inline after the header; no references, so the tracer skips it.
 struct GcBytes {
@@ -326,6 +344,11 @@ void js_trace(GcHeap* h, GcCell* c) {
         for i32 i = 0; i < o.elen; i++ {
             gc_mark_value(h, *(o.elems + i));
         }
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            JsProxy* p = cast(JsProxy*, o);
+            gc_mark_value(h, p.target);
+            gc_mark_value(h, p.handler);
+        }
         return;
     }
     if c.kind == GC_FUNCTION {
@@ -429,6 +452,16 @@ JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     o.proto = proto;
     props_init(&o.props);
     return o;
+}
+
+JsProxy* js_new_proxy(GcHeap* h, JsObject* proto, Value target, Value handler) {
+    JsProxy* p = cast(JsProxy*, gc_alloc(h, GC_OBJECT, sizeof(JsProxy)));
+    p.obj_flags = OBJF_PROXY;
+    p.proto = proto;
+    props_init(&p.props);
+    p.target = target;
+    p.handler = handler;
+    return p;
 }
 
 JsObject* js_new_array(GcHeap* h, JsObject* proto) {

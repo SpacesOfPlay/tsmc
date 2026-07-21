@@ -180,12 +180,23 @@ load.
    but then hits a separate `linkify-it` issue, so it remains unlisted.
    Mutating-on-array-like (`push.call(arrayLike)`) write-back is still out of
    scope.
-1. **I1 — core + Reflect basics.** `JsProxy` + GC + constructor +
-   proto-snapshot + `typeof`/`value_is_callable` piercing; `get`/`set`/
-   `has`/`deleteProperty` traps at their four sites; `Reflect.get`/`set`/
-   `has`/`deleteProperty`/`getPrototypeOf`/`ownKeys`. Diff test: logging/
-   validating proxies defaulting via `Reflect`, membrane read/write, `in`,
-   `delete`, nested proxies, `receiver` threading.
+1. **I1 — core + Reflect basics. (done)** `JsProxy` (JsObject-prefix +
+   `OBJF_PROXY`, GC-traced target/handler), the `Proxy` constructor with the
+   proto snapshot, and the `get`/`set`/`has`/`deleteProperty` traps wired at
+   their sites — `get_prop_atom`, `set_prop_atom`, `OP_IN`, and **both**
+   `OP_DELPROP` (dot) and `OP_DELINDEX` (computed) delete opcodes. Each trap
+   falls back to the target when absent, throws if a present trap is not
+   callable, and propagates exceptions. `Reflect.get`/`set`/`has`/
+   `deleteProperty`/`getPrototypeOf`/`ownKeys` (a public `vm_set_prop_value`
+   was added for `Reflect.set`). `typeof` an object-target proxy is
+   `'object'`; callability piercing is deferred to I3. `test/diff/proxy.js`
+   matches Node (traps + Reflect defaults, validating proxy, nested/recursive
+   proxies, symbol-keyed get, dot+computed delete, non-object target/handler
+   TypeErrors). Two bugs the review's "silent-bypass" concern predicted were
+   caught and fixed: dot-form `delete` used a separate opcode (`OP_DELPROP`),
+   and a pre-existing gap where `arr["1"]` (string-numeric key) skipped the
+   element part — now fixed in `get_prop_atom`/`set_prop_atom` for all paths.
+   A missing GC root on the `Reflect` object under `--gc-stress` was fixed.
 2. **I2 — enumeration + descriptors + the bypass audit.** `ownKeys` wiring
    (`vm_own_keys` + `Object.keys`/`getOwnPropertyNames`),
    `getOwnPropertyDescriptor`, `defineProperty`; work through the §3

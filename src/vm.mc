@@ -938,13 +938,124 @@ private Value ensure_prototype(VM* vm, Value fnv) {
 }
 
 // objv stays rooted by the caller; false means an error was thrown.
+// --- Proxy: route fundamental operations through the handler traps ---------
+
+// A property-key atom back to its key Value: a Symbol for a symbol atom
+// (high bit set), else a string.
+Value atom_to_key(VM* vm, u32 a) {
+    if (a & 0x80000000) != 0 {
+        return vec_get(&vm.symbols, a & 0x7fffffff);
+    }
+    GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, a));
+    return value_cell(&g.head);
+}
+
+// Look up a named trap on a proxy handler. Returns 1 with *out set (a
+// callable trap), 0 (absent — the caller performs the default on the
+// target), or -1 (present but not callable — a TypeError was thrown).
+private i32 proxy_trap(VM* vm, JsProxy* p, str name, Value* out) {
+    Value t;
+    if !vm_get_prop_value(vm, p.handler, atom_intern(&vm.atoms, name), &t) { return 0; }
+    if value_is_undefined(t) || value_is_null(t) { return 0; }
+    if !value_is_callable(t) {
+        vm_throw_error(vm, ERR_TYPE, "proxy handler trap is not a function");
+        return 0 - 1;
+    }
+    *out = t;
+    return 1;
+}
+
+private bool proxy_get(VM* vm, JsProxy* p, u32 a, Value receiver, Value* out) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "get", &trap);
+    if tr < 0 { *out = value_undefined(); return false; }
+    if tr == 0 { return get_prop_atom(vm, p.target, a, out); }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value key = atom_to_key(vm, a);
+    gc_root(&vm.heap, key);
+    noinit Value[3] cargs;
+    cargs[0] = p.target;
+    cargs[1] = key;
+    cargs[2] = receiver;
+    *out = vm_call_value(vm, trap, p.handler, &cargs[0], 3);
+    gc_root_reset(&vm.heap, rm);
+    return !vm.has_pending;
+}
+
+private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "set", &trap);
+    if tr < 0 { return false; }
+    if tr == 0 { return set_prop_atom(vm, p.target, a, v); }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value key = atom_to_key(vm, a);
+    gc_root(&vm.heap, key);
+    noinit Value[4] cargs;
+    cargs[0] = p.target;
+    cargs[1] = key;
+    cargs[2] = v;
+    cargs[3] = receiver;
+    ignore vm_call_value(vm, trap, p.handler, &cargs[0], 4);
+    gc_root_reset(&vm.heap, rm);
+    return !vm.has_pending;
+}
+
+bool proxy_has(VM* vm, JsProxy* p, u32 a) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "has", &trap);
+    if tr < 0 { return false; }
+    if tr == 0 {
+        if value_is_object(p.target) { return js_has_prop(value_as_object(p.target), a); }
+        return false;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value key = atom_to_key(vm, a);
+    gc_root(&vm.heap, key);
+    noinit Value[2] cargs;
+    cargs[0] = p.target;
+    cargs[1] = key;
+    Value r = vm_call_value(vm, trap, p.handler, &cargs[0], 2);
+    gc_root_reset(&vm.heap, rm);
+    return js_truthy(r);
+}
+
+bool proxy_delete(VM* vm, JsProxy* p, u32 a) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "deleteProperty", &trap);
+    if tr < 0 { return false; }
+    if tr == 0 {
+        if value_is_object(p.target) { return js_delete_prop(value_as_object(p.target), a); }
+        return true;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value key = atom_to_key(vm, a);
+    gc_root(&vm.heap, key);
+    noinit Value[2] cargs;
+    cargs[0] = p.target;
+    cargs[1] = key;
+    Value r = vm_call_value(vm, trap, p.handler, &cargs[0], 2);
+    gc_root_reset(&vm.heap, rm);
+    return js_truthy(r);
+}
+
 private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     *out = value_undefined();
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
-        if (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
-            *out = value_int(o.elen);
-            return true;
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            return proxy_get(vm, cast(JsProxy*, o), a, objv, out);
+        }
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length {
+                *out = value_int(o.elen);
+                return true;
+            }
+            // a string-numeric key (e.g. arr["1"]) reads the element part
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 && idx < o.elen {
+                *out = js_array_get(o, idx);
+                return true;
+            }
         }
         if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
             i32 idx = ta_atom_index(vm, a);
@@ -1061,18 +1172,35 @@ bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
     return true;
 }
 
+// Public property set through the full path (proxy set trap, array length,
+// typed arrays, accessors). Used by Reflect.set and similar.
+bool vm_set_prop_value(VM* vm, Value objv, u32 a, Value v) {
+    return set_prop_atom(vm, objv, a, v);
+}
+
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
-        if (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
-            f64 n = js_to_number(v);
-            i32 ni = cast(i32, n);
-            if cast(f64, ni) == n && ni >= 0 {
-                js_array_set_length(o, ni);
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            return proxy_set(vm, cast(JsProxy*, o), a, v, objv);
+        }
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length {
+                f64 n = js_to_number(v);
+                i32 ni = cast(i32, n);
+                if cast(f64, ni) == n && ni >= 0 {
+                    js_array_set_length(o, ni);
+                    return true;
+                }
+                vm_throw_error(vm, ERR_RANGE, "invalid array length");
+                return false;
+            }
+            // a string-numeric key (e.g. arr["1"] = x) writes the element part
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 {
+                js_array_set(o, idx, v);
                 return true;
             }
-            vm_throw_error(vm, ERR_RANGE, "invalid array length");
-            return false;
         }
         if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
             i32 idx = ta_atom_index(vm, a);
@@ -2356,7 +2484,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* o = value_as_object(objv);
                     bool r = false;
                     i32 idx = val_to_index(key);
-                    if (o.obj_flags & OBJF_ARRAY) != 0 && idx >= 0 {
+                    if (o.obj_flags & OBJF_PROXY) != 0 {
+                        r = proxy_has(vm, cast(JsProxy*, o), key_to_atom(vm, key));
+                    } else if (o.obj_flags & OBJF_ARRAY) != 0 && idx >= 0 {
                         r = js_array_has(o, idx);
                     } else {
                         u32 a = key_to_atom(vm, key);
@@ -2365,6 +2495,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             r = true;
                         }
                     }
+                    if vm.has_pending { break case; }
                     vm.sp -= 2;
                     vpush(vm, value_bool(r));
                 }
@@ -2679,7 +2810,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value objv = vpeek(vm, 0);
                 bool r = true;
                 if value_is_object(objv) {
-                    r = js_delete_prop(value_as_object(objv), a);
+                    JsObject* o = value_as_object(objv);
+                    if (o.obj_flags & OBJF_PROXY) != 0 {
+                        r = proxy_delete(vm, cast(JsProxy*, o), a);
+                        if vm.has_pending { break case; }
+                    } else {
+                        r = js_delete_prop(o, a);
+                    }
                 }
                 vm.sp--;
                 vpush(vm, value_bool(r));
@@ -2694,7 +2831,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         js_array_set(value_as_object(objv), idx, value_undefined());
                     }
                 } else if value_is_object(objv) {
-                    r = js_delete_prop(value_as_object(objv), key_to_atom(vm, key));
+                    JsObject* dob = value_as_object(objv);
+                    if (dob.obj_flags & OBJF_PROXY) != 0 {
+                        r = proxy_delete(vm, cast(JsProxy*, dob), key_to_atom(vm, key));
+                        if vm.has_pending { break case; }
+                    } else {
+                        r = js_delete_prop(dob, key_to_atom(vm, key));
+                    }
                 }
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
