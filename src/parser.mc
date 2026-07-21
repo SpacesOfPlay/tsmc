@@ -1937,7 +1937,7 @@ Node* parse_statement(Parser* p) {
     if k == TOK_KW_BREAK || k == TOK_KW_CONTINUE {
         Node* n = nnew(p, k == TOK_KW_BREAK ? N_BREAK : N_CONTINUE);
         advance(p);
-        if at(p, TOK_IDENT) && !p.cur.newline_before {
+        if is_binding_ident(p.cur.kind) && !p.cur.newline_before {
             n.name = p.cur.text;
             advance(p);
         }
@@ -1996,7 +1996,9 @@ Node* parse_statement(Parser* p) {
         ignore parse_member_or_call(p, true);
         return null;
     }
-    if k == TOK_IDENT && peek(p).kind == TOK_COLON {
+    // A label may be a plain identifier or a contextual keyword (e.g. the
+    // `out` variance modifier, valid as an identifier outside type positions).
+    if is_binding_ident(k) && peek(p).kind == TOK_COLON {
         Node* n = nnew(p, N_LABELED);
         n.name = p.cur.text;
         advance(p);
