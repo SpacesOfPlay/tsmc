@@ -421,6 +421,26 @@ private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value
     return value_cell(&arr.head);
 }
 
+// The mirror of getOwnPropertyNames: own symbol-keyed properties only.
+private Value nat_object_getownsymbols(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&arr.head));
+    PropList* props = value_props(arg_at(args, argc, 0));
+    if props != null {
+        i32 n = 0;
+        for i32 i = 0; i < props.len; i++ {
+            u32 key = (props.items + i).key;
+            if (key & 0x80000000) == 0 { continue; }
+            js_array_set(arr, n, atom_to_key(vm, key));
+            n++;
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&arr.head);
+}
+
 private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     Value ov = arg_at(args, argc, 0);
     Value pv = arg_at(args, argc, 1);
@@ -494,9 +514,11 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
         return value_undefined();
     }
     i32 rm = gc_root_mark(&vm.heap);
-    Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
-    gc_root(&vm.heap, kv);
-    u32 key = atom_intern(&vm.atoms, sview(kv));
+    // a Symbol is a valid property key, so take the reflection key path
+    // rather than a plain ToString (which throws on a Symbol)
+    str sk;
+    u32 key = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
     Value desc = arg_at(args, argc, 2);
     if !value_is_object(desc) {
         gc_root_reset(&vm.heap, rm);
@@ -11863,6 +11885,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "getPrototypeOf", &nat_object_getproto);
     def_static(vm, object_ctor, "setPrototypeOf", &nat_object_setproto);
     def_static(vm, object_ctor, "getOwnPropertyNames", &nat_object_getownnames);
+    def_static(vm, object_ctor, "getOwnPropertySymbols", &nat_object_getownsymbols);
     def_static(vm, object_ctor, "fromEntries", &nat_object_fromentries);
     def_static(vm, object_ctor, "defineProperty", &nat_object_defineproperty);
     def_static(vm, object_ctor, "defineProperties", &nat_object_defineproperties);

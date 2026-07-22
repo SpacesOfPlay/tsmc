@@ -27,6 +27,7 @@ Confirmed running with output identical to Node.
 | `clsx@2.1.1` | conditional class strings |
 | `escape-string-regexp@4.0.0` | regex metacharacter escaping |
 | `eventemitter3@5.0.1` | event emitter |
+| `pino-std-serializers@7.0.0` | log serializers (symbol-keyed properties) |
 | `fast-deep-equal@3.1.3` | recursive deep equality |
 | `fast-json-stable-stringify@2.1.0` | stable JSON serialization |
 | `immer@10.1.1` | immutable updates via Proxy (object drafts) |
@@ -98,7 +99,6 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
-| `pino-std-serializers` | `Cannot convert a Symbol value to a string` in a hot path. |
 
 ## Will it work? Rules of thumb
 
