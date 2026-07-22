@@ -8,43 +8,23 @@ str node_fetch_source() {
     return "'use strict';
 const http = require('http');
 const https = require('https');
-
-function makeHeaders(obj) {
-  return {
-    get: function (name) { const v = obj[String(name).toLowerCase()]; return v === undefined ? null : v; },
-    has: function (name) { return obj[String(name).toLowerCase()] !== undefined; },
-    forEach: function (cb) { for (const k in obj) cb(obj[k], k, this); },
-    keys: function () { return Object.keys(obj)[Symbol.iterator](); },
-    entries: function () { const e = []; for (const k in obj) e.push([k, obj[k]]); return e[Symbol.iterator](); },
-    _raw: obj,
-  };
-}
-
-class Response {
-  constructor(status, statusText, headersObj, bodyBuf, url) {
-    this.status = status;
-    this.statusText = statusText || '';
-    this.ok = status >= 200 && status < 300;
-    this.redirected = false;
-    this.url = url || '';
-    this.headers = makeHeaders(headersObj || {});
-    this.bodyUsed = false;
-    this._buf = bodyBuf || Buffer.alloc(0);
-  }
-  text() { this.bodyUsed = true; return Promise.resolve(this._buf.toString('utf8')); }
-  json() { return this.text().then(function (t) { return JSON.parse(t); }); }
-  arrayBuffer() {
-    this.bodyUsed = true;
-    const b = this._buf;
-    const ab = new ArrayBuffer(b.length);
-    const v = new Uint8Array(ab);
-    for (let i = 0; i < b.length; i++) v[i] = b[i];
-    return Promise.resolve(ab);
-  }
-}
+// the same classes the Headers / Request / Response globals resolve to, so a
+// fetched Response really is `instanceof Response`
+const webapi = require('_webapi');
+const Headers = webapi.Headers;
+const Request = webapi.Request;
+const Response = webapi.Response;
 
 function fetch(resource, options) {
   options = options || {};
+  if (resource instanceof Request) {
+    const merged = {};
+    for (const k of Object.keys(options)) merged[k] = options[k];
+    if (merged.method === undefined) merged.method = resource.method;
+    if (merged.headers === undefined) merged.headers = resource.headers;
+    if (merged.body === undefined && resource._buf && resource._buf.length > 0) merged.body = resource._buf;
+    options = merged;
+  }
   return new Promise(function (resolve, reject) {
     let urlStr = typeof resource === 'string' ? resource : (resource && resource.url) || String(resource);
     let u;
@@ -57,7 +37,8 @@ function fetch(resource, options) {
     const mod = secure ? https : http;
     const headers = {};
     const oh = options.headers || {};
-    for (const k in oh) headers[k] = oh[k];
+    if (oh instanceof Headers) { oh.forEach(function (v, k) { headers[k] = v; }); }
+    else { for (const k in oh) headers[k] = oh[k]; }
     const req = mod.request({
       host: u.hostname,
       port: u.port || (secure ? 443 : 80),
@@ -69,7 +50,12 @@ function fetch(resource, options) {
       const chunks = [];
       res.on('data', function (c) { chunks.push(c); });
       res.on('end', function () {
-        resolve(new Response(res.statusCode, res.statusMessage, res.headers, Buffer.concat(chunks), urlStr));
+        resolve(new Response(Buffer.concat(chunks), {
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          headers: res.headers,
+          url: urlStr,
+        }));
       });
       res.on('error', reject);
     });
@@ -79,6 +65,6 @@ function fetch(resource, options) {
   });
 }
 
-module.exports = { fetch: fetch, Response: Response };
+module.exports = { fetch: fetch, Headers: Headers, Request: Request, Response: Response };
 ";
 }

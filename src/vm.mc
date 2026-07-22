@@ -1542,6 +1542,39 @@ void vm_set_global(VM* vm, str name, Value v) {
     intmap_set<Value>(&vm.globals, a, v);
 }
 
+// A global whose value is produced on first read. Stored as an accessor, which
+// the global read path resolves, so a binding backed by an internal module
+// costs nothing for scripts that never mention it. Because globalThis mirrors
+// the globals table by descriptor, the same accessor also serves
+// globalThis.<name> when installed before that snapshot.
+void vm_set_lazy_global(VM* vm, str name, NativeFn getter) {
+    // the accessor is rooted before the getter is allocated: until it lands in
+    // the globals table nothing else references it
+    i32 rm = gc_root_mark(&vm.heap);
+    JsAccessor* ac = js_new_accessor(&vm.heap);
+    Value acv = value_cell(&ac.head);
+    gc_root(&vm.heap, acv);
+    ac.get = vm_make_native(vm, getter, name);
+    vm_set_global(vm, name, acv);
+    gc_root_reset(&vm.heap, rm);
+}
+
+// Mirrors an existing global onto the globalThis object. That object is a
+// snapshot taken while the built-ins are installed, so globals added later
+// (the entry-point ones: fetch and its data types) have to be published
+// explicitly to show up as properties. Node makes `fetch` enumerable but its
+// data types not, hence the flag.
+void vm_mirror_global(VM* vm, str name, bool enumerable) {
+    Value* gt = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "globalThis"));
+    if gt == null || !value_is_object(*gt) { return; }
+    u32 a = atom_intern(&vm.atoms, name);
+    Value* v = intmap_get<Value>(&vm.globals, a);
+    if v == null { return; }
+    u8 attrs = PROP_WRITABLE | PROP_CONFIGURABLE;
+    if enumerable { attrs = attrs | PROP_ENUMERABLE; }
+    props_set_desc(&value_as_object(*gt).props, a, *v, attrs);
+}
+
 Value vm_make_native(VM* vm, NativeFn f, str name) {
     JsNative* n = js_new_native(&vm.heap, f, name);
     return value_cell(&n.head);
@@ -2244,7 +2277,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 Value* g = intmap_get<Value>(&vm.globals, a);
                 if g != null {
-                    vpush(vm, *g);
+                    Value gv0 = *g;
+                    // a lazy global (see vm_set_lazy_global): an accessor
+                    // resolves through its getter, so the value it stands for
+                    // is only built when something actually reads the name
+                    if value_is_accessor(gv0) {
+                        JsAccessor* lac = value_as_accessor(gv0);
+                        if value_is_callable(lac.get) {
+                            Value dummy0 = value_undefined();
+                            gv0 = vm_call_value(vm, lac.get, value_undefined(), &dummy0, 0);
+                            if vm.has_pending { break case; }
+                        } else {
+                            gv0 = value_undefined();
+                        }
+                    }
+                    vpush(vm, gv0);
                 } else {
                     // Free identifiers resolve against the global object, which
                     // inherits Object.prototype, so bare `toString` /

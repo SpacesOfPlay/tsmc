@@ -132,7 +132,7 @@ are blocked by a deliberate policy rather than a missing feature.
 **Not implemented core modules:** `child_process`, `worker_threads`,
 `cluster`, `dgram`, `dns` (module), `readline`, `vm`, `perf_hooks`,
 `async_hooks`. No `Intl`, `WeakRef`, `FinalizationRegistry`, or
-`setImmediate`. `fetch` works but `Headers`/`Request`/`Response` are not
+`setImmediate`. `fetch` works, as do the `Headers`/`Request`/`Response`
 globals. TLS/HTTP is client + plain-HTTP-server only (no HTTPS server).
 
 ## Reproducing

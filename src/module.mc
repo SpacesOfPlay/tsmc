@@ -25,6 +25,7 @@ import node_assert;
 import node_net;
 import node_http;
 import node_fetch;
+import node_webapi;
 import node_tls;
 import node_https;
 
@@ -307,7 +308,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "buffer") || str_equal(s, "timers")
         || str_equal(s, "net") || str_equal(s, "http")
         || str_equal(s, "tls") || str_equal(s, "https")
-        || str_equal(s, "tty") || str_equal(s, "_fetch")
+        || str_equal(s, "tty") || str_equal(s, "_fetch") || str_equal(s, "_webapi")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -986,6 +987,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "tls") { return node_tls_source(); }
     if str_equal(name, "https") { return node_https_source(); }
     if str_equal(name, "_fetch") { return node_fetch_source(); }
+    if str_equal(name, "_webapi") { return node_webapi_source(); }
     if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     return null_str();
 }
@@ -1285,9 +1287,54 @@ private Value nat_fetch(void* vmp, Value callee, Value thisv, Value* args, i32 a
     return vm_call_value(vm, impl_fetch, value_undefined(), args, argc);
 }
 
+// The `_webapi` classes behind the Headers / Request / Response globals. Each
+// is a lazy global, so the module is only built if a script names one.
+private Value webapi_class(VM* vm, str which) {
+    str none;
+    none.data = null;
+    none.len = 0;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value impl = module_require(vm, none, "_webapi");
+    if vm.has_pending || !value_is_object(impl) { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, impl);
+    Value cls;
+    bool ok = vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, which), &cls);
+    gc_root_reset(&vm.heap, rm);
+    if !ok { return value_undefined(); }
+    // cls stays reachable through the module held in the require cache
+    // memoize: `which` is also the global's name, so replacing the accessor
+    // with the resolved class makes every later read a plain global lookup
+    if value_is_callable(cls) {
+        vm_set_global(vm, which, cls);
+        vm_mirror_global(vm, which, false);
+    }
+    return cls;
+}
+
+private Value nat_g_headers(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webapi_class(cast(VM*, vmp), "Headers");
+}
+
+private Value nat_g_request(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webapi_class(cast(VM*, vmp), "Request");
+}
+
+private Value nat_g_response(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webapi_class(cast(VM*, vmp), "Response");
+}
+
 i32 module_run_entry(VM* vm, str src, str path) {
     // `fetch` is a global in Node 18+; install it as a lazy native.
     vm_set_global(vm, "fetch", vm_make_native(vm, &nat_fetch, "fetch"));
+    // its data types are globals too, resolved on first mention
+    vm_set_lazy_global(vm, "Headers", &nat_g_headers);
+    vm_set_lazy_global(vm, "Request", &nat_g_request);
+    vm_set_lazy_global(vm, "Response", &nat_g_response);
+    // publish onto globalThis, whose snapshot predates all four
+    vm_mirror_global(vm, "fetch", true);
+    vm_mirror_global(vm, "Headers", false);
+    vm_mirror_global(vm, "Request", false);
+    vm_mirror_global(vm, "Response", false);
 
     // __filename / __dirname for the entry file (absolute, entry-scoped).
     str fname = canon_path(path);
