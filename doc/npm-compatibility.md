@@ -30,7 +30,7 @@ Confirmed running with output identical to Node.
 | `pino-std-serializers@7.0.0` | log serializers (symbol-keyed properties) |
 | `fast-deep-equal@3.1.3` | recursive deep equality |
 | `fast-json-stable-stringify@2.1.0` | stable JSON serialization |
-| `immer@10.1.1` | immutable updates via Proxy (object drafts) |
+| `immer@10.1.1` | immutable updates via Proxy (object **and array** drafts) |
 | `bignumber.js@9.1.2` | arbitrary-precision decimals |
 | `decimal.js@10.4.3` | arbitrary-precision decimals |
 | `chalk@4.1.2` | terminal string styling (all color models + chaining) |
@@ -118,9 +118,10 @@ are blocked by a deliberate policy rather than a missing feature.
 **Likely fails**
 - **Native addons** (`.node` / N-API): `sharp`, `better-sqlite3`, `canvas`,
   native `bcrypt`, etc. — unsupported outright.
-- **`Proxy` array-target writes**: the core traps work (`immer`'s object
-  drafts run), but mutating array methods through a proxy receiver — and so
-  `immer`'s array drafts, and reactivity layers built on them — do not.
+- **Native addons and runtime code generation** remain the two hard walls;
+  see the table above. `Proxy` is otherwise broadly supported, including
+  mutating array methods through a proxy receiver (`immer`'s array drafts
+  run), so Proxy-based reactivity and immutability layers are worth trying.
 - **Runtime code generation**: anything calling `eval` or `new Function`
   (many template compilers, `ajv`, `lodash`'s root detection).
 - **Heavier crypto/auth**: only `crypto.createHash('sha256')`,

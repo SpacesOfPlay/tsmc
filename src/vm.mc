@@ -1289,6 +1289,19 @@ bool vm_set_prop_value(VM* vm, Value objv, u32 a, Value v) {
     return set_prop_atom(vm, objv, a, v);
 }
 
+// Public delete through the full path, so a proxy's deleteProperty trap
+// fires. Used by the generic (array-like receiver) Array methods.
+bool vm_delete_prop_value(VM* vm, Value objv, u32 a) {
+    if value_is_object(objv) {
+        JsObject* o = value_as_object(objv);
+        if (o.obj_flags & OBJF_PROXY) != 0 { return proxy_delete(vm, cast(JsProxy*, o), a); }
+        return js_delete_prop(o, a);
+    }
+    PropList* props = value_props(objv);
+    if props != null { return props_remove(props, a); }
+    return true;
+}
+
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
@@ -2602,16 +2615,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     JsObject* o = value_as_object(objv);
                     bool r = false;
-                    i32 idx = val_to_index(key);
                     if (o.obj_flags & OBJF_PROXY) != 0 {
                         r = proxy_has(vm, cast(JsProxy*, o), key_to_atom(vm, key));
-                    } else if (o.obj_flags & OBJF_ARRAY) != 0 && idx >= 0 {
-                        r = js_array_has(o, idx);
                     } else {
                         u32 a = key_to_atom(vm, key);
-                        r = js_has_prop(o, a);
-                        if !r && (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
+                        // array elements and `length` live outside the property
+                        // table; resolve through the atom so a string-form
+                        // index ("0" in arr) answers like the numeric one
+                        i32 idx = (o.obj_flags & OBJF_ARRAY) != 0
+                            ? ta_atom_index(vm, a) : -1;
+                        if (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
                             r = true;
+                        } else if idx >= 0 {
+                            r = js_array_has(o, idx);
+                        } else {
+                            r = js_has_prop(o, a);
                         }
                     }
                     if vm.has_pending { break case; }

@@ -801,28 +801,41 @@ private Value nat_object_isextensible(void* vmp, Value callee, Value thisv, Valu
     return value_bool((value_as_object(ov).obj_flags & OBJF_NONEXT) == 0);
 }
 
-private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
-    PropList* props = value_props(thisv);
-    if props == null { return value_bool(false); }
-    Value kv = arg_at(args, argc, 0);
-    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_ARRAY) != 0
-            && value_is_int(kv) {
-        return value_bool(js_array_has(value_as_object(thisv), value_as_int(kv)));
-    }
+// Own-property existence, shared by Object.prototype.hasOwnProperty and
+// Object.hasOwn. Array elements and an array's `length`, typed-array indices,
+// and a string's indices and `length` all live outside the property table, so
+// each is checked explicitly. The key is resolved to an atom first, so a
+// string-form index (arr["0"]) answers the same as the numeric one.
+private bool own_prop_exists(VM* vm, Value ov, Value kv) {
     str sk;
     u32 a = reflect_key(vm, kv, &sk);
-    if vm.has_pending { return value_bool(false); }
-    if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_TYPEDARRAY) != 0 {
-        i32 idx = ta_atom_index(vm, a);
-        if idx >= 0 {
-            JsObject* o = value_as_object(thisv);
-            return value_bool(idx < ta_len(vm, o));
+    if vm.has_pending { return false; }
+
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { return true; }
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 { return js_array_has(o, idx); }
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 { return idx < ta_len(vm, o); }
         }
+    } else if value_is_string(ov) {
+        if a == vm.atom_length { return true; }
+        i32 idx = ta_atom_index(vm, a);
+        if idx >= 0 { return idx < value_as_string(ov).u16len; }
     }
-    if props_get(props, a) != null { return value_bool(true); }
+
+    PropList* props = value_props(ov);
+    if props != null && props_get(props, a) != null { return true; }
     Value fv;
-    return value_bool(fn_own_synth(vm, thisv, a, &fv));
+    return fn_own_synth(vm, ov, a, &fv);
+}
+
+private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return value_bool(own_prop_exists(vm, thisv, arg_at(args, argc, 0)));
 }
 
 // Object.prototype.propertyIsEnumerable: own AND enumerable.
@@ -960,13 +973,18 @@ private Value nat_array_ctor(void* vmp, Value callee, Value thisv, Value* args, 
     return value_cell(&arr.head);
 }
 
-private Value nat_array_isarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    // Array.isArray pierces proxies: true iff the (transitive) target is an array
-    Value v = arg_at(args, argc, 0);
+// True iff v is an array, looking through any chain of proxies. This is the
+// IsArray the spec uses, so Array.isArray and JSON serialization agree: a
+// proxy wrapping an array serializes as an array.
+private bool is_array_pierced(Value v) {
     while value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0 {
         v = cast(JsProxy*, value_as_object(v)).target;
     }
-    return value_bool(value_is_array(v));
+    return value_is_array(v);
+}
+
+private Value nat_array_isarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(is_array_pierced(arg_at(args, argc, 0)));
 }
 
 private Value nat_array_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -1085,8 +1103,165 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
     return value_cell(&arr.head);
 }
 
+// --- generic mutating Array methods ----------------------------------------
+// The spec defines the mutating Array methods over `this` in terms of
+// Get/Set/Delete, so they must also work on an array-like or a Proxy (whose
+// traps then fire, which is what immer's array drafts rely on). A real array
+// keeps the direct element-storage fast path below; anything else that is an
+// object routes through these helpers. A non-object receiver still gets the
+// loud refusal from this_array.
+
+private bool needs_generic_array(Value thisv) {
+    return !value_is_array(thisv) && value_is_object(thisv);
+}
+
+private i32 al_length(VM* vm, Value recv) {
+    Value lv;
+    if !vm_get_prop_value(vm, recv, vm.atom_length, &lv) { return 0; }
+    f64 lf = js_to_number(lv);
+    if lf != lf || lf < 0.0 { return 0; }
+    if lf > 2147483647.0 { return 2147483647; }
+    return cast(i32, lf);
+}
+
+private void al_set_length(VM* vm, Value recv, i32 n) {
+    ignore vm_set_prop_value(vm, recv, vm.atom_length, value_int(n));
+}
+
+private Value al_get(VM* vm, Value recv, i32 i) {
+    Value v;
+    if !vm_get_prop_value(vm, recv, index_atom(vm, i), &v) { return value_undefined(); }
+    return v;
+}
+
+private void al_set(VM* vm, Value recv, i32 i, Value v) {
+    ignore vm_set_prop_value(vm, recv, index_atom(vm, i), v);
+}
+
+private void al_del(VM* vm, Value recv, i32 i) {
+    ignore vm_delete_prop_value(vm, recv, index_atom(vm, i));
+}
+
+private Value arr_push_generic(VM* vm, Value recv, Value* args, i32 argc) {
+    i32 len = al_length(vm, recv);
+    for i32 i = 0; i < argc; i++ {
+        al_set(vm, recv, len, *(args + i));
+        if vm.has_pending { return value_undefined(); }
+        len++;
+    }
+    al_set_length(vm, recv, len);
+    return value_int(len);
+}
+
+private Value arr_pop_generic(VM* vm, Value recv) {
+    i32 len = al_length(vm, recv);
+    if len == 0 {
+        al_set_length(vm, recv, 0);
+        return value_undefined();
+    }
+    Value v = al_get(vm, recv, len - 1);
+    if vm.has_pending { return value_undefined(); }
+    al_del(vm, recv, len - 1);
+    al_set_length(vm, recv, len - 1);
+    return v;
+}
+
+private Value arr_shift_generic(VM* vm, Value recv) {
+    i32 len = al_length(vm, recv);
+    if len == 0 {
+        al_set_length(vm, recv, 0);
+        return value_undefined();
+    }
+    Value first = al_get(vm, recv, 0);
+    for i32 i = 1; i < len; i++ {
+        al_set(vm, recv, i - 1, al_get(vm, recv, i));
+        if vm.has_pending { return value_undefined(); }
+    }
+    al_del(vm, recv, len - 1);
+    al_set_length(vm, recv, len - 1);
+    return first;
+}
+
+private Value arr_unshift_generic(VM* vm, Value recv, Value* args, i32 argc) {
+    i32 len = al_length(vm, recv);
+    for i32 i = len - 1; i >= 0; i-- {
+        al_set(vm, recv, i + argc, al_get(vm, recv, i));
+        if vm.has_pending { return value_undefined(); }
+    }
+    for i32 i = 0; i < argc; i++ {
+        al_set(vm, recv, i, *(args + i));
+        if vm.has_pending { return value_undefined(); }
+    }
+    al_set_length(vm, recv, len + argc);
+    return value_int(len + argc);
+}
+
+private Value arr_reverse_generic(VM* vm, Value recv) {
+    i32 len = al_length(vm, recv);
+    for i32 i = 0; i < len / 2; i++ {
+        i32 j = len - 1 - i;
+        Value a = al_get(vm, recv, i);
+        Value b = al_get(vm, recv, j);
+        al_set(vm, recv, i, b);
+        al_set(vm, recv, j, a);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return recv;
+}
+
+private Value arr_fill_generic(VM* vm, Value recv, Value* args, i32 argc) {
+    i32 len = al_length(vm, recv);
+    Value v = arg_at(args, argc, 0);
+    i32 start = argc > 1 ? rel_index(to_int_sat(*(args + 1)), len) : 0;
+    i32 end = argc > 2 && !value_is_undefined(*(args + 2))
+        ? rel_index(to_int_sat(*(args + 2)), len) : len;
+    for i32 i = start; i < end; i++ {
+        al_set(vm, recv, i, v);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return recv;
+}
+
+private Value arr_splice_generic(VM* vm, Value recv, Value* args, i32 argc) {
+    i32 len = al_length(vm, recv);
+    i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, len);
+    i32 del = len - start;
+    if argc > 1 {
+        del = to_int_sat(*(args + 1));
+        if del < 0 { del = 0; }
+        if del > len - start { del = len - start; }
+    }
+    i32 n_items = argc > 2 ? argc - 2 : 0;
+
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* removed = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&removed.head));
+    for i32 i = 0; i < del; i++ {
+        js_array_set(removed, i, al_get(vm, recv, start + i));
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    }
+    if n_items < del {
+        for i32 i = start; i < len - del; i++ {
+            al_set(vm, recv, i + n_items, al_get(vm, recv, i + del));
+        }
+        for i32 i = len - del + n_items; i < len; i++ { al_del(vm, recv, i); }
+    } else if n_items > del {
+        for i32 i = len - del - 1; i >= start; i-- {
+            al_set(vm, recv, i + n_items, al_get(vm, recv, i + del));
+        }
+    }
+    for i32 i = 0; i < n_items; i++ {
+        al_set(vm, recv, start + i, *(args + 2 + i));
+    }
+    al_set_length(vm, recv, len - del + n_items);
+    gc_root_reset(&vm.heap, rm);
+    if vm.has_pending { return value_undefined(); }
+    return value_cell(&removed.head);
+}
+
 private Value nat_arr_push(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_push_generic(vm, thisv, args, argc); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     for i32 i = 0; i < argc; i++ {
@@ -1097,6 +1272,7 @@ private Value nat_arr_push(void* vmp, Value callee, Value thisv, Value* args, i3
 
 private Value nat_arr_pop(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_pop_generic(vm, thisv); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     if a.elen == 0 { return value_undefined(); }
@@ -1107,6 +1283,7 @@ private Value nat_arr_pop(void* vmp, Value callee, Value thisv, Value* args, i32
 
 private Value nat_arr_shift(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_shift_generic(vm, thisv); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     if a.elen == 0 { return value_undefined(); }
@@ -1120,6 +1297,7 @@ private Value nat_arr_shift(void* vmp, Value callee, Value thisv, Value* args, i
 
 private Value nat_arr_unshift(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_unshift_generic(vm, thisv, args, argc); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     i32 old = a.elen;
@@ -1191,6 +1369,7 @@ private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i
 
 private Value nat_arr_splice(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_splice_generic(vm, thisv, args, argc); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, a.elen);
@@ -1633,6 +1812,7 @@ private Value nat_arr_flatmap(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_arr_reverse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_reverse_generic(vm, thisv); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     i32 i = 0;
@@ -1649,6 +1829,7 @@ private Value nat_arr_reverse(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_arr_fill(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if needs_generic_array(thisv) { return arr_fill_generic(vm, thisv, args, argc); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     Value v = arg_at(args, argc, 0);
@@ -2467,20 +2648,7 @@ private Value nat_object_is(void* vmp, Value callee, Value thisv, Value* args, i
 
 private Value nat_object_hasown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    Value ov = arg_at(args, argc, 0);
-    PropList* props = value_props(ov);
-    if props == null { return value_bool(false); }
-    Value kv = arg_at(args, argc, 1);
-    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_ARRAY) != 0
-            && value_is_int(kv) {
-        return value_bool(js_array_has(value_as_object(ov), value_as_int(kv)));
-    }
-    str sk;
-    u32 a = reflect_key(vm, kv, &sk);
-    if vm.has_pending { return value_bool(false); }
-    if props_entry(props, a) != null { return value_bool(true); }
-    Value fv;
-    return value_bool(fn_own_synth(vm, ov, a, &fv));
+    return value_bool(own_prop_exists(vm, arg_at(args, argc, 0), arg_at(args, argc, 1)));
 }
 
 // --- Number / Boolean ------------------------------------------------------------
@@ -3461,14 +3629,20 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
         }
     }
     vec_push(seen, pid);
-    if (o.obj_flags & OBJF_ARRAY) != 0 {
+    // a proxy wrapping an array serializes as an array, reading its length and
+    // elements through the traps
+    bool proxied_array = (o.obj_flags & OBJF_ARRAY) == 0
+        && (o.obj_flags & OBJF_PROXY) != 0 && is_array_pierced(v);
+    if (o.obj_flags & OBJF_ARRAY) != 0 || proxied_array {
+        i32 n = proxied_array ? al_length(vm, v) : o.elen;
         str_buf_add(sb, "[");
-        for i32 i = 0; i < o.elen; i++ {
+        for i32 i = 0; i < n; i++ {
             if i > 0 { str_buf_add(sb, ","); }
             json_indent_into(sb, gap, depth + 1);
             i32 rm = gc_root_mark(&vm.heap);
             string ks = format("{}", i);
-            Value child = json_transform(vm, ctx, v, ks, js_array_get(o, i));
+            Value ev = proxied_array ? al_get(vm, v, i) : js_array_get(o, i);
+            Value child = json_transform(vm, ctx, v, ks, ev);
             free(ks);
             gc_root(&vm.heap, child);
             bool wrote = json_write(vm, sb, child, ctx, depth + 1);
@@ -3481,7 +3655,7 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
                 str_buf_add(sb, "null");
             }
         }
-        if o.elen > 0 { json_indent_into(sb, gap, depth); }
+        if n > 0 { json_indent_into(sb, gap, depth); }
         str_buf_add(sb, "]");
     } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
         // a typed array serializes like an object keyed by its indices
