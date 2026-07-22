@@ -45,8 +45,18 @@ newline). `g`/`y` are handled by the String/RegExp layer through
 
 ## Deferred (diagnostics or documented gaps)
 
-Named groups and named backreferences, lookbehind, Unicode property
-escapes (`\p{…}`), the `u` flag's code-point semantics and the sticky
-`y` flag's full behavior. Backreferences to unset groups match empty
+Named groups and named backreferences, lookbehind, the `u` flag's full
+code-point semantics and the sticky `y` flag's full behavior.
+
+Unicode property escapes (`\p{…}` / `\P{…}`) **are** supported in `u`
+mode — see `PLAN_M36_regex_uniprops.md`. They need no matcher work:
+under `u` the class instruction already decodes a whole code point, so a
+property escape only has to contribute code-point ranges, exactly like
+`\d`/`\w`/`\s`. The tables live in the generated `regex_uniprops_data.mc`
+(general categories as one run-length table, `Script` as another, one
+range list per binary property). Not supported, and raising
+`SyntaxError` rather than degrading to a literal: `Script_Extensions=`,
+Script value short aliases, the remaining binary properties, and
+`v`-mode set notation. Backreferences to unset groups match empty
 (per spec). No compiled-pattern portability concerns — progs are
 owned by the VM and freed at teardown.

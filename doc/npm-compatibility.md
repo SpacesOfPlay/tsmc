@@ -48,6 +48,7 @@ Confirmed running with output identical to Node.
 | `he@1.2.0` | HTML entity encode/decode |
 | `strip-ansi@6.0.1` | remove ANSI escape codes |
 | `pluralize@8.0.0` | English pluralization |
+| `camelcase@6.3.0` | case conversion (regex `\p{…}` property escapes) |
 | `dedent@1.5.3` | template-literal dedent |
 
 ### Parsing & config
@@ -98,7 +99,9 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 | package(s) | blocker |
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
-| `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
+
+Every package in the probe matrix that *can* run now does; the two above
+are blocked by a deliberate policy rather than a missing feature.
 
 ## Will it work? Rules of thumb
 
@@ -144,9 +147,10 @@ tsmc   tools/npm_compat_probe.js > tsmc.txt
 ```
 
 Each package is exercised with a real call (not just `require`), and a
-package counts as working only when tsmc's output equals Node's — a package
-that loads but returns wrong output (e.g. `camelcase`) is **not** listed as
-working. Add a line to the probe to test another package.
+package counts as working only when tsmc's output equals Node's. A package
+that loads but returns wrong output is **not** listed as working — that bar
+matters, since a silently wrong result is worse than a clean failure.
+Add a line to the probe to test another package.
 
 See also the `npm-package-compat` project memory for the running list of
 which gaps have since been closed (e.g. the `arguments` object, which

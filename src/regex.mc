@@ -6,6 +6,7 @@
 
 import vec;
 import str;
+import "regex_uniprops_data.mc";
 
 // --- node tree ------------------------------------------------------------
 
@@ -228,6 +229,112 @@ private void add_space(Vec<RxRange>* rs) {
     class_add(rs, 11, 12);   // \v \f
 }
 
+// --- Unicode property escapes (\p{...} / \P{...}) --------------------------
+
+// Appends the code-point ranges of one Unicode property to `rs`. Accepts a
+// general category (short or long name, single category or group letter,
+// optionally spelled `General_Category=Lu` / `gc=Lu`) and the supported
+// binary properties. Returns false for anything else — including the
+// deliberately unsupported `Script=` — so the caller can reject the pattern
+// instead of silently matching something else.
+private bool uniprop_ranges(Vec<RxRange>* rs, str name) {
+    str n = name;
+    // an explicit `lhs=rhs` form: only General_Category is supported
+    i32 eq = -1;
+    for i32 i = 0; i < n.len; i++ {
+        if *(n.data + i) == '=' { eq = i; break; }
+    }
+    if eq >= 0 {
+        str lhs;
+        lhs.data = n.data;
+        lhs.len = eq;
+        n.data = n.data + eq + 1;
+        n.len = n.len - eq - 1;
+        if n.len == 0 { return false; }
+        // Script= is a partition, walked like the category table.
+        // Script_Extensions is multi-valued and deliberately unsupported.
+        if str_equal(lhs, "Script") || str_equal(lhs, "sc") {
+            i32 sid = uniprop_script_id(n);
+            if sid < 0 { return false; }
+            for i32 i = 0; i < UNI_SC_RUNS; i++ {
+                if cast(i32, UNI_SC_ID[i]) != sid { continue; }
+                i32 lo = cast(i32, UNI_SC_START[i]);
+                i32 hi = 0x10FFFF;
+                if i + 1 < UNI_SC_RUNS { hi = cast(i32, UNI_SC_START[i + 1]) - 1; }
+                class_add(rs, lo, hi);
+            }
+            return true;
+        }
+        if !str_equal(lhs, "General_Category") && !str_equal(lhs, "gc") { return false; }
+    }
+    if n.len == 0 { return false; }
+
+    u32 mask = uniprop_gc_mask(n);
+    if mask != 0 {
+        for i32 i = 0; i < UNI_GC_RUNS; i++ {
+            u32 bit = cast(u32, 1) << UNI_GC_CAT[i];
+            if (mask & bit) == 0 { continue; }
+            i32 lo = cast(i32, UNI_GC_START[i]);
+            i32 hi = 0x10FFFF;
+            if i + 1 < UNI_GC_RUNS { hi = cast(i32, UNI_GC_START[i + 1]) - 1; }
+            class_add(rs, lo, hi);
+        }
+        return true;
+    }
+    u32* tbl;
+    i32 cnt;
+    if uniprop_binary(n, &tbl, &cnt) {
+        for i32 i = 0; i < cnt; i++ {
+            class_add(rs, cast(i32, *(tbl + i * 2)), cast(i32, *(tbl + i * 2 + 1)));
+        }
+        return true;
+    }
+    return false;
+}
+
+// Complement of `src` over the whole code-point space. `src` must be in
+// ascending order, which the generated tables and the run walk both are.
+private void uniprop_complement(Vec<RxRange>* dst, Vec<RxRange>* src) {
+    i32 next = 0;
+    for i32 i = 0; i < src.len; i++ {
+        RxRange r = vec_get(src, i);
+        if r.lo > next { class_add(dst, next, r.lo - 1); }
+        if r.hi + 1 > next { next = r.hi + 1; }
+    }
+    if next <= 0x10FFFF { class_add(dst, next, 0x10FFFF); }
+}
+
+// Parses `\p{Name}` / `\P{Name}` with p.pos on the `p`/`P`, appending the
+// resulting ranges to `rs`. Returns false (and marks the pattern failed) for
+// a malformed or unsupported property.
+private bool parse_uniprop(RxParser* p, Vec<RxRange>* rs, bool negated) {
+    p.pos++;                       // past p / P
+    if px_cur(p) != '{' { p.failed = true; return false; }
+    p.pos++;
+    i32 start = p.pos;
+    while p.pos < p.src.len && px_cur(p) != '}' { p.pos++; }
+    if p.pos >= p.src.len { p.failed = true; return false; }
+    str name;
+    name.data = p.src.data + start;
+    name.len = p.pos - start;
+    p.pos++;                       // past }
+
+    Vec<RxRange> tmp = vec_new<RxRange>(8);
+    bool ok = uniprop_ranges(&tmp, name);
+    if !ok {
+        vec_free(&tmp);
+        p.failed = true;
+        return false;
+    }
+    if negated {
+        uniprop_complement(rs, &tmp);
+    } else {
+        for i32 i = 0; i < tmp.len; i++ { vec_push(rs, vec_get(&tmp, i)); }
+    }
+    vec_free(&tmp);
+    return true;
+}
+
 // Complement of [lo..hi] style set over 0..255 given the base ranges.
 private void add_negated(Vec<RxRange>* dst, Vec<RxRange>* base) {
     // mark covered bytes, then emit gaps
@@ -371,6 +478,13 @@ private RxNode* parse_class(RxParser* p) {
                 vec_free(&base);
                 continue;
             }
+            // \p{...} inside a class contributes its ranges as a class member;
+            // \P{...} contributes the property's complement, which is not the
+            // same as negating the enclosing class.
+            if (e == 'p' || e == 'P') && p.unicode && px_at(p, p.pos + 1) == '{' {
+                ignore parse_uniprop(p, &rs, e == 'P');
+                continue;
+            }
             lo = escape_char(p);
         } else {
             lo = px_read_cp(p);
@@ -492,9 +606,14 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             return n;
         }
         if (e == 'p' || e == 'P') && p.unicode && px_at(p, p.pos + 1) == '{' {
-            // Unicode property escapes need large tables — unsupported.
-            p.failed = true;
-            return rx_node(RN_CHAR);
+            Vec<RxRange> rs = vec_new<RxRange>(8);
+            bool ok = parse_uniprop(p, &rs, e == 'P');
+            i32 ci = register_class(p, &rs, false);
+            vec_free(&rs);
+            if !ok { return rx_node(RN_CHAR); }
+            RxNode* n = rx_node(RN_CLASS);
+            n.cls = ci;
+            return n;
         }
         i32 ch = escape_char(p);
         return cp_to_node(ch);
