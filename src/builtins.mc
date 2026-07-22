@@ -113,6 +113,20 @@ private i32 to_int_arg(Value v) {
     return cast(i32, cast(i64, d));
 }
 
+// ToIntegerOrInfinity truncated toward zero and saturated to the i32 range.
+// A plain (i32) cast of +/-Infinity or an out-of-range magnitude overflows
+// (Infinity casts to 0), which silently corrupts a length-relative index —
+// e.g. slice(1, Infinity) would compute end 0 and return nothing. Saturating
+// lets the subsequent clamp-to-length do the right thing. Only for indices
+// that are later clamped against a length, never for allocation sizes.
+private i32 to_int_sat(Value v) {
+    f64 d = js_to_number(v);
+    if d != d { return 0; }
+    if d >= 2147483647.0 { return 2147483647; }
+    if d <= -2147483648.0 { return -2147483648; }
+    return cast(i32, cast(i64, d));
+}
+
 private u32 bi_atom(VM* vm, str name) {
     return atom_intern(&vm.atoms, name);
 }
@@ -347,9 +361,11 @@ private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* a
         JsObject* p = value_as_object(ov).proto;
         if p != null { return value_cell(&p.head); }
     } else if value_is_function(ov) {
-        // derived-class ctor -> parent ctor; else Function.prototype
+        // an explicitly set [[Prototype]] (parent ctor or plain object / null),
+        // else the default Function.prototype
         Value fp = value_as_function(ov).fproto;
-        if value_is_function(fp) || value_is_native(fp) { return fp; }
+        if value_is_function(fp) || value_is_native(fp) || value_is_object(fp) { return fp; }
+        if value_is_null(fp) { return value_null(); }
         if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
     } else if value_is_native(ov) {
         if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
@@ -415,6 +431,14 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
         } else if value_is_null(pv) {
             o.proto = null;
         }
+    } else if value_is_function(ov) {
+        // a function's [[Prototype]] is stored inline; accept a plain object,
+        // another callable, or null (undefined means "unchanged").
+        if value_is_object(pv) || value_is_function(pv) || value_is_native(pv) {
+            value_as_function(ov).fproto = pv;
+        } else if value_is_null(pv) {
+            value_as_function(ov).fproto = value_null();
+        }
     }
     return ov;
 }
@@ -434,31 +458,40 @@ private bool desc_has(VM* vm, Value ov, str name) {
 private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) {
-        vm_throw_error(vm, ERR_TYPE, "Object.defineProperty called on non-object");
-        return value_undefined();
-    }
-    JsObject* o = value_as_object(ov);
-    if (o.obj_flags & OBJF_PROXY) != 0 {
-        JsProxy* p = cast(JsProxy*, o);
-        Value trap = proxy_trap_fn(vm, p, "defineProperty");
-        if value_is_callable(trap) {
-            i32 rmp = gc_root_mark(&vm.heap);
+    // The receiver's own-property table: objects, functions, and natives each
+    // carry one. Proxies trap; only objects can be proxies.
+    PropList* props = null;
+    if value_is_function(ov) {
+        props = &value_as_function(ov).props;
+    } else if value_is_native(ov) {
+        props = &value_as_native(ov).props;
+    } else if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            JsProxy* p = cast(JsProxy*, o);
+            Value trap = proxy_trap_fn(vm, p, "defineProperty");
+            if value_is_callable(trap) {
+                i32 rmp = gc_root_mark(&vm.heap);
+                noinit Value[3] ca;
+                ca[0] = p.target;
+                ca[1] = arg_at(args, argc, 1);
+                ca[2] = arg_at(args, argc, 2);
+                ignore vm_call_value(vm, trap, p.handler, &ca[0], 3);
+                gc_root_reset(&vm.heap, rmp);
+                return ov;
+            }
+            // default: defineProperty(target, key, desc)
             noinit Value[3] ca;
             ca[0] = p.target;
             ca[1] = arg_at(args, argc, 1);
             ca[2] = arg_at(args, argc, 2);
-            ignore vm_call_value(vm, trap, p.handler, &ca[0], 3);
-            gc_root_reset(&vm.heap, rmp);
+            ignore nat_object_defineproperty(vmp, callee, thisv, &ca[0], 3);
             return ov;
         }
-        // default: defineProperty(target, key, desc)
-        noinit Value[3] ca;
-        ca[0] = p.target;
-        ca[1] = arg_at(args, argc, 1);
-        ca[2] = arg_at(args, argc, 2);
-        ignore nat_object_defineproperty(vmp, callee, thisv, &ca[0], 3);
-        return ov;
+        props = &o.props;
+    } else {
+        vm_throw_error(vm, ERR_TYPE, "Object.defineProperty called on non-object");
+        return value_undefined();
     }
     i32 rm = gc_root_mark(&vm.heap);
     Value kv = js_to_string_value(vm, arg_at(args, argc, 1));
@@ -472,7 +505,7 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
     }
 
     // start from the existing attributes, or all-false for a new property
-    Prop* existing = props_entry(&o.props, key);
+    Prop* existing = props_entry(props, key);
     u8 flags = existing != null ? existing.flags : 0;
 
     Value tmp;
@@ -509,7 +542,7 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
         }
         stored = val;
     }
-    props_set_desc(&o.props, key, stored, flags);
+    props_set_desc(props, key, stored, flags);
     gc_root_reset(&vm.heap, rm);
     return ov;
 }
@@ -518,7 +551,9 @@ private Value nat_object_defineproperties(void* vmp, Value callee, Value thisv, 
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
     Value props = arg_at(args, argc, 1);
-    if !value_is_object(ov) || !value_is_object(props) { return ov; }
+    // per-key defineProperty handles object/function/native receivers
+    bool ok_target = value_is_object(ov) || value_is_function(ov) || value_is_native(ov);
+    if !ok_target || !value_is_object(props) { return ov; }
     JsObject* p = value_as_object(props);
     // snapshot keys first; defining may reallocate the source table
     i32 n = p.props.len;
@@ -1093,11 +1128,11 @@ private Value nat_arr_copywithin(void* vmp, Value callee, Value thisv, Value* ar
     JsObject* o = this_array(vm, thisv);
     if o == null { return value_undefined(); }
     i32 len = o.elen;
-    i32 target = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, len);
-    i32 start = rel_index(argc > 1 ? to_int_arg(*(args + 1)) : 0, len);
+    i32 target = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, len);
+    i32 start = rel_index(argc > 1 ? to_int_sat(*(args + 1)) : 0, len);
     i32 end = len;
     if argc > 2 && !value_is_undefined(*(args + 2)) {
-        end = rel_index(to_int_arg(*(args + 2)), len);
+        end = rel_index(to_int_sat(*(args + 2)), len);
     }
     i32 count = end - start;
     if count > len - target { count = len - target; }
@@ -1114,10 +1149,10 @@ private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
-    i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, a.elen);
+    i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, a.elen);
     i32 end = a.elen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        end = rel_index(to_int_arg(*(args + 1)), a.elen);
+        end = rel_index(to_int_sat(*(args + 1)), a.elen);
     }
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
@@ -1136,10 +1171,10 @@ private Value nat_arr_splice(void* vmp, Value callee, Value thisv, Value* args, 
     VM* vm = as_vm(vmp);
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
-    i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, a.elen);
+    i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, a.elen);
     i32 del = a.elen - start;
     if argc > 1 {
-        del = to_int_arg(*(args + 1));
+        del = to_int_sat(*(args + 1));
         if del < 0 { del = 0; }
         if del > a.elen - start { del = a.elen - start; }
     }
@@ -1235,7 +1270,7 @@ private Value nat_arr_indexof(void* vmp, Value callee, Value thisv, Value* args,
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value needle = arg_at(args, argc, 0);
-    i32 start_at = argc > 1 ? rel_index(to_int_arg(*(args + 1)), a.elen) : 0;
+    i32 start_at = argc > 1 ? rel_index(to_int_sat(*(args + 1)), a.elen) : 0;
     for i32 i = start_at; i < a.elen; i++ {
         if !js_array_has(a, i) { continue; }   // indexOf skips holes
         if js_strict_eq(js_array_get(a, i), needle) { return value_int(i); }
@@ -1278,7 +1313,7 @@ private Value nat_arr_lastindexof(void* vmp, Value callee, Value thisv, Value* a
     Value needle = arg_at(args, argc, 0);
     i32 start = a.elen - 1;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        i32 s = to_int_arg(*(args + 1));
+        i32 s = to_int_sat(*(args + 1));
         if s < 0 { s += a.elen; }
         if s < start { start = s; }
     }
@@ -1535,7 +1570,7 @@ private Value nat_arr_flat(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
-    i32 depth = argc > 0 && !value_is_undefined(*(args)) ? to_int_arg(*(args)) : 1;
+    i32 depth = argc > 0 && !value_is_undefined(*(args)) ? to_int_sat(*(args)) : 1;
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&out.head));
@@ -1595,8 +1630,8 @@ private Value nat_arr_fill(void* vmp, Value callee, Value thisv, Value* args, i3
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     Value v = arg_at(args, argc, 0);
-    i32 start = argc > 1 ? rel_index(to_int_arg(*(args + 1)), a.elen) : 0;
-    i32 end = argc > 2 ? rel_index(to_int_arg(*(args + 2)), a.elen) : a.elen;
+    i32 start = argc > 1 ? rel_index(to_int_sat(*(args + 1)), a.elen) : 0;
+    i32 end = argc > 2 ? rel_index(to_int_sat(*(args + 2)), a.elen) : a.elen;
     for i32 i = start; i < end; i++ {
         *(a.elems + i) = v;
     }
@@ -1954,10 +1989,10 @@ private Value nat_str_slice(void* vmp, Value callee, Value thisv, Value* args, i
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     i32 ulen = value_as_string(sv2).u16len;
-    i32 start = rel_index(argc > 0 ? to_int_arg(*(args)) : 0, ulen);
+    i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, ulen);
     i32 end = ulen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        end = rel_index(to_int_arg(*(args + 1)), ulen);
+        end = rel_index(to_int_sat(*(args + 1)), ulen);
     }
     if end < start { end = start; }
     Value r = str_u16_range(vm, sv2, start, end);
@@ -1971,10 +2006,10 @@ private Value nat_str_substring(void* vmp, Value callee, Value thisv, Value* arg
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     i32 ulen = value_as_string(sv2).u16len;
-    i32 a = argc > 0 ? to_int_arg(*(args)) : 0;
+    i32 a = argc > 0 ? to_int_sat(*(args)) : 0;
     i32 b = ulen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        b = to_int_arg(*(args + 1));
+        b = to_int_sat(*(args + 1));
     }
     if a < 0 { a = 0; }
     if b < 0 { b = 0; }
@@ -2046,7 +2081,7 @@ private Value nat_str_substr(void* vmp, Value callee, Value thisv, Value* args, 
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     i32 ulen = value_as_string(sv2).u16len;
-    i32 start = argc > 0 ? to_int_arg(*(args)) : 0;
+    i32 start = argc > 0 ? to_int_sat(*(args)) : 0;
     if start < 0 {
         start = ulen + start;
         if start < 0 { start = 0; }
@@ -2054,10 +2089,11 @@ private Value nat_str_substr(void* vmp, Value callee, Value thisv, Value* args, 
     if start > ulen { start = ulen; }
     i32 len = ulen - start;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
-        len = to_int_arg(*(args + 1));
+        len = to_int_sat(*(args + 1));
         if len < 0 { len = 0; }
     }
-    if start + len > ulen { len = ulen - start; }
+    // compare against the remaining count, not start+len, to avoid overflow
+    if len > ulen - start { len = ulen - start; }
     Value r = str_u16_range(vm, sv2, start, start + len);
     gc_root_reset(&vm.heap, rm);
     return r;
@@ -7416,10 +7452,10 @@ private Value nat_ta_fill(void* vmp, Value callee, Value thisv, Value* args, i32
     if o == null { return value_undefined(); }
     i32 len = ta_len(vm, o);
     Value v = arg_at(args, argc, 0);
-    i32 start = argc > 1 ? ta_rel(to_int_arg(arg_at(args, argc, 1)), len) : 0;
+    i32 start = argc > 1 ? ta_rel(to_int_sat(arg_at(args, argc, 1)), len) : 0;
     i32 end = len;
     if argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) {
-        end = ta_rel(to_int_arg(arg_at(args, argc, 2)), len);
+        end = ta_rel(to_int_sat(arg_at(args, argc, 2)), len);
     }
     for i32 i = start; i < end; i++ { vm_ta_set(vm, o, i, v); }
     return thisv;
@@ -7528,10 +7564,10 @@ private Value nat_ta_subarray(void* vmp, Value callee, Value thisv, Value* args,
     i32 boff = ta_off(vm, o);
     i32 esz = ta_elem_size(kind);
     JsObject* buf = ta_buffer(vm, o);
-    i32 b = argc > 0 ? ta_rel(to_int_arg(arg_at(args, argc, 0)), len) : 0;
+    i32 b = argc > 0 ? ta_rel(to_int_sat(arg_at(args, argc, 0)), len) : 0;
     i32 e = len;
     if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
-        e = ta_rel(to_int_arg(arg_at(args, argc, 1)), len);
+        e = ta_rel(to_int_sat(arg_at(args, argc, 1)), len);
     }
     if e < b { e = b; }
     return ta_make(vm, kind, buf, boff + b * esz, e - b);
@@ -7543,10 +7579,10 @@ private Value nat_ta_slice(void* vmp, Value callee, Value thisv, Value* args, i3
     if o == null { return value_undefined(); }
     i32 len = ta_len(vm, o);
     i32 kind = ta_kind(vm, o);
-    i32 b = argc > 0 ? ta_rel(to_int_arg(arg_at(args, argc, 0)), len) : 0;
+    i32 b = argc > 0 ? ta_rel(to_int_sat(arg_at(args, argc, 0)), len) : 0;
     i32 e = len;
     if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
-        e = ta_rel(to_int_arg(arg_at(args, argc, 1)), len);
+        e = ta_rel(to_int_sat(arg_at(args, argc, 1)), len);
     }
     if e < b { e = b; }
     i32 n = e - b;

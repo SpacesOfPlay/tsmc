@@ -1007,7 +1007,7 @@ private Value run_js_builtin(VM* vm, str name, str src) {
     if js_get_prop(cache, key, &cached) {
         free(canon.data);
         Value ex;
-        if value_is_object(cached) && js_get_prop(value_as_object(cached), exports_atom, &ex) { return ex; }
+        if value_is_object(cached) && vm_get_prop_value(vm, cached, exports_atom, &ex) { return ex; }
         return value_undefined();
     }
     free(canon.data);
@@ -1061,7 +1061,10 @@ private Value run_js_builtin(VM* vm, str name, str src) {
     Value result = value_undefined();
     if !vm.has_pending {
         Value ex;
-        if js_get_prop(module, exports_atom, &ex) { result = ex; }
+        // read through the property path so a module that redefined
+        // module.exports as a getter (Object.defineProperty(module,
+        // 'exports', {get})) yields the getter's value, not the accessor
+        if vm_get_prop_value(vm, value_cell(&module.head), exports_atom, &ex) { result = ex; }
     }
     gc_root_reset(&vm.heap, rm);
     bump_destroy(&arena);
@@ -1122,7 +1125,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
         free(resolved.data);
         free(canon.data);
         Value ex;
-        if value_is_object(cached) && js_get_prop(value_as_object(cached), exports_atom, &ex) { return ex; }
+        if value_is_object(cached) && vm_get_prop_value(vm, cached, exports_atom, &ex) { return ex; }
         return value_undefined();
     }
 
@@ -1240,7 +1243,10 @@ Value module_require(VM* vm, str importer_path, str spec) {
     Value result = value_undefined();
     if !vm.has_pending {
         Value ex;
-        if js_get_prop(module, exports_atom, &ex) { result = ex; }
+        // read through the property path so a module that redefined
+        // module.exports as a getter (Object.defineProperty(module,
+        // 'exports', {get})) yields the getter's value, not the accessor
+        if vm_get_prop_value(vm, value_cell(&module.head), exports_atom, &ex) { result = ex; }
     }
     gc_root_reset(&vm.heap, rm);
     bump_destroy(&arena);

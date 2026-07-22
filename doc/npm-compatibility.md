@@ -32,7 +32,8 @@ Confirmed running with output identical to Node.
 | `immer@10.1.1` | immutable updates via Proxy (object drafts) |
 | `bignumber.js@9.1.2` | arbitrary-precision decimals |
 | `decimal.js@10.4.3` | arbitrary-precision decimals |
-| `chalk@4.1.2` | terminal string styling |
+| `chalk@4.1.2` | terminal string styling (all color models + chaining) |
+| `ramda@0.30.1` | functional utilities (incl. `pipe`/`compose`/`curry`) |
 
 ### IDs
 | package | notes |
@@ -56,10 +57,11 @@ Confirmed running with output identical to Node.
 | `ini@4.1.3` | INI parse/stringify |
 | `query-string@7.1.3` | URL query parse/stringify |
 
-### Templating
+### Templating & markup
 | package | notes |
 |---|---|
 | `mustache@4.2.0` | logic-less templates |
+| `marked@12.0.2` | Markdown → HTML (uses private class methods) |
 
 ### Validation & versioning
 | package | notes |
@@ -96,8 +98,6 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 | `ansi-colors` | **`Proxy` / `Reflect`** invariant/edge behavior (core traps work; `immer` runs). |
 | `markdown-it` | A `linkify-it` schema-setup issue (it now clears the earlier array-like-receiver blocker, but has a further gap). |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
-| `marked` | Uses **private methods** (`this.#m()`) in class-field initializers. |
-| `ramda` | Mostly runs (sum/add/map work after the apply + toString fixes); `pipe`/`compose` still differ in ramda's arity machinery. |
 | `pino-std-serializers` | `Cannot convert a Symbol value to a string` in a hot path. |
 
 ## Will it work? Rules of thumb

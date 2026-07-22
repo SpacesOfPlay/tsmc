@@ -1187,11 +1187,19 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = value_int(arity);
             return true;
         }
-        // static inheritance: walk the derived-ctor [[Prototype]] chain
+        // [[Prototype]] chain: an explicitly set fproto (a parent ctor, or a
+        // plain object via Object.setPrototypeOf), otherwise Function.prototype.
         if value_is_function(objv) {
             Value fp = value_as_function(objv).fproto;
             if value_is_function(fp) || value_is_native(fp) {
                 return get_prop_atom(vm, fp, a, out);
+            }
+            if value_is_object(fp) {
+                ignore js_get_prop(value_as_object(fp), a, out);
+                return true;
+            }
+            if value_is_null(fp) {
+                return true;   // explicit null [[Prototype]]: nothing inherited
             }
         }
         if vm.function_proto != null { ignore js_get_prop(vm.function_proto, a, out); }
@@ -1239,6 +1247,24 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
         return true;
     }
     return true;
+}
+
+// HasProperty for a callable receiver (function/native): own props, the
+// synthesized name/length/prototype, then the [[Prototype]] chain — a parent
+// ctor, a plain object set via Object.setPrototypeOf, or Function.prototype.
+bool fn_has_prop(VM* vm, Value objv, u32 a) {
+    PropList* props = value_is_function(objv)
+        ? &value_as_function(objv).props : &value_as_native(objv).props;
+    if props_entry(props, a) != null { return true; }
+    if a == vm.atom_name || a == vm.atom_length || a == vm.atom_prototype { return true; }
+    if value_is_function(objv) {
+        Value fp = value_as_function(objv).fproto;
+        if value_is_function(fp) || value_is_native(fp) { return fn_has_prop(vm, fp, a); }
+        if value_is_object(fp) { return js_has_prop(value_as_object(fp), a); }
+        if value_is_null(fp) { return false; }
+    }
+    if vm.function_proto != null { return js_has_prop(vm.function_proto, a); }
+    return false;
 }
 
 // Resolves accessor properties through their getter; false = threw.
@@ -2565,7 +2591,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_IN: {
                 Value objv = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
-                if !value_is_object(objv) {
+                if value_is_function(objv) || value_is_native(objv) {
+                    bool r = fn_has_prop(vm, objv, key_to_atom(vm, key));
+                    if !vm.has_pending {
+                        vm.sp -= 2;
+                        vpush(vm, value_bool(r));
+                    }
+                } else if !value_is_object(objv) {
                     vm_throw_error(vm, ERR_TYPE, "'in' requires an object");
                 } else {
                     JsObject* o = value_as_object(objv);

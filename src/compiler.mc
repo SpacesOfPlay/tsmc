@@ -325,6 +325,16 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
         scan_all_names(set, n);
         return;
     }
+    // An instance field initializer is hoisted into the constructor, so its
+    // identifiers are captured by that (possibly synthesized) function just
+    // like a method body. Its computed key is likewise compiled in the
+    // constructor. Treat both as inner-function code so the enclosing scope
+    // cellifies anything they close over.
+    if n.kind == N_CLASS_MEMBER && member_is_field(n) {
+        scan_all_names(set, n.b);
+        if (n.flags & NF_COMPUTED) != 0 { scan_all_names(set, n.a); }
+        return;
+    }
     scan_inner(set, n.a, false);
     scan_inner(set, n.b, false);
     scan_inner(set, n.c, false);
