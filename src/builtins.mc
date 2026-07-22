@@ -11661,75 +11661,99 @@ private Value nat_proxy_revocable(void* vmp, Value callee, Value thisv, Value* a
     return value_cell(&result.head);
 }
 
-private bool reflect_target(VM* vm, Value* args, i32 argc, str who, JsObject** out) {
+// Reflect accepts any object-like receiver. Functions and natives are
+// objects too: they carry their own property table and [[Prototype]], so
+// they must not be rejected here.
+private bool reflect_target(VM* vm, Value* args, i32 argc, str who, Value* out) {
     Value target = arg_at(args, argc, 0);
-    if !value_is_object(target) {
+    if !value_is_object(target) && !value_is_function(target) && !value_is_native(target) {
         vm_throw_error(vm, ERR_TYPE, who);
         return false;
     }
-    *out = value_as_object(target);
+    *out = target;
     return true;
+}
+
+// The receiver as a plain object, or null when it is a function/native.
+private JsObject* reflect_obj(Value t) {
+    return value_is_object(t) ? value_as_object(t) : null;
 }
 
 private Value nat_reflect_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.get called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.get called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
     Value out;
-    ignore vm_get_prop_value(vm, value_cell(&o.head), a, &out);
+    ignore vm_get_prop_value(vm, t, a, &out);
     return out;
 }
 
 private Value nat_reflect_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.set called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.set called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
-    bool ok = vm_set_prop_value(vm, value_cell(&o.head), a, arg_at(args, argc, 2));
+    bool ok = vm_set_prop_value(vm, t, a, arg_at(args, argc, 2));
     return value_bool(ok);
 }
 
 private Value nat_reflect_has(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.has called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.has called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    JsObject* o = reflect_obj(t);
+    if o == null { return value_bool(fn_has_prop(vm, t, a)); }
     bool r = (o.obj_flags & OBJF_PROXY) != 0 ? proxy_has(vm, cast(JsProxy*, o), a) : js_has_prop(o, a);
     return value_bool(r);
 }
 
 private Value nat_reflect_delete(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.deleteProperty called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.deleteProperty called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
+    JsObject* o = reflect_obj(t);
+    if o == null {
+        PropList* props = value_props(t);
+        return value_bool(props != null ? props_remove(props, a) : false);
+    }
     bool r = (o.obj_flags & OBJF_PROXY) != 0 ? proxy_delete(vm, cast(JsProxy*, o), a) : js_delete_prop(o, a);
     return value_bool(r);
 }
 
 private Value nat_reflect_getprototypeof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.getPrototypeOf called on non-object", &o) { return value_undefined(); }
-    if o.proto == null { return value_null(); }
-    return value_cell(&o.proto.head);
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.getPrototypeOf called on non-object", &t) { return value_undefined(); }
+    // shares Object.getPrototypeOf, which resolves a function's [[Prototype]]
+    return nat_object_getproto(vmp, callee, thisv, args, argc);
+}
+
+private Value nat_reflect_setprototypeof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.setPrototypeOf called on non-object", &t) { return value_undefined(); }
+    ignore nat_object_setproto(vmp, callee, thisv, args, argc);
+    return value_bool(!vm.has_pending);
 }
 
 private Value nat_reflect_ownkeys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.ownKeys called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.ownKeys called on non-object", &t) { return value_undefined(); }
     // for a proxy, the raw ownKeys trap result (strings + symbols); otherwise
-    // the object's own keys
-    JsObject* arr = (o.obj_flags & OBJF_PROXY) != 0
-        ? proxy_own_keys(vm, cast(JsProxy*, o))
-        : vm_own_keys(vm, value_cell(&o.head));
-    return value_cell(&arr.head);
+    // every own key, non-enumerable included (unlike Object.keys)
+    JsObject* o = reflect_obj(t);
+    if o != null && (o.obj_flags & OBJF_PROXY) != 0 {
+        return value_cell(&proxy_own_keys(vm, cast(JsProxy*, o)).head);
+    }
+    return nat_object_getownnames(vmp, callee, thisv, args, argc);
 }
 
 private Value nat_reflect_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -11738,8 +11762,8 @@ private Value nat_reflect_getownpropdesc(void* vmp, Value callee, Value thisv, V
 
 private Value nat_reflect_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* o;
-    if !reflect_target(vm, args, argc, "Reflect.defineProperty called on non-object", &o) { return value_undefined(); }
+    Value t;
+    if !reflect_target(vm, args, argc, "Reflect.defineProperty called on non-object", &t) { return value_undefined(); }
     ignore nat_object_defineproperty(vmp, callee, thisv, args, argc);
     return value_bool(!vm.has_pending);
 }
@@ -11805,6 +11829,7 @@ private void install_proxy_reflect(VM* vm) {
     def_method(vm, reflect, "has", &nat_reflect_has);
     def_method(vm, reflect, "deleteProperty", &nat_reflect_delete);
     def_method(vm, reflect, "getPrototypeOf", &nat_reflect_getprototypeof);
+    def_method(vm, reflect, "setPrototypeOf", &nat_reflect_setprototypeof);
     def_method(vm, reflect, "ownKeys", &nat_reflect_ownkeys);
     def_method(vm, reflect, "getOwnPropertyDescriptor", &nat_reflect_getownpropdesc);
     def_method(vm, reflect, "defineProperty", &nat_reflect_defineproperty);

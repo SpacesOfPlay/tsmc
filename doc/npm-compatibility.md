@@ -62,6 +62,7 @@ Confirmed running with output identical to Node.
 |---|---|
 | `mustache@4.2.0` | logic-less templates |
 | `marked@12.0.2` | Markdown → HTML (uses private class methods) |
+| `markdown-it@14.1.0` | Markdown → HTML (plugin architecture) |
 
 ### Validation & versioning
 | package | notes |
@@ -86,6 +87,7 @@ Confirmed running with output identical to Node.
 | `picocolors@1.0.1` | ANSI color strings |
 | `kleur@4.1.5` | ANSI color strings |
 | `colorette@2.0.20` | ANSI color strings |
+| `ansi-colors@4.1.3` | ANSI color strings (chainable) |
 
 ## Does not work (yet)
 
@@ -95,8 +97,6 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 | package(s) | blocker |
 |---|---|
 | `lodash`, `qs` | **Dynamic code** — `new Function(...)` / `eval` are refused by design (no runtime code generation). |
-| `ansi-colors` | **`Proxy` / `Reflect`** invariant/edge behavior (core traps work; `immer` runs). |
-| `markdown-it` | A `linkify-it` schema-setup issue (it now clears the earlier array-like-receiver blocker, but has a further gap). |
 | `camelcase` | **Regex Unicode property escapes** (`\p{Lu}`) are ignored — the package *runs* but returns wrong output. |
 | `pino-std-serializers` | `Cannot convert a Symbol value to a string` in a hot path. |
 
@@ -115,8 +115,9 @@ means tsmc intentionally does not support the feature; the rest are gaps.
 **Likely fails**
 - **Native addons** (`.node` / N-API): `sharp`, `better-sqlite3`, `canvas`,
   native `bcrypt`, etc. — unsupported outright.
-- **`Proxy`/`Reflect`-based** reactivity/immutability: `immer`, `mobx`, Vue
-  reactivity.
+- **`Proxy` array-target writes**: the core traps work (`immer`'s object
+  drafts run), but mutating array methods through a proxy receiver — and so
+  `immer`'s array drafts, and reactivity layers built on them — do not.
 - **Runtime code generation**: anything calling `eval` or `new Function`
   (many template compilers, `ajv`, `lodash`'s root detection).
 - **Heavier crypto/auth**: only `crypto.createHash('sha256')`,
