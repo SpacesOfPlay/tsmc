@@ -306,6 +306,9 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
     if n.kind == N_THIS {
         strmap_set<i32>(set, "this", 1);
     }
+    if n.kind == N_NEW_TARGET {
+        strmap_set<i32>(set, "%newtarget", 1);
+    }
     if n.kind == N_SUPER {
         strmap_set<i32>(set, "%super", 1);
     }
@@ -976,7 +979,8 @@ private void compile_call(Compiler* co, Node* n) {
         emit_load_name(co, "%super", n);
         ch_op(ch, OP_THIS);
         i32 c = compile_args(co, &n.kids);
-        if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
+        // both super forms forward new.target to the base constructor
+        if c >= 0 { ch_op_u16(ch, OP_SUPERCALL, c); } else { ch_op(ch, OP_SUPERCALL_ARRAY); }
         return;
     }
     if callee.kind == N_MEMBER && callee.a.kind == N_SUPER {
@@ -1062,6 +1066,19 @@ private void compile_expr(Compiler* co, Node* n) {
             }
         }
         ch_op(ch, OP_THIS);
+        return;
+    }
+    if k == N_NEW_TARGET {
+        // in an arrow, load the enclosing function's captured new.target
+        if co.cur.is_arrow {
+            FScope* fs = co.cur;
+            str nm = "%newtarget";
+            if find_local(fs, nm) >= 0 || resolve_upval(fs, nm) >= 0 {
+                emit_load_name(co, nm, n);
+                return;
+            }
+        }
+        ch_op(ch, OP_NEWTARGET);
         return;
     }
     if k == N_ARRAY {
@@ -1484,6 +1501,17 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         i32 bi = declare(co, "this", true, false);
         CBind b = vec_get(&fs.binds, bi);
         ch_op(&fs.ch, OP_THIS);
+        ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
+        ch_op(&fs.ch, OP_POP);
+        if b.is_cell {
+            ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
+        }
+    }
+    // implicit `new.target` binding, captured lexically by nested arrows.
+    if !fs.is_arrow && strmap_get<i32>(&fs.inner, "%newtarget") != null {
+        i32 bi = declare(co, "%newtarget", true, false);
+        CBind b = vec_get(&fs.binds, bi);
+        ch_op(&fs.ch, OP_NEWTARGET);
         ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
         ch_op(&fs.ch, OP_POP);
         if b.is_cell {

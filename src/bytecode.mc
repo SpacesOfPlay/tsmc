@@ -15,6 +15,8 @@ enum Op {
     OP_THIS,
     OP_ARGUMENTS,    // pushes this frame's arguments object
     OP_CURFUNC,      // pushes the currently-executing function (named fn expr)
+    OP_NEWTARGET,    // pushes new.target: the constructor, or undefined
+    OP_SUPERCALL,    // like OP_CALL but propagates the caller's new.target
 
     OP_GETLOCAL,     // u16 slot
     OP_SETLOCAL,     // u16 slot; keeps value on stack
@@ -76,6 +78,7 @@ enum Op {
     OP_ARR_SLICE_FROM, // u16 start; [arr/str] -> new array of the tail
     OP_CALL_ARRAY,   // [fn, this, argsarr] -> result
     OP_NEW_ARRAY,    // [ctor, argsarr] -> instance
+    OP_SUPERCALL_ARRAY, // [fn, this, argsarr] -> result, propagating new.target
     OP_JUMP_NULLISH, // u16; top nullish: pop, jump
     OP_JUMP_NULLISH_METH, // u16; peek(1) nullish: pop 2, jump
     OP_CHECK_ITERABLE,   // top must be an array or string

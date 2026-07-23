@@ -44,6 +44,7 @@ struct Frame {
     i32 base;
     Value this_val;
     Value arguments_obj;  // the `arguments` object, or undefined if unused
+    Value new_target;   // new.target: the constructor, or undefined; super() propagates it
     bool is_ctor;
     JsGenerator* gen;   // non-null while running a generator/async body
 }
@@ -103,6 +104,7 @@ struct VM {
     i32 sp;
     Frame* frames;
     i32 fp;
+    Value pending_new_target;  // new.target for the next vm_call_stack frame
     Handler* handlers;
     i32 hp;
     IntMap<Value> globals;
@@ -272,6 +274,7 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
 
 private void vm_mark_roots(GcHeap* h, void* ctx) {
     VM* vm = cast(VM*, ctx);
+    gc_mark_value(h, vm.pending_new_target);
     for i32 i = 0; i < vm.sp; i++ {
         gc_mark_value(h, *(vm.stack + i));
     }
@@ -280,6 +283,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         if fr.fun != null { gc_mark_cell(h, &fr.fun.head); }
         gc_mark_value(h, fr.this_val);
         gc_mark_value(h, fr.arguments_obj);
+        gc_mark_value(h, fr.new_target);
     }
     for i32 i = 0; i < vm.globals.cap; i++ {
         IntSlot<Value>* sl = vm.globals.slots + i;
@@ -1913,6 +1917,7 @@ void vm_init(VM* vm) {
     vm.sp = 0;
     vm.frames = alloc<Frame>(VM_FRAMES_MAX);
     vm.fp = 0;
+    vm.pending_new_target = value_undefined();
     vm.handlers = alloc<Handler>(VM_HANDLERS_MAX);
     vm.hp = 0;
     intmap_init<Value>(&vm.globals);
@@ -2197,6 +2202,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.fun != null { vpush(vm, value_cell(&fr.fun.head)); }
                 else { vpush(vm, value_undefined()); }
             }
+            case OP_NEWTARGET: { vpush(vm, fr.new_target); }
             case OP_GETLOCAL: {
                 vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;
@@ -2724,10 +2730,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vpush(vm, value_cell(&f.head));
             }
-            case OP_CALL, OP_NEW: {
+            case OP_CALL, OP_NEW, OP_SUPERCALL: {
                 i32 argc = rd_u16(code, ip);
                 ip += 2;
                 fr.cur_ip = ip;   // this frame's call site, for stack traces
+                // super() forwards the current frame's new.target to the base
+                // constructor; captured now, before fr is reassigned
+                Value inherited_target = fr.new_target;
                 Value fnv;
                 Value thisv;
                 if op == OP_NEW {
@@ -2788,6 +2797,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.this_val = thisv;
                             nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
+                            if op == OP_NEW { nf.new_target = fnv; }
+                            else if op == OP_SUPERCALL { nf.new_target = inherited_target; }
+                            else { nf.new_target = value_undefined(); }
                             nf.gen = null;
                             vm.fp++;
                             gc_root_reset(&vm.heap, arm);
@@ -3249,8 +3261,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, ov);
             }
-            case OP_CALL_ARRAY, OP_NEW_ARRAY: {
+            case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: {
                 fr.cur_ip = ip;   // call site, for stack traces
+                // new.target for the frame vm_call_stack is about to build:
+                // the constructor for `new`, the inherited target for super()
+                if op == OP_NEW_ARRAY { vm.pending_new_target = vpeek(vm, 1); }
+                else if op == OP_SUPERCALL_ARRAY { vm.pending_new_target = fr.new_target; }
                 if op == OP_NEW_ARRAY {
                     Value fnv2 = vpeek(vm, 1);
                     if !value_is_callable(fnv2) {
@@ -3418,6 +3434,7 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.this_val = value_undefined();
     fr.arguments_obj = value_undefined();
     fr.is_ctor = false;
+    fr.new_target = value_undefined();
     fr.gen = null;
     vm.fp++;
     i32 status = vm_execute(vm, vm.fp);
@@ -3645,6 +3662,7 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     nf.this_val = g.this_val;
     nf.arguments_obj = g.arguments_obj;
     nf.is_ctor = false;
+    nf.new_target = value_undefined();
     nf.gen = g;
     vm.fp++;
     g.state = GEN_RUNNING;
@@ -4189,6 +4207,9 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.this_val = thisv;
     nf.arguments_obj = argobj;
     nf.is_ctor = false;
+    // a super()/new spread call stashes the new.target here; consume it once
+    nf.new_target = vm.pending_new_target;
+    vm.pending_new_target = value_undefined();
     nf.gen = null;
     vm.fp++;
     gc_root_reset(&vm.heap, arm);

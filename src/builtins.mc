@@ -2853,6 +2853,124 @@ private Value nat_decode_uri(void* vmp, Value callee, Value thisv, Value* args, 
     return uri_decode(as_vm(vmp), thisv, args, argc, false);
 }
 
+// The legacy `escape` / `unescape` globals. They operate on UTF-16 code
+// units; this iterates code points, which agrees with Node across the BMP
+// (astral scalars still emit a surrogate pair, per spec). Common today only
+// via `unescape(encodeURIComponent(s))` for UTF-8 byte strings.
+private bool escape_unmodified(u32 cp) {
+    if (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') { return true; }
+    return cp == '@' || cp == '*' || cp == '_' || cp == '+' || cp == '-' || cp == '.' || cp == '/';
+}
+
+private void escape_put_u(str_buf* sb, str hex, u32 v16) {
+    u8[6] esc;
+    esc[0] = '%';
+    esc[1] = 'u';
+    esc[2] = *(hex.data + ((v16 >> 12) & 15));
+    esc[3] = *(hex.data + ((v16 >> 8) & 15));
+    esc[4] = *(hex.data + ((v16 >> 4) & 15));
+    esc[5] = *(hex.data + (v16 & 15));
+    str e;
+    e.data = &esc[0];
+    e.len = 6;
+    str_buf_add(sb, e);
+}
+
+private Value nat_escape(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str s = sview(sv);
+    str_buf sb;
+    str_buf_init(&sb);
+    str hex = "0123456789ABCDEF";
+    i32 off = 0;
+    while off < s.len {
+        i32 n;
+        u32 cp = cast(u32, utf8_decode(s, off, &n));
+        off += n;
+        if escape_unmodified(cp) {
+            u8[1] ch;
+            ch[0] = cast(u8, cp);
+            str one;
+            one.data = &ch[0];
+            one.len = 1;
+            str_buf_add(&sb, one);
+        } else if cp < cast(u32, 256) {
+            u8[3] esc;
+            esc[0] = '%';
+            esc[1] = *(hex.data + (cp >> 4));
+            esc[2] = *(hex.data + (cp & 15));
+            str e;
+            e.data = &esc[0];
+            e.len = 3;
+            str_buf_add(&sb, e);
+        } else if cp < cast(u32, 65536) {
+            escape_put_u(&sb, hex, cp);
+        } else {
+            u32 v = cp - cast(u32, 65536);
+            escape_put_u(&sb, hex, cast(u32, 0xD800) + (v >> 10));
+            escape_put_u(&sb, hex, cast(u32, 0xDC00) + (v & cast(u32, 0x3FF)));
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_unescape(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str s = sview(sv);
+    str_buf sb;
+    str_buf_init(&sb);
+    i32 i = 0;
+    while i < s.len {
+        u8 c = *(s.data + i);
+        if c == '%' && i + 5 < s.len && *(s.data + i + 1) == 'u'
+           && hex_val(*(s.data + i + 2)) >= 0 && hex_val(*(s.data + i + 3)) >= 0
+           && hex_val(*(s.data + i + 4)) >= 0 && hex_val(*(s.data + i + 5)) >= 0 {
+            i32 cp = (hex_val(*(s.data + i + 2)) << 12) | (hex_val(*(s.data + i + 3)) << 8)
+                   | (hex_val(*(s.data + i + 4)) << 4) | hex_val(*(s.data + i + 5));
+            i += 6;
+            // a high surrogate immediately followed by a low surrogate escape
+            // is one astral code point (the UTF-16 pair the code units form)
+            if cp >= 0xD800 && cp <= 0xDBFF && i + 5 < s.len && *(s.data + i) == '%'
+               && *(s.data + i + 1) == 'u'
+               && hex_val(*(s.data + i + 2)) >= 0 && hex_val(*(s.data + i + 3)) >= 0
+               && hex_val(*(s.data + i + 4)) >= 0 && hex_val(*(s.data + i + 5)) >= 0 {
+                i32 lo = (hex_val(*(s.data + i + 2)) << 12) | (hex_val(*(s.data + i + 3)) << 8)
+                       | (hex_val(*(s.data + i + 4)) << 4) | hex_val(*(s.data + i + 5));
+                if lo >= 0xDC00 && lo <= 0xDFFF {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+            }
+            wtf8_put_cp(&sb, cp);
+        } else if c == '%' && i + 2 < s.len
+                  && hex_val(*(s.data + i + 1)) >= 0 && hex_val(*(s.data + i + 2)) >= 0 {
+            wtf8_put_cp(&sb, (hex_val(*(s.data + i + 1)) << 4) | hex_val(*(s.data + i + 2)));
+            i += 3;
+        } else {
+            u8[1] ch;
+            ch[0] = c;
+            str one;
+            one.data = &ch[0];
+            one.len = 1;
+            str_buf_add(&sb, one);
+            i++;
+        }
+    }
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
 // Deep clone for structuredClone. `keys`/`clones` map an original's
 // identity to its clone so cycles and shared references are preserved.
 private Value struct_clone(VM* vm, Value v, Vec<u64>* keys, Vec<Value>* clones) {
@@ -12070,6 +12188,9 @@ private Value nat_reflect_construct(void* vmp, Value callee, Value thisv, Value*
     gc_root(&vm.heap, instv);
     Value* av;
     i32 n = reflect_spread_args(vm, arg_at(args, argc, 1), &av);
+    // new.target is the explicit newTarget argument, or the target itself
+    Value ntv = argc > 2 ? arg_at(args, argc, 2) : target;
+    vm.pending_new_target = value_is_callable(ntv) ? ntv : target;
     Value res = vm_call_value(vm, target, instv, av, n);
     free(av);
     gc_root_reset(&vm.heap, rm);
@@ -12348,6 +12469,8 @@ void builtins_install(VM* vm) {
     ignore def_global_fn(vm, "structuredClone", &nat_structured_clone);
     ignore def_global_fn(vm, "encodeURIComponent", &nat_encode_uri_comp);
     ignore def_global_fn(vm, "encodeURI", &nat_encode_uri);
+    ignore def_global_fn(vm, "escape", &nat_escape);
+    ignore def_global_fn(vm, "unescape", &nat_unescape);
     ignore def_global_fn(vm, "decodeURIComponent", &nat_decode_uri_comp);
     ignore def_global_fn(vm, "decodeURI", &nat_decode_uri);
     ignore def_global_fn(vm, "parseInt", &nat_parseint);
@@ -12561,4 +12684,7 @@ void builtins_install(VM* vm) {
     Value gtv = value_cell(&gt.head);
     props_set_desc(&gt.props, bi_atom(vm, "globalThis"), gtv, METHOD_ATTRS);
     vm_set_global(vm, "globalThis", gtv);
+    // Node exposes the same global object as `global` too (=== globalThis).
+    props_set_desc(&gt.props, bi_atom(vm, "global"), gtv, METHOD_ATTRS);
+    vm_set_global(vm, "global", gtv);
 }
