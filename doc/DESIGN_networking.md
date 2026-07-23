@@ -227,14 +227,16 @@ Stages 1–5 shipped (M31–M37).
    `fetch('https://…')` trustworthy. Secure by default; no transminc
    re-export was needed after all.
 5. **Servers.** `net.Server` + `http.createServer` (accept loop in the
-   reactor) landed in M32/M33. The TLS server (M37) uses picotls server
-   mode with an **ECDSA-P256** certificate: a `sign_certificate` bridge
-   over the already-vendored `uECC_sign`, EC private-key parsing, a
-   per-server context, and `tls.createServer` / `https.createServer`. A
-   connection is upgraded by installing a server session on the accepted
-   fd and re-owning the reactor handle. RSA server certs would need a
-   private-key signing implementation (no CRT modexp is vendored) and are
-   left as a follow-up.
+   reactor) landed in M32/M33. The TLS server uses picotls server mode
+   with an **ECDSA-P256** (M37) or **RSA** (M38) certificate, auto-
+   detected from the key: `sign_certificate` bridges over the vendored
+   `uECC_sign` (ECDSA) and a tsmc-added RSASSA-PSS signer (a big-exponent
+   modexp + PSS encode; plain `EM^d mod n`, no CRT), private-key parsing
+   (EC SEC1/PKCS#8, RSA PKCS#1/PKCS#8), a per-server context, and
+   `tls.createServer` / `https.createServer`. A connection is upgraded by
+   installing a server session on the accepted fd and re-owning the
+   reactor handle. Ed25519 server certs (raw-pubkey only) and CRT
+   acceleration for RSA are the remaining follow-ups.
 
 ## 7. Risks / open items
 

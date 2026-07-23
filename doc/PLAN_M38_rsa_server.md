@@ -1,6 +1,16 @@
 # PLAN M38 — RSA server certificates (RSASSA-PSS)
 
-**Status: planned.**
+**Status: complete.** All four increments landed. `https.createServer` /
+`tls.createServer` accept an RSA certificate (auto-detected from the
+key) and sign the CertificateVerify with RSASSA-PSS;
+`test/diff/https_server_rsa.js` serves and fetches GET, POST, and a large
+multi-record response over three concurrent loopback connections,
+byte-identical to Node and clean under `--gc-stress`. Signing is plain
+`EM^d mod n` (no CRT). The in-memory sign/verify round-trip is gated in
+`test/unit/test_tls.mc`. Suite green: 58 tests, 88 gc-stress scripts,
+full node diff. Still out of scope, as planned: PKCS#1-v1.5 signatures,
+CRT acceleration, encrypted keys, and the M37 carry-overs (client-cert
+auth, SNI selection, resumption, ALPN).
 
 The follow-up left open by M37: `https.createServer` / `tls.createServer`
 with an **RSA** certificate, alongside the ECDSA-P256 one already
