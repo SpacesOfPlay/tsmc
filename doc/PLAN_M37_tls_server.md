@@ -1,6 +1,16 @@
 # PLAN M37 — TLS 1.3 server (ECDSA-P256, HTTPS)
 
-**Status: planned.**
+**Status: complete.** All four increments landed. `tls.createServer` and
+`https.createServer` present an ECDSA-P256 certificate over TLS 1.3;
+`test/diff/https_server.js` serves and fetches GET, POST, and a large
+multi-record response over three concurrent loopback connections,
+byte-identical to Node and clean under `--gc-stress`. The server signs
+each CertificateVerify with its P-256 key via the tsmc-added bridge, and
+the (in-process) client verifies it. Suite green: 58 tests, 88 gc-stress
+scripts, full node diff. A teardown bug surfaced and was fixed along the
+way — see the note in §4 (I3). Still out of scope, as planned: RSA and
+Ed25519 server certs, client-cert auth, SNI cert selection, session
+resumption, and ALPN.
 
 Stage 5 of the networking roadmap (`memory: networking-roadmap`): an
 outbound-and-inbound TLS story. Today tsmc is a TLS *client* only; this
@@ -110,19 +120,30 @@ note in `THIRD_PARTY.md`).
   server-wrap one end, client the other) if practical before the JS
   layer.
 
-- **I3 — JS tls/https server + hermetic diff test.** `tls.createServer`
-  (build the ctx from `cert`/`key`, `net.createServer` under it, upgrade
-  each connection, surface a server `TLSSocket`), the http server
-  running over that socket, and `https.createServer` in `node_https.mc`.
-  `test/diff/https_server.js`: a loopback HTTPS GET/POST round-trip, the
-  tsmc client hitting the tsmc server, matched byte-for-byte to Node.
-  The cert/key are a committed fixture (a long-dated self-signed
-  ECDSA-P256 pair; `tools/gen_tls_server_cert.sh` documents
-  regeneration, like `gen_ca_roots.sh`). The client uses
-  `rejectUnauthorized: false` so the test is self-contained — it still
-  verifies the server's CertificateVerify signature against the
-  presented leaf key, so the ECDSA *sign*↔*verify* path is exercised for
-  real; it just does not require wiring the `ca:` trust option.
+- **I3 — JS tls/https server + hermetic diff test.** *Done.*
+  `tls.createServer` builds the context from `cert`/`key`, runs a
+  `net.createServer` under it, and upgrades each accepted connection to a
+  server `TLSSocket` (`__tls_server_wrap` then re-own the handle). The
+  http `Server` gained an optional connection-factory argument so
+  `https.createServer` injects the TLS one and the HTTP protocol runs
+  unchanged over a TLSSocket. `test/diff/https_server.js` matches Node.
+  The cert/key are a committed fixture (a ~100-year self-signed
+  ECDSA-P256 pair; `tools/gen_tls_server_cert.sh` regenerates, like
+  `gen_ca_roots.sh`). The client uses `rejectUnauthorized: false` so the
+  test is self-contained — it still verifies the server's
+  CertificateVerify signature against the presented leaf key, so the
+  ECDSA *sign*↔*verify* path is exercised for real; it just does not
+  require the `ca:` trust option.
+
+  > **Teardown bug found and fixed here.** `ServerResponse.end` calls
+  > `socket.end()`, and `TLSSocket.end()` had merely set a flag and
+  > waited for the peer's close_notify. For a `Connection: close`
+  > response that meant *neither* side ever closed — the exchange
+  > completed with correct output but both handles stayed ref'd and the
+  > process hung. `TLSSocket.end()` now closes the connection once its
+  > outbound ciphertext has drained (tracked via a new `__tls_wants_write`
+  > native), so the peer sees EOF. Verified with a 50 KB multi-record
+  > response over concurrent connections, natural exit.
 
 - **I4 — docs.** `DESIGN_networking.md` server note,
   `npm-compatibility.md` (HTTPS server now supported), `THIRD_PARTY.md`

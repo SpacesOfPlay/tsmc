@@ -179,10 +179,14 @@ function serveConnection(server, socket) {
 }
 
 class Server extends EventEmitter {
-  constructor(handler) {
+  constructor(handler, connFactory) {
     super();
     if (typeof handler === 'function') this.on('request', handler);
-    this._net = net.createServer((sock) => serveConnection(this, sock));
+    // connFactory(onConn) yields a listen/address/close server whose
+    // connections are handed to onConn. Plain net by default; https injects a
+    // TLS one so the HTTP protocol runs unchanged over a TLSSocket.
+    const make = connFactory || ((onConn) => net.createServer(onConn));
+    this._net = make((sock) => serveConnection(this, sock));
     this._net.on('error', (e) => this.emit('error', e));
     this._net.on('listening', () => this.emit('listening'));
   }

@@ -10,6 +10,7 @@ const HS_DONE = 1;
 const HAS_DATA = 2;
 const T_EOF = 4;
 const T_ERR = 8;
+const T_WANT_WRITE = 16;
 
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');
@@ -49,7 +50,15 @@ class TLSSocket extends EventEmitter {
         if (this.destroyed) return;
       }
     }
-    if (st & T_EOF) { this.emit('end'); this._finish(); }
+    if (st & T_EOF) { this.emit('end'); this._finish(); return; }
+    // an end()ed socket closes once its outbound ciphertext has drained, so the
+    // peer sees EOF (a Connection: close response would otherwise hang)
+    this._maybeFinish();
+  }
+  _maybeFinish() {
+    if (this._ending && !this.destroyed && !this._connecting && !__tls_wants_write(this._id)) {
+      this._finish();
+    }
   }
   _sendBuf(buf) {
     let off = 0;
@@ -71,7 +80,10 @@ class TLSSocket extends EventEmitter {
   }
   end(data, enc) {
     if (data != null) this.write(data, enc);
-    this._ending = true;   // wait for the peer's close_notify (EOF) to finish
+    this._ending = true;
+    // close once the queued ciphertext has flushed; if it already has (the
+    // common small-response case, no reactor event pending) close now
+    if (!this._connecting) queueMicrotask(() => this._maybeFinish());
     return this;
   }
   _finish() {
@@ -88,6 +100,54 @@ class TLSSocket extends EventEmitter {
   setKeepAlive() { return this; }
   setEncoding() { return this; }
   setTimeout() { return this; }
+}
+
+// First PEM block of `pem` -> DER Buffer (a Buffer is passed through as-is).
+function pemToDer(pem) {
+  if (Buffer.isBuffer(pem)) return pem;
+  const parts = String(pem).split('-----');
+  const b64 = (parts[2] || '').replace(/[^A-Za-z0-9+/=]/g, '');
+  return Buffer.from(b64, 'base64');
+}
+
+// A TLS 1.3 server presenting an ECDSA-P256 certificate. Shaped like
+// net.createServer: `onSecure` (and the 'secureConnection' event) receive a
+// TLSSocket once its handshake completes. listen/address/close proxy to an
+// underlying net server; the shared context is freed on close.
+function createServer(opts, onSecure) {
+  if (typeof opts === 'function') { onSecure = opts; opts = {}; }
+  opts = opts || {};
+  const server = new EventEmitter();
+  const ctxId = __tls_server_ctx(pemToDer(opts.cert), pemToDer(opts.key));
+  if (ctxId < 0) {
+    server.listen = function () {
+      queueMicrotask(() => server.emit('error', new Error('tls.createServer: invalid certificate or key (ECDSA-P256 required)')));
+      return server;
+    };
+    server.address = () => null;
+    server.close = function (cb) { if (typeof cb === 'function') queueMicrotask(cb); return server; };
+    return server;
+  }
+  if (typeof onSecure === 'function') server.on('secureConnection', onSecure);
+  const net = require('net');
+  const raw = net.createServer((sock) => {
+    if (__tls_server_wrap(sock._id, ctxId) !== 0) { sock.destroy(); return; }
+    const tsock = new TLSSocket();
+    tsock._id = sock._id;
+    tsock._connecting = true;
+    __net_set_owner(sock._id, tsock);
+    tsock.on('secureConnect', () => server.emit('secureConnection', tsock));
+  });
+  raw.on('error', (e) => server.emit('error', e));
+  raw.on('listening', () => server.emit('listening'));
+  server.listen = function (port, host, cb) { raw.listen(port, host, cb); return server; };
+  server.address = () => raw.address();
+  server.close = function (cb) {
+    raw.close(() => { __tls_server_ctx_free(ctxId); server.emit('close'); });
+    if (typeof cb === 'function') server.on('close', cb);
+    return server;
+  };
+  return server;
 }
 
 function connect(opts, cb) {
@@ -114,6 +174,7 @@ function connect(opts, cb) {
 module.exports = {
   TLSSocket: TLSSocket,
   connect: connect,
+  createServer: createServer,
   // SPKI-pin trust (ECDSA-P256): replaces CA validation with a key pin
   setEcdsaPin: function (hex) { __tls_pin_ecdsa(hex); },
 };

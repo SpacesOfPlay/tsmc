@@ -8505,6 +8505,14 @@ private Value nat_tls_verify_error(void* vmp, Value callee, Value thisv, Value* 
     return new_str(vm, tls_chain_err_str(code));
 }
 
+// True while outbound ciphertext is still queued: an ending socket must wait
+// for it to drain before closing so the response is not truncated.
+private Value nat_tls_wants_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
+    return value_bool(s != null && tls_wants_write(s));
+}
+
 // Copy up to `cap` bytes out of a JS Buffer or typed array into `out`.
 // Returns the count, or -1 if the value is not byte-like or overflows `cap`.
 private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
@@ -8568,6 +8576,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_close", &nat_tls_close);
     ignore def_global_fn(vm, "__tls_established", &nat_tls_established);
     ignore def_global_fn(vm, "__tls_verify_error", &nat_tls_verify_error);
+    ignore def_global_fn(vm, "__tls_wants_write", &nat_tls_wants_write);
     ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);
     ignore def_global_fn(vm, "__net_listen", &nat_net_listen);

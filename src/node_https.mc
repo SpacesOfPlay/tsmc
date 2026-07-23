@@ -25,9 +25,19 @@ function toOpts(opts) {
 function request(opts, cb) { return http.request(toOpts(opts), cb); }
 function get(opts, cb) { const r = request(opts, cb); r.end(); return r; }
 
+// An HTTPS server: the http.Server machinery, but with each connection coming
+// from a tls.createServer (a TLSSocket) instead of a plain net socket.
+function createServer(opts, handler) {
+  if (typeof opts === 'function') { handler = opts; opts = {}; }
+  const tls = require('tls');
+  return new http.Server(handler, (onConn) => tls.createServer(opts, onConn));
+}
+
 module.exports = {
   request: request,
   get: get,
+  createServer: createServer,
+  Server: http.Server,
   Agent: function () {},
   globalAgent: {},
 };

@@ -213,7 +213,7 @@ tsmc's GC is single-threaded and a threadpool is its own hazard.
 
 ## 6. Suggested staging (each lands green + `--gc-stress`)
 
-Stages 1–4 shipped as M31–M35; stage 5 (servers) is the open one.
+Stages 1–5 shipped (M31–M37).
 
 1. **Reactor.** (M31) Convert `vm_run_event_loop` to a real poll loop with
    the handle table, real-clock timer integration, and ref-counting. No new
@@ -227,9 +227,14 @@ Stages 1–4 shipped as M31–M35; stage 5 (servers) is the open one.
    `fetch('https://…')` trustworthy. Secure by default; no transminc
    re-export was needed after all.
 5. **Servers.** `net.Server` + `http.createServer` (accept loop in the
-   reactor), then TLS server via picotls server mode. `net.Server` /
-   `http.createServer` already landed in M32/M33 (see `node_net.mc` /
-   `node_http.mc`); the TLS server side is the remaining piece.
+   reactor) landed in M32/M33. The TLS server (M37) uses picotls server
+   mode with an **ECDSA-P256** certificate: a `sign_certificate` bridge
+   over the already-vendored `uECC_sign`, EC private-key parsing, a
+   per-server context, and `tls.createServer` / `https.createServer`. A
+   connection is upgraded by installing a server session on the accepted
+   fd and re-owning the reactor handle. RSA server certs would need a
+   private-key signing implementation (no CRT modexp is vendored) and are
+   left as a follow-up.
 
 ## 7. Risks / open items
 

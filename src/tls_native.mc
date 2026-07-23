@@ -336,7 +336,7 @@ private i32 tls_feed(TlsSession* s) {
     return flags;
 }
 
-private bool tls_wants_write(TlsSession* s) {
+bool tls_wants_write(TlsSession* s) {
     return s.send_off < cast(i64, s.sendbuf.off);
 }
 

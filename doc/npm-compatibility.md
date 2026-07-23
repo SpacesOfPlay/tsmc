@@ -133,7 +133,9 @@ are blocked by a deliberate policy rather than a missing feature.
 `cluster`, `dgram`, `dns` (module), `readline`, `vm`, `perf_hooks`,
 `async_hooks`. No `Intl`, `WeakRef`, `FinalizationRegistry`, or
 `setImmediate`. `fetch` works, as do the `Headers`/`Request`/`Response`
-globals. TLS/HTTP is client + plain-HTTP-server only (no HTTPS server).
+globals. HTTP is client + server; HTTPS is client, plus a server with an
+**ECDSA-P256** certificate (`https.createServer({cert, key})` — RSA and
+Ed25519 server certs are not supported).
 
 ## Reproducing
 
