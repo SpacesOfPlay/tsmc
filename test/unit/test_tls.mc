@@ -237,6 +237,52 @@ private bool run_rsa_sign_verify() {
     return true;
 }
 
+// The CRT private operation produces EXACTLY the same signature as the plain
+// EM^d mod n, over several message representatives, and the result verifies.
+// The CRT==plain equality is deterministic (no PSS salt here — the raw op is
+// applied to a fixed EM), so it is an exact cross-check of the new bignum.
+private bool run_rsa_crt() {
+    for i32 t = 0; t < 6; t = t + 1 {
+        // a fixed EM < n: top byte 0x01 (< n's 0xc3), rest a per-t pattern
+        u8[256] em;
+        em[0] = cast(u8, 0x01);
+        for i32 i = 1; i < RSA_TEST_KLEN; i = i + 1 {
+            em[i] = cast(u8, (i * (t + 1) + 17) & 0xFF);
+        }
+        u8[256] s_plain;
+        u8[256] s_crt;
+        if !mc_rsa_privop_plain(&RSA_TEST_N[0], RSA_TEST_KLEN, &RSA_TEST_D[0], RSA_TEST_KLEN,
+                                &em[0], RSA_TEST_KLEN, &s_plain[0]) { return false; }
+        if !mc_rsa_privop_crt(&RSA_TEST_P[0], RSA_TEST_HLEN, &RSA_TEST_Q[0], RSA_TEST_HLEN,
+                              &RSA_TEST_DP[0], RSA_TEST_HLEN, &RSA_TEST_DQ[0], RSA_TEST_HLEN,
+                              &RSA_TEST_QINV[0], RSA_TEST_HLEN, RSA_TEST_KLEN,
+                              &em[0], RSA_TEST_KLEN, &s_crt[0]) { return false; }
+        for i32 i = 0; i < RSA_TEST_KLEN; i = i + 1 {
+            if s_plain[i] != s_crt[i] { return false; }
+        }
+        // sanity: s^e mod n == em (the private op really inverts the public one)
+        u8[256] back;
+        if !mc_rsa_pub_modexp(&RSA_TEST_N[0], RSA_TEST_KLEN, RSA_TEST_E,
+                              &s_crt[0], RSA_TEST_KLEN, &back[0]) { return false; }
+        for i32 i = 0; i < RSA_TEST_KLEN; i = i + 1 {
+            if back[i] != em[i] { return false; }
+        }
+    }
+    // a full PSS sign through the CRT path still verifies
+    u8[64] mhash;
+    for i32 i = 0; i < 32; i = i + 1 { mhash[i] = cast(u8, (i * 11 + 5) & 0xFF); }
+    u8[600] pem;
+    i32 pemlen = 0;
+    if !mc_rsa_pss_prepare(32, &mhash[0], RSA_TEST_KLEN, &RSA_TEST_N[0], &pem[0], &pemlen) { return false; }
+    u8[256] sig;
+    if !mc_rsa_privop_crt(&RSA_TEST_P[0], RSA_TEST_HLEN, &RSA_TEST_Q[0], RSA_TEST_HLEN,
+                          &RSA_TEST_DP[0], RSA_TEST_HLEN, &RSA_TEST_DQ[0], RSA_TEST_HLEN,
+                          &RSA_TEST_QINV[0], RSA_TEST_HLEN, RSA_TEST_KLEN,
+                          &pem[0], pemlen, &sig[0]) { return false; }
+    return rsa_pss_verify(&RSA_TEST_N[0], RSA_TEST_KLEN, RSA_TEST_E,
+                          &sig[0], RSA_TEST_KLEN, &mhash[0], 32);
+}
+
 i32 main() {
     // Live VM heap alongside picotls: exercises both allocators together.
     VM m;
@@ -247,6 +293,7 @@ i32 main() {
     check(run_handshake_ed25519(), "in-memory TLS 1.3 handshake (Ed25519 server cert)");
     check(run_handshake_ecdsa(), "in-memory TLS 1.3 handshake (ECDSA-P256 server cert)");
     check(run_rsa_sign_verify(), "RSASSA-PSS sign/verify round-trip (2048-bit, sha256/384/512)");
+    check(run_rsa_crt(), "RSA CRT private op equals plain EM^d mod n, and verifies");
 
     gc_collect(&m.heap);
     check(str_equal(gc_string_view(g), "coexist"), "GC heap intact after handshakes");

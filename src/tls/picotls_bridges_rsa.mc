@@ -660,10 +660,8 @@ bool emsa_pss_encode(i32 hlen, u8* mhash, u8* em, i32 emlen, i32 embits) {
 }
 }
 
-// RSASSA-PSS sign: PSS-encode mhash for the given modulus, then s = EM^d mod n.
-// n_be/d_be big-endian; sig_out gets klen big-endian bytes. mhash is already
-// Hash(data).
-bool mc_rsa_pss_sign(u8* n_be, i32 klen, u8* d_be, i32 dlen, i32 hlen, u8* mhash, u8* sig_out) {
+// EMSA-PSS-encode mhash for the given modulus; em_out gets emlen_out bytes.
+bool mc_rsa_pss_prepare(i32 hlen, u8* mhash, i32 klen, u8* n_be, u8* em_out, i32* emlen_out) {
     if klen <= 0 || klen > 512 { return false; }
     i32 nw = (klen + 7) / 8;
     u64[64] n;
@@ -672,15 +670,162 @@ bool mc_rsa_pss_sign(u8* n_be, i32 klen, u8* d_be, i32 dlen, i32 hlen, u8* mhash
     i32 embits = modbits - 1;
     i32 emlen = (embits + 7) / 8;
     if emlen < hlen + hlen + 2 { return false; }
-    u8[600] em;
-    if !emsa_pss_encode(hlen, mhash, &em[0], emlen, embits) { return false; }
-    u64[64] emnum;
-    rbn_from_be(&emnum[0], &em[0], emlen, nw);
-    if rbn_cmp(&emnum[0], &n[0], nw) >= 0 { return false; }
-    u64[64] s;
-    rbn_powm_bytes(&s[0], &emnum[0], d_be, dlen, &n[0], nw);
-    rbn_to_be(sig_out, klen, &s[0], nw);
+    if !emsa_pss_encode(hlen, mhash, em_out, emlen, embits) { return false; }
+    *emlen_out = emlen;
     return true;
+}
+
+// The plain RSA private operation: s = EM^d mod n. em is emlen big-endian
+// bytes (must be < n); s_out gets klen big-endian bytes.
+bool mc_rsa_privop_plain(u8* n_be, i32 klen, u8* d_be, i32 dlen, u8* em, i32 emlen, u8* s_out) {
+    if klen <= 0 || klen > 512 { return false; }
+    i32 nw = (klen + 7) / 8;
+    u64[64] n;
+    rbn_from_be(&n[0], n_be, klen, nw);
+    u64[64] c;
+    rbn_from_be(&c[0], em, emlen, nw);
+    if rbn_cmp(&c[0], &n[0], nw) >= 0 { return false; }
+    u64[64] s;
+    rbn_powm_bytes(&s[0], &c[0], d_be, dlen, &n[0], nw);
+    rbn_to_be(s_out, klen, &s[0], nw);
+    return true;
+}
+
+// --- CRT private operation (~4x faster than the plain modexp) --------------
+
+// out (nw words) = a + b, returns the carry out of the top word.
+private {
+u64 rbn_add(u64* out, u64* a, u64* b, i32 nw) {
+    u64 carry = 0;
+    for i32 j = 0; j < nw; j = j + 1 {
+        u64 s1 = a[j] + b[j];  u64 c1 = cast(u64, s1 < a[j]);
+        u64 s2 = s1 + carry;   u64 c2 = cast(u64, s2 < carry);
+        out[j] = s2;
+        carry = c1 + c2;
+    }
+    return carry;
+}
+}
+
+// Schoolbook multiply: out (2*nw words) = a * b (each nw words).
+private {
+void rbn_mul_full(u64* out, u64* a, u64* b, i32 nw) {
+    for i32 i = 0; i < 2 * nw; i = i + 1 { out[i] = 0; }
+    for i32 i = 0; i < nw; i = i + 1 {
+        u64 carry = 0;
+        for i32 j = 0; j < nw; j = j + 1 {
+            u64 hi; u64 lo;
+            rbn_mul64(a[i], b[j], &hi, &lo);
+            u64 s1 = out[i + j] + lo;  u64 c1 = cast(u64, s1 < lo);
+            u64 s2 = s1 + carry;       u64 c2 = cast(u64, s2 < carry);
+            out[i + j] = s2;
+            carry = hi + c1 + c2;
+        }
+        i32 k = i + nw;
+        while carry != 0 {
+            u64 s = out[k] + carry;
+            carry = cast(u64, s < carry);
+            out[k] = s;
+            k = k + 1;
+        }
+    }
+}
+}
+
+// out (hw words) = c mod p, where c is cnw words and p is hw words (p < c
+// possible). Bit-by-bit: shift-and-conditional-subtract, the same reduction
+// rbn_dbl uses, so no general division is needed. out stays < p throughout.
+private {
+void rbn_mod_reduce(u64* out, u64* c, i32 cnw, u64* p, i32 hw) {
+    for i32 i = 0; i < hw; i = i + 1 { out[i] = 0; }
+    for i32 wi = cnw - 1; wi >= 0; wi = wi - 1 {
+        for i32 b = 63; b >= 0; b = b - 1 {
+            u64 bit = (c[wi] >> cast(u64, b)) & cast(u64, 1);
+            u64 carry = bit;
+            for i32 j = 0; j < hw; j = j + 1 {
+                u64 v = out[j];
+                out[j] = (v << 1) | carry;
+                carry = v >> 63;
+            }
+            u64[64] tmp;
+            u64 borrow = rbn_sub(&tmp[0], out, p, hw);
+            if carry != 0 || borrow == 0 {
+                for i32 j = 0; j < hw; j = j + 1 { out[j] = tmp[j]; }
+            }
+        }
+    }
+}
+}
+
+// a*b mod p via Montgomery (p odd). Result normal form.
+private {
+void rbn_modmul(u64* out, u64* a, u64* b, u64* p, i32 hw) {
+    u64 n0inv = rbn_n0inv(p[0]);
+    u64[64] r2;
+    rbn_r2(&r2[0], p, hw);
+    u64[64] bm;
+    rbn_mont_mul(&bm[0], b, &r2[0], p, n0inv, hw);   // bm = b*R mod p
+    rbn_mont_mul(out, a, &bm[0], p, n0inv, hw);       // out = a*b mod p
+}
+}
+
+// The CRT RSA private operation: s = EM^d mod n, computed via p/q. Produces
+// the same value as mc_rsa_privop_plain, faster. All inputs big-endian; s_out
+// is klen bytes. klen = modulus byte length.
+bool mc_rsa_privop_crt(u8* p_be, i32 plen, u8* q_be, i32 qlen,
+                       u8* dp_be, i32 dplen, u8* dq_be, i32 dqlen,
+                       u8* qinv_be, i32 qinvlen, i32 klen, u8* em, i32 emlen, u8* s_out) {
+    i32 nw = (klen + 7) / 8;
+    i32 hw = plen > qlen ? (plen + 7) / 8 : (qlen + 7) / 8;
+    if hw <= 0 || 2 * hw > 64 { return false; }
+    u64[64] p; rbn_from_be(&p[0], p_be, plen, hw);
+    u64[64] q; rbn_from_be(&q[0], q_be, qlen, hw);
+    u64[64] qinv; rbn_from_be(&qinv[0], qinv_be, qinvlen, hw);
+    u64[64] c; rbn_from_be(&c[0], em, emlen, nw);
+
+    u64[64] cp; rbn_mod_reduce(&cp[0], &c[0], nw, &p[0], hw);
+    u64[64] cq; rbn_mod_reduce(&cq[0], &c[0], nw, &q[0], hw);
+    u64[64] m1; rbn_powm_bytes(&m1[0], &cp[0], dp_be, dplen, &p[0], hw);
+    u64[64] m2; rbn_powm_bytes(&m2[0], &cq[0], dq_be, dqlen, &q[0], hw);
+
+    // m2 mod p (m2 < q < 2p, so at most one subtraction), then diff = m1 - m2p mod p
+    u64[64] m2p;
+    u64[64] t;
+    u64 bsub = rbn_sub(&t[0], &m2[0], &p[0], hw);
+    if bsub == 0 {
+        for i32 i = 0; i < hw; i = i + 1 { m2p[i] = t[i]; }   // m2 >= p
+    } else {
+        for i32 i = 0; i < hw; i = i + 1 { m2p[i] = m2[i]; }
+    }
+    u64[64] diff;
+    u64 db = rbn_sub(&diff[0], &m1[0], &m2p[0], hw);
+    if db != 0 {
+        u64[64] d2;
+        ignore rbn_add(&d2[0], &diff[0], &p[0], hw);         // borrowed: + p
+        for i32 i = 0; i < hw; i = i + 1 { diff[i] = d2[i]; }
+    }
+
+    u64[64] h;
+    rbn_modmul(&h[0], &qinv[0], &diff[0], &p[0], hw);        // h = qinv*diff mod p
+
+    u64[64] hq;                                              // h*q, up to 2*hw words
+    rbn_mul_full(&hq[0], &h[0], &q[0], hw);
+    u64[64] m2ext;                                           // m2 zero-extended to 2*hw
+    for i32 i = 0; i < 2 * hw; i = i + 1 { m2ext[i] = i < hw ? m2[i] : cast(u64, 0); }
+    u64[64] s;
+    ignore rbn_add(&s[0], &hq[0], &m2ext[0], 2 * hw);        // s = m2 + h*q  (< n)
+
+    rbn_to_be(s_out, klen, &s[0], nw);
+    return true;
+}
+
+// RSASSA-PSS sign (plain path): PSS-encode then s = EM^d mod n. Kept as the
+// CRT-less fallback and as the CRT unit test's oracle.
+bool mc_rsa_pss_sign(u8* n_be, i32 klen, u8* d_be, i32 dlen, i32 hlen, u8* mhash, u8* sig_out) {
+    u8[600] em;
+    i32 emlen = 0;
+    if !mc_rsa_pss_prepare(hlen, mhash, klen, n_be, &em[0], &emlen) { return false; }
+    return mc_rsa_privop_plain(n_be, klen, d_be, dlen, &em[0], emlen, sig_out);
 }
 
 struct rsa_sign_cert_ctx_t {

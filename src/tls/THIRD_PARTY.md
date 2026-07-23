@@ -53,11 +53,15 @@ verbatim — refresh by re-copying the list above.
   the TLS server (`src/tls_native.mc`).
 - RSA-PSS **server-side signing** (`picotls_bridges_rsa.mc`):
   `rsa_pss_pl_sign_certificate` (the `sign_certificate` callback),
-  `mc_rsa_pss_sign` (PSS-encode then `EM^d mod n`), `emsa_pss_encode`
-  (inverse of the existing verify), `rbn_powm_bytes` (a big-exponent
-  modexp — the vendored `rbn_powm` only takes a `u64` public exponent),
-  and `rsa_sign_cert_ctx_t`. Plain modexp with `n`/`d` (no CRT). Used by
-  the TLS server (`src/tls_native.mc`).
+  `mc_rsa_pss_prepare` / `mc_rsa_privop_plain` / `mc_rsa_pss_sign`
+  (PSS-encode then `EM^d mod n`), `emsa_pss_encode` (inverse of the
+  existing verify), `rbn_powm_bytes` (a big-exponent modexp — the
+  vendored `rbn_powm` only takes a `u64` public exponent), and
+  `rsa_sign_cert_ctx_t`. CRT acceleration: `mc_rsa_privop_crt` (`EM^d mod
+  n` via `p`/`q`/`dP`/`dQ`/`qInv`, ~4× faster, produces a byte-identical
+  result) with the bignum helpers `rbn_add`, `rbn_mul_full`,
+  `rbn_mod_reduce`, `rbn_modmul`. Used by the TLS server
+  (`src/tls_native.mc`).
 
 ## Trusted root bundle (`ca_roots_data.mc`)
 
