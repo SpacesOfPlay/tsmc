@@ -257,3 +257,103 @@ i32 ecdsa_p256_accept_verify_cert_cb(ptls_verify_certificate_t* self,
     *out_verify_data = cast(void*, ctx);
     return 0;
 }
+
+// ===========================================================================
+// LOCAL ADDITION (tsmc) — ECDSA-P256 server-side signing for a TLS 1.3
+// sign_certificate callback, plus a raw-public-key verify. picotls-minc ships
+// only Ed25519 signing; the P-256 signing primitive (uECC_sign) is present
+// but unbridged. Re-apply on re-export (see src/tls/THIRD_PARTY.md).
+// ===========================================================================
+
+// uECC needs a nonce RNG before uECC_sign / uECC_make_key. Adapt the module
+// CSPRNG; uECC expects 1 = success.
+private { i32 mc_uecc_rng(u8* dest, u32 size) {
+    mc_csprng_bytes(cast(void*, dest), cast(u64, size));
+    return 1;
+}}
+
+// Install the nonce RNG. Idempotent; call before any P-256 signing.
+void mc_ecdsa_p256_sign_init() {
+    uECC_set_rng(mc_uecc_rng);
+}
+
+struct ecdsa_sign_cert_ctx_t {
+    ptls_sign_certificate_t super;
+    u8[32] private_key;   // P-256 scalar, big-endian
+}
+
+// One raw 32-byte big-endian value -> DER INTEGER at out; returns bytes
+// written. Leading zero bytes are stripped; a 0x00 is prepended when the top
+// bit is set so the value is not read as negative.
+private { i32 mc_der_put_int(u8* src, u8* out) {
+    i32 start = 0;
+    while start < 31 && src[start] == cast(u8, 0) { start++; }
+    i32 vlen = 32 - start;
+    bool pad = (src[start] & cast(u8, 0x80)) != cast(u8, 0);
+    i32 content = vlen + (pad ? 1 : 0);
+    out[0] = cast(u8, 0x02);
+    out[1] = cast(u8, content);
+    i32 o = 2;
+    if pad { out[o] = cast(u8, 0); o = o + 1; }
+    for i32 i = 0; i < vlen; i++ { out[o + i] = src[start + i]; }
+    return 2 + content;
+}}
+
+// Flat r||s (64 bytes) -> DER SEQUENCE { INTEGER r, INTEGER s } at out; returns
+// the length. Always < 128 bytes, so the SEQUENCE length is single-byte. This
+// is the exact inverse of mc_ecdsa_sig_der_to_raw above.
+i32 mc_ecdsa_sig_raw_to_der(u8* raw, u8* out) {
+    u8[80] body;
+    i32 rl = mc_der_put_int(&raw[0], &body[0]);
+    i32 sl = mc_der_put_int(&raw[32], &body[rl]);
+    i32 content = rl + sl;
+    out[0] = cast(u8, 0x30);
+    out[1] = cast(u8, content);
+    for i32 i = 0; i < content; i++ { out[2 + i] = body[i]; }
+    return 2 + content;
+}
+
+// sign_certificate callback: SHA-256 the data-to-sign picotls hands us, sign
+// it with the P-256 scalar, DER-encode, and push. Advertises ecdsa_secp256r1_
+// sha256 (0x0403).
+i32 ecdsa_p256_pl_sign_certificate(ptls_sign_certificate_t* self, ptls_t* tls,
+                                   ptls_async_job_t** async_job, u16* selected_algorithm,
+                                   ptls_buffer_t* output, ptls_iovec_t input,
+                                   u16* algorithms, u64 num_algorithms) {
+    ecdsa_sign_cert_ctx_t* ctx = cast(ecdsa_sign_cert_ctx_t*, self);
+    bool supported = false;
+    for u64 i = 0; i < num_algorithms; i++ {
+        if algorithms[i] == cast(u16, 0x0403) { supported = true; break; }
+    }
+    if !supported { return 0 - 1; }
+    *selected_algorithm = cast(u16, 0x0403);
+    u8[32] digest;
+    mc_sha256_hash(input.base, input.len, &digest[0]);
+    u8[64] raw;
+    if uECC_sign(&ctx.private_key[0], &digest[0], cast(u32, 32), &raw[0], uECC_secp256r1()) != 1 {
+        return 0 - 1;
+    }
+    u8[80] der;
+    i32 der_len = mc_ecdsa_sig_raw_to_der(&raw[0], &der[0]);
+    if ptls_buffer__do_pushv(output, &der[0], cast(u64, der_len)) != 0 { return 0 - 1; }
+    return 0;
+}
+
+// Raw-public-key verify: certs[0] IS the P-256 SubjectPublicKeyInfo (not an
+// X.509 cert). Extract the pubkey and arm the handshake-signature check. Used
+// by the raw-pubkey in-memory tests; the socket path uses the X.509 callbacks.
+i32 ecdsa_p256_raw_verify_cert_cb(ptls_verify_certificate_t* self,
+                                  ptls_t* tls, u8* server_name,
+                                  verify_sign_fn* out_verify_sign,
+                                  void** out_verify_data,
+                                  ptls_iovec_t* certs, u64 num_certs) {
+    if num_certs == cast(u64, 0) { return 0 - 1; }
+    ecdsa_p256_verify_ctx_t* ctx = new(ecdsa_p256_verify_ctx_t);
+    if mc_spki_extract_p256_pubkey(certs[0].base, certs[0].len, &ctx.public_key_xy[0]) != 0 {
+        free(cast(void*, ctx));
+        return 0 - 1;
+    }
+    *out_verify_sign = ecdsa_p256_pl_verify_sign;
+    *out_verify_data = cast(void*, ctx);
+    return 0;
+}

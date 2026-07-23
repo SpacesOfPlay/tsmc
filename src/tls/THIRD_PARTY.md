@@ -44,6 +44,13 @@ verbatim — refresh by re-copying the list above.
   `in^e mod n` primitive over the file-private bignum, used by the
   certificate-chain signature verifier (`src/tls_verify.mc`) for
   RSASSA-PKCS1-v1_5. The padding/DigestInfo check is done in the caller.
+- ECDSA-P256 **server-side signing** (`picotls_bridges_p256.mc`):
+  `ecdsa_p256_pl_sign_certificate` (the `sign_certificate` callback),
+  `mc_ecdsa_sig_raw_to_der` (r‖s → DER), `mc_ecdsa_p256_sign_init` (nonce
+  RNG), `ecdsa_sign_cert_ctx_t`, and `ecdsa_p256_raw_verify_cert_cb` (a
+  raw-public-key verify). picotls-minc ships only Ed25519 signing; the
+  P-256 signing primitive (`uECC_sign`) is present but unbridged. Used by
+  the TLS server (`src/tls_native.mc`).
 
 ## Trusted root bundle (`ca_roots_data.mc`)
 
