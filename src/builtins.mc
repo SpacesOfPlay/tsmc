@@ -7212,7 +7212,6 @@ private Value nat_buf_slice(void* vmp, Value callee, Value thisv, Value* args, i
 }
 
 private Value nat_buf_equals(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
     if !value_is_object(thisv) || !value_is_array(ov) { return value_bool(false); }
     JsObject* a = value_as_object(thisv);
@@ -7265,7 +7264,6 @@ private Value nat_buf_copy(void* vmp, Value callee, Value thisv, Value* args, i3
 }
 
 private Value nat_buf_fill(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
     JsObject* b = value_as_object(thisv);
     i32 len = b.elen;
     Value fv = arg_at(args, argc, 0);
@@ -8509,7 +8507,6 @@ private i32 hex2(u8 c) {
 }
 
 private Value nat_tls_pin_ecdsa(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
     Value hv = arg_at(args, argc, 0);
     if !value_is_string(hv) { return value_undefined(); }
     str h = sview(hv);
