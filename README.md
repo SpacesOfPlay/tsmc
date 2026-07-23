@@ -2,18 +2,35 @@
 
 A TypeScript interpreter written in [minc](https://github.com/mattiasljungstrom/minc).
 
-Status: **early development (M0 scaffolding)**. Nothing runs yet.
+`tsmc script.ts` runs TypeScript the way Bun and Deno do: type
+annotations are parsed and erased, nothing is type-checked, and the TS
+constructs with runtime semantics (`enum`, `namespace`, constructor
+parameter properties) are lowered and executed. It is a bytecode VM with
+a precise mark-sweep GC, written in minc. `.js` files run as well, and
+`node_modules` resolve through the CommonJS and ESM algorithms.
 
-## What it will be
+## What runs
 
-`tsmc script.ts` — a CLI that runs TypeScript the way Bun and Deno do:
-type annotations are parsed and erased, nothing is type-checked, and the
-TS constructs with runtime semantics (`enum`, `namespace`, constructor
-parameter properties) are lowered and executed. Bytecode VM, precise
-mark-sweep GC, written fully in modern minc.
+Supported ECMAScript includes classes, generators, async/await,
+top-level await, modules (CommonJS and ESM), Proxy/Reflect, BigInt,
+typed arrays, `Map`/`Set`/`WeakMap`/`WeakSet`, and regular expressions
+including Unicode property escapes.
 
-See `doc/META_PLAN.md` for the locked design decisions, architecture,
-and milestone roadmap.
+A subset of the Node.js standard library is implemented: `fs` (with
+`fs/promises`), `path`, `os`, `events`, `stream`, `util`, `buffer`,
+`zlib`, `assert`, `process`, `timers`, and `tty`; `crypto` provides
+SHA-256 and the `random*` functions. Networking covers `net`, `http`,
+and `https` clients and servers, the `fetch` and `URL` globals, and a
+TLS 1.3 stack: the client validates the server certificate against a
+bundled root store, and the server presents an ECDSA-P256 or RSA
+certificate.
+
+Not supported: `eval` / `new Function` (no runtime code generation),
+native addons, `Intl`, and several core modules (`child_process`,
+`worker_threads`, `dns`, and others). `doc/npm-compatibility.md` lists
+npm packages that have been run against the interpreter.
+
+See `doc/META_PLAN.md` for the design decisions and architecture.
 
 ## Build
 
