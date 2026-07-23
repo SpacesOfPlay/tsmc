@@ -69,8 +69,16 @@ function Run-Tests {
         $exe = Join-Path $unitBuild ($f.BaseName + ".exe")
         $rc = Invoke-Minc @($f.FullName, "-o", $exe)
         if ($rc -ne 0) { Fail "$($f.BaseName) (compile)"; $fail++; continue }
-        & $exe
-        if ($LASTEXITCODE -ne 0) { Fail "$($f.BaseName) (exit $LASTEXITCODE)"; $fail++; continue }
+        # Capture output: check.mc is silent on success and several tests
+        # deliberately exercise the interpreter's error paths (uncaught throws,
+        # bad JSON/regex, rejected source), which print to stderr. Surface that
+        # only when the test actually fails, so a passing run stays clean.
+        $testOut = & $exe 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Fail "$($f.BaseName) (exit $LASTEXITCODE)"; $fail++
+            $testOut | ForEach-Object { Write-Host "      $_" }
+            continue
+        }
         Pass $f.BaseName; $pass++
     }
 

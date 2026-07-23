@@ -127,7 +127,6 @@ i32 ed25519_pl_verify_cert_cb(ptls_verify_certificate_t* self,
     u8* pubkey = certs[0].base + certs[0].len - cast(u64, 32);
     *out_verify_sign = ed25519_pl_verify_sign;
     *out_verify_data = ed25519_pl_make_verify_ctx(pubkey);
-    eprint("ed25519_pl_verify_cert_cb returning 0\n");
     return 0;
 }
 

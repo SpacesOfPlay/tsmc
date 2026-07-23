@@ -35,6 +35,11 @@ additions marked `LOCAL ADDITION (tsmc)`. **Re-apply all of them after
 re-exporting picotls-minc** (or add them upstream); everything else is
 verbatim — refresh by re-copying the list above.
 
+One local *removal*: a leftover debug print in `ed25519_pl_verify_cert_cb`
+(`picotls_bridges.mc`), `eprint("ed25519_pl_verify_cert_cb returning 0")`,
+was deleted — it fired on every successful handshake and polluted stderr.
+Re-delete it on re-export.
+
 - `ecdsa_p256_accept_verify_cert_cb` (`picotls_bridges_p256.mc`) and
   `rsa_pss_accept_verify_cert_cb` (`picotls_bridges_rsa.mc`): the pinned
   verify callbacks minus the SPKI-pin comparison (accept any cert, still
