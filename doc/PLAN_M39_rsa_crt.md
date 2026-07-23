@@ -1,6 +1,13 @@
 # PLAN M39 — CRT-accelerated RSA signing
 
-**Status: planned.**
+**Status: complete.** Both increments landed. The RSA server signs via
+CRT when the key carries its parameters (the common case), producing a
+signature identical to the plain path and ~4× faster; a key without them
+falls back to plain `EM^d mod n`. `test/unit/test_tls.mc` asserts
+`CRT == plain` bit for bit over several inputs, and
+`test/diff/https_server_rsa.js` now exercises the CRT path end to end,
+byte-identical to Node and clean under `--gc-stress`. Suite green: 58
+tests, 89 gc-stress scripts, full node diff.
 
 The optimization M38 deferred. RSA server signing currently uses the
 plain private operation `s = EM^d mod n` — a full-width modexp with a

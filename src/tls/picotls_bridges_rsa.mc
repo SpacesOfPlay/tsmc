@@ -834,10 +834,17 @@ struct rsa_sign_cert_ctx_t {
     i32 klen;
     u8[512] d;    // private exponent, big-endian
     i32 dlen;
+    bool has_crt;             // p/q/dP/dQ/qInv present -> use the CRT path
+    u8[256] p;    i32 plen;
+    u8[256] q;    i32 qlen;
+    u8[256] dp;   i32 dplen;
+    u8[256] dq;   i32 dqlen;
+    u8[256] qinv; i32 qinvlen;
 }
 
 // sign_certificate callback: pick a PSS hash the client offers (prefer
-// sha256), hash the data, sign.
+// sha256), hash the data, PSS-encode, and apply the private op (CRT when the
+// key carries its parameters, otherwise plain EM^d mod n).
 i32 rsa_pss_pl_sign_certificate(ptls_sign_certificate_t* self, ptls_t* tls,
                                 ptls_async_job_t** async_job, u16* selected_algorithm,
                                 ptls_buffer_t* output, ptls_iovec_t input,
@@ -858,10 +865,19 @@ i32 rsa_pss_pl_sign_certificate(ptls_sign_certificate_t* self, ptls_t* tls,
     *selected_algorithm = chosen;
     u8[64] mhash;
     rsa_hash(hlen, input.base, input.len, &mhash[0]);
+    u8[600] em;
+    i32 emlen = 0;
+    if !mc_rsa_pss_prepare(hlen, &mhash[0], ctx.klen, &ctx.n[0], &em[0], &emlen) { return 0 - 1; }
     u8[512] sig;
-    if !mc_rsa_pss_sign(&ctx.n[0], ctx.klen, &ctx.d[0], ctx.dlen, hlen, &mhash[0], &sig[0]) {
-        return 0 - 1;
+    bool ok;
+    if ctx.has_crt {
+        ok = mc_rsa_privop_crt(&ctx.p[0], ctx.plen, &ctx.q[0], ctx.qlen,
+                               &ctx.dp[0], ctx.dplen, &ctx.dq[0], ctx.dqlen,
+                               &ctx.qinv[0], ctx.qinvlen, ctx.klen, &em[0], emlen, &sig[0]);
+    } else {
+        ok = mc_rsa_privop_plain(&ctx.n[0], ctx.klen, &ctx.d[0], ctx.dlen, &em[0], emlen, &sig[0]);
     }
+    if !ok { return 0 - 1; }
     if ptls_buffer__do_pushv(output, &sig[0], cast(u64, ctx.klen)) != 0 { return 0 - 1; }
     return 0;
 }

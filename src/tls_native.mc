@@ -489,23 +489,53 @@ private bool tls_read_int(u8* der, DerTlv* t, u8* out, i32 cap, i32* out_len) {
     return true;
 }
 
-// From a cursor positioned just after the version INTEGER of an
-// RSAPrivateKey (SEQUENCE { version, n, e, d, p, q, ... }), read n and d.
-private bool tls_rsa_from_seq(u8* der, DerCursor* in, u8* n_out, i32* klen, u8* d_out, i32* dlen) {
+// The parsed pieces of an RSA private key. The CRT fields are optional (a
+// bare n/d key leaves has_crt false and the server uses the plain path).
+struct TlsRsaKey {
+    u8[512] n;    i32 klen;
+    u8[512] d;    i32 dlen;
+    bool has_crt;
+    u8[256] p;    i32 plen;
+    u8[256] q;    i32 qlen;
+    u8[256] dp;   i32 dplen;
+    u8[256] dq;   i32 dqlen;
+    u8[256] qinv; i32 qinvlen;
+}
+
+// From a cursor positioned just after the version INTEGER of an RSAPrivateKey
+// (SEQUENCE { version, n, e, d, p, q, dP, dQ, qInv }), read n and d, and the
+// CRT parameters when present.
+private bool tls_rsa_from_seq(u8* der, DerCursor* in, TlsRsaKey* k) {
     DerTlv nt;
     if !der_read_tlv(in, &nt) || nt.tag != cast(u8, 0x02) { return false; }
-    if !tls_read_int(der, &nt, n_out, 512, klen) { return false; }
+    if !tls_read_int(der, &nt, &k.n[0], 512, &k.klen) { return false; }
     DerTlv et;
     if !der_read_tlv(in, &et) || et.tag != cast(u8, 0x02) { return false; }   // e, skipped
     DerTlv dt;
     if !der_read_tlv(in, &dt) || dt.tag != cast(u8, 0x02) { return false; }
-    return tls_read_int(der, &dt, d_out, 512, dlen);
+    if !tls_read_int(der, &dt, &k.d[0], 512, &k.dlen) { return false; }
+    // optional CRT parameters (all five, or none)
+    k.has_crt = false;
+    DerTlv pt;
+    if der_read_tlv(in, &pt) && pt.tag == cast(u8, 0x02)
+       && tls_read_int(der, &pt, &k.p[0], 256, &k.plen) {
+        DerTlv qt;
+        DerTlv dpt;
+        DerTlv dqt;
+        DerTlv qit;
+        if der_read_tlv(in, &qt) && qt.tag == cast(u8, 0x02) && tls_read_int(der, &qt, &k.q[0], 256, &k.qlen)
+           && der_read_tlv(in, &dpt) && dpt.tag == cast(u8, 0x02) && tls_read_int(der, &dpt, &k.dp[0], 256, &k.dplen)
+           && der_read_tlv(in, &dqt) && dqt.tag == cast(u8, 0x02) && tls_read_int(der, &dqt, &k.dq[0], 256, &k.dqlen)
+           && der_read_tlv(in, &qit) && qit.tag == cast(u8, 0x02) && tls_read_int(der, &qit, &k.qinv[0], 256, &k.qinvlen) {
+            k.has_crt = true;
+        }
+    }
+    return true;
 }
 
-// Extract the RSA modulus (n) and private exponent (d) from a private key in
-// DER, PKCS#1 (RSAPrivateKey) or PKCS#8 (PrivateKeyInfo wrapping it). The CRT
-// parameters are not needed (plain EM^d mod n signing).
-private bool tls_parse_rsa_key(u8* der, u64 der_len, u8* n_out, i32* klen, u8* d_out, i32* dlen) {
+// Parse an RSA private key from DER, PKCS#1 (RSAPrivateKey) or PKCS#8
+// (PrivateKeyInfo wrapping it).
+private bool tls_parse_rsa_key(u8* der, u64 der_len, TlsRsaKey* k) {
     DerCursor c = DerCursor{ .buf = der, .pos = 0, .end = der_len };
     DerTlv seq;
     if !der_read_tlv(&c, &seq) || seq.tag != cast(u8, 0x30) { return false; }
@@ -516,7 +546,7 @@ private bool tls_parse_rsa_key(u8* der, u64 der_len, u8* n_out, i32* klen, u8* d
     // AlgorithmIdentifier) is PKCS#8
     i32 next = der_peek_tag(&in);
     if next == 0x02 {
-        return tls_rsa_from_seq(der, &in, n_out, klen, d_out, dlen);
+        return tls_rsa_from_seq(der, &in, k);
     }
     if next == 0x30 {
         DerTlv alg;
@@ -529,7 +559,7 @@ private bool tls_parse_rsa_key(u8* der, u64 der_len, u8* n_out, i32* klen, u8* d
         DerCursor in2 = der_enter(der, &seq2);
         DerTlv ver2;
         if !der_read_tlv(&in2, &ver2) || ver2.tag != cast(u8, 0x02) { return false; }
-        return tls_rsa_from_seq(der, &in2, n_out, klen, d_out, dlen);
+        return tls_rsa_from_seq(der, &in2, k);
     }
     return false;
 }
@@ -566,15 +596,12 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     mc_ecdsa_p256_sign_init();
 
     u8[32] scalar;
-    u8[512] rsa_n;
-    i32 rsa_klen = 0;
-    u8[512] rsa_d;
-    i32 rsa_dlen = 0;
+    TlsRsaKey rsa;
     bool is_ec = tls_parse_ec_scalar(key_der, key_len, &scalar[0]);
     bool is_rsa = false;
     if !is_ec {
-        is_rsa = tls_parse_rsa_key(key_der, key_len, &rsa_n[0], &rsa_klen, &rsa_d[0], &rsa_dlen);
-        if is_rsa && (rsa_klen <= 0 || rsa_klen > 512) { is_rsa = false; }
+        is_rsa = tls_parse_rsa_key(key_der, key_len, &rsa);
+        if is_rsa && (rsa.klen <= 0 || rsa.klen > 512) { is_rsa = false; }
     }
     if !is_ec && !is_rsa { return 0 - 1; }
 
@@ -608,10 +635,23 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
         sc.rsa_sign = rsa_sign_cert_ctx_t{
             .super = ptls_sign_certificate_t{ .cb = rsa_pss_pl_sign_certificate },
         };
-        sc.rsa_sign.klen = rsa_klen;
-        sc.rsa_sign.dlen = rsa_dlen;
-        for i32 i = 0; i < rsa_klen; i++ { sc.rsa_sign.n[i] = rsa_n[i]; }
-        for i32 i = 0; i < rsa_dlen; i++ { sc.rsa_sign.d[i] = rsa_d[i]; }
+        sc.rsa_sign.klen = rsa.klen;
+        sc.rsa_sign.dlen = rsa.dlen;
+        for i32 i = 0; i < rsa.klen; i++ { sc.rsa_sign.n[i] = rsa.n[i]; }
+        for i32 i = 0; i < rsa.dlen; i++ { sc.rsa_sign.d[i] = rsa.d[i]; }
+        sc.rsa_sign.has_crt = rsa.has_crt;
+        if rsa.has_crt {
+            sc.rsa_sign.plen = rsa.plen;
+            sc.rsa_sign.qlen = rsa.qlen;
+            sc.rsa_sign.dplen = rsa.dplen;
+            sc.rsa_sign.dqlen = rsa.dqlen;
+            sc.rsa_sign.qinvlen = rsa.qinvlen;
+            for i32 i = 0; i < rsa.plen; i++ { sc.rsa_sign.p[i] = rsa.p[i]; }
+            for i32 i = 0; i < rsa.qlen; i++ { sc.rsa_sign.q[i] = rsa.q[i]; }
+            for i32 i = 0; i < rsa.dplen; i++ { sc.rsa_sign.dp[i] = rsa.dp[i]; }
+            for i32 i = 0; i < rsa.dqlen; i++ { sc.rsa_sign.dq[i] = rsa.dq[i]; }
+            for i32 i = 0; i < rsa.qinvlen; i++ { sc.rsa_sign.qinv[i] = rsa.qinv[i]; }
+        }
         sc.ctx.sign_certificate = &sc.rsa_sign.super;
     }
     // no verify_certificate: client-certificate auth is out of scope

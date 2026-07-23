@@ -231,12 +231,12 @@ Stages 1–5 shipped (M31–M37).
    with an **ECDSA-P256** (M37) or **RSA** (M38) certificate, auto-
    detected from the key: `sign_certificate` bridges over the vendored
    `uECC_sign` (ECDSA) and a tsmc-added RSASSA-PSS signer (a big-exponent
-   modexp + PSS encode; plain `EM^d mod n`, no CRT), private-key parsing
-   (EC SEC1/PKCS#8, RSA PKCS#1/PKCS#8), a per-server context, and
-   `tls.createServer` / `https.createServer`. A connection is upgraded by
-   installing a server session on the accepted fd and re-owning the
-   reactor handle. Ed25519 server certs (raw-pubkey only) and CRT
-   acceleration for RSA are the remaining follow-ups.
+   modexp + PSS encode, CRT-accelerated when the key carries
+   `p/q/dP/dQ/qInv`, M39), private-key parsing (EC SEC1/PKCS#8, RSA
+   PKCS#1/PKCS#8), a per-server context, and `tls.createServer` /
+   `https.createServer`. A connection is upgraded by installing a server
+   session on the accepted fd and re-owning the reactor handle. Ed25519
+   server certs (raw-pubkey only) are the remaining follow-up.
 
 ## 7. Risks / open items
 
