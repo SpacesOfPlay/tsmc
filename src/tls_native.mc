@@ -255,6 +255,7 @@ struct TlsSession {
     i32 chain_err;            // X509_V_* when the failure was cert validation
     bool checked_connect;     // confirmed the non-blocking TCP connect
     bool started;
+    bool is_server;           // accepted connection: no connect, no ClientHello
     bool established;
     bool failed;
     bool eof;
@@ -277,6 +278,7 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
     s.chain_err = 0;
     s.checked_connect = false;
     s.started = false;
+    s.is_server = false;
     s.established = false;
     s.failed = false;
     s.eof = false;
@@ -357,16 +359,20 @@ private bool tls_flush(TlsSession* s, i64 fd) {
 i32 tls_pump(TlsSession* s, i64 fd) {
     if s.failed { return TLS_ERR; }
     i32 flags = 0;
-    // confirm the non-blocking TCP connect completed before any TLS I/O
-    if !s.checked_connect {
-        if net_os_connect_result(fd) != 0 { s.failed = true; return TLS_ERR; }
-        s.checked_connect = true;
-    }
-    if !s.started {
-        s.started = true;
-        u64 c = 0;
-        i32 r = ptls_handshake(s.tls, &s.sendbuf, null, &c, null);
-        if r != 0 && r != 514 { s.failed = true; return TLS_ERR; }
+    // A client confirms the non-blocking TCP connect and kicks the ClientHello;
+    // a server's fd is already connected (from accept) and it waits for the
+    // client to speak first, so tls_feed alone drives its handshake.
+    if !s.is_server {
+        if !s.checked_connect {
+            if net_os_connect_result(fd) != 0 { s.failed = true; return TLS_ERR; }
+            s.checked_connect = true;
+        }
+        if !s.started {
+            s.started = true;
+            u64 c = 0;
+            i32 r = ptls_handshake(s.tls, &s.sendbuf, null, &c, null);
+            if r != 0 && r != 514 { s.failed = true; return TLS_ERR; }
+        }
     }
     if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
     bool more = true;
@@ -420,3 +426,144 @@ bool tls_failed(TlsSession* s) { return s.failed; }
 
 // X509_V_* code when the failure was certificate validation, else 0.
 i32 tls_chain_error(TlsSession* s) { return s.chain_err; }
+
+// --- server: ECDSA-P256 X.509 certificate ----------------------------------
+
+// Extract the 32-byte P-256 private scalar from an EC private key in DER, in
+// either SEC1 (`ECPrivateKey`) or PKCS#8 (`PrivateKeyInfo` wrapping SEC1)
+// form. A key that is not a 32-byte-scalar EC key is rejected (false), which
+// keeps a wrong-curve or non-EC key out of the server rather than failing
+// mid-handshake.
+private bool tls_copy_scalar(u8* der, u64 off, u64 len, u8* out32) {
+    while len > cast(u64, 32) && der[off] == cast(u8, 0) { off = off + 1; len = len - 1; }
+    if len == cast(u64, 0) || len > cast(u64, 32) { return false; }
+    for i32 i = 0; i < 32; i++ { out32[i] = cast(u8, 0); }
+    u64 pad = cast(u64, 32) - len;
+    for u64 i = 0; i < len; i++ { out32[pad + i] = der[off + i]; }
+    return true;
+}
+
+private bool tls_parse_ec_scalar(u8* der, u64 der_len, u8* out32) {
+    DerCursor c = DerCursor{ .buf = der, .pos = 0, .end = der_len };
+    DerTlv seq;
+    if !der_read_tlv(&c, &seq) || seq.tag != cast(u8, 0x30) { return false; }
+    DerCursor in = der_enter(der, &seq);
+    DerTlv ver;
+    if !der_read_tlv(&in, &ver) || ver.tag != cast(u8, 0x02) { return false; }
+    i32 version = ver.len > cast(u64, 0) ? cast(i32, der[ver.content + ver.len - 1]) : 0 - 1;
+    if version == 1 {
+        // SEC1: privateKey OCTET STRING is the scalar.
+        DerTlv oct;
+        if !der_read_tlv(&in, &oct) || oct.tag != cast(u8, 0x04) { return false; }
+        return tls_copy_scalar(der, oct.content, oct.len, out32);
+    }
+    if version == 0 {
+        // PKCS#8: skip AlgorithmIdentifier, then privateKey OCTET STRING holds
+        // a SEC1 ECPrivateKey whose scalar we want.
+        DerTlv alg;
+        if !der_read_tlv(&in, &alg) || alg.tag != cast(u8, 0x30) { return false; }
+        DerTlv pk;
+        if !der_read_tlv(&in, &pk) || pk.tag != cast(u8, 0x04) { return false; }
+        DerCursor sec = DerCursor{ .buf = der, .pos = pk.content, .end = pk.content + pk.len };
+        DerTlv seq2;
+        if !der_read_tlv(&sec, &seq2) || seq2.tag != cast(u8, 0x30) { return false; }
+        DerCursor in2 = der_enter(der, &seq2);
+        DerTlv ver2;
+        if !der_read_tlv(&in2, &ver2) || ver2.tag != cast(u8, 0x02) { return false; }
+        DerTlv oct2;
+        if !der_read_tlv(&in2, &oct2) || oct2.tag != cast(u8, 0x04) { return false; }
+        return tls_copy_scalar(der, oct2.content, oct2.len, out32);
+    }
+    return false;
+}
+
+// A server certificate + key, one per tls.createServer, kept alive for the
+// server's lifetime (all its connections share it). Referenced from JS by a
+// small registry id.
+struct TlsServerCtx {
+    ptls_context_t ctx;
+    ecdsa_sign_cert_ctx_t sign;
+    ptls_iovec_t[1] certs;
+    u8* cert_der;             // owned copy
+    u64 cert_len;
+}
+
+private const i32 TLS_SERVER_CTX_MAX = 64;
+private TlsServerCtx*[64] g_server_ctxs;
+private bool g_server_ctxs_inited = false;
+
+private void tls_server_ctxs_init() {
+    if g_server_ctxs_inited { return; }
+    for i32 i = 0; i < TLS_SERVER_CTX_MAX; i++ { g_server_ctxs[i] = null; }
+    g_server_ctxs_inited = true;
+}
+
+// Build a server context from an X.509 cert DER and an EC private key DER.
+// Returns a registry id, or -1 (bad/unsupported key, or registry full).
+i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
+    tls_ctx_init();
+    tls_server_ctxs_init();
+    mc_ecdsa_p256_sign_init();
+    u8[32] scalar;
+    if !tls_parse_ec_scalar(key_der, key_len, &scalar[0]) { return 0 - 1; }
+    i32 slot = 0 - 1;
+    for i32 i = 0; i < TLS_SERVER_CTX_MAX; i++ {
+        if g_server_ctxs[i] == null { slot = i; break; }
+    }
+    if slot < 0 { return 0 - 1; }
+
+    TlsServerCtx* sc = alloc<TlsServerCtx>(1);
+    sc.cert_der = alloc<u8>(cert_len > cast(u64, 0) ? cast(i32, cert_len) : 1);
+    for u64 i = 0; i < cert_len; i++ { sc.cert_der[i] = cert_der[i]; }
+    sc.cert_len = cert_len;
+    sc.certs[0] = ptls_iovec_init(sc.cert_der, cert_len);
+    sc.sign = ecdsa_sign_cert_ctx_t{
+        .super = ptls_sign_certificate_t{ .cb = ecdsa_p256_pl_sign_certificate },
+    };
+    for i32 i = 0; i < 32; i++ { sc.sign.private_key[i] = scalar[i]; }
+
+    sc.ctx = ptls_context_t{};
+    sc.ctx.random_bytes = mc_csprng_bytes;
+    sc.ctx.get_time = &g_tls_time;
+    sc.ctx.key_exchanges = &g_keyex[0];
+    sc.ctx.cipher_suites = &g_cslist[0];
+    sc.ctx.certificates.list = &sc.certs[0];
+    sc.ctx.certificates.count = cast(u64, 1);
+    sc.ctx.sign_certificate = &sc.sign.super;
+    // no verify_certificate: client-certificate auth is out of scope
+
+    g_server_ctxs[slot] = sc;
+    return slot;
+}
+
+void tls_server_ctx_free(i32 id) {
+    if id < 0 || id >= TLS_SERVER_CTX_MAX { return; }
+    TlsServerCtx* sc = g_server_ctxs[id];
+    if sc == null { return; }
+    free(cast(void*, sc.cert_der));
+    free(cast(void*, sc));
+    g_server_ctxs[id] = null;
+}
+
+// A server-side session for an already-accepted fd, using the shared context.
+TlsSession* tls_server_session_new(i32 ctx_id) {
+    if ctx_id < 0 || ctx_id >= TLS_SERVER_CTX_MAX { return null; }
+    tls_server_ctxs_init();
+    TlsServerCtx* sc = g_server_ctxs[ctx_id];
+    if sc == null { return null; }
+    TlsSession* s = alloc<TlsSession>(1);
+    s.tls = ptls_new(&sc.ctx, 1);   // is_server = 1
+    if s.tls == null { free(s); return null; }
+    ptls_buffer_init(&s.sendbuf, &s.send_small[0], 1024);
+    ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
+    s.send_off = 0;
+    s.cipher_in_len = 0;
+    s.chain_err = 0;
+    s.checked_connect = false;
+    s.started = false;
+    s.is_server = true;
+    s.established = false;
+    s.failed = false;
+    s.eof = false;
+    return s;
+}

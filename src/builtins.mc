@@ -8505,10 +8505,63 @@ private Value nat_tls_verify_error(void* vmp, Value callee, Value thisv, Value* 
     return new_str(vm, tls_chain_err_str(code));
 }
 
+// Copy up to `cap` bytes out of a JS Buffer or typed array into `out`.
+// Returns the count, or -1 if the value is not byte-like or overflows `cap`.
+private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
+    if !value_is_object(bufv) { return 0 - 1; }
+    JsObject* o = value_as_object(bufv);
+    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
+    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    if len > cap { return 0 - 1; }
+    for i32 i = 0; i < len; i++ {
+        i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, i))) : buf_byte(o, i);
+        *(out + i) = cast(u8, b & 0xFF);
+    }
+    return len;
+}
+
+// __tls_server_ctx(certDer, keyDer): build a shared server context from an
+// X.509 cert and its EC private key (both DER buffers). Returns a registry id
+// or -1 (bad/unsupported key).
+private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    u8[8192] cert;
+    i32 clen = tls_js_bytes(vm, arg_at(args, argc, 0), &cert[0], 8192);
+    u8[2048] key;
+    i32 klen = tls_js_bytes(vm, arg_at(args, argc, 1), &key[0], 2048);
+    if clen < 0 || klen < 0 { return value_int(-1); }
+    i32 id = tls_server_ctx_new(&cert[0], cast(u64, clen), &key[0], cast(u64, klen));
+    return value_int(id);
+}
+
+// __tls_server_wrap(handleId, ctxId): install a server TLS session on an
+// already-accepted fd handle. The caller then re-owns the handle to a
+// TLSSocket so the reactor pumps TLS instead of plain net.
+private Value nat_tls_server_wrap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    i32 ctx_id = to_int_arg(arg_at(args, argc, 1));
+    if vm_handle_fd(vm, id) < 0 { return value_int(-1); }
+    TlsSession* s = tls_server_session_new(ctx_id);
+    if s == null { return value_int(-1); }
+    vm_handle_set_ext(vm, id, cast(void*, s));
+    vm_handle_set_interest(vm, id, cast(i16, NET_POLLIN));
+    return value_int(0);
+}
+
+// __tls_server_ctx_free(ctxId): release a server context on server.close.
+private Value nat_tls_server_ctx_free(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    tls_server_ctx_free(to_int_arg(arg_at(args, argc, 0)));
+    return value_undefined();
+}
+
 private void net_install(VM* vm) {
     ignore net_os_init();
     vm_set_reactor_hook(vm, &net_reactor_dispatch);
     ignore def_global_fn(vm, "__tls_connect", &nat_tls_connect);
+    ignore def_global_fn(vm, "__tls_server_ctx", &nat_tls_server_ctx);
+    ignore def_global_fn(vm, "__tls_server_wrap", &nat_tls_server_wrap);
+    ignore def_global_fn(vm, "__tls_server_ctx_free", &nat_tls_server_ctx_free);
     ignore def_global_fn(vm, "__tls_pump", &nat_tls_pump);
     ignore def_global_fn(vm, "__tls_read", &nat_tls_read);
     ignore def_global_fn(vm, "__tls_write", &nat_tls_write);
