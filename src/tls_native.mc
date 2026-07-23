@@ -477,12 +477,71 @@ private bool tls_parse_ec_scalar(u8* der, u64 der_len, u8* out32) {
     return false;
 }
 
+// One INTEGER's content bytes, big-endian, with a leading 0x00 sign byte
+// stripped. False if it overflows `cap`.
+private bool tls_read_int(u8* der, DerTlv* t, u8* out, i32 cap, i32* out_len) {
+    u64 off = t.content;
+    u64 len = t.len;
+    if len > cast(u64, 0) && der[off] == cast(u8, 0) { off = off + 1; len = len - 1; }
+    if cast(i32, len) > cap { return false; }
+    for u64 i = 0; i < len; i++ { out[i] = der[off + i]; }
+    *out_len = cast(i32, len);
+    return true;
+}
+
+// From a cursor positioned just after the version INTEGER of an
+// RSAPrivateKey (SEQUENCE { version, n, e, d, p, q, ... }), read n and d.
+private bool tls_rsa_from_seq(u8* der, DerCursor* in, u8* n_out, i32* klen, u8* d_out, i32* dlen) {
+    DerTlv nt;
+    if !der_read_tlv(in, &nt) || nt.tag != cast(u8, 0x02) { return false; }
+    if !tls_read_int(der, &nt, n_out, 512, klen) { return false; }
+    DerTlv et;
+    if !der_read_tlv(in, &et) || et.tag != cast(u8, 0x02) { return false; }   // e, skipped
+    DerTlv dt;
+    if !der_read_tlv(in, &dt) || dt.tag != cast(u8, 0x02) { return false; }
+    return tls_read_int(der, &dt, d_out, 512, dlen);
+}
+
+// Extract the RSA modulus (n) and private exponent (d) from a private key in
+// DER, PKCS#1 (RSAPrivateKey) or PKCS#8 (PrivateKeyInfo wrapping it). The CRT
+// parameters are not needed (plain EM^d mod n signing).
+private bool tls_parse_rsa_key(u8* der, u64 der_len, u8* n_out, i32* klen, u8* d_out, i32* dlen) {
+    DerCursor c = DerCursor{ .buf = der, .pos = 0, .end = der_len };
+    DerTlv seq;
+    if !der_read_tlv(&c, &seq) || seq.tag != cast(u8, 0x30) { return false; }
+    DerCursor in = der_enter(der, &seq);
+    DerTlv ver;
+    if !der_read_tlv(&in, &ver) || ver.tag != cast(u8, 0x02) { return false; }
+    // after version: an INTEGER (the modulus) is PKCS#1; a SEQUENCE (the
+    // AlgorithmIdentifier) is PKCS#8
+    i32 next = der_peek_tag(&in);
+    if next == 0x02 {
+        return tls_rsa_from_seq(der, &in, n_out, klen, d_out, dlen);
+    }
+    if next == 0x30 {
+        DerTlv alg;
+        if !der_read_tlv(&in, &alg) || alg.tag != cast(u8, 0x30) { return false; }
+        DerTlv pk;
+        if !der_read_tlv(&in, &pk) || pk.tag != cast(u8, 0x04) { return false; }
+        DerCursor rc = DerCursor{ .buf = der, .pos = pk.content, .end = pk.content + pk.len };
+        DerTlv seq2;
+        if !der_read_tlv(&rc, &seq2) || seq2.tag != cast(u8, 0x30) { return false; }
+        DerCursor in2 = der_enter(der, &seq2);
+        DerTlv ver2;
+        if !der_read_tlv(&in2, &ver2) || ver2.tag != cast(u8, 0x02) { return false; }
+        return tls_rsa_from_seq(der, &in2, n_out, klen, d_out, dlen);
+    }
+    return false;
+}
+
 // A server certificate + key, one per tls.createServer, kept alive for the
 // server's lifetime (all its connections share it). Referenced from JS by a
-// small registry id.
+// small registry id. Holds both sign-context shapes; whichever matches the
+// key is wired into ctx.sign_certificate.
 struct TlsServerCtx {
     ptls_context_t ctx;
-    ecdsa_sign_cert_ctx_t sign;
+    ecdsa_sign_cert_ctx_t ec_sign;
+    rsa_sign_cert_ctx_t rsa_sign;
     ptls_iovec_t[1] certs;
     u8* cert_der;             // owned copy
     u64 cert_len;
@@ -498,14 +557,27 @@ private void tls_server_ctxs_init() {
     g_server_ctxs_inited = true;
 }
 
-// Build a server context from an X.509 cert DER and an EC private key DER.
-// Returns a registry id, or -1 (bad/unsupported key, or registry full).
+// Build a server context from an X.509 cert DER and a private key DER,
+// auto-detecting the key type: an ECDSA-P256 scalar, otherwise RSA. Returns a
+// registry id, or -1 (bad/unsupported key, or registry full).
 i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     tls_ctx_init();
     tls_server_ctxs_init();
     mc_ecdsa_p256_sign_init();
+
     u8[32] scalar;
-    if !tls_parse_ec_scalar(key_der, key_len, &scalar[0]) { return 0 - 1; }
+    u8[512] rsa_n;
+    i32 rsa_klen = 0;
+    u8[512] rsa_d;
+    i32 rsa_dlen = 0;
+    bool is_ec = tls_parse_ec_scalar(key_der, key_len, &scalar[0]);
+    bool is_rsa = false;
+    if !is_ec {
+        is_rsa = tls_parse_rsa_key(key_der, key_len, &rsa_n[0], &rsa_klen, &rsa_d[0], &rsa_dlen);
+        if is_rsa && (rsa_klen <= 0 || rsa_klen > 512) { is_rsa = false; }
+    }
+    if !is_ec && !is_rsa { return 0 - 1; }
+
     i32 slot = 0 - 1;
     for i32 i = 0; i < TLS_SERVER_CTX_MAX; i++ {
         if g_server_ctxs[i] == null { slot = i; break; }
@@ -517,10 +589,6 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     for u64 i = 0; i < cert_len; i++ { sc.cert_der[i] = cert_der[i]; }
     sc.cert_len = cert_len;
     sc.certs[0] = ptls_iovec_init(sc.cert_der, cert_len);
-    sc.sign = ecdsa_sign_cert_ctx_t{
-        .super = ptls_sign_certificate_t{ .cb = ecdsa_p256_pl_sign_certificate },
-    };
-    for i32 i = 0; i < 32; i++ { sc.sign.private_key[i] = scalar[i]; }
 
     sc.ctx = ptls_context_t{};
     sc.ctx.random_bytes = mc_csprng_bytes;
@@ -529,7 +597,23 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     sc.ctx.cipher_suites = &g_cslist[0];
     sc.ctx.certificates.list = &sc.certs[0];
     sc.ctx.certificates.count = cast(u64, 1);
-    sc.ctx.sign_certificate = &sc.sign.super;
+
+    if is_ec {
+        sc.ec_sign = ecdsa_sign_cert_ctx_t{
+            .super = ptls_sign_certificate_t{ .cb = ecdsa_p256_pl_sign_certificate },
+        };
+        for i32 i = 0; i < 32; i++ { sc.ec_sign.private_key[i] = scalar[i]; }
+        sc.ctx.sign_certificate = &sc.ec_sign.super;
+    } else {
+        sc.rsa_sign = rsa_sign_cert_ctx_t{
+            .super = ptls_sign_certificate_t{ .cb = rsa_pss_pl_sign_certificate },
+        };
+        sc.rsa_sign.klen = rsa_klen;
+        sc.rsa_sign.dlen = rsa_dlen;
+        for i32 i = 0; i < rsa_klen; i++ { sc.rsa_sign.n[i] = rsa_n[i]; }
+        for i32 i = 0; i < rsa_dlen; i++ { sc.rsa_sign.d[i] = rsa_d[i]; }
+        sc.ctx.sign_certificate = &sc.rsa_sign.super;
+    }
     // no verify_certificate: client-certificate auth is out of scope
 
     g_server_ctxs[slot] = sc;
