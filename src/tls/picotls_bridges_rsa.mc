@@ -578,3 +578,145 @@ i32 rsa_pss_accept_verify_cert_cb(ptls_verify_certificate_t* self,
     *out_verify_data = cast(void*, ctx);
     return 0;
 }
+
+// ===========================================================================
+// LOCAL ADDITION (tsmc) — RSA server-side signing (RSASSA-PSS). picotls-minc
+// verifies RSA-PSS but cannot sign: rbn_powm takes a u64 exponent (the public
+// e), not a full-width private d. Adds a big-exponent modexp, EMSA-PSS-encode,
+// and the sign_certificate callback. Plain s = EM^d mod n (no CRT); n and d
+// only. Re-apply on re-export (see src/tls/THIRD_PARTY.md).
+// ===========================================================================
+
+// Modular exponentiation with a big-endian byte-array exponent (the private
+// d), Montgomery square-and-multiply — rbn_powm generalized past its u64
+// exponent.
+private {
+void rbn_powm_bytes(u64* out, u64* base, u8* exp_be, i32 exp_len, u64* n, i32 nw) {
+    u64 n0inv = rbn_n0inv(n[0]);
+    u64[64] r2;
+    rbn_r2(&r2[0], n, nw);
+    u64[64] one;
+    for i32 i = 0; i < nw; i = i + 1 { one[i] = 0; }
+    one[0] = 1;
+    u64[64] base_m;
+    rbn_mont_mul(&base_m[0], base, &r2[0], n, n0inv, nw);
+    u64[64] res_m;
+    rbn_mont_mul(&res_m[0], &one[0], &r2[0], n, n0inv, nw);
+    u64[64] tmp;
+    bool started = false;
+    for i32 bi = 0; bi < exp_len; bi = bi + 1 {
+        i32 byte = cast(i32, exp_be[bi]);
+        for i32 b = 7; b >= 0; b = b - 1 {
+            i32 bit = (byte >> b) & 1;
+            if !started {
+                if bit == 0 { continue; }
+                started = true;
+            }
+            rbn_mont_mul(&tmp[0], &res_m[0], &res_m[0], n, n0inv, nw);
+            for i32 j = 0; j < nw; j = j + 1 { res_m[j] = tmp[j]; }
+            if bit != 0 {
+                rbn_mont_mul(&tmp[0], &res_m[0], &base_m[0], n, n0inv, nw);
+                for i32 j = 0; j < nw; j = j + 1 { res_m[j] = tmp[j]; }
+            }
+        }
+    }
+    rbn_mont_mul(out, &res_m[0], &one[0], n, n0inv, nw);
+}
+}
+
+// EMSA-PSS-ENCODE with a fresh random salt of length hlen (TLS 1.3). Produces
+// em[0..emlen); embits = modbits - 1. The inverse of emsa_pss_verify above.
+private {
+bool emsa_pss_encode(i32 hlen, u8* mhash, u8* em, i32 emlen, i32 embits) {
+    i32 slen = hlen;
+    if emlen < hlen + slen + 2 { return false; }
+    u8[64] salt;
+    mc_csprng_bytes(cast(void*, &salt[0]), cast(u64, slen));
+
+    u8[200] mprime;
+    for i32 i = 0; i < 8; i = i + 1 { mprime[i] = 0; }
+    for i32 i = 0; i < hlen; i = i + 1 { mprime[8 + i] = mhash[i]; }
+    for i32 i = 0; i < slen; i = i + 1 { mprime[8 + hlen + i] = salt[i]; }
+    u8[64] H;
+    rsa_hash(hlen, &mprime[0], cast(u64, 8 + hlen + slen), &H[0]);
+
+    i32 dblen = emlen - hlen - 1;
+    i32 pslen = emlen - hlen - slen - 2;
+    u8[600] db;
+    for i32 i = 0; i < pslen; i = i + 1 { db[i] = 0; }
+    db[pslen] = cast(u8, 0x01);
+    for i32 i = 0; i < slen; i = i + 1 { db[pslen + 1 + i] = salt[i]; }
+
+    u8[600] dbmask;
+    mgf1(hlen, &H[0], hlen, &dbmask[0], dblen);
+    for i32 i = 0; i < dblen; i = i + 1 {
+        em[i] = cast(u8, cast(i32, db[i]) ^ cast(i32, dbmask[i]));
+    }
+    i32 zbits = 8 * emlen - embits;
+    if zbits > 0 { em[0] = cast(u8, cast(i32, em[0]) & (0xff >> zbits)); }
+    for i32 i = 0; i < hlen; i = i + 1 { em[dblen + i] = H[i]; }
+    em[emlen - 1] = cast(u8, 0xbc);
+    return true;
+}
+}
+
+// RSASSA-PSS sign: PSS-encode mhash for the given modulus, then s = EM^d mod n.
+// n_be/d_be big-endian; sig_out gets klen big-endian bytes. mhash is already
+// Hash(data).
+bool mc_rsa_pss_sign(u8* n_be, i32 klen, u8* d_be, i32 dlen, i32 hlen, u8* mhash, u8* sig_out) {
+    if klen <= 0 || klen > 512 { return false; }
+    i32 nw = (klen + 7) / 8;
+    u64[64] n;
+    rbn_from_be(&n[0], n_be, klen, nw);
+    i32 modbits = rbn_bitlen(&n[0], nw);
+    i32 embits = modbits - 1;
+    i32 emlen = (embits + 7) / 8;
+    if emlen < hlen + hlen + 2 { return false; }
+    u8[600] em;
+    if !emsa_pss_encode(hlen, mhash, &em[0], emlen, embits) { return false; }
+    u64[64] emnum;
+    rbn_from_be(&emnum[0], &em[0], emlen, nw);
+    if rbn_cmp(&emnum[0], &n[0], nw) >= 0 { return false; }
+    u64[64] s;
+    rbn_powm_bytes(&s[0], &emnum[0], d_be, dlen, &n[0], nw);
+    rbn_to_be(sig_out, klen, &s[0], nw);
+    return true;
+}
+
+struct rsa_sign_cert_ctx_t {
+    ptls_sign_certificate_t super;
+    u8[512] n;    // modulus, big-endian
+    i32 klen;
+    u8[512] d;    // private exponent, big-endian
+    i32 dlen;
+}
+
+// sign_certificate callback: pick a PSS hash the client offers (prefer
+// sha256), hash the data, sign.
+i32 rsa_pss_pl_sign_certificate(ptls_sign_certificate_t* self, ptls_t* tls,
+                                ptls_async_job_t** async_job, u16* selected_algorithm,
+                                ptls_buffer_t* output, ptls_iovec_t input,
+                                u16* algorithms, u64 num_algorithms) {
+    rsa_sign_cert_ctx_t* ctx = cast(rsa_sign_cert_ctx_t*, self);
+    u16[3] want = { 0x0804, 0x0805, 0x0806 };
+    i32[3] wanth = { 32, 48, 64 };
+    u16 chosen = 0;
+    i32 hlen = 0;
+    for i32 k = 0; k < 3; k = k + 1 {
+        bool offered = false;
+        for u64 i = 0; i < num_algorithms; i = i + 1 {
+            if algorithms[i] == want[k] { offered = true; break; }
+        }
+        if offered { chosen = want[k]; hlen = wanth[k]; break; }
+    }
+    if chosen == cast(u16, 0) { return 0 - 1; }
+    *selected_algorithm = chosen;
+    u8[64] mhash;
+    rsa_hash(hlen, input.base, input.len, &mhash[0]);
+    u8[512] sig;
+    if !mc_rsa_pss_sign(&ctx.n[0], ctx.klen, &ctx.d[0], ctx.dlen, hlen, &mhash[0], &sig[0]) {
+        return 0 - 1;
+    }
+    if ptls_buffer__do_pushv(output, &sig[0], cast(u64, ctx.klen)) != 0 { return 0 - 1; }
+    return 0;
+}

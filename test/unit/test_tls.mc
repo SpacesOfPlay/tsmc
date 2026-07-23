@@ -8,6 +8,7 @@
 
 import str;
 import "../helpers/check.mc";
+import "../helpers/rsa_key_fixture.mc";
 import "../../src/value.mc";
 import "../../src/object.mc";
 import "../../src/vm.mc";
@@ -213,6 +214,29 @@ private bool run_handshake_ecdsa() {
     return ok;
 }
 
+// RSASSA-PSS sign (private d) round-trips through the existing verify (public
+// e) for all three TLS 1.3 hash lengths, on the 2048-bit fixture key. Both
+// sides take the same message digest, so a fixed synthetic digest exercises
+// the sign/encode + modexp + verify path without needing the private hash.
+private bool run_rsa_sign_verify() {
+    i32[3] hlens = { 32, 48, 64 };
+    for i32 k = 0; k < 3; k = k + 1 {
+        i32 hlen = hlens[k];
+        u8[64] mhash;
+        for i32 i = 0; i < hlen; i = i + 1 { mhash[i] = cast(u8, (i * 7 + 3) & 0xFF); }
+        u8[512] sig;
+        if !mc_rsa_pss_sign(&RSA_TEST_N[0], RSA_TEST_KLEN, &RSA_TEST_D[0], RSA_TEST_KLEN,
+                            hlen, &mhash[0], &sig[0]) { return false; }
+        if !rsa_pss_verify(&RSA_TEST_N[0], RSA_TEST_KLEN, RSA_TEST_E,
+                           &sig[0], RSA_TEST_KLEN, &mhash[0], hlen) { return false; }
+        // a tampered signature must NOT verify
+        sig[10] = cast(u8, cast(i32, sig[10]) ^ 1);
+        if rsa_pss_verify(&RSA_TEST_N[0], RSA_TEST_KLEN, RSA_TEST_E,
+                          &sig[0], RSA_TEST_KLEN, &mhash[0], hlen) { return false; }
+    }
+    return true;
+}
+
 i32 main() {
     // Live VM heap alongside picotls: exercises both allocators together.
     VM m;
@@ -222,6 +246,7 @@ i32 main() {
 
     check(run_handshake_ed25519(), "in-memory TLS 1.3 handshake (Ed25519 server cert)");
     check(run_handshake_ecdsa(), "in-memory TLS 1.3 handshake (ECDSA-P256 server cert)");
+    check(run_rsa_sign_verify(), "RSASSA-PSS sign/verify round-trip (2048-bit, sha256/384/512)");
 
     gc_collect(&m.heap);
     check(str_equal(gc_string_view(g), "coexist"), "GC heap intact after handshakes");
