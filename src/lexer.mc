@@ -10,6 +10,7 @@
 import vec;
 import map;
 import diag;
+import "regex_uniprops_data.mc";   // general-category runs, for Unicode identifiers
 
 enum TokKind {
     TOK_EOF,
@@ -126,6 +127,81 @@ private bool is_id_start(u8 c) {
 
 private bool is_id_part(u8 c) {
     return is_id_start(c) || is_digit(c);
+}
+
+// --- Unicode identifiers ---------------------------------------------
+//
+// Beyond ASCII an identifier character is decided by its general
+// category, read from the same run table the regex \p{...} escapes use.
+// ID_Start is L* plus Nl; ID_Continue adds Mn, Mc, Nd and Pc. The small
+// Other_ID_Start / Other_ID_Continue sets are listed explicitly.
+
+const u32 UNI_ID_START_CATS = 1 | 2 | 4 | 8 | 16 | 512;              // Lu Ll Lt Lm Lo Nl
+const u32 UNI_ID_CONT_CATS = 32 | 64 | 256 | 2048;                  // Mn Mc Nd Pc
+
+// The category bit of `cp`: the runs partition the code space, so the
+// last run starting at or below cp holds it.
+private u32 uni_gc_bit(u32 cp) {
+    i32 lo = 0;
+    i32 hi = UNI_GC_RUNS - 1;
+    while lo < hi {
+        i32 mid = (lo + hi + 1) / 2;
+        if UNI_GC_START[mid] <= cp { lo = mid; } else { hi = mid - 1; }
+    }
+    return cast(u32, 1) << UNI_GC_CAT[lo];
+}
+
+private bool uni_is_id_start(u32 cp) {
+    // Other_ID_Start
+    if cp == 0x1885 || cp == 0x1886 || cp == 0x2118
+        || cp == 0x212E || cp == 0x309B || cp == 0x309C { return true; }
+    return (uni_gc_bit(cp) & UNI_ID_START_CATS) != 0;
+}
+
+private bool uni_is_id_cont(u32 cp) {
+    if cp == 0x200C || cp == 0x200D { return true; }   // ZWNJ, ZWJ
+    // Other_ID_Continue
+    if cp == 0xB7 || cp == 0x387 || cp == 0x19DA
+        || (cp >= 0x1369 && cp <= 0x1371) { return true; }
+    return (uni_gc_bit(cp) & (UNI_ID_START_CATS | UNI_ID_CONT_CATS)) != 0;
+}
+
+// Decodes the UTF-8 sequence at `pos`. *len receives its byte length;
+// a malformed sequence yields 0 with a length of 1.
+private u32 utf8_decode_at(Lexer* lx, i32 pos, i32* len) {
+    *len = 1;
+    u8 b0 = lx_at(lx, pos);
+    if b0 < 0x80 { return cast(u32, b0); }
+    i32 n = 0;
+    u32 cp = 0;
+    if (b0 & 0xE0) == 0xC0 { n = 2; cp = cast(u32, b0 & 0x1F); }
+    else if (b0 & 0xF0) == 0xE0 { n = 3; cp = cast(u32, b0 & 0x0F); }
+    else if (b0 & 0xF8) == 0xF0 { n = 4; cp = cast(u32, b0 & 0x07); }
+    else { return 0; }
+    if pos + n > lx.src.len { return 0; }
+    for i32 i = 1; i < n; i++ {
+        u8 b = lx_at(lx, pos + i);
+        if (b & 0xC0) != 0x80 { return 0; }
+        cp = (cp << 6) | cast(u32, b & 0x3F);
+    }
+    *len = n;
+    return cp;
+}
+
+// Identifier start/continue at `pos`, ASCII or not. *len receives the
+// number of bytes the character occupies.
+private bool id_start_at(Lexer* lx, i32 pos, i32* len) {
+    u8 c = lx_at(lx, pos);
+    if c < 0x80 { *len = 1; return is_id_start(c); }
+    u32 cp = utf8_decode_at(lx, pos, len);
+    return cp != 0 && uni_is_id_start(cp);
+}
+
+private bool id_part_at(Lexer* lx, i32 pos, i32* len) {
+    u8 c = lx_at(lx, pos);
+    if c < 0x80 { *len = 1; return is_id_part(c); }
+    u32 cp = utf8_decode_at(lx, pos, len);
+    return cp != 0 && uni_is_id_cont(cp);
 }
 
 // WTF-8: lone surrogates encode like normal 3-byte sequences; the
@@ -437,17 +513,19 @@ private void scan_ident(Lexer* lx, Token* t) {
         }
         esc = true;
     } else {
-        lx.pos++;
+        i32 n;
+        ignore id_start_at(lx, lx.pos, &n);
+        lx.pos += n;
     }
     while lx.pos < lx.src.len {
         u8 c = lx_cur(lx);
         if c == '\\' {
             if scan_ident_escape(lx) < 0 { break; }
             esc = true;
-        } else if is_id_part(c) {
-            lx.pos++;
         } else {
-            break;
+            i32 n;
+            if !id_part_at(lx, lx.pos, &n) { break; }
+            lx.pos += n;
         }
     }
     if esc { t.text = decode_ident(lx, a, lx.pos); }
@@ -462,13 +540,15 @@ private void scan_ident(Lexer* lx, Token* t) {
 
 private void scan_private_name(Lexer* lx, Token* t) {
     lx.pos++;
-    if lx.pos >= lx.src.len || !is_id_start(lx_cur(lx)) {
+    i32 n;
+    if lx.pos >= lx.src.len || !id_start_at(lx, lx.pos, &n) {
         lex_error(lx, lx.pos - 1, lx.pos, "expected identifier after '#'");
         t.kind = TOK_ERROR;
         return;
     }
     i32 a = lx.pos;
-    while lx.pos < lx.src.len && is_id_part(lx_cur(lx)) { lx.pos++; }
+    lx.pos += n;
+    while lx.pos < lx.src.len && id_part_at(lx, lx.pos, &n) { lx.pos += n; }
     t.kind = TOK_PRIVATE_NAME;
     t.text = lx_view(lx, a, lx.pos);
 }
@@ -927,7 +1007,8 @@ Token lexer_next(Lexer* lx) {
         return t;
     }
     u8 c = lx_cur(lx);
-    if is_id_start(c) || (c == '\\' && lx_at(lx, lx.pos + 1) == 'u') {
+    i32 idlen;
+    if id_start_at(lx, lx.pos, &idlen) || (c == '\\' && lx_at(lx, lx.pos + 1) == 'u') {
         scan_ident(lx, &t);
     } else if is_digit(c) {
         scan_number(lx, &t);
