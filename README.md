@@ -19,7 +19,8 @@ including Unicode property escapes.
 A subset of the Node.js standard library is implemented: `fs` (with
 `fs/promises`), `path`, `os`, `events`, `stream`, `util`, `buffer`,
 `zlib`, `assert`, `process`, `timers`, and `tty`; `crypto` provides
-SHA-256 and the `random*` functions. Networking covers `net`, `http`,
+MD5/SHA-1/SHA-256/SHA-384/SHA-512 hashes, HMAC, and the `random*`
+functions. Networking covers `net`, `http`,
 and `https` clients and servers, the `fetch` and `URL` globals, and a
 TLS 1.3 stack: the client validates the server certificate against a
 bundled root store, and the server presents an ECDSA-P256 or RSA

@@ -23,6 +23,7 @@ import inflate;
 import net_os;
 import tls_native;
 import tls_chain;
+import "tls/picotls.mc";   // cifra SHA-384/512 for the crypto module's digests
 
 // Platform math not covered by the math module: hyperbolic functions
 // and the accurate log1p/expm1, used by the extra Math.* methods.
@@ -10705,6 +10706,209 @@ private void sha256_hash(u8* data, i32 len, u8* out) {
     }
 }
 
+// MD5 (RFC 1321). Legacy, but createHash('md5') is common; cifra ships no MD5.
+
+private u32 md5_lrot(u32 x, u32 c) { return (x << c) | (x >> (32 - c)); }
+
+private void md5_block(u8* block, u32* st, u32* kt, u8* sh) {
+    u32[16] m;
+    for i32 i = 0; i < 16; i++ {
+        i32 off = i * 4;
+        u32 b0 = cast(u32, *(block + off));
+        u32 b1 = cast(u32, *(block + off + 1));
+        u32 b2 = cast(u32, *(block + off + 2));
+        u32 b3 = cast(u32, *(block + off + 3));
+        m[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);   // little-endian
+    }
+    u32 a = *(st + 0);
+    u32 b = *(st + 1);
+    u32 c = *(st + 2);
+    u32 d = *(st + 3);
+    for i32 i = 0; i < 64; i++ {
+        u32 f;
+        i32 g;
+        if i < 16 { f = (b & c) | ((~b) & d); g = i; }
+        else if i < 32 { f = (d & b) | ((~d) & c); g = (5 * i + 1) & 15; }
+        else if i < 48 { f = b ^ c ^ d; g = (3 * i + 5) & 15; }
+        else { f = c ^ (b | (~d)); g = (7 * i) & 15; }
+        f = f + a + *(kt + i) + m[g];
+        a = d; d = c; c = b;
+        b = b + md5_lrot(f, cast(u32, *(sh + i)));
+    }
+    *(st + 0) = *(st + 0) + a;
+    *(st + 1) = *(st + 1) + b;
+    *(st + 2) = *(st + 2) + c;
+    *(st + 3) = *(st + 3) + d;
+}
+
+private void md5_hash(u8* data, i32 len, u8* out) {
+    u32[64] kt = {
+        0xD76AA478, 0xE8C7B756, 0x242070DB, 0xC1BDCEEE, 0xF57C0FAF, 0x4787C62A, 0xA8304613, 0xFD469501,
+        0x698098D8, 0x8B44F7AF, 0xFFFF5BB1, 0x895CD7BE, 0x6B901122, 0xFD987193, 0xA679438E, 0x49B40821,
+        0xF61E2562, 0xC040B340, 0x265E5A51, 0xE9B6C7AA, 0xD62F105D, 0x02441453, 0xD8A1E681, 0xE7D3FBC8,
+        0x21E1CDE6, 0xC33707D6, 0xF4D50D87, 0x455A14ED, 0xA9E3E905, 0xFCEFA3F8, 0x676F02D9, 0x8D2A4C8A,
+        0xFFFA3942, 0x8771F681, 0x6D9D6122, 0xFDE5380C, 0xA4BEEA44, 0x4BDECFA9, 0xF6BB4B60, 0xBEBFBC70,
+        0x289B7EC6, 0xEAA127FA, 0xD4EF3085, 0x04881D05, 0xD9D4D039, 0xE6DB99E5, 0x1FA27CF8, 0xC4AC5665,
+        0xF4292244, 0x432AFF97, 0xAB9423A7, 0xFC93A039, 0x655B59C3, 0x8F0CCC92, 0xFFEFF47D, 0x85845DD1,
+        0x6FA87E4F, 0xFE2CE6E0, 0xA3014314, 0x4E0811A1, 0xF7537E82, 0xBD3AF235, 0x2AD7D2BB, 0xEB86D391
+    };
+    u8[64] sh = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+    };
+    u32[4] st = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476 };
+    i32 pos = 0;
+    while pos + 64 <= len {
+        md5_block(data + pos, &st[0], &kt[0], &sh[0]);
+        pos = pos + 64;
+    }
+    u8[128] fb;
+    memset(cast(void*, &fb[0]), 0, 128);
+    i32 rem = len - pos;
+    if rem > 0 { memcpy(cast(void*, &fb[0]), cast(void*, data + pos), cast(i64, rem)); }
+    fb[rem] = 0x80;
+    i32 nb = rem >= 56 ? 128 : 64;
+    i64 bitlen = cast(i64, len) * 8;
+    for i32 i = 0; i < 8; i++ { fb[nb - 8 + i] = cast(u8, (bitlen >> (i * 8)) & 0xFF); }   // little-endian length
+    md5_block(&fb[0], &st[0], &kt[0], &sh[0]);
+    if nb == 128 { md5_block(&fb[64], &st[0], &kt[0], &sh[0]); }
+    for i32 i = 0; i < 4; i++ {
+        u32 v = st[i];
+        *(out + i * 4) = cast(u8, v & 0xFF);
+        *(out + i * 4 + 1) = cast(u8, (v >> 8) & 0xFF);
+        *(out + i * 4 + 2) = cast(u8, (v >> 16) & 0xFF);
+        *(out + i * 4 + 3) = cast(u8, (v >> 24) & 0xFF);
+    }
+}
+
+// SHA-1 (FIPS 180-4). Legacy, but createHash('sha1') is common; cifra ships no SHA-1.
+
+private u32 sha1_lrot(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
+
+private void sha1_block(u8* block, u32* h) {
+    u32[80] w;
+    for i32 i = 0; i < 16; i++ {
+        i32 off = i * 4;
+        u32 b0 = cast(u32, *(block + off));
+        u32 b1 = cast(u32, *(block + off + 1));
+        u32 b2 = cast(u32, *(block + off + 2));
+        u32 b3 = cast(u32, *(block + off + 3));
+        w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+    for i32 i = 16; i < 80; i++ {
+        u32 v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+        w[i] = sha1_lrot(v, 1);
+    }
+    u32 a = *(h + 0);
+    u32 b = *(h + 1);
+    u32 c = *(h + 2);
+    u32 d = *(h + 3);
+    u32 e = *(h + 4);
+    for i32 i = 0; i < 80; i++ {
+        u32 f;
+        u32 k;
+        if i < 20 { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+        else if i < 40 { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if i < 60 { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        u32 t = sha1_lrot(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = sha1_lrot(b, 30); b = a; a = t;
+    }
+    *(h + 0) = *(h + 0) + a;
+    *(h + 1) = *(h + 1) + b;
+    *(h + 2) = *(h + 2) + c;
+    *(h + 3) = *(h + 3) + d;
+    *(h + 4) = *(h + 4) + e;
+}
+
+private void sha1_hash(u8* data, i32 len, u8* out) {
+    u32[5] h = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+    i32 pos = 0;
+    while pos + 64 <= len {
+        sha1_block(data + pos, &h[0]);
+        pos = pos + 64;
+    }
+    u8[128] fb;
+    memset(cast(void*, &fb[0]), 0, 128);
+    i32 rem = len - pos;
+    if rem > 0 { memcpy(cast(void*, &fb[0]), cast(void*, data + pos), cast(i64, rem)); }
+    fb[rem] = 0x80;
+    i32 nb = rem >= 56 ? 128 : 64;
+    i64 bitlen = cast(i64, len) * 8;
+    for i32 i = 0; i < 8; i++ { fb[nb - 1 - i] = cast(u8, (bitlen >> (i * 8)) & 0xFF); }   // big-endian length
+    sha1_block(&fb[0], &h[0]);
+    if nb == 128 { sha1_block(&fb[64], &h[0]); }
+    for i32 i = 0; i < 5; i++ {
+        u32 v = h[i];
+        *(out + i * 4) = cast(u8, v >> 24);
+        *(out + i * 4 + 1) = cast(u8, (v >> 16) & 0xFF);
+        *(out + i * 4 + 2) = cast(u8, (v >> 8) & 0xFF);
+        *(out + i * 4 + 3) = cast(u8, v & 0xFF);
+    }
+}
+
+// Digest algorithms are keyed by their output length, which is unique across
+// the supported set: md5=16, sha1=20, sha256=32, sha384=48, sha512=64.
+// Returns the length, or -1 for an unsupported name.
+private i32 crypto_algo_id(str a) {
+    if ci_eq(a, "md5") { return 16; }
+    if ci_eq(a, "sha1") || ci_eq(a, "sha-1") { return 20; }
+    if ci_eq(a, "sha256") || ci_eq(a, "sha-256") { return 32; }
+    if ci_eq(a, "sha384") || ci_eq(a, "sha-384") { return 48; }
+    if ci_eq(a, "sha512") || ci_eq(a, "sha-512") { return 64; }
+    return 0 - 1;
+}
+
+// HMAC block size: 64 for md5/sha1/sha256, 128 for sha384/sha512.
+private i32 crypto_algo_block_len(i32 dlen) { return dlen <= 32 ? 64 : 128; }
+
+// One-shot hash of `len` bytes at `data` into `dlen` output bytes.
+private void crypto_algo_hash(i32 dlen, u8* data, i32 len, u8* out) {
+    if dlen == 16 { md5_hash(data, len, out); }
+    else if dlen == 20 { sha1_hash(data, len, out); }
+    else if dlen == 32 { sha256_hash(data, len, out); }
+    else if dlen == 48 {
+        cf_sha512_context st;
+        cf_sha384_init(&st);
+        cf_sha384_update(&st, cast(void*, data), cast(u64, len));
+        cf_sha384_digest_final(&st, out);
+    } else {
+        cf_sha512_context st;
+        cf_sha512_init(&st);
+        cf_sha512_update(&st, cast(void*, data), cast(u64, len));
+        cf_sha512_digest_final(&st, out);
+    }
+}
+
+// HMAC (RFC 2104): H((K0^opad) || H((K0^ipad) || msg)), where K0 is the key
+// hashed down if it exceeds the block, else zero-padded to the block.
+private void hmac_compute(i32 dlen, u8* key, i32 klen, u8* msg, i32 mlen, u8* out) {
+    i32 bs = crypto_algo_block_len(dlen);
+    u8* k0 = alloc<u8>(bs);
+    memset(cast(void*, k0), 0, cast(i64, bs));
+    if klen > bs {
+        crypto_algo_hash(dlen, key, klen, k0);   // rest of k0 stays zero
+    } else if klen > 0 {
+        memcpy(cast(void*, k0), cast(void*, key), cast(i64, klen));
+    }
+    i32 inner_len = bs + mlen;
+    u8* inner = alloc<u8>(inner_len > 0 ? inner_len : 1);
+    for i32 i = 0; i < bs; i++ { *(inner + i) = *(k0 + i) ^ 0x36; }
+    if mlen > 0 { memcpy(cast(void*, inner + bs), cast(void*, msg), cast(i64, mlen)); }
+    u8[64] ihash;
+    crypto_algo_hash(dlen, inner, inner_len, &ihash[0]);
+    i32 outer_len = bs + dlen;
+    u8* outer = alloc<u8>(outer_len);
+    for i32 i = 0; i < bs; i++ { *(outer + i) = *(k0 + i) ^ 0x5C; }
+    memcpy(cast(void*, outer + bs), cast(void*, &ihash[0]), cast(i64, dlen));
+    crypto_algo_hash(dlen, outer, outer_len, out);
+    free(k0);
+    free(inner);
+    free(outer);
+}
+
 // Platform CSPRNG: fills `n` bytes at `buf`. Returns false if unavailable.
 when os(windows) {
     private extern "advapi32.dll" u8 SystemFunction036(void* buf, u32 len);
@@ -10750,23 +10954,52 @@ else {
     tsmc_unsupported_target__add_a_when_os_arm _unsupported_random;
 }
 
-private bool crypto_is_sha256(str a) {
-    return ci_eq(a, "sha256") || ci_eq(a, "sha-256");
+// Coerce a key/data argument to a byte Buffer: a Buffer passes through, a
+// string is encoded as UTF-8.
+private Value crypto_to_byte_buffer(VM* vm, Value v) {
+    if value_is_array(v) { return v; }
+    Value s = js_to_string_value(vm, v);
+    vm_push(vm, s);
+    str_buf sb;
+    str_buf_init(&sb);
+    str_to_bytes(&sb, sview(s), ENC_UTF8);
+    Value b = buf_from_bytes(vm, sb.data, sb.len);
+    str_buf_free(&sb);
+    vm_pop(vm);
+    return b;
+}
+
+// digest([encoding]): a Buffer of the raw bytes, or an encoded string when an
+// encoding is given. Shared by Hash and Hmac.
+private Value crypto_finalize_digest(VM* vm, u8* bytes, i32 dlen, Value encv) {
+    Value b = buf_from_bytes(vm, bytes, dlen);
+    if value_is_string(encv) {
+        vm_push(vm, b);
+        i32 enc = buf_parse_enc(encv, ENC_HEX);
+        Value r = bytes_to_str(vm, value_as_object(b), enc, 0, dlen);
+        vm_pop(vm);
+        return r;
+    }
+    return b;
 }
 
 private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
     vm_push(vm, algv);
-    if !crypto_is_sha256(sview(algv)) {
+    i32 id = crypto_algo_id(sview(algv));
+    if id < 0 {
         vm_pop(vm);
-        vm_throw_error(vm, ERR_ERROR, "Digest method not supported (only sha256)");
+        vm_throw_error(vm, ERR_ERROR, "Digest method not supported");
         return value_undefined();
     }
     JsObject* h = js_new_object(&vm.heap, vm.crypto_hash_proto);
     vm_push(vm, value_cell(&h.head));
     Value accbuf = buf_from_bytes(vm, null, 0);
+    vm_push(vm, accbuf);
     props_set_desc(&h.props, bi_atom(vm, "%buf"), accbuf, 0);
+    props_set_desc(&h.props, bi_atom(vm, "%algo"), value_number(cast(f64, id)), 0);
+    vm_pop(vm);   // accbuf
     vm_pop(vm);   // h
     vm_pop(vm);   // algv
     return value_cell(&h.head);
@@ -10808,23 +11041,74 @@ private Value nat_hash_digest(void* vmp, Value callee, Value thisv, Value* args,
         || !value_is_array(bufv) {
         return value_undefined();
     }
+    JsObject* self = value_as_object(thisv);
+    i32 id = 32;
+    Value algov;
+    if js_get_prop(self, bi_atom(vm, "%algo"), &algov) && value_is_number(algov) {
+        id = cast(i32, value_as_f64(algov));
+    }
     JsObject* acc = value_as_object(bufv);
     i32 n = acc.elen;
     u8* data = alloc<u8>(n > 0 ? n : 1);
     for i32 i = 0; i < n; i++ { *(data + i) = cast(u8, buf_byte(acc, i)); }
-    u8[32] digest;
-    sha256_hash(data, n, &digest[0]);
+    u8[64] digest;
+    crypto_algo_hash(id, data, n, &digest[0]);
     free(data);
-    Value b = buf_from_bytes(vm, &digest[0], 32);
-    Value encv = arg_at(args, argc, 0);
-    if value_is_string(encv) {
-        vm_push(vm, b);
-        i32 enc = buf_parse_enc(encv, ENC_HEX);
-        Value r = bytes_to_str(vm, value_as_object(b), enc, 0, 32);
+    return crypto_finalize_digest(vm, &digest[0], id, arg_at(args, argc, 0));
+}
+
+private Value nat_crypto_create_hmac(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, algv);
+    i32 id = crypto_algo_id(sview(algv));
+    if id < 0 {
         vm_pop(vm);
-        return r;
+        vm_throw_error(vm, ERR_ERROR, "Digest method not supported");
+        return value_undefined();
     }
-    return b;
+    Value keybuf = crypto_to_byte_buffer(vm, arg_at(args, argc, 1));
+    vm_push(vm, keybuf);
+    JsObject* h = js_new_object(&vm.heap, vm.crypto_hmac_proto);
+    vm_push(vm, value_cell(&h.head));
+    Value accbuf = buf_from_bytes(vm, null, 0);
+    vm_push(vm, accbuf);
+    props_set_desc(&h.props, bi_atom(vm, "%buf"), accbuf, 0);
+    props_set_desc(&h.props, bi_atom(vm, "%algo"), value_number(cast(f64, id)), 0);
+    props_set_desc(&h.props, bi_atom(vm, "%key"), keybuf, 0);
+    vm_pop(vm);   // accbuf
+    vm_pop(vm);   // h
+    vm_pop(vm);   // keybuf
+    vm_pop(vm);   // algv
+    return value_cell(&h.head);
+}
+
+private Value nat_hmac_digest(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* self = value_as_object(thisv);
+    Value bufv;
+    Value keyv;
+    if !js_get_prop(self, bi_atom(vm, "%buf"), &bufv) || !value_is_array(bufv) { return value_undefined(); }
+    if !js_get_prop(self, bi_atom(vm, "%key"), &keyv) || !value_is_array(keyv) { return value_undefined(); }
+    i32 id = 32;
+    Value algov;
+    if js_get_prop(self, bi_atom(vm, "%algo"), &algov) && value_is_number(algov) {
+        id = cast(i32, value_as_f64(algov));
+    }
+    JsObject* msg = value_as_object(bufv);
+    JsObject* key = value_as_object(keyv);
+    i32 mlen = msg.elen;
+    i32 klen = key.elen;
+    u8* mbytes = alloc<u8>(mlen > 0 ? mlen : 1);
+    for i32 i = 0; i < mlen; i++ { *(mbytes + i) = cast(u8, buf_byte(msg, i)); }
+    u8* kbytes = alloc<u8>(klen > 0 ? klen : 1);
+    for i32 i = 0; i < klen; i++ { *(kbytes + i) = cast(u8, buf_byte(key, i)); }
+    u8[64] out;
+    hmac_compute(id, kbytes, klen, mbytes, mlen, &out[0]);
+    free(mbytes);
+    free(kbytes);
+    return crypto_finalize_digest(vm, &out[0], id, arg_at(args, argc, 0));
 }
 
 private Value nat_crypto_random_bytes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10905,9 +11189,15 @@ private JsObject* build_crypto_module(VM* vm) {
     def_method(vm, vm.crypto_hash_proto, "update", &nat_hash_update);
     def_method(vm, vm.crypto_hash_proto, "digest", &nat_hash_digest);
 
+    // Hmac shares update() (both accumulate into %buf); only digest differs.
+    vm.crypto_hmac_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_method(vm, vm.crypto_hmac_proto, "update", &nat_hash_update);
+    def_method(vm, vm.crypto_hmac_proto, "digest", &nat_hmac_digest);
+
     JsObject* mod;
     JsObject* ns = new_node_module(vm, &mod);
     def_node_export(vm, mod, ns, "createHash", &nat_crypto_create_hash);
+    def_node_export(vm, mod, ns, "createHmac", &nat_crypto_create_hmac);
     def_node_export(vm, mod, ns, "randomBytes", &nat_crypto_random_bytes);
     def_node_export(vm, mod, ns, "randomFillSync", &nat_crypto_random_fill_sync);
     def_node_export(vm, mod, ns, "randomUUID", &nat_crypto_random_uuid);
