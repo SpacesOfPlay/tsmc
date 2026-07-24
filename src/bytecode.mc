@@ -17,6 +17,7 @@ enum Op {
     OP_CURFUNC,      // pushes the currently-executing function (named fn expr)
     OP_NEWTARGET,    // pushes new.target: the constructor, or undefined
     OP_SUPERCALL,    // like OP_CALL but propagates the caller's new.target
+    OP_DYNIMPORT,    // pops (referrer, spec); pushes a promise of the namespace
 
     OP_GETLOCAL,     // u16 slot
     OP_SETLOCAL,     // u16 slot; keeps value on stack

@@ -252,6 +252,27 @@ private i32 name_const(Compiler* co, str name) {
     return ch_add_const(&co.cur.ch, value_int(cast(i32, a)));
 }
 
+// import.meta.url as a file:// URL of the current module, built at compile
+// time from its path (backslashes normalized, a leading slash before a
+// Windows drive letter).
+private i32 import_meta_url_const(Compiler* co) {
+    str p = co.src_name;
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "file://");
+    if p.len == 0 || (*(p.data) != '/' && *(p.data) != '\\') {
+        str_buf_add_byte(&sb, cast(u8, '/'));
+    }
+    for i32 i = 0; i < p.len; i++ {
+        u8 c = *(p.data + i);
+        if c == cast(u8, '\\') { c = cast(u8, '/'); }
+        str_buf_add_byte(&sb, c);
+    }
+    i32 idx = str_const(co, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return idx;
+}
+
 // Numeric property keys stringify the JS way: 1, not 1.0.
 private i32 num_key_const(Compiler* co, f64 num) {
     i64 iv = cast(i64, num);
@@ -972,6 +993,19 @@ private void compile_opt_chain(Compiler* co, Node* n) {
 private void compile_call(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     Node* callee = n.a;
+    if callee.kind == N_IMPORT_EXPR {
+        // dynamic import(spec): compile the specifier, then hand it and this
+        // module's path to the runtime loader (OP_DYNIMPORT -> a promise).
+        if n.kids.len < 1 {
+            cerror(co, n, "import() requires exactly one argument");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        compile_expr(co, *(n.kids.items + 0));
+        ch_op_u16(ch, OP_CONST, str_const(co, co.src_name));
+        ch_op(ch, OP_DYNIMPORT);
+        return;
+    }
     if callee.kind == N_SUPER {
         if !super_available(co) {
             cerror(co, n, "super outside a derived class constructor");
@@ -1058,6 +1092,20 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_IDENT { emit_load_ident(co, n); return; }
+    if k == N_IMPORT_META {
+        // import.meta: an object exposing `url` (a file:// URL of this module).
+        ch_op(ch, OP_NEWOBJ);
+        ch_op(ch, OP_DUP);
+        ch_op_u16(ch, OP_CONST, import_meta_url_const(co));
+        ch_op_u16(ch, OP_SETPROP, name_const(co, "url"));
+        ch_op(ch, OP_POP);
+        return;
+    }
+    if k == N_IMPORT_EXPR {
+        cerror(co, n, "import is only valid as import(...) or import.meta");
+        ch_op(ch, OP_UNDEF);
+        return;
+    }
     if k == N_THIS {
         FScope* fs = co.cur;
         str nm = "this";

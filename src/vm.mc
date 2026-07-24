@@ -93,6 +93,11 @@ struct IoHandle {
 // dependency on builtins.
 type ReactorHook = fn(VM*, i32, i16): void;
 
+// Dynamic import — `import(spec)` — evaluated by the module layer. Installed
+// there, so vm.mc stays free of the module/loader machinery. Takes (spec,
+// referrer path) and returns a promise of the module namespace.
+type DynImportHook = fn(VM*, Value, Value): Value;
+
 // Builds the `arguments` object from a call's argument values, installed by
 // builtins so vm.mc's call sites stay free of the object/iterator builtins.
 type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
@@ -175,6 +180,8 @@ struct VM {
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
     ReactorHook reactor_hook;   // net module's ready-handle dispatcher, or null
+    DynImportHook dynimport_hook;   // module layer's import(spec), or null
+    void* esm_loader;           // persistent ESM Loader for dynamic import, or null
     ArgumentsBuilder arguments_builder;   // builds `arguments`, or null
     Vec<Value> symbols;      // registry: id - 0x80000000 -> symbol cell
     Value sym_iterator;      // well-known Symbol.iterator
@@ -1988,6 +1995,8 @@ void vm_init(VM* vm) {
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
     vm.reactor_hook = null;
+    vm.dynimport_hook = null;
+    vm.esm_loader = null;
     vm.arguments_builder = null;
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
@@ -2206,6 +2215,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 else { vpush(vm, value_undefined()); }
             }
             case OP_NEWTARGET: { vpush(vm, fr.new_target); }
+            case OP_DYNIMPORT: {
+                // spec and referrer stay on the stack (rooted) across the hook,
+                // which allocates the promise and may load/evaluate a module.
+                Value spec = vpeek(vm, 1);
+                Value referrer = vpeek(vm, 0);
+                Value result = value_undefined();
+                if vm.dynimport_hook != null {
+                    result = vm.dynimport_hook(vm, spec, referrer);
+                }
+                vpop(vm);
+                vpop(vm);
+                vpush(vm, result);
+            }
             case OP_GETLOCAL: {
                 vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;
@@ -3958,6 +3980,9 @@ void* vm_handle_ext(VM* vm, i32 idx) {
 }
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
+void vm_set_dynimport_hook(VM* vm, DynImportHook h) { vm.dynimport_hook = h; }
+void* vm_esm_loader(VM* vm) { return vm.esm_loader; }
+void vm_set_esm_loader(VM* vm, void* p) { vm.esm_loader = p; }
 void vm_set_arguments_builder(VM* vm, ArgumentsBuilder b) { vm.arguments_builder = b; }
 
 // Build the arguments object for a call whose template needs it. Args live at

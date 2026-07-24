@@ -508,15 +508,10 @@ private void module_free(Module* mod) {
     free(mod);
 }
 
-// Loads and runs an entry module and its graph. Returns the exit code.
-i32 module_run(VM* vm, str entry_path) {
-    Loader ld;
-    ld.vm = vm;
-    vec_init<ModulePtr>(&ld.mods, 8);
-    diags_init(&ld.diags);
-    ld.failed = false;
-
-    i32 entry = load_module(&ld, entry_path);
+// Loads and runs an entry module and its graph in the caller-owned loader
+// (shared with dynamic import). Returns the exit code; the caller frees `ld`.
+private i32 module_run(VM* vm, Loader* ld, str entry_path) {
+    i32 entry = load_module(ld, entry_path);
     i32 status = 0;
     if ld.failed || ld.diags.n_errors > 0 {
         if ld.diags.n_errors > 0 {
@@ -527,16 +522,10 @@ i32 module_run(VM* vm, str entry_path) {
         }
         status = 2;
     } else {
-        status = eval_module(&ld, entry);
+        status = eval_module(ld, entry);
         if status == 0 { status = vm_run_event_loop(vm); }
         if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
     }
-
-    for i32 i = 0; i < ld.mods.len; i++ {
-        module_free(vec_get(&ld.mods, i));
-    }
-    vec_free(&ld.mods);
-    diags_free(&ld.diags);
     return status;
 }
 
@@ -1323,6 +1312,187 @@ private Value nat_g_response(void* vmp, Value callee, Value thisv, Value* args, 
     return webapi_class(cast(VM*, vmp), "Response");
 }
 
+// --- dynamic import() -------------------------------------------------------
+
+private bool path_ends_with(str p, str ext) {
+    if p.len < ext.len { return false; }
+    for i32 i = 0; i < ext.len; i++ {
+        if *(p.data + p.len - ext.len + i) != *(ext.data + i) { return false; }
+    }
+    return true;
+}
+private bool path_is_mjs(str p) { return path_ends_with(p, ".mjs") || path_ends_with(p, ".mts"); }
+private bool path_is_cjs(str p) { return path_ends_with(p, ".cjs") || path_ends_with(p, ".cts"); }
+private bool path_is_json(str p) { return path_ends_with(p, ".json"); }
+
+private Value take_pending(VM* vm) {
+    Value e = vm.pending;
+    vm.has_pending = false;
+    vm.pending = value_undefined();
+    return e;
+}
+
+// Constructs (but does not throw) an error value to reject the import promise.
+private Value make_reject_error(VM* vm, i32 kind, str msg) {
+    vm_throw_error(vm, kind, msg);
+    return take_pending(vm);
+}
+
+// Post-order evaluation that CAPTURES a throw (to reject the import promise)
+// rather than printing it. Returns true on success; on throw sets *err.
+private bool dyn_eval(Loader* ld, i32 idx, Value* err) {
+    VM* vm = ld.vm;
+    Module* mod = vec_get(&ld.mods, idx);
+    if mod.state == MOD_DONE || mod.state == MOD_EVALUATING { return true; }
+    if mod.tmpl == null {
+        *err = make_reject_error(vm, ERR_SYNTAX, "module failed to compile");
+        return false;
+    }
+    mod.state = MOD_EVALUATING;
+    for i32 i = 0; i < mod.dep_idx.len; i++ {
+        i32 dep = vec_get(&mod.dep_idx, i);
+        if dep < 0 { continue; }
+        if !dyn_eval(ld, dep, err) { return false; }
+    }
+    i32 nargs = 1 + mod.dep_idx.len;
+    Value* argv = alloc<Value>(nargs);
+    *(argv) = value_cell(&mod.ns.head);
+    for i32 i = 0; i < mod.dep_idx.len; i++ {
+        i32 dep = vec_get(&mod.dep_idx, i);
+        if dep >= 0 {
+            *(argv + i + 1) = value_cell(&vec_get(&ld.mods, dep).ns.head);
+        } else {
+            *(argv + i + 1) = value_undefined();
+        }
+    }
+    JsFunction* f = js_new_function(&vm.heap, mod.tmpl, 0);
+    ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), argv, nargs);
+    free(argv);
+    mod.state = MOD_DONE;
+    if vm.has_pending {
+        *err = take_pending(vm);
+        return false;
+    }
+    return true;
+}
+
+// import(spec) from `referrer`: resolves and loads the target, returning its
+// namespace. On failure sets *ok=false and *err to the rejection value.
+// ESM files evaluate through the shared loader (singleton, deps supported);
+// builtins / CJS / JSON go through require() with Node's default+named interop.
+private Value module_dynamic_import_ns(VM* vm, str spec, str referrer, bool* ok, Value* err) {
+    *ok = true;
+
+    str bname = builtin_name(spec);
+    if bname.data != null {
+        Value ex = module_require(vm, referrer, spec);
+        if vm.has_pending { *ok = false; *err = take_pending(vm); return value_undefined(); }
+        JsObject* ns = js_builtin_namespace(vm, ex);
+        return value_cell(&ns.head);
+    }
+
+    str resolved = resolve_specifier(referrer, spec);
+    if resolved.data == null {
+        // not an ESM file path — defer to the require resolver (packages, CJS)
+        Value ex = module_require(vm, referrer, spec);
+        if vm.has_pending { *ok = false; *err = take_pending(vm); return value_undefined(); }
+        JsObject* ns = js_builtin_namespace(vm, ex);
+        return value_cell(&ns.head);
+    }
+
+    bool is_esm = path_is_mjs(resolved);
+    if !is_esm && !path_is_cjs(resolved) && !path_is_json(resolved) {
+        FileData fd = file_read(resolved);
+        if fd.data != null {
+            str s;
+            s.data = fd.data;
+            s.len = fd.len;
+            is_esm = has_module_syntax(s);
+            free(fd.data);
+        }
+    }
+
+    if !is_esm {
+        free(resolved.data);
+        Value ex = module_require(vm, referrer, spec);
+        if vm.has_pending { *ok = false; *err = take_pending(vm); return value_undefined(); }
+        JsObject* ns = js_builtin_namespace(vm, ex);
+        return value_cell(&ns.head);
+    }
+
+    // ESM: load the subgraph into the shared loader (deduped with static
+    // modules) and evaluate, capturing any throw.
+    Loader* ld = cast(Loader*, vm_esm_loader(vm));
+    if ld == null {
+        free(resolved.data);
+        *ok = false;
+        *err = make_reject_error(vm, ERR_ERROR, "dynamic import is unavailable here");
+        return value_undefined();
+    }
+    i32 before_errors = ld.diags.n_errors;
+    bool saved_failed = ld.failed;
+    ld.failed = false;
+    i32 idx = load_module(ld, resolved);
+    bool load_bad = ld.failed || ld.diags.n_errors > before_errors || idx < 0;
+    ld.failed = saved_failed;
+    free(resolved.data);
+    if load_bad {
+        *ok = false;
+        *err = make_reject_error(vm, ERR_SYNTAX, "error loading dynamically imported module");
+        return value_undefined();
+    }
+    Value everr = value_undefined();
+    if !dyn_eval(ld, idx, &everr) {
+        *ok = false;
+        *err = everr;
+        return value_undefined();
+    }
+    Module* mod = vec_get(&ld.mods, idx);
+    return value_cell(&mod.ns.head);
+}
+
+// Installed as vm.dynimport_hook: runs import(spec) and returns a settled
+// promise of the namespace (or the rejection).
+private Value dynimport_hook(VM* vm, Value specv, Value referrerv) {
+    Value pv = vm_promise_new(vm);
+    vm_push(vm, pv);
+
+    Value sv = js_to_string_value(vm, specv);
+    if vm.has_pending {
+        Value e = take_pending(vm);
+        vm_push(vm, e);
+        vm_promise_settle(vm, pv, e, true);
+        vm_pop(vm);   // e
+        vm_pop(vm);   // pv
+        return pv;
+    }
+    vm_push(vm, sv);
+
+    str spec = js_str_view(sv);
+    str referrer;
+    referrer.data = null;
+    referrer.len = 0;
+    if value_is_string(referrerv) { referrer = js_str_view(referrerv); }
+
+    bool ok = true;
+    Value err = value_undefined();
+    Value ns = module_dynamic_import_ns(vm, spec, referrer, &ok, &err);
+
+    vm_pop(vm);   // sv
+
+    if ok {
+        vm_push(vm, ns);
+        vm_promise_settle(vm, pv, ns, false);
+        vm_pop(vm);
+    } else {
+        vm_push(vm, err);
+        vm_promise_settle(vm, pv, err, true);
+        vm_pop(vm);
+    }
+    vm_pop(vm);   // pv
+    return pv;
+}
+
 i32 module_run_entry(VM* vm, str src, str path) {
     // `fetch` is a global in Node 18+; install it as a lazy native.
     vm_set_global(vm, "fetch", vm_make_native(vm, &nat_fetch, "fetch"));
@@ -1352,14 +1522,33 @@ i32 module_run_entry(VM* vm, str src, str path) {
     str resolve_path = path;
     if !spec_is_absolute(path) { resolve_path = fclean; }
 
+    // A persistent loader shared by static loading and dynamic import(), so a
+    // module imported both ways is one instance. It outlives the whole run
+    // (including the event loop), where every dynamic import happens.
+    Loader ld;
+    ld.vm = vm;
+    vec_init<ModulePtr>(&ld.mods, 8);
+    diags_init(&ld.diags);
+    ld.failed = false;
+    vm_set_esm_loader(vm, cast(void*, &ld));
+    vm_set_dynimport_hook(vm, &dynimport_hook);
+
     i32 rc;
-    if has_module_syntax(src) {
-        rc = module_run(vm, resolve_path);
+    if has_module_syntax(src) || path_is_mjs(path) {
+        rc = module_run(vm, &ld, resolve_path);
     } else {
         // plain script: expose a CommonJS `require` bound to the entry file
         vm_set_global(vm, "require", make_require_fn(vm, resolve_path));
         rc = vm_run_source(vm, src, resolve_path);
     }
+
+    vm_set_esm_loader(vm, null);
+    for i32 i = 0; i < ld.mods.len; i++ {
+        module_free(vec_get(&ld.mods, i));
+    }
+    vec_free(&ld.mods);
+    diags_free(&ld.diags);
+
     free(fname.data);
     return rc;
 }

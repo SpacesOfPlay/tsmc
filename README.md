@@ -12,9 +12,10 @@ a precise mark-sweep GC, written in minc. `.js` files run as well, and
 ## What runs
 
 Supported ECMAScript includes classes, generators, async/await,
-top-level await, modules (CommonJS and ESM), Proxy/Reflect, BigInt,
-typed arrays, `Map`/`Set`/`WeakMap`/`WeakSet`, and regular expressions
-including Unicode property escapes.
+top-level await, modules (CommonJS and ESM, including dynamic
+`import()`), Proxy/Reflect, BigInt, typed arrays,
+`Map`/`Set`/`WeakMap`/`WeakSet`, and regular expressions including
+Unicode property escapes.
 
 A subset of the Node.js standard library is implemented: `fs` (with
 `fs/promises`), `path`, `os`, `events`, `stream`, `util`, `buffer`,
