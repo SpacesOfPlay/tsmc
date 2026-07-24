@@ -2715,6 +2715,27 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(r));
                 }
             }
+            case OP_HASPRIVATE: {
+                // #name in obj: an own/inherited check for the private field's
+                // hidden atom, never routed through a proxy trap. Non-object
+                // right-hand sides throw, like the ordinary `in` operator.
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
+                ip += 2;
+                Value objv = vpeek(vm, 0);
+                if value_is_function(objv) || value_is_native(objv) {
+                    bool r = fn_has_prop(vm, objv, a);
+                    if !vm.has_pending {
+                        vm.sp--;
+                        vpush(vm, value_bool(r));
+                    }
+                } else if value_is_object(objv) {
+                    bool r = js_has_prop(value_as_object(objv), a);
+                    vm.sp--;
+                    vpush(vm, value_bool(r));
+                } else {
+                    vm_throw_error(vm, ERR_TYPE, "Cannot use 'in' to search for a private field in a non-object");
+                }
+            }
             case OP_JUMP: { ip = rd_u16(code, ip); }
             case OP_JUMPF: {
                 i32 target = rd_u16(code, ip);

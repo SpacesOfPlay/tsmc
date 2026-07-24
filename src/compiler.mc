@@ -1106,6 +1106,11 @@ private void compile_expr(Compiler* co, Node* n) {
         ch_op(ch, OP_UNDEF);
         return;
     }
+    if k == N_PRIVATE_IDENT {
+        cerror(co, n, "a private name is only valid as the left side of 'in'");
+        ch_op(ch, OP_UNDEF);
+        return;
+    }
     if k == N_THIS {
         FScope* fs = co.cur;
         str nm = "this";
@@ -1290,6 +1295,12 @@ private void compile_expr(Compiler* co, Node* n) {
             i32 j = ch_jump(ch, jop);
             compile_expr(co, n.b);
             ch_patch(ch, j);
+            return;
+        }
+        if n.op == TOK_KW_IN && n.a.kind == N_PRIVATE_IDENT {
+            // #name in obj: brand check for the private field's hidden atom.
+            compile_expr(co, n.b);
+            ch_op_u16(ch, OP_HASPRIVATE, private_key_const(co, n.a.name));
             return;
         }
         compile_expr(co, n.a);
