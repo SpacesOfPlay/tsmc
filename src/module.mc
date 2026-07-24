@@ -126,6 +126,7 @@ struct Loader {
     Vec<ModulePtr> mods;
     DiagList diags;
     bool failed;
+    i32 printed;   // diags already reported, each against its own module's source
 }
 
 // --- path handling -----------------------------------------------------------
@@ -399,6 +400,9 @@ private i32 load_module(Loader* ld, str path) {
     lower_init(&lw, &mod.arena, &ld.diags);
     lower_program(&lw, prog);
     if ld.diags.n_errors > 0 {
+        // report against this module's own source, while it is in scope
+        diags_print_from(&ld.diags, mod.path, src, ld.printed);
+        ld.printed = ld.diags.list.len;
         lower_destroy(&lw);
         parser_destroy(&p);
         ld.failed = true;
@@ -421,6 +425,8 @@ private i32 load_module(Loader* ld, str path) {
     mod.ns = vm_new_namespace(ld.vm);
 
     if ld.diags.n_errors > 0 {
+        diags_print_from(&ld.diags, mod.path, src, ld.printed);
+        ld.printed = ld.diags.list.len;
         vec_free(&specs);
         lower_destroy(&lw);
         parser_destroy(&p);
@@ -514,11 +520,14 @@ private i32 module_run(VM* vm, Loader* ld, str entry_path) {
     i32 entry = load_module(ld, entry_path);
     i32 status = 0;
     if ld.failed || ld.diags.n_errors > 0 {
-        if ld.diags.n_errors > 0 {
-            str name;
-            name.data = null;
-            name.len = 0;
-            diags_print(&ld.diags, entry_path, name);
+        // load_module already reported each diagnostic against the source it
+        // came from; anything left is from a module whose source is gone.
+        if ld.diags.list.len > ld.printed {
+            str none;
+            none.data = null;
+            none.len = 0;
+            diags_print_from(&ld.diags, entry_path, none, ld.printed);
+            ld.printed = ld.diags.list.len;
         }
         status = 2;
     } else {
@@ -1042,10 +1051,10 @@ private Value run_js_builtin(VM* vm, str name, str src) {
             JsFunction* f = js_new_function(&vm.heap, t, 0);
             ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
         } else {
-            diags_print(&d, name, name);
+            diags_print(&d, name, src);
         }
     } else {
-        diags_print(&d, name, name);
+        diags_print(&d, name, src);
     }
     parser_destroy(&p);
     lower_destroy(&lw);
@@ -1219,11 +1228,11 @@ Value module_require(VM* vm, str importer_path, str spec) {
             JsFunction* f = js_new_function(&vm.heap, t, 0);
             ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
         } else {
-            diags_print(&d, resolved, owned_name);
+            diags_print(&d, resolved, src);
             vm_throw_error(vm, ERR_SYNTAX, "error compiling required module");
         }
     } else {
-        diags_print(&d, resolved, resolved);
+        diags_print(&d, resolved, src);
         vm_throw_error(vm, ERR_SYNTAX, "error parsing required module");
     }
 
@@ -1530,6 +1539,7 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vec_init<ModulePtr>(&ld.mods, 8);
     diags_init(&ld.diags);
     ld.failed = false;
+    ld.printed = 0;
     vm_set_esm_loader(vm, cast(void*, &ld));
     vm_set_dynimport_hook(vm, &dynimport_hook);
 

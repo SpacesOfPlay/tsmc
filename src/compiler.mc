@@ -1019,7 +1019,7 @@ private void compile_call(Compiler* co, Node* n) {
         if c >= 0 { ch_op_u16(ch, OP_SUPERCALL, c); } else { ch_op(ch, OP_SUPERCALL_ARRAY); }
         return;
     }
-    if callee.kind == N_MEMBER && callee.a.kind == N_SUPER {
+    if (callee.kind == N_MEMBER || callee.kind == N_INDEX) && callee.a.kind == N_SUPER {
         if !super_available(co) {
             cerror(co, n, "super outside a class method");
             ch_op(ch, OP_UNDEF);
@@ -1027,7 +1027,13 @@ private void compile_call(Compiler* co, Node* n) {
         }
         emit_load_name(co, "%super", n);
         ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
-        ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
+        if callee.kind == N_INDEX {
+            compile_expr(co, callee.b);
+            ch_op(ch, OP_GETINDEX);
+        } else {
+            ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
+        }
+        // the receiver stays `this`, as for super.name(...)
         ch_op(ch, OP_THIS);
         i32 c = compile_args(co, &n.kids);
         if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
@@ -1183,14 +1189,18 @@ private void compile_expr(Compiler* co, Node* n) {
                 continue;
             }
             if (p.flags & (NF_GETTER | NF_SETTER)) != 0 {
-                if (p.flags & NF_COMPUTED) != 0 {
-                    cerror(co, p, "computed accessors are not supported yet");
-                    continue;
-                }
                 ch_op(ch, OP_DUP);
-                compile_expr(co, p.b);
-                i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
-                ch_op_u16(ch, aop, prop_key_const(co, p.a));
+                if (p.flags & NF_COMPUTED) != 0 {
+                    compile_expr(co, p.a);
+                    compile_expr(co, p.b);
+                    i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
+                    ch_op_u16(ch, aop, 1);   // object-literal accessors are enumerable
+                } else {
+                    compile_expr(co, p.b);
+                    i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
+                    ch_op_u16(ch, aop, prop_key_const(co, p.a));
+                    ch_u16(ch, 1);   // object-literal accessors are enumerable
+                }
                 ch_op(ch, OP_POP);
                 continue;
             }
@@ -1405,6 +1415,19 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_INDEX {
+        if n.a.kind == N_SUPER {
+            // super[expr]: the computed form of super.name
+            if !super_available(co) {
+                cerror(co, n, "super outside a class method");
+                ch_op(ch, OP_UNDEF);
+                return;
+            }
+            emit_load_name(co, "%super", n);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+            compile_expr(co, n.b);
+            ch_op(ch, OP_GETINDEX);
+            return;
+        }
         if chain_has_opt(n) {
             compile_opt_chain(co, n);
             return;
@@ -1813,19 +1836,20 @@ private void compile_class_expr(Compiler* co, Node* c) {
         if is_method {
             ch_op_u16(ch, OP_GETLOCAL, is_static ? t_ctor : t_proto);
             if (m.flags & NF_COMPUTED) != 0 {
-                if is_acc {
-                    cerror(co, m, "computed accessors are not supported yet");
-                    ch_op(ch, OP_POP);
-                    continue;
-                }
                 compile_expr(co, m.a);
                 compile_function(co, m.b, false);
-                ch_op(ch, OP_SETINDEX);
+                if is_acc {
+                    i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
+                    ch_op_u16(ch, aop, 0);   // class accessors are non-enumerable
+                } else {
+                    ch_op(ch, OP_SETINDEX);
+                }
                 ch_op(ch, OP_POP);
             } else if is_acc {
                 compile_function(co, m.b, false);
                 i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
                 ch_op_u16(ch, aop, prop_key_const(co, m.a));
+                ch_u16(ch, 0);   // class accessors are non-enumerable
                 ch_op(ch, OP_POP);
             } else {
                 compile_function(co, m.b, false);

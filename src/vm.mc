@@ -1280,6 +1280,38 @@ bool fn_has_prop(VM* vm, Value objv, u32 a) {
     return false;
 }
 
+// The accessor for `a` on a function/native receiver: own properties first,
+// then the [[Prototype]] chain (a parent constructor or a plain object), the
+// same walk fn_has_prop does. null when the property is absent or plain data.
+private JsAccessor* fn_find_accessor(Value objv, u32 a) {
+    Value cur = objv;
+    while true {
+        if value_is_object(cur) {
+            JsObject* o = value_as_object(cur);
+            while o != null {
+                Prop* pe = props_entry(&o.props, a);
+                if pe != null {
+                    if value_is_accessor(pe.val) { return value_as_accessor(pe.val); }
+                    return null;
+                }
+                o = o.proto;
+            }
+            return null;
+        }
+        PropList* props = null;
+        if value_is_function(cur) { props = &value_as_function(cur).props; }
+        else if value_is_native(cur) { props = &value_as_native(cur).props; }
+        else { return null; }
+        Prop* pe = props_entry(props, a);
+        if pe != null {
+            if value_is_accessor(pe.val) { return value_as_accessor(pe.val); }
+            return null;
+        }
+        if !value_is_function(cur) { return null; }
+        cur = value_as_function(cur).fproto;
+    }
+}
+
 // Resolves accessor properties through their getter; false = threw.
 bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
     if !get_prop_atom(vm, objv, a, out) { return false; }
@@ -1377,12 +1409,20 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
         js_set_prop(o, a, v);
         return true;
     }
-    if value_is_function(objv) {
-        props_set(&value_as_function(objv).props, a, v);
-        return true;
-    }
-    if value_is_native(objv) {
-        props_set(&value_as_native(objv).props, a, v);
+    if value_is_function(objv) || value_is_native(objv) {
+        // a setter on the function or its [[Prototype]] intercepts the write,
+        // as it does for ordinary objects (static accessors live here)
+        JsAccessor* ac = fn_find_accessor(objv, a);
+        if ac != null {
+            if value_is_callable(ac.set) {
+                Value[1] sa = { v };
+                ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
+                return !vm.has_pending;
+            }
+            return true;   // getter-only property: write ignored
+        }
+        if value_is_function(objv) { props_set(&value_as_function(objv).props, a, v); }
+        else { props_set(&value_as_native(objv).props, a, v); }
         return true;
     }
     if is_nullish(objv) {
@@ -1531,6 +1571,28 @@ private u32 key_to_atom(VM* vm, Value key) {
     u32 a = atom_intern(&vm.atoms, gc_string_view(value_as_string(s)));
     vm.sp--;
     return a;
+}
+
+// Installs `fnv` as the getter or setter of `a` on `objv`, reusing an existing
+// accessor there so a get/set pair defined separately lands on one property.
+private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, bool enumer) {
+    PropList* props = null;
+    if value_is_object(objv) { props = &value_as_object(objv).props; }
+    else if value_is_function(objv) { props = &value_as_function(objv).props; }
+    else if value_is_native(objv) { props = &value_as_native(objv).props; }
+    if props == null { return; }
+    Value* ex = props_get(props, a);
+    JsAccessor* ac = null;
+    if ex != null && value_is_accessor(*ex) {
+        ac = value_as_accessor(*ex);
+    } else {
+        ac = js_new_accessor(&vm.heap);
+        // class accessors are non-enumerable; object-literal ones enumerable
+        u8 attrs = PROP_CONFIGURABLE;
+        if enumer { attrs = PROP_CONFIGURABLE | PROP_ENUMERABLE; }
+        props_set_desc(props, a, value_cell(&ac.head), attrs);
+    }
+    if is_getter { ac.get = fnv; } else { ac.set = fnv; }
 }
 
 // Symbol keys and %-hidden atoms stay out of enumeration.
@@ -3126,24 +3188,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_DEFGETTER, OP_DEFSETTER: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                Value fnv2 = vpeek(vm, 0);
-                Value objv = vpeek(vm, 1);
-                PropList* props = null;
-                if value_is_object(objv) { props = &value_as_object(objv).props; }
-                else if value_is_function(objv) { props = &value_as_function(objv).props; }
-                else if value_is_native(objv) { props = &value_as_native(objv).props; }
-                if props != null {
-                    Value* ex = props_get(props, a);
-                    JsAccessor* ac = null;
-                    if ex != null && value_is_accessor(*ex) {
-                        ac = value_as_accessor(*ex);
-                    } else {
-                        ac = js_new_accessor(&vm.heap);
-                        props_set(props, a, value_cell(&ac.head));
-                    }
-                    if op == OP_DEFGETTER { ac.get = fnv2; } else { ac.set = fnv2; }
-                }
+                bool enumer = rd_u16(code, ip) != 0;
+                ip += 2;
+                def_accessor(vm, vpeek(vm, 1), a, vpeek(vm, 0), op == OP_DEFGETTER, enumer);
                 vm.sp--;
+            }
+            case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: {
+                // computed accessor: `get [expr]() {}` / `set [expr](v) {}`
+                bool enumer = rd_u16(code, ip) != 0;
+                ip += 2;
+                u32 a = key_to_atom(vm, vpeek(vm, 1));
+                if vm.has_pending { break case; }
+                def_accessor(vm, vpeek(vm, 2), a, vpeek(vm, 0), op == OP_DEFGETTER_DYN, enumer);
+                vm.sp -= 2;
             }
             case OP_ARR_APPEND: {
                 Value v = vpeek(vm, 0);

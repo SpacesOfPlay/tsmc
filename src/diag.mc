@@ -85,8 +85,11 @@ LineCol diag_line_col(str src, i32 offset) {
     return lc;
 }
 
-void diags_print(DiagList* d, str src_name, str src) {
-    for i32 i = 0; i < d.list.len; i++ {
+// Prints diagnostics from `start` onward. `src` must be the source text the
+// spans index into — passing anything else (a path, an empty str) collapses
+// every position to line 1.
+void diags_print_from(DiagList* d, str src_name, str src, i32 start) {
+    for i32 i = start; i < d.list.len; i++ {
         Diag dg = vec_get(&d.list, i);
         LineCol lc = diag_line_col(src, dg.span.start);
         str sev = "error";
@@ -94,4 +97,8 @@ void diags_print(DiagList* d, str src_name, str src) {
         if dg.severity == DIAG_NOTE { sev = "note"; }
         eprint("{}:{}:{}: {}: {}\n", src_name, lc.line, lc.col, sev, dg.message);
     }
+}
+
+void diags_print(DiagList* d, str src_name, str src) {
+    diags_print_from(d, src_name, src, 0);
 }

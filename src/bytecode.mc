@@ -71,8 +71,12 @@ enum Op {
     OP_THROW,
 
     OP_SETPROTO,     // [obj, proto] pops proto, keeps obj
-    OP_DEFGETTER,    // u16 name; [obj, fn] pops fn, keeps obj
-    OP_DEFSETTER,    // u16 name; [obj, fn] pops fn, keeps obj
+    // Accessor definition. The trailing u16 is 1 when the property is
+    // enumerable (object literals) and 0 when it is not (class bodies).
+    OP_DEFGETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj
+    OP_DEFSETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj
+    OP_DEFGETTER_DYN,// u16 enum; [obj, key, fn] pops key+fn, keeps obj
+    OP_DEFSETTER_DYN,// u16 enum; [obj, key, fn] pops key+fn, keeps obj
     OP_ARR_APPEND,   // [arr, v] pops v, keeps arr
     OP_ARR_SPREAD,   // [arr, src] pops src; appends elements/chars
     OP_OBJ_SPREAD,   // [obj, src] pops src; copies own props

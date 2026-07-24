@@ -791,6 +791,14 @@ private Node* parse_primary(Parser* p) {
         advance(p);
         return n;
     }
+    // `async function` must be tested before the identifier case: `async` is a
+    // contextual keyword, so the general branch below would swallow it and
+    // leave `function` stranded.
+    if k == TOK_KW_ASYNC && peek(p).kind == TOK_KW_FUNCTION && !peek(p).newline_before {
+        advance(p);
+        advance(p);
+        return parse_function_rest(p, NF_ASYNC, false);
+    }
     if k == TOK_IDENT || is_ctx_ident(k) {
         Node* n = nnew(p, N_IDENT);
         n.name = p.cur.text;
@@ -827,11 +835,6 @@ private Node* parse_primary(Parser* p) {
     if k == TOK_KW_FUNCTION {
         advance(p);
         return parse_function_rest(p, 0, false);
-    }
-    if k == TOK_KW_ASYNC && peek(p).kind == TOK_KW_FUNCTION && !peek(p).newline_before {
-        advance(p);
-        advance(p);
-        return parse_function_rest(p, NF_ASYNC, false);
     }
     if k == TOK_KW_CLASS { return parse_class(p, 0, false); }
     if k == TOK_KW_IMPORT {
