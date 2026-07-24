@@ -86,6 +86,7 @@ struct Compiler {
     FScope* cur;
     str pending_label;
     bool in_module;
+    bool static_this;   // inside a static block / field: `this` is the class ctor
     StrMap<ModImport> mod_imports;   // valid while in_module
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
@@ -100,6 +101,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.pending_label.data = null;
     co.pending_label.len = 0;
     co.in_module = false;
+    co.static_this = false;
     strmap_init<ModImport>(&co.mod_imports);
     co.src.data = null;
     co.src.len = 0;
@@ -1057,13 +1059,17 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_IDENT { emit_load_ident(co, n); return; }
     if k == N_THIS {
-        if co.cur.is_arrow {
-            FScope* fs = co.cur;
-            str nm = "this";
+        FScope* fs = co.cur;
+        str nm = "this";
+        if fs.is_arrow {
             if find_local(fs, nm) >= 0 || resolve_upval(fs, nm) >= 0 {
                 emit_load_name(co, nm, n);
                 return;
             }
+        } else if co.static_this && find_local(fs, nm) >= 0 {
+            // inline static block / field: `this` is the class-scoped binding
+            emit_load_name(co, nm, n);
+            return;
         }
         ch_op(ch, OP_THIS);
         return;
@@ -1640,11 +1646,25 @@ private void compile_class_expr(Compiler* co, Node* c) {
         ch_op(ch, OP_POP);
     }
 
+    // Inner class-name binding: inside the class body the class name refers to
+    // the class itself, initialized before static blocks and static field
+    // initializers run — unlike the outer binding a class *statement* adds,
+    // which is still in TDZ during class creation. `declare` cellifies it
+    // automatically when a method or field initializer closes over it.
+    i32 name_bind = 0 - 1;
+    if c.name.len > 0 {
+        name_bind = declare(co, c.name, true, false);
+        CBind* nb = fs.binds.data + name_bind;
+        if nb.is_cell { ch_op_u16(ch, OP_NEWCELL_UNDEF, nb.slot); }
+    }
+
     // partition members
     Vec<NodePtr> fields = vec_new<NodePtr>(4);
     Node* ctor_member = null;
+    bool has_static = false;
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
+        if m.kind == N_STATIC_BLOCK { has_static = true; continue; }
         if m.kind != N_CLASS_MEMBER { continue; }
         if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
             && (m.flags & (NF_GETTER | NF_SETTER)) == 0
@@ -1654,6 +1674,12 @@ private void compile_class_expr(Compiler* co, Node* c) {
         }
         if member_is_field(m) {
             vec_push(&fields, m);
+            continue;
+        }
+        // a static data member (static field) also runs with `this` = the class
+        if (m.flags & NF_STATIC) != 0 && (m.b == null || m.b.kind != N_FUNCTION)
+            && (m.flags & (NF_GETTER | NF_SETTER)) == 0 {
+            has_static = true;
         }
     }
 
@@ -1672,6 +1698,24 @@ private void compile_class_expr(Compiler* co, Node* c) {
     i32 t_ctor = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_ctor);
     ch_op(ch, OP_POP);
+
+    // Bind the inner class name to the freshly built constructor, so static
+    // blocks / fields and any closure over it see the class value.
+    if name_bind >= 0 {
+        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+        emit_init_binding(co, name_bind);
+    }
+
+    // Static blocks and static field initializers run with `this` bound to the
+    // constructor; expose it as a class-scoped `this` (cellified when a nested
+    // arrow closes over it).
+    if has_static {
+        i32 this_bind = declare(co, "this", true, false);
+        CBind* tb = fs.binds.data + this_bind;
+        if tb.is_cell { ch_op_u16(ch, OP_NEWCELL_UNDEF, tb.slot); }
+        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+        emit_init_binding(co, this_bind);
+    }
 
     // static inheritance: derived ctor's [[Prototype]] is the parent ctor
     if derived {
@@ -1733,12 +1777,17 @@ private void compile_class_expr(Compiler* co, Node* c) {
         }
         if is_static {
             ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+            bool saved_st = co.static_this;
             if (m.flags & NF_COMPUTED) != 0 {
-                compile_expr(co, m.a);
+                compile_expr(co, m.a);   // computed key keeps the outer `this`
+                co.static_this = true;
                 if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+                co.static_this = saved_st;
                 ch_op(ch, OP_SETINDEX);
             } else {
+                co.static_this = true;
                 if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+                co.static_this = saved_st;
                 ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
             }
             ch_op(ch, OP_POP);
@@ -1749,7 +1798,10 @@ private void compile_class_expr(Compiler* co, Node* c) {
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK {
+            bool saved_st = co.static_this;
+            co.static_this = true;
             compile_stmt(co, m.a);
+            co.static_this = saved_st;
         }
     }
 
