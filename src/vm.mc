@@ -942,6 +942,18 @@ private Value ensure_prototype(VM* vm, Value fnv) {
     Value* p = props_get(props, vm.atom_prototype);
     if p != null { return *p; }
     JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
+    // An ordinary function's .prototype carries a non-enumerable back-reference,
+    // so `new Fn().constructor` resolves. A generator's .prototype has no such
+    // property — it is only the object its results inherit from.
+    bool gen_like = false;
+    if value_is_function(fnv) {
+        FnTemplate* ft = value_as_function(fnv).tmpl;
+        if ft != null { gen_like = ft.is_gen || ft.is_async; }
+    }
+    if !gen_like {
+        props_set_desc(&pr.props, atom_intern(&vm.atoms, "constructor"), fnv,
+            PROP_WRITABLE | PROP_CONFIGURABLE);
+    }
     if value_is_function(fnv) { props = &value_as_function(fnv).props; }
     if value_is_native(fnv) { props = &value_as_native(fnv).props; }
     // .prototype is writable but never enumerated (matches a function's
@@ -1748,6 +1760,31 @@ private void inspect_quoted(str_buf* sb, str s) {
 
 // Node-like single-line inspect. `nested` quotes strings; the seen set
 // guards cycles; depth bounds recursion.
+// The name console output prefixes an object with: the name of the
+// constructor owned by the nearest prototype that declares one. Empty for a
+// plain object (constructor Object), which is printed without a prefix.
+private str inspect_ctor_name(VM* vm, JsObject* o) {
+    str none = "";
+    u32 ca = atom_intern(&vm.atoms, "constructor");
+    JsObject* p = o.proto;
+    while p != null {
+        Value* c = props_get(&p.props, ca);
+        if c != null {
+            str nm = none;
+            if value_is_function(*c) {
+                FnTemplate* ft = value_as_function(*c).tmpl;
+                if ft != null { nm = ft.name; }
+            } else if value_is_native(*c) {
+                nm = value_as_native(*c).name;
+            }
+            if nm.len == 0 || str_equal(nm, "Object") { return none; }
+            return nm;
+        }
+        p = p.proto;
+    }
+    return none;
+}
+
 private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, Vec<u64>* seen) {
     if value_is_string(v) {
         if nested { inspect_quoted(sb, gc_string_view(value_as_string(v))); }
@@ -1853,6 +1890,17 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
                 str_buf_add(sb, " ]");
             }
         } else {
+            // Node prefixes an object with its constructor's name unless it is
+            // a plain one, and marks a null prototype.
+            if o.proto == null {
+                str_buf_add(sb, "[Object: null prototype] ");
+            } else {
+                str cn = inspect_ctor_name(vm, o);
+                if cn.len > 0 {
+                    str_buf_add(sb, cn);
+                    str_buf_add(sb, " ");
+                }
+            }
             i32 n = 0;
             str_buf tmp;
             str_buf_init(&tmp);
