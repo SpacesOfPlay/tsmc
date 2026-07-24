@@ -5260,15 +5260,40 @@ private void map_put(JsMap* mp, Value key, Value val) {
     mp.count++;
 }
 
-private JsMap* this_map(VM* vm, Value thisv) {
+// The collection's storage. A `class X extends Set` instance is an ordinary
+// object that carries the storage under a hidden property instead of being a
+// JsMap: a JsMap has no property table, so the instance must stay an object
+// for fields assigned in the subclass to survive.
+private JsMap* map_storage(VM* vm, Value thisv) {
     if value_is_map(thisv) { return value_as_map(thisv); }
+    if value_is_object(thisv) {
+        Value* d = props_get(&value_as_object(thisv).props, bi_atom(vm, "%mapdata"));
+        if d != null && value_is_map(*d) { return value_as_map(*d); }
+    }
+    return null;
+}
+
+private JsMap* this_map(VM* vm, Value thisv) {
+    JsMap* mp = map_storage(vm, thisv);
+    if mp != null { return mp; }
     vm_throw_error(vm, ERR_TYPE, "receiver is not a Map or Set");
     return null;
 }
 
-private Value make_map(VM* vm, Value iterable, bool is_set) {
-    JsMap* mp = js_new_map(&vm.heap, is_set ? vm_set_proto(vm) : vm_map_proto(vm), is_set);
-    if bi_nullish(iterable) { return value_cell(&mp.head); }
+private Value make_map(VM* vm, Value thisv, Value iterable, bool is_set) {
+    JsObject* base = is_set ? vm_set_proto(vm) : vm_map_proto(vm);
+    JsMap* mp = js_new_map(&vm.heap, base, is_set);
+    // `new Subclass(...)` arrives with a receiver already built from the
+    // subclass prototype; hand it the storage and keep that object. A direct
+    // `new Set()` (receiver prototype is the built-in one) yields the JsMap
+    // itself, which the caller substitutes for the receiver.
+    JsObject* recv = null;
+    if value_is_object(thisv) && value_as_object(thisv).proto != base {
+        recv = value_as_object(thisv);
+        props_set_desc(&recv.props, bi_atom(vm, "%mapdata"), value_cell(&mp.head), 0);
+    }
+    Value result = recv != null ? value_cell(&recv.head) : value_cell(&mp.head);
+    if bi_nullish(iterable) { return result; }
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&mp.head));
     if value_is_array(iterable) {
@@ -5307,15 +5332,15 @@ private Value make_map(VM* vm, Value iterable, bool is_set) {
         }
     }
     gc_root_reset(&vm.heap, rm);
-    return value_cell(&mp.head);
+    return result;
 }
 
 private Value nat_map_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return make_map(as_vm(vmp), arg_at(args, argc, 0), false);
+    return make_map(as_vm(vmp), thisv, arg_at(args, argc, 0), false);
 }
 
 private Value nat_set_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return make_map(as_vm(vmp), arg_at(args, argc, 0), true);
+    return make_map(as_vm(vmp), thisv, arg_at(args, argc, 0), true);
 }
 
 private Value nat_map_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10556,12 +10581,12 @@ private Value nat_types_is_regexp(void* vmp, Value callee, Value thisv, Value* a
     return value_bool(proto_chain_has(arg_at(args, argc, 0), as_vm(vmp).regexp_proto));
 }
 private Value nat_types_is_map(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    Value v = arg_at(args, argc, 0);
-    return value_bool(value_is_map(v) && !value_as_map(v).is_set);
+    JsMap* mp = map_storage(as_vm(vmp), arg_at(args, argc, 0));
+    return value_bool(mp != null && !mp.is_set);
 }
 private Value nat_types_is_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    Value v = arg_at(args, argc, 0);
-    return value_bool(value_is_map(v) && value_as_map(v).is_set);
+    JsMap* mp = map_storage(as_vm(vmp), arg_at(args, argc, 0));
+    return value_bool(mp != null && mp.is_set);
 }
 private Value nat_types_is_promise(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return value_bool(vm_is_promise(as_vm(vmp), arg_at(args, argc, 0)));
