@@ -274,6 +274,22 @@ private i32 import_meta_url_const(Compiler* co) {
 }
 
 // Numeric property keys stringify the JS way: 1, not 1.0.
+// The property-name text of a numeric key, copied into the arena so it can
+// outlive this call as a function's inferred name.
+private str num_key_text(Compiler* co, f64 num) {
+    i64 iv = cast(i64, num);
+    string s;
+    if cast(f64, iv) == num { s = format("{}", iv); } else { s = format("{}", num); }
+    str view = s;
+    u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
+    memcpy(copy, view.data, view.len);
+    free(s);
+    str r;
+    r.data = copy;
+    r.len = view.len;
+    return r;
+}
+
 private i32 num_key_const(Compiler* co, f64 num) {
     i64 iv = cast(i64, num);
     string s;
@@ -608,6 +624,8 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         ch_op(ch, OP_SEQ);
         i32 j = ch_jump(ch, OP_JUMPF);
         ch_op(ch, OP_POP);
+        // named evaluation: an anonymous default takes the bound name
+        if pat.a != null && pat.a.kind == N_IDENT { infer_name(pat.b, pat.a.name); }
         compile_expr(co, pat.b);
         ch_patch(ch, j);
         compile_destructure(co, pat.a, declare_mode);
@@ -668,6 +686,8 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                     ch_op(ch, OP_SEQ);
                     i32 j2 = ch_jump(ch, OP_JUMPF);
                     ch_op(ch, OP_POP);
+                    // named evaluation: an anonymous default takes the name
+                    if target != null && target.kind == N_IDENT { infer_name(pp.b, target.name); }
                     compile_expr(co, pp.b);
                     ch_patch(ch, j2);
                     compile_destructure(co, target, declare_mode);
@@ -775,6 +795,8 @@ private void compile_assign(Compiler* co, Node* n) {
     Node* t = n.a;
     if n.op == TOK_EQ {
         if t.kind == N_IDENT {
+            // named evaluation: `x = function(){}` names the function `x`
+            infer_name(n.b, t.name);
             compile_expr(co, n.b);
             emit_store_ident(co, t);
             return;
@@ -1218,6 +1240,14 @@ private void compile_expr(Compiler* co, Node* n) {
             }
             ch_op(ch, OP_DUP);
             if p.b != null {
+                // named evaluation: `{ fn: function(){} }` names the function
+                // `fn`. A computed key is only known at run time, so those
+                // stay anonymous.
+                if p.a != null && (p.a.kind == N_IDENT || p.a.kind == N_STRING) {
+                    infer_name(p.b, p.a.name);
+                } else if p.a != null && p.a.kind == N_NUMBER {
+                    infer_name(p.b, num_key_text(co, p.a.num));
+                }
                 compile_expr(co, p.b);
             } else {
                 emit_load_name(co, p.a.name, p);
@@ -1546,6 +1576,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_SEQ);
         i32 j = ch_jump(&fs.ch, OP_JUMPF);
+        // named evaluation: an anonymous default takes the parameter's name
+        if prm.a != null && prm.a.kind == N_IDENT { infer_name(prm.b, prm.a.name); }
         compile_expr(co, prm.b);
         ch_op_u16(&fs.ch, OP_SETLOCAL, i);
         ch_op(&fs.ch, OP_POP);
