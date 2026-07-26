@@ -632,24 +632,45 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         return;
     }
     if k == N_ARRAY_PATTERN || (!declare_mode && k == N_ARRAY) {
-        i32 tmp = alloc_slot(co.cur);
-        ch_op_u16(ch, OP_SETLOCAL, tmp);
+        // Array patterns consume the value through the iterator protocol, so
+        // any iterable works and errors from the iterator surface. `t_done`
+        // tracks exhaustion, which decides both the value an element sees and
+        // whether the iterator still has to be closed at the end.
+        i32 t_iter = alloc_slot(co.cur);
+        i32 t_done = alloc_slot(co.cur);
+        ch_op(ch, OP_GET_ITER);
+        ch_op_u16(ch, OP_SETLOCAL, t_iter);
         ch_op(ch, OP_POP);
+        ch_op(ch, OP_FALSE);
+        ch_op_u16(ch, OP_SETLOCAL, t_done);
+        ch_op(ch, OP_POP);
+        bool exhausted = false;
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* e = *(pat.kids.items + i);
-            if e.kind == N_HOLE { continue; }
+            if e.kind == N_HOLE {
+                // an elision still advances the iterator
+                ch_op_u16(ch, OP_GETLOCAL, t_iter);
+                ch_op_u16(ch, OP_ITER_STEP, t_done);
+                ch_op(ch, OP_POP);
+                continue;
+            }
             if e.kind == N_REST || e.kind == N_SPREAD {
-                ch_op_u16(ch, OP_GETLOCAL, tmp);
-                ch_op_u16(ch, OP_ARR_SLICE_FROM, i);
+                ch_op_u16(ch, OP_GETLOCAL, t_iter);
+                ch_op_u16(ch, OP_ITER_REST, t_done);
                 compile_destructure(co, e.a, declare_mode);
+                exhausted = true;
                 break;
             }
-            ch_op_u16(ch, OP_GETLOCAL, tmp);
-            ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(i)));
-            ch_op(ch, OP_GETINDEX);
+            ch_op_u16(ch, OP_GETLOCAL, t_iter);
+            ch_op_u16(ch, OP_ITER_STEP, t_done);
             compile_destructure(co, e, declare_mode);
         }
-        co.cur.cur_slots--;
+        // a pattern that stopped early releases the iterator
+        if !exhausted {
+            ch_op_u16(ch, OP_GETLOCAL, t_iter);
+            ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+        }
+        co.cur.cur_slots -= 2;
         return;
     }
     if k == N_OBJECT_PATTERN || (!declare_mode && k == N_OBJECT) {

@@ -3548,6 +3548,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(done));
                 }
             }
+            case OP_ITER_STEP: {
+                i32 dslot = rd_u16(code, ip);
+                ip += 2;
+                iter_step(vm, fr.base + dslot);
+            }
+            case OP_ITER_REST: {
+                i32 dslot = rd_u16(code, ip);
+                ip += 2;
+                iter_rest(vm, fr.base + dslot);
+            }
+            case OP_ITER_CLOSE: {
+                i32 dslot = rd_u16(code, ip);
+                ip += 2;
+                iter_close(vm, fr.base + dslot);
+            }
             case OP_REGEX: {
                 Value srcv = *(t.consts + rd_u16(code, ip));
                 ip += 2;
@@ -3698,7 +3713,68 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
 // --- iterator protocol --------------------------------------------------
 
 // v stays rooted by the caller; false = threw.
+// The three array-destructuring steps live outside the interpreter loop: their
+// locals would otherwise enlarge its stack frame, and deep native re-entry
+// (a callback recursing through a builtin) has only so much room.
+// `di` is the absolute stack index of the "exhausted" flag.
+
+private void iter_step(VM* vm, i32 di) {
+    Value iter = vpeek(vm, 0);
+    if js_truthy(*(vm.stack + di)) {
+        // spent: the element sees undefined and the iterator is left alone
+        vm.sp--;
+        vpush(vm, value_undefined());
+        return;
+    }
+    Value val;
+    bool done = false;
+    if !vm_iter_next(vm, iter, &val, &done) { return; }
+    *(vm.stack + di) = value_bool(done);
+    vm.sp--;
+    vpush(vm, done ? value_undefined() : val);
+}
+
+private void iter_rest(VM* vm, i32 di) {
+    Value iter = vpeek(vm, 0);
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vpush(vm, value_cell(&arr.head));   // rooted while draining
+    if !js_truthy(*(vm.stack + di)) {
+        while true {
+            Value val;
+            bool done = false;
+            if !vm_iter_next(vm, iter, &val, &done) { break; }
+            if done { break; }
+            js_array_set(arr, arr.elen, val);
+        }
+    }
+    if vm.has_pending { return; }
+    *(vm.stack + di) = value_bool(true);
+    Value res = vpop(vm);   // arr
+    vm.sp--;                // iter
+    vpush(vm, res);
+}
+
+private void iter_close(VM* vm, i32 di) {
+    Value iter = vpeek(vm, 0);
+    if !js_truthy(*(vm.stack + di)) {
+        Value m;
+        if vm_get_prop_value(vm, iter, atom_intern(&vm.atoms, "return"), &m) {
+            if value_is_callable(m) {
+                Value dummy = value_undefined();
+                ignore vm_call_value(vm, m, iter, &dummy, 0);
+            }
+        }
+    }
+    if vm.has_pending { return; }
+    vm.sp--;
+}
+
 bool vm_get_iterator(VM* vm, Value v, Value* out) {
+    // null/undefined have no properties to read the iterator method from
+    if is_nullish(v) {
+        vm_throw_error(vm, ERR_TYPE, "value is not iterable");
+        return false;
+    }
     Value m;
     if !vm_get_prop_value(vm, v, vm.sym_iterator_id, &m) { return false; }
     if !value_is_callable(m) {

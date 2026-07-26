@@ -93,6 +93,12 @@ enum Op {
     OP_YIELD,        // suspend the generator frame; top is the value
     OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
     OP_ITER_NEXT,    // [iter] -> [value, done]
+    // Array destructuring drives the iterator through these. The u16 operand
+    // is the local slot holding the "exhausted" flag, so a spent iterator is
+    // never stepped again.
+    OP_ITER_STEP,    // u16 done slot; [iter] -> value (undefined once done)
+    OP_ITER_REST,    // u16 done slot; [iter] -> array of the remaining values
+    OP_ITER_CLOSE,   // u16 done slot; [iter] -> ; calls return() unless done
     OP_REGEX         // u16 source const, u16 flags const -> RegExp object
 }
 
