@@ -1235,8 +1235,24 @@ private void compile_expr(Compiler* co, Node* n) {
         // literal text includes the trailing 'n'
         str t = n.name;
         if t.len > 0 && *(t.data + t.len - 1) == 'n' { t.len--; }
+        // numeric separators are part of the literal but not of its value
+        bool has_sep = false;
+        for i32 i = 0; i < t.len; i++ {
+            if *(t.data + i) == '_' { has_sep = true; }
+        }
+        if has_sep {
+            u8* clean = cast(u8*, bump_alloc(co.arena, t.len));
+            i32 w = 0;
+            for i32 i = 0; i < t.len; i++ {
+                u8 c = *(t.data + i);
+                if c != '_' { *(clean + w) = c; w++; }
+            }
+            t.data = clean;
+            t.len = w;
+        }
         bool ok;
         BigNum bn = bn_from_str(t, &ok);
+        if !ok { cerror(co, n, "invalid BigInt literal"); }
         GcBigInt* g = js_new_bigint(co.heap, bn);
         bn_free(&bn);
         Value bv = value_cell(&g.head);

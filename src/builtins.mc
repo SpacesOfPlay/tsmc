@@ -4502,9 +4502,55 @@ private Value nat_bigint_ctor(void* vmp, Value callee, Value thisv, Value* args,
 private Value nat_bigint_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     if !value_is_bigint(thisv) { return new_str(vm, "0"); }
-    string s = bn_to_str(bigint_view(value_as_bigint(thisv)));
-    Value r = new_str(vm, s);
-    free(s);
+    BigNum v = bigint_view(value_as_bigint(thisv));
+    Value radv = arg_at(args, argc, 0);
+    i32 radix = 10;
+    if !value_is_undefined(radv) { radix = to_int_arg(radv); }
+    if radix < 2 || radix > 36 {
+        vm_throw_error(vm, ERR_RANGE, "toString() radix must be between 2 and 36");
+        return value_undefined();
+    }
+    if radix == 10 {
+        string s = bn_to_str(v);
+        Value r = new_str(vm, s);
+        free(s);
+        return r;
+    }
+    // repeated division by the radix, least-significant digit first
+    str digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    str_buf sb;
+    str_buf_init(&sb);
+    BigNum acc = bn_copy(v);
+    bool neg = acc.neg;
+    acc.neg = false;
+    BigNum rad = bn_from_i64(cast(i64, radix));
+    if bn_is_zero(acc) { str_buf_add_byte(&sb, cast(u8, '0')); }
+    while !bn_is_zero(acc) {
+        BigNum rem;
+        bool ok;
+        BigNum q = bn_divmod(acc, rad, &rem, &ok);
+        if !ok { bn_free(&rem); bn_free(&q); break; }
+        string ds = bn_to_str(rem);
+        str dv = ds;
+        i32 d = 0;
+        for i32 i = 0; i < dv.len; i++ { d = d * 10 + (cast(i32, *(dv.data + i)) - cast(i32, '0')); }
+        free(ds);
+        str_buf_add_byte(&sb, *(digits.data + d));
+        bn_free(&rem);
+        bn_free(&acc);
+        acc = q;
+    }
+    bn_free(&acc);
+    bn_free(&rad);
+    // digits came out reversed
+    str body = str_buf_to_str(&sb);
+    str_buf out;
+    str_buf_init(&out);
+    if neg { str_buf_add_byte(&out, cast(u8, '-')); }
+    for i32 i = body.len - 1; i >= 0; i-- { str_buf_add_byte(&out, *(body.data + i)); }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    str_buf_free(&sb);
     return r;
 }
 

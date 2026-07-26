@@ -290,6 +290,39 @@ BigNum bn_pow(BigNum a, BigNum e, bool* ok) {
 // --- conversions -----------------------------------------------------
 
 // Parses an optionally-signed decimal integer. *ok false on bad input.
+private i32 bn_digit_val(u8 c) {
+    if c >= '0' && c <= '9' { return cast(i32, c) - cast(i32, '0'); }
+    if c >= 'a' && c <= 'f' { return cast(i32, c) - cast(i32, 'a') + 10; }
+    if c >= 'A' && c <= 'F' { return cast(i32, c) - cast(i32, 'A') + 10; }
+    return 0 - 1;
+}
+
+// Digits in base 2, 8 or 16, accumulated as value = value * radix + digit.
+private BigNum bn_from_digits(str s, i32 i, i32 end, i32 radix, bool* ok) {
+    BigNum r = bn_from_i64(cast(i64, 0));
+    BigNum rad = bn_from_i64(cast(i64, radix));
+    bool any = false;
+    for i32 k = i; k < end; k++ {
+        i32 d = bn_digit_val(*(s.data + k));
+        if d < 0 || d >= radix { *ok = false; break; }
+        any = true;
+        BigNum t = bn_mul(r, rad);
+        BigNum dv = bn_from_i64(cast(i64, d));
+        BigNum sum = bn_add(t, dv);
+        bn_free(&r);
+        bn_free(&t);
+        bn_free(&dv);
+        r = sum;
+    }
+    bn_free(&rad);
+    if !any { *ok = false; }
+    if !*ok {
+        bn_free(&r);
+        return bn_zero();
+    }
+    return r;
+}
+
 BigNum bn_from_str(str s, bool* ok) {
     *ok = true;
     i32 i = 0;
@@ -304,6 +337,15 @@ BigNum bn_from_str(str s, bool* ok) {
         i++;
     }
     if i >= end { *ok = false; return bn_zero(); }
+    // a 0x / 0b / 0o prefix selects the radix; those forms take no sign
+    if !neg && end - i > 2 && *(s.data + i) == '0' {
+        u8 p = *(s.data + i + 1);
+        i32 radix = 0;
+        if p == 'x' || p == 'X' { radix = 16; }
+        else if p == 'b' || p == 'B' { radix = 2; }
+        else if p == 'o' || p == 'O' { radix = 8; }
+        if radix != 0 { return bn_from_digits(s, i + 2, end, radix, ok); }
+    }
     i32 ndig = end - i;
     // limbs = ceil(ndig / 9)
     i32 nlimbs = (ndig + 8) / 9;
