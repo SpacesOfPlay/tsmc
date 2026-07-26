@@ -2130,6 +2130,36 @@ private void compile_var_stmt(Compiler* co, Node* n) {
     }
 }
 
+// Lexical declarations hoist to the top of their scope as TDZ holes. Split out
+// because a switch's case block is a single scope spanning every clause, so it
+// feeds each clause's statements through here before compiling any of them.
+private void hoist_lexical_decls(Compiler* co, NodeList* list, Vec<str>* vnames) {
+    for i32 i = 0; i < list.len; i++ {
+        Node* s = *(list.items + i);
+        if s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0 {
+            for i32 j = 0; j < s.kids.len; j++ {
+                Node* d = *(s.kids.items + j);
+                check_lexical_vs_var(co, d.a, vnames);
+                declare_pattern(co, d.a, (s.flags & NF_CONST) != 0 ? 1 : 0);
+            }
+        }
+        if s.kind == N_CLASS && s.name.len > 0 {
+            if names_has(vnames, s.name) { redeclared(co, s, s.name); }
+            declare_lexical(co, s, s.name, false);
+        }
+    }
+}
+
+// Function declarations bind before any statement runs.
+private void hoist_function_decls(Compiler* co, NodeList* list) {
+    for i32 i = 0; i < list.len; i++ {
+        Node* s = *(list.items + i);
+        if s.kind == N_FUNCTION && s.name.len > 0 {
+            declare_plain(co, s, s.name);
+        }
+    }
+}
+
 // Block statement list with optional class-field injection after a
 // leading super() call (constructors only).
 private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields, i32 n_fields) {
@@ -2143,30 +2173,9 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     for i32 i = 0; i < list.len; i++ {
         collect_var_names(*(list.items + i), &vnames);
     }
-
-    // lexical declarations hoist to block top as TDZ holes
-    for i32 i = 0; i < list.len; i++ {
-        Node* s = *(list.items + i);
-        if s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0 {
-            for i32 j = 0; j < s.kids.len; j++ {
-                Node* d = *(s.kids.items + j);
-                check_lexical_vs_var(co, d.a, &vnames);
-                declare_pattern(co, d.a, (s.flags & NF_CONST) != 0 ? 1 : 0);
-            }
-        }
-        if s.kind == N_CLASS && s.name.len > 0 {
-            if names_has(&vnames, s.name) { redeclared(co, s, s.name); }
-            declare_lexical(co, s, s.name, false);
-        }
-    }
+    hoist_lexical_decls(co, list, &vnames);
     vec_free(&vnames);
-    // function declarations bind and initialize first
-    for i32 i = 0; i < list.len; i++ {
-        Node* s = *(list.items + i);
-        if s.kind == N_FUNCTION && s.name.len > 0 {
-            declare_plain(co, s, s.name);
-        }
-    }
+    hoist_function_decls(co, list);
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if s.kind == N_FUNCTION && s.name.len > 0 {
@@ -2698,6 +2707,35 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 tmp = alloc_slot(fs);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, OP_POP);
+        // Every clause shares one scope. It is opened before the clause
+        // comparisons, because the jump table branches straight into a body
+        // and would otherwise skip the code that puts the bindings in TDZ.
+        fs.depth++;
+        i32 saved_binds = fs.binds.len;
+        i32 saved_slots = fs.cur_slots;
+        Vec<str> svars = vec_new<str>(4);
+        for i32 i = 0; i < n.kids.len; i++ {
+            NodeList* cl = &(*(n.kids.items + i)).kids;
+            for i32 s = 0; s < cl.len; s++ { collect_var_names(*(cl.items + s), &svars); }
+        }
+        for i32 i = 0; i < n.kids.len; i++ {
+            hoist_lexical_decls(co, &(*(n.kids.items + i)).kids, &svars);
+        }
+        vec_free(&svars);
+        for i32 i = 0; i < n.kids.len; i++ {
+            hoist_function_decls(co, &(*(n.kids.items + i)).kids);
+        }
+        for i32 i = 0; i < n.kids.len; i++ {
+            NodeList* cl = &(*(n.kids.items + i)).kids;
+            for i32 s = 0; s < cl.len; s++ {
+                Node* st = *(cl.items + s);
+                if st.kind == N_FUNCTION && st.name.len > 0 {
+                    i32 li = find_local(fs, st.name);
+                    compile_function(co, st, false);
+                    emit_init_binding(co, li);
+                }
+            }
+        }
         Vec<i32> case_jumps = vec_new<i32>(8);
         i32 default_idx = -1;
         LoopCtx lc = make_loop_ctx(co, false);
@@ -2715,9 +2753,6 @@ private void compile_stmt(Compiler* co, Node* n) {
         }
         i32 jdefault = ch_jump(ch, OP_JUMP);
         vec_push(&fs.loops, lc);
-        fs.depth++;
-        i32 saved_binds = fs.binds.len;
-        i32 saved_slots = fs.cur_slots;
         for i32 i = 0; i < n.kids.len; i++ {
             Node* c = *(n.kids.items + i);
             i32 j = vec_get(&case_jumps, i);
@@ -2727,7 +2762,10 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_patch(ch, jdefault);
             }
             for i32 s = 0; s < c.kids.len; s++ {
-                compile_stmt(co, *(c.kids.items + s));
+                Node* st = *(c.kids.items + s);
+                // already bound and initialized above
+                if st.kind == N_FUNCTION && st.name.len > 0 { continue; }
+                compile_stmt(co, st);
             }
         }
         if default_idx < 0 { ch_patch(ch, jdefault); }
