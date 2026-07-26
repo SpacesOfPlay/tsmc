@@ -84,7 +84,7 @@ i32 main() {
     // uncaught throw exits 1
     check_eq(run("throw new Error('x');"), 1, "uncaught exits 1");
     // compile error exits 2
-    check_eq(run("const o = {}; o.x ||= 1;"), 2, "unsupported exits 2");
+    check_eq(run("@dec class C {}"), 2, "unsupported exits 2");
 
     return check_done("test_hardening");
 }

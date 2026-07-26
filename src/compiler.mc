@@ -861,18 +861,69 @@ private void compile_assign(Compiler* co, Node* n) {
         return;
     }
     if n.op == TOK_AMPAMP_EQ || n.op == TOK_PIPEPIPE_EQ || n.op == TOK_QUESTION_QUESTION_EQ {
-        if t.kind != N_IDENT {
-            cerror(co, t, "logical assignment to members is not supported yet");
-            return;
-        }
+        // Short-circuiting assignment: the store only happens on the branch
+        // that takes it, so a setter is left alone otherwise. The target's
+        // subexpressions are evaluated once, hence the temporaries.
         i32 jop = OP_JF_KEEP;
         if n.op == TOK_PIPEPIPE_EQ { jop = OP_JT_KEEP; }
         if n.op == TOK_QUESTION_QUESTION_EQ { jop = OP_JNN_KEEP; }
-        emit_load_ident(co, t);
-        i32 j = ch_jump(ch, jop);
-        compile_expr(co, n.b);
-        emit_store_ident(co, t);
-        ch_patch(ch, j);
+        if t.kind == N_IDENT {
+            // named evaluation applies to an identifier target, not a member
+            infer_name(n.b, t.name);
+            emit_load_ident(co, t);
+            i32 j = ch_jump(ch, jop);
+            compile_expr(co, n.b);
+            emit_store_ident(co, t);
+            ch_patch(ch, j);
+            return;
+        }
+        if t.kind == N_MEMBER {
+            if (t.flags & NF_OPT_CHAIN) != 0 {
+                cerror(co, t, "invalid assignment target");
+                return;
+            }
+            i32 kc = (t.flags & NF_PRIVATE) != 0
+                ? private_key_const(co, t.name) : name_const(co, t.name);
+            i32 t_obj = alloc_slot(co.cur);
+            compile_expr(co, t.a);
+            ch_op_u16(ch, OP_SETLOCAL, t_obj);
+            ch_op(ch, OP_POP);
+            ch_op_u16(ch, OP_GETLOCAL, t_obj);
+            ch_op_u16(ch, OP_GETPROP, kc);
+            i32 j = ch_jump(ch, jop);
+            ch_op_u16(ch, OP_GETLOCAL, t_obj);
+            compile_expr(co, n.b);
+            ch_op_u16(ch, OP_SETPROP, kc);
+            ch_patch(ch, j);
+            co.cur.cur_slots--;
+            return;
+        }
+        if t.kind == N_INDEX {
+            if (t.flags & NF_OPT_CHAIN) != 0 {
+                cerror(co, t, "invalid assignment target");
+                return;
+            }
+            i32 t_obj = alloc_slot(co.cur);
+            i32 t_key = alloc_slot(co.cur);
+            compile_expr(co, t.a);
+            ch_op_u16(ch, OP_SETLOCAL, t_obj);
+            ch_op(ch, OP_POP);
+            compile_expr(co, t.b);
+            ch_op_u16(ch, OP_SETLOCAL, t_key);
+            ch_op(ch, OP_POP);
+            ch_op_u16(ch, OP_GETLOCAL, t_obj);
+            ch_op_u16(ch, OP_GETLOCAL, t_key);
+            ch_op(ch, OP_GETINDEX);
+            i32 j = ch_jump(ch, jop);
+            ch_op_u16(ch, OP_GETLOCAL, t_obj);
+            ch_op_u16(ch, OP_GETLOCAL, t_key);
+            compile_expr(co, n.b);
+            ch_op(ch, OP_SETINDEX);
+            ch_patch(ch, j);
+            co.cur.cur_slots -= 2;
+            return;
+        }
+        cerror(co, t, "invalid assignment target");
         return;
     }
     i32 op = compound_op_code(n.op);
