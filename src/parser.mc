@@ -486,6 +486,13 @@ private Node* parse_binding(Parser* p) {
             if eat(p, TOK_DOTDOTDOT) {
                 el = nnew(p, N_REST);
                 el.a = parse_binding(p);
+                // a rest element closes the pattern: it takes no default and
+                // nothing may follow it, not even a trailing comma
+                if at(p, TOK_EQ) {
+                    perror(p, "a rest element cannot have a default");
+                } else if !at(p, TOK_RBRACK) {
+                    perror(p, "a rest element must be last");
+                }
             } else {
                 el = parse_binding(p);
                 if eat(p, TOK_EQ) {
@@ -511,8 +518,13 @@ private Node* parse_binding(Parser* p) {
                 Node* r = nnew(p, N_REST);
                 r.a = parse_binding(p);
                 vec_push(&p.scratch, r);
-                if !eat(p, TOK_COMMA) { break; }
-                continue;
+                // as in array patterns, a rest property ends the pattern
+                if at(p, TOK_EQ) {
+                    perror(p, "a rest property cannot have a default");
+                } else if !at(p, TOK_RBRACE) {
+                    perror(p, "a rest property must be last");
+                }
+                break;
             }
             Node* pp = nnew(p, N_PATTERN_PROP);
             if at(p, TOK_LBRACK) {
@@ -578,7 +590,12 @@ private void parse_params_into(Parser* p) {
             prm.a = parse_binding(p);
             if eat(p, TOK_QUESTION) { prm.flags |= NF_OPTIONAL; }
             if eat(p, TOK_COLON) { ts_type(p); }
-            if eat(p, TOK_EQ) { prm.b = parse_assign(p); }
+            if eat(p, TOK_EQ) {
+                if (prm.flags & NF_REST) != 0 {
+                    perror(p, "a rest parameter cannot have a default");
+                }
+                prm.b = parse_assign(p);
+            }
             vec_push(&p.scratch, nfin(p, prm));
         }
         if !eat(p, TOK_COMMA) { break; }

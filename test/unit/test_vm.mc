@@ -132,6 +132,29 @@ i32 main() {
     check_status("const o = {}; o.x ||= 1;", 2, "unsupported exit 2");
     check_status("syntax error here(", 2, "parse error exit 2");
 
+    // a rest element ends its pattern: nothing may follow, and it takes no
+    // default. Rejections, so they are checked by exit code rather than by
+    // diffing output against node.
+    check_status("const [...r, x] = [1, 2];", 2, "array rest not last");
+    check_status("const [...r, ] = [1, 2];", 2, "array rest then elision");
+    check_status("const [...r, ...q] = [1, 2];", 2, "array two rests");
+    check_status("const [...r,] = [1, 2];", 2, "array rest trailing comma");
+    check_status("const [...r = 1] = [1];", 2, "array rest default");
+    check_status("const [[...r, x]] = [[1, 2]];", 2, "nested array rest not last");
+    check_status("const {...r, x} = {};", 2, "object rest not last");
+    check_status("const {...r = 1} = {};", 2, "object rest default");
+    check_status("let r, x; [...r, x] = [1, 2];", 2, "assigned array rest not last");
+    check_status("let r, x; ({...r, x} = {});", 2, "assigned object rest not last");
+    check_status("function f(...r, x) {}", 2, "rest parameter not last");
+    check_status("function f(...r = 1) {}", 2, "rest parameter default");
+    check_status("const f = (...r, x) => {};", 2, "arrow rest not last");
+    // A rest in its proper place is still accepted. These snippets run in a
+    // bare VM with no standard globals, so they avoid anything needing them —
+    // the valid destructuring forms are covered against node in
+    // test/diff/dstr_iterator.js.
+    check_status("function f(a, ...r) { return r.length; } probe(f(1, 2, 3));", 0, "rest parameter ok");
+    check_status("probe([...[1, 2], 3].length);", 0, "array literal spread ok");
+
     // GC stress: collect on every allocation through the full pipeline
     {
         i32 st = run_snippet("let s = ''; for (let i = 0; i < 200; i++) { s = s + 'x'; } probe(s.length); const arr = []; for (let i = 0; i < 100; i++) { arr[i] = { v: i }; } let tot = 0; for (let i = 0; i < 100; i++) { tot += arr[i].v; } probe(tot);", false);

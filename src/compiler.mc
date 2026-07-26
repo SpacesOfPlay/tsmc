@@ -655,6 +655,11 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                 continue;
             }
             if e.kind == N_REST || e.kind == N_SPREAD {
+                // in the assignment form the pattern arrived as an array
+                // literal, so the "rest comes last" rule is checked here
+                if i != pat.kids.len - 1 {
+                    cerror(co, e, "a rest element must be last");
+                }
                 ch_op_u16(ch, OP_GETLOCAL, t_iter);
                 ch_op_u16(ch, OP_ITER_REST, t_done);
                 compile_destructure(co, e.a, declare_mode);
@@ -681,6 +686,9 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* pp = *(pat.kids.items + i);
             if pp.kind == N_REST || pp.kind == N_SPREAD {
+                if i != pat.kids.len - 1 {
+                    cerror(co, pp, "a rest property must be last");
+                }
                 // rest object: copy remaining own props
                 JsObject* ex = js_new_array(co.heap, null);
                 gc_root(co.heap, value_cell(&ex.head));
