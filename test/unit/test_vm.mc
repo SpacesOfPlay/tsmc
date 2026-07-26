@@ -155,6 +155,13 @@ i32 main() {
     check_status("function f(a, ...r) { return r.length; } probe(f(1, 2, 3));", 0, "rest parameter ok");
     check_status("probe([...[1, 2], 3].length);", 0, "array literal spread ok");
 
+    // a private member is not a deletable reference, and a private name has to
+    // be a well-formed identifier
+    check_status("class C { #x = 1; m() { delete this.#x; } }", 2, "delete private field");
+    check_status("class C { #m() {} r() { delete this.#m; } }", 2, "delete private method");
+    check_status("class C { # = 1; }", 2, "bare # rejected");
+    check_status("class C { #\\u{ZZ} = 1; }", 2, "bad private escape rejected");
+
     // GC stress: collect on every allocation through the full pipeline
     {
         i32 st = run_snippet("let s = ''; for (let i = 0; i < 200; i++) { s = s + 'x'; } probe(s.length); const arr = []; for (let i = 0; i < 100; i++) { arr[i] = { v: i }; } let tot = 0; for (let i = 0; i < 100; i++) { tot += arr[i].v; } probe(tot);", false);

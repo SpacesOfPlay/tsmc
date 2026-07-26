@@ -540,17 +540,38 @@ private void scan_ident(Lexer* lx, Token* t) {
 
 private void scan_private_name(Lexer* lx, Token* t) {
     lx.pos++;
+    i32 a = lx.pos;
     i32 n;
-    if lx.pos >= lx.src.len || !id_start_at(lx, lx.pos, &n) {
-        lex_error(lx, lx.pos - 1, lx.pos, "expected identifier after '#'");
+    bool esc = false;
+    // the name after '#' follows identifier rules, Unicode escapes included
+    if lx.pos < lx.src.len && lx_cur(lx) == '\\' {
+        if scan_ident_escape(lx) < 0 {
+            lex_error(lx, a - 1, lx.pos + 1, "invalid Unicode escape in identifier");
+            t.kind = TOK_ERROR;
+            lx.pos++;
+            return;
+        }
+        esc = true;
+    } else if lx.pos >= lx.src.len || !id_start_at(lx, lx.pos, &n) {
+        lex_error(lx, a - 1, lx.pos, "expected identifier after '#'");
         t.kind = TOK_ERROR;
         return;
+    } else {
+        lx.pos += n;
     }
-    i32 a = lx.pos;
-    lx.pos += n;
-    while lx.pos < lx.src.len && id_part_at(lx, lx.pos, &n) { lx.pos += n; }
+    while lx.pos < lx.src.len {
+        if lx_cur(lx) == '\\' {
+            if scan_ident_escape(lx) < 0 { break; }
+            esc = true;
+        } else if id_part_at(lx, lx.pos, &n) {
+            lx.pos += n;
+        } else {
+            break;
+        }
+    }
     t.kind = TOK_PRIVATE_NAME;
-    t.text = lx_view(lx, a, lx.pos);
+    if esc { t.text = decode_ident(lx, a, lx.pos); }
+    else { t.text = lx_view(lx, a, lx.pos); }
 }
 
 // --- numbers --------------------------------------------------------

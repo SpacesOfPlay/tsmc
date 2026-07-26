@@ -43,3 +43,20 @@ console.log('proxy:', Box.isBox(p), 'trap fired:', trapped);
 // class, where the private name is in scope).
 console.log('ternary:', Box.describe(b), Box.describe({}));
 console.log('negation:', Box.lacks({}), Box.lacks(b));
+
+// A private name follows identifier rules: non-ASCII characters and Unicode
+// escapes are allowed, and an escape names the same member as the literal
+// character does.
+class Escaped {
+  #℘ = 'wp';
+  #\u{6F} = 'oh';
+  #ZW_‍_J = 'zwj';
+  #\u{6D}() { return 'meth'; }
+  read() { return [this.#℘, this.#o, this.#ZW_‍_J, this.#m()].join(','); }
+  escapedIsSame() { return this.#\u{6F} === this.#o; }
+  static brand(o) { return #\u{6F} in o; }
+}
+const esc = new Escaped();
+console.log('unicode private:', esc.read());
+console.log('escape aliases literal:', esc.escapedIsSame());
+console.log('escaped brand:', Escaped.brand(esc), Escaped.brand({}));

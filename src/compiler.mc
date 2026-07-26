@@ -1447,6 +1447,12 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_UNARY {
         if n.op == TOK_KW_DELETE {
             Node* t = n.a;
+            // a private member is not a deletable reference
+            if t.kind == N_MEMBER && (t.flags & NF_PRIVATE) != 0 {
+                cerror(co, n, "private members cannot be deleted");
+                ch_op(ch, OP_FALSE);
+                return;
+            }
             if t.kind == N_MEMBER && (t.flags & (NF_OPT_CHAIN | NF_PRIVATE)) == 0 {
                 compile_expr(co, t.a);
                 ch_op_u16(ch, OP_DELPROP, name_const(co, t.name));
