@@ -388,8 +388,28 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
 
 // --- binding declaration helpers ------------------------------------------------
 
-private void declare_lexical(Compiler* co, str name, bool is_const) {
+// A binding for `name` in the innermost scope. Bindings are pushed as scopes
+// open and truncated as they close, so everything at the current depth sits at
+// the end of the list; `want_lexical` narrows the search to let/const/class.
+private bool bound_here(FScope* fs, str name, bool want_lexical) {
+    for i32 i = fs.binds.len - 1; i >= 0; i-- {
+        CBind b = vec_get(&fs.binds, i);
+        if b.depth < fs.depth { return false; }
+        if str_equal(b.name, name) { return !want_lexical || b.tdz; }
+    }
+    return false;
+}
+
+private void redeclared(Compiler* co, Node* at, str name) {
+    string m = format("'{}' has already been declared", name);
+    cerror(co, at, m);
+    free(m);
+}
+
+private void declare_lexical(Compiler* co, Node* at, str name, bool is_const) {
     FScope* fs = co.cur;
+    // a lexical name may not share its scope with any other declaration
+    if at != null && bound_here(fs, name, false) { redeclared(co, at, name); }
     i32 bi = declare(co, name, is_const, true);
     CBind b = vec_get(&fs.binds, bi);
     if b.is_cell {
@@ -399,8 +419,10 @@ private void declare_lexical(Compiler* co, str name, bool is_const) {
     }
 }
 
-private void declare_plain(Compiler* co, str name) {
+private void declare_plain(Compiler* co, Node* at, str name) {
     FScope* fs = co.cur;
+    // a function declaration may repeat, but not over a lexical name
+    if at != null && bound_here(fs, name, true) { redeclared(co, at, name); }
     i32 bi = declare(co, name, false, false);
     CBind b = vec_get(&fs.binds, bi);
     if b.is_cell {
@@ -414,9 +436,9 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
     if pat == null { return; }
     i32 k = pat.kind;
     if k == N_IDENT {
-        if mode == 0 { declare_lexical(co, pat.name, false); }
-        if mode == 1 { declare_lexical(co, pat.name, true); }
-        if mode == 2 { declare_plain(co, pat.name); }
+        if mode == 0 { declare_lexical(co, pat, pat.name, false); }
+        if mode == 1 { declare_lexical(co, pat, pat.name, true); }
+        if mode == 2 { declare_plain(co, pat, pat.name); }
         if mode == 3 { hoist_declare_var(co, pat); }
         return;
     }
@@ -457,6 +479,46 @@ private void hoist_declare_var(Compiler* co, Node* id) {
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
     }
+}
+
+// The var-declared names of a statement list, used to reject a lexical name
+// that collides with a `var` in the same scope. `var` hoists out of nested
+// blocks but not out of functions, so the walk mirrors hoist_vars.
+private void collect_var_names(Node* n, Vec<str>* out) {
+    if n == null { return; }
+    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
+    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
+        for i32 i = 0; i < n.kids.len; i++ {
+            collect_pattern_names((*(n.kids.items + i)).a, out);
+        }
+        return;
+    }
+    collect_var_names(n.a, out);
+    collect_var_names(n.b, out);
+    collect_var_names(n.c, out);
+    collect_var_names(n.d, out);
+    for i32 i = 0; i < n.kids.len; i++ {
+        collect_var_names(*(n.kids.items + i), out);
+    }
+}
+
+private bool names_has(Vec<str>* names, str name) {
+    for i32 i = 0; i < names.len; i++ {
+        if str_equal(vec_get(names, i), name) { return true; }
+    }
+    return false;
+}
+
+// Reports each lexical name in `pat` that a `var` in the same scope also binds.
+private void check_lexical_vs_var(Compiler* co, Node* pat, Vec<str>* vnames) {
+    if vnames.len == 0 { return; }
+    Vec<str> lnames = vec_new<str>(2);
+    collect_pattern_names(pat, &lnames);
+    for i32 i = 0; i < lnames.len; i++ {
+        str nm = vec_get(&lnames, i);
+        if names_has(vnames, nm) { redeclared(co, pat, nm); }
+    }
+    vec_free(&lnames);
 }
 
 private void hoist_vars(Compiler* co, Node* n) {
@@ -2076,24 +2138,33 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     i32 saved_binds = fs.binds.len;
     i32 saved_slots = fs.cur_slots;
 
+    // the `var` names this scope binds, which no lexical name here may repeat
+    Vec<str> vnames = vec_new<str>(4);
+    for i32 i = 0; i < list.len; i++ {
+        collect_var_names(*(list.items + i), &vnames);
+    }
+
     // lexical declarations hoist to block top as TDZ holes
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0 {
             for i32 j = 0; j < s.kids.len; j++ {
                 Node* d = *(s.kids.items + j);
+                check_lexical_vs_var(co, d.a, &vnames);
                 declare_pattern(co, d.a, (s.flags & NF_CONST) != 0 ? 1 : 0);
             }
         }
         if s.kind == N_CLASS && s.name.len > 0 {
-            declare_lexical(co, s.name, false);
+            if names_has(&vnames, s.name) { redeclared(co, s, s.name); }
+            declare_lexical(co, s, s.name, false);
         }
     }
+    vec_free(&vnames);
     // function declarations bind and initialize first
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if s.kind == N_FUNCTION && s.name.len > 0 {
-            declare_plain(co, s.name);
+            declare_plain(co, s, s.name);
         }
     }
     for i32 i = 0; i < list.len; i++ {
@@ -2923,7 +2994,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
             }
         }
         if d.kind == N_CLASS && d.name.len > 0 {
-            declare_lexical(co, d.name, false);
+            declare_lexical(co, d, d.name, false);
         }
     }
 
@@ -2933,7 +3004,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
         bool exported = s.kind == N_EXPORT;
         Node* d = exported && s.a != null ? s.a : s;
         if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
-            declare_plain(co, d.name);
+            declare_plain(co, d, d.name);
         }
     }
     for i32 i = 0; i < prog.kids.len; i++ {

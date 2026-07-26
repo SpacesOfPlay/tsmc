@@ -162,6 +162,23 @@ i32 main() {
     check_status("class C { # = 1; }", 2, "bare # rejected");
     check_status("class C { #\\u{ZZ} = 1; }", 2, "bad private escape rejected");
 
+    // a lexical name may not share its scope with another declaration
+    check_status("{ let x; let x; }", 2, "let redeclared by let");
+    check_status("{ let x; const x = 1; }", 2, "let redeclared by const");
+    check_status("{ let x; var x; }", 2, "let redeclared by var");
+    check_status("{ var x; let x; }", 2, "var redeclared by let");
+    check_status("{ let x; function x() {} }", 2, "let redeclared by function");
+    check_status("{ class x {} let x; }", 2, "class redeclared by let");
+    check_status("let y; let y;", 2, "top-level let redeclared");
+    check_status("switch (1) { case 1: let x; case 2: let x; }", 2, "switch cases share a scope");
+    check_status("function f() { let x; { var x; } }", 2, "var hoists into a lexical scope");
+    // shadowing in a nested scope, and repeated var or function, stay legal
+    check_status("{ let x; { let x; } } probe(1);", 0, "shadowing ok");
+    check_status("{ var x; var x; } probe(1);", 0, "repeated var ok");
+    check_status("{ function g() {} function g() {} } probe(1);", 0, "repeated function ok");
+    check_status("function f() { var x; { let x; } } f(); probe(1);", 0, "inner lexical shadows var");
+    check_status("function f() { { let x; } var x; } f(); probe(1);", 0, "var outside the block ok");
+
     // GC stress: collect on every allocation through the full pipeline
     {
         i32 st = run_snippet("let s = ''; for (let i = 0; i < 200; i++) { s = s + 'x'; } probe(s.length); const arr = []; for (let i = 0; i < 100; i++) { arr[i] = { v: i }; } let tot = 0; for (let i = 0; i < 100; i++) { tot += arr[i].v; } probe(tot);", false);
