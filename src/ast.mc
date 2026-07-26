@@ -122,6 +122,7 @@ const i32 NF_STAR = 16777216;       // export *
 const i32 NF_DEFINITE = 33554432;   // x!: definite assignment
 const i32 NF_PRIVATE = 67108864;    // #name member access
 const i32 NF_EXPORTED = 134217728;  // dotted-inner namespace
+const i32 NF_METHOD = 268435456;    // method definition: parameters must be unique
 
 struct NodeList {
     Node** items;

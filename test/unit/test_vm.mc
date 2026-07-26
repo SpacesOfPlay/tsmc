@@ -179,6 +179,21 @@ i32 main() {
     check_status("function f() { var x; { let x; } } f(); probe(1);", 0, "inner lexical shadows var");
     check_status("function f() { { let x; } var x; } f(); probe(1);", 0, "var outside the block ok");
 
+    // a repeated parameter name needs a simple list in an ordinary function
+    check_status("function f(a, a = 1) {}", 2, "dup param with default");
+    check_status("function f(a, ...a) {}", 2, "dup param with rest");
+    check_status("function f([a], a) {}", 2, "dup param with pattern");
+    check_status("function f([a, a]) {}", 2, "dup within one pattern");
+    check_status("const f = (a, a) => {};", 2, "dup arrow param");
+    check_status("const o = { m(a, a) {} };", 2, "dup object method param");
+    check_status("class C { m(a, a) {} }", 2, "dup class method param");
+    check_status("class C { constructor(a, a) {} }", 2, "dup constructor param");
+    // a simple list in an ordinary function may repeat, as may a plain
+    // function-valued property
+    check_status("function f(a, a) { return a; } probe(f(1, 2));", 0, "dup simple param ok");
+    check_status("const o = { m: function (a, a) { return a; } }; probe(o.m(1, 2));", 0, "dup property function ok");
+    check_status("function* g(a, a) {} probe(1);", 0, "dup generator param ok");
+
     // GC stress: collect on every allocation through the full pipeline
     {
         i32 st = run_snippet("let s = ''; for (let i = 0; i < 200; i++) { s = s + 'x'; } probe(s.length); const arr = []; for (let i = 0; i < 100; i++) { arr[i] = { v: i }; } let tot = 0; for (let i = 0; i < 100; i++) { tot += arr[i].v; } probe(tot);", false);

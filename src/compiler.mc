@@ -1699,6 +1699,32 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         scan_inner(&fs.inner, *(fields + i), true);
     }
 
+    // A repeated parameter name is only tolerated in the simple parameter list
+    // of an ordinary function. A method or arrow always requires unique names,
+    // as does any list carrying a default, a rest element or a pattern.
+    bool simple_params = true;
+    for i32 i = 0; i < f.kids.len; i++ {
+        Node* prm = *(f.kids.items + i);
+        if prm.b != null || (prm.flags & NF_REST) != 0
+            || prm.a == null || prm.a.kind != N_IDENT { simple_params = false; }
+    }
+    if !simple_params || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
+        Vec<str> pnames = vec_new<str>(4);
+        for i32 i = 0; i < f.kids.len; i++ {
+            collect_pattern_names((*(f.kids.items + i)).a, &pnames);
+        }
+        for i32 i = 0; i < pnames.len; i++ {
+            str nm = vec_get(&pnames, i);
+            for i32 j = 0; j < i; j++ {
+                if str_equal(vec_get(&pnames, j), nm) {
+                    redeclared(co, f, nm);
+                    break;
+                }
+            }
+        }
+        vec_free(&pnames);
+    }
+
     // params
     i32 n_params = 0;
     for i32 i = 0; i < f.kids.len; i++ {

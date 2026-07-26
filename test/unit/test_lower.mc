@@ -79,10 +79,10 @@ i32 main() {
 
     // parameter properties
     check_lower("class P { constructor(private x: number, y: string) {} }",
-        "(program (class P (member (ident constructor) (function (block (expr-stmt (assign = (member-expr x (this)) (ident x)))) (param:16384 (ident x)) (param (ident y))))))",
+        "(program (class P (member (ident constructor) (function:268435456 (block (expr-stmt (assign = (member-expr x (this)) (ident x)))) (param:16384 (ident x)) (param (ident y))))))",
         "param property assignment");
     check_lower("class D extends B { constructor(readonly r: number) { super(r); f(); } }",
-        "(program (class D (ident B) (member (ident constructor) (function (block (expr-stmt (call (super) (ident r))) (expr-stmt (assign = (member-expr r (this)) (ident r))) (expr-stmt (call (ident f)))) (param:16384 (ident r))))))",
+        "(program (class D (ident B) (member (ident constructor) (function:268435456 (block (expr-stmt (call (super) (ident r))) (expr-stmt (assign = (member-expr r (this)) (ident r))) (expr-stmt (call (ident f)))) (param:16384 (ident r))))))",
         "param property after super call");
 
     // abstract members dropped

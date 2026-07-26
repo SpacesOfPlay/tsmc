@@ -149,7 +149,7 @@ i32 main() {
 
     // classes
     check_ast("class A extends B { x = 1; static m() {} get y() { return 1; } #p = 2; constructor(private z: number) {} }",
-        "(program (class A (ident B) (member (ident x) (number 1.0)) (member:16 (ident m) (function (block))) (member:2048 (ident y) (function (block (return (number 1.0))))) (member (private-ident p) (number 2.0)) (member (ident constructor) (function (block) (param:16384 (ident z))))))",
+        "(program (class A (ident B) (member (ident x) (number 1.0)) (member:16 (ident m) (function:268435456 (block))) (member:2048 (ident y) (function:268435456 (block (return (number 1.0))))) (member (private-ident p) (number 2.0)) (member (ident constructor) (function:268435456 (block) (param:16384 (ident z))))))",
         "class members");
 
     // TS runtime constructs keep full AST

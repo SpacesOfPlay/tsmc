@@ -722,7 +722,9 @@ private Node* parse_object(Parser* p) {
             pr.a = prop_name(p);
         }
         if at(p, TOK_LPAREN) || at(p, TOK_LT) {
-            pr.b = parse_callable(p, fnflags);
+            // a method definition, unlike `key: function (...)`, requires
+            // its parameter names to be unique
+            pr.b = parse_callable(p, fnflags | NF_METHOD);
         } else if eat(p, TOK_COLON) {
             pr.b = parse_assign(p);
         } else if eat(p, TOK_EQ) {
@@ -1516,7 +1518,9 @@ private Node* parse_class_member(Parser* p) {
     if at(p, TOK_LPAREN) || at(p, TOK_LT) {
         if (m.flags & NF_ASYNC) != 0 { fnflags |= NF_ASYNC; }
         if (m.flags & NF_GENERATOR) != 0 { fnflags |= NF_GENERATOR; }
-        m.b = parse_callable(p, fnflags);
+        // NF_METHOD goes to the function, not the member: class and object
+        // methods need unique parameter names
+        m.b = parse_callable(p, fnflags | NF_METHOD);
         if fnflags != 0 { m.flags |= fnflags; }
         return nfin(p, m);
     }
