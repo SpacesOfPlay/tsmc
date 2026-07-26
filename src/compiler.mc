@@ -1388,12 +1388,25 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_DUP);
                 compile_expr(co, p.a);
                 if p.b != null { compile_expr(co, p.b); } else { ch_op(ch, OP_UNDEF); }
-                ch_op(ch, OP_SETINDEX);
+                ch_op(ch, OP_DEFPROP_DYN);
                 ch_op(ch, OP_POP);
                 continue;
             }
             if (p.flags & NF_SHORTHAND) != 0 && p.b != null {
                 cerror(co, p, "shorthand initializer outside destructuring");
+                continue;
+            }
+            // `{ __proto__: v }` written as a plain key sets the prototype
+            // instead of defining a property. The shorthand, computed, method
+            // and accessor spellings all stay ordinary properties.
+            if p.b != null && p.a != null
+                && (p.a.kind == N_IDENT || p.a.kind == N_STRING)
+                && str_equal(p.a.name, "__proto__")
+                && (p.b.kind != N_FUNCTION || (p.b.flags & NF_METHOD) == 0) {
+                ch_op(ch, OP_DUP);
+                compile_expr(co, p.b);
+                ch_op(ch, OP_SETPROTO);
+                ch_op(ch, OP_POP);
                 continue;
             }
             ch_op(ch, OP_DUP);
@@ -1410,7 +1423,7 @@ private void compile_expr(Compiler* co, Node* n) {
             } else {
                 emit_load_name(co, p.a.name, p);
             }
-            ch_op_u16(ch, OP_SETPROP, prop_key_const(co, p.a));
+            ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, p.a));
             ch_op(ch, OP_POP);
         }
         return;

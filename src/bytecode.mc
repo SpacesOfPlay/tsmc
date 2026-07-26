@@ -71,6 +71,10 @@ enum Op {
     OP_THROW,
 
     OP_SETPROTO,     // [obj, proto] pops proto, keeps obj
+    // Object literals define their own properties rather than assigning them,
+    // so an inherited setter (notably __proto__) is not invoked.
+    OP_DEFPROP,      // u16 name; [obj, val] pops val, keeps obj
+    OP_DEFPROP_DYN,  // [obj, key, val] pops key+val, keeps obj
     // Accessor definition. The trailing u16 is 1 when the property is
     // enumerable (object literals) and 0 when it is not (class bodies).
     OP_DEFGETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj

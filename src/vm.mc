@@ -3225,13 +3225,33 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value protov = vpop(vm);
                 Value objv = vpeek(vm, 0);
                 if value_is_object(objv) {
-                    JsObject* p = null;
-                    if value_is_object(protov) { p = value_as_object(protov); }
-                    value_as_object(objv).proto = p;
+                    // only an object or null is a prototype; `{__proto__: 5}`
+                    // leaves the object's prototype alone
+                    if value_is_object(protov) {
+                        value_as_object(objv).proto = value_as_object(protov);
+                    } else if value_is_null(protov) {
+                        value_as_object(objv).proto = null;
+                    }
                 } else if value_is_function(objv) {
                     // static inheritance: a derived ctor's [[Prototype]]
                     value_as_function(objv).fproto = protov;
                 }
+            }
+            case OP_DEFPROP: {
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
+                ip += 2;
+                Value v = vpop(vm);
+                Value objv = vpeek(vm, 0);
+                if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
+            }
+            case OP_DEFPROP_DYN: {
+                Value v = vpop(vm);
+                Value kv = vpeek(vm, 0);
+                u32 a = key_to_atom(vm, kv);
+                if vm.has_pending { break case; }
+                vm.sp--;
+                Value objv = vpeek(vm, 0);
+                if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
             }
             case OP_DEFGETTER, OP_DEFSETTER: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
@@ -4529,7 +4549,32 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
     GcString* flg = gc_new_string(&vm.heap, flags);
     js_set_prop(re, vm.atom_flags, value_cell(&flg.head));
     js_set_prop(re, vm.atom_lastindex, value_int(0));
+    // the flag set, reported one property per flag as on RegExp.prototype
+    bool f_i = false;
+    bool f_m = false;
+    bool f_s = false;
+    bool f_u = false;
+    bool f_y = false;
+    bool f_d = false;
+    bool f_v = false;
+    for i32 k = 0; k < flags.len; k++ {
+        u8 c = *(flags.data + k);
+        if c == 'i' { f_i = true; }
+        if c == 'm' { f_m = true; }
+        if c == 's' { f_s = true; }
+        if c == 'u' { f_u = true; }
+        if c == 'y' { f_y = true; }
+        if c == 'd' { f_d = true; }
+        if c == 'v' { f_v = true; }
+    }
     js_set_prop(re, atom_intern(&vm.atoms, "global"), value_bool(prog.global));
+    js_set_prop(re, atom_intern(&vm.atoms, "ignoreCase"), value_bool(f_i));
+    js_set_prop(re, atom_intern(&vm.atoms, "multiline"), value_bool(f_m));
+    js_set_prop(re, atom_intern(&vm.atoms, "dotAll"), value_bool(f_s));
+    js_set_prop(re, atom_intern(&vm.atoms, "unicode"), value_bool(f_u));
+    js_set_prop(re, atom_intern(&vm.atoms, "sticky"), value_bool(f_y));
+    js_set_prop(re, atom_intern(&vm.atoms, "hasIndices"), value_bool(f_d));
+    js_set_prop(re, atom_intern(&vm.atoms, "unicodeSets"), value_bool(f_v));
     return vpop(vm);
 }
 

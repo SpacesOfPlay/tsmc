@@ -464,6 +464,19 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
     return ov;
 }
 
+// `obj.__proto__` — the accessor form of Object.get/setPrototypeOf, defined on
+// Object.prototype so it reaches anything inheriting from it.
+private Value nat_proto_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value[1] a = { thisv };
+    return nat_object_getproto(vmp, callee, value_undefined(), &a[0], 1);
+}
+
+private Value nat_proto_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value[2] a = { thisv, arg_at(args, argc, 0) };
+    ignore nat_object_setproto(vmp, callee, value_undefined(), &a[0], 2);
+    return value_undefined();
+}
+
 // True if ov has an own or inherited property named `name`.
 private bool desc_has(VM* vm, Value ov, str name) {
     if !value_is_object(ov) { return false; }
@@ -1754,6 +1767,25 @@ private Value nat_arr_findlast(void* vmp, Value callee, Value thisv, Value* args
         if js_truthy(r) { return e; }
     }
     return value_undefined();
+}
+
+private Value nat_arr_findlastindex(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_arraylike(vm, thisv);
+    if a == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    for i32 i = a.elen - 1; i >= 0; i-- {
+        Value e = js_array_get(a, i);
+        Value[3] ca = { e, value_int(i), thisv };
+        Value r = vm_call_value(vm, fun, value_undefined(), &ca[0], 3);
+        if vm.has_pending { return value_undefined(); }
+        if js_truthy(r) { return value_int(i); }
+    }
+    return value_int(0 - 1);
 }
 
 // Flattens one level (arrays only) into dst.
@@ -12617,6 +12649,20 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
     def_method(vm, vm.object_proto, "propertyIsEnumerable", &nat_property_is_enumerable);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
+    {
+        // __proto__: a get/set accessor, so it follows the prototype chain
+        JsNative* pg = js_new_native(&vm.heap, &nat_proto_get, "__proto__");
+        vm_push(vm, value_cell(&pg.head));
+        JsNative* ps = js_new_native(&vm.heap, &nat_proto_set, "__proto__");
+        vm_push(vm, value_cell(&ps.head));
+        JsAccessor* pac = js_new_accessor(&vm.heap);
+        pac.get = value_cell(&pg.head);
+        pac.set = value_cell(&ps.head);
+        props_set_desc(&vm.object_proto.props, bi_atom(vm, "__proto__"),
+            value_cell(&pac.head), PROP_CONFIGURABLE);
+        vm_pop(vm);
+        vm_pop(vm);
+    }
 
     // Array
     JsNative* array_ctor = def_global_fn(vm, "Array", &nat_array_ctor);
@@ -12644,6 +12690,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "find", &nat_arr_find);
     def_method(vm, vm.array_proto, "findIndex", &nat_arr_findindex);
     def_method(vm, vm.array_proto, "findLast", &nat_arr_findlast);
+    def_method(vm, vm.array_proto, "findLastIndex", &nat_arr_findlastindex);
     def_method(vm, vm.array_proto, "at", &nat_arr_at);
     def_method(vm, vm.array_proto, "flat", &nat_arr_flat);
     def_method(vm, vm.array_proto, "flatMap", &nat_arr_flatmap);
