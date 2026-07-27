@@ -3180,7 +3180,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         r = proxy_delete(vm, cast(JsProxy*, o), a);
                         if vm.has_pending { break case; }
                     } else {
-                        r = js_delete_prop(o, a);
+                        // deleting an absent property succeeds; only a
+                        // non-configurable own property refuses
+                        Prop* pe = props_entry(&o.props, a);
+                        if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
+                            r = false;
+                        } else {
+                            ignore js_delete_prop(o, a);
+                        }
                     }
                 }
                 vm.sp--;
@@ -3501,7 +3508,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_KEYS: {
                 Value src = vpeek(vm, 0);
-                JsObject* arr = vm_own_keys(vm, src);
+                JsObject* arr = forin_keys(vm, src);
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
             }
@@ -3667,6 +3674,43 @@ private void normalize_args(VM* vm, FnTemplate* ft, i32 argc) {
 
 // Own enumerable keys as an array of strings; strings enumerate their
 // indices. Result is unrooted — consume before the next allocation.
+// for-in visits enumerable string keys along the whole prototype chain, each
+// name only once; a shadowing own property hides the inherited one.
+private JsObject* forin_keys(VM* vm, Value objv) {
+    JsObject* own = vm_own_keys(vm, objv);
+    if !value_is_object(objv) { return own; }
+    JsObject* proto = value_as_object(objv).proto;
+    if proto == null { return own; }
+    vpush(vm, value_cell(&own.head));
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vpush(vm, value_cell(&out.head));
+    i32 n = 0;
+    for i32 i = 0; i < own.elen; i++ {
+        js_array_set(out, n, js_array_get(own, i));
+        n++;
+    }
+    JsObject* cur = proto;
+    while cur != null {
+        JsObject* pk = vm_own_keys(vm, value_cell(&cur.head));
+        vpush(vm, value_cell(&pk.head));
+        for i32 i = 0; i < pk.elen; i++ {
+            Value k = js_array_get(pk, i);
+            bool seen = false;
+            for i32 j = 0; j < out.elen; j++ {
+                if js_strict_eq(js_array_get(out, j), k) { seen = true; break; }
+            }
+            if !seen {
+                js_array_set(out, n, k);
+                n++;
+            }
+        }
+        vm.sp--;
+        cur = cur.proto;
+    }
+    vm.sp -= 2;
+    return out;
+}
+
 JsObject* vm_own_keys(VM* vm, Value objv) {
     if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_PROXY) != 0 {
         // route through the ownKeys trap, keeping only string keys (for-in and

@@ -894,6 +894,17 @@ private bool proto_chain_has(JsObject* o, JsObject* target) {
 // Object.prototype.toString -> "[object <tag>]" with the correct builtin tag
 // (Array/String/Number/.../Date/RegExp/Error), as many type-detection idioms
 // depend on (e.g. `Object.prototype.toString.call(x) === '[object Array]'`).
+// Object.prototype.valueOf: the receiver itself, so a plain object is its own
+// primitive-conversion fallback.
+private Value nat_object_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if bi_nullish(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "valueOf called on null or undefined");
+        return value_undefined();
+    }
+    return thisv;
+}
+
 private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str tag = "Object";
@@ -2190,7 +2201,13 @@ private Value nat_str_includes(void* vmp, Value callee, Value thisv, Value* args
     gc_root(&vm.heap, sv2);
     Value nv = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, nv);
-    bool r = str_find_from(sview(sv2), sview(nv), 0) >= 0;
+    // the optional second argument is where the search starts
+    i32 begin = 0;
+    if !value_is_undefined(arg_at(args, argc, 1)) { begin = to_int_sat(arg_at(args, argc, 1)); }
+    if begin < 0 { begin = 0; }
+    str hay = sview(sv2);
+    bool r = false;
+    if begin <= hay.len { r = str_find_from(hay, sview(nv), begin) >= 0; }
     gc_root_reset(&vm.heap, rm);
     return value_bool(r);
 }
@@ -2202,7 +2219,18 @@ private Value nat_str_startswith(void* vmp, Value callee, Value thisv, Value* ar
     gc_root(&vm.heap, sv2);
     Value nv = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, nv);
-    bool r = str_starts_with(sview(sv2), sview(nv));
+    // the optional second argument is the position to match at
+    i32 begin = 0;
+    if !value_is_undefined(arg_at(args, argc, 1)) { begin = to_int_sat(arg_at(args, argc, 1)); }
+    if begin < 0 { begin = 0; }
+    str hay = sview(sv2);
+    bool r = false;
+    if begin <= hay.len {
+        str tail;
+        tail.data = hay.data + begin;
+        tail.len = hay.len - begin;
+        r = str_starts_with(tail, sview(nv));
+    }
     gc_root_reset(&vm.heap, rm);
     return value_bool(r);
 }
@@ -2214,7 +2242,16 @@ private Value nat_str_endswith(void* vmp, Value callee, Value thisv, Value* args
     gc_root(&vm.heap, sv2);
     Value nv = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, nv);
-    bool r = str_ends_with(sview(sv2), sview(nv));
+    // the optional second argument is the end of the region to test
+    str hay = sview(sv2);
+    i32 end = hay.len;
+    if !value_is_undefined(arg_at(args, argc, 1)) { end = to_int_sat(arg_at(args, argc, 1)); }
+    if end < 0 { end = 0; }
+    if end > hay.len { end = hay.len; }
+    str head;
+    head.data = hay.data;
+    head.len = end;
+    bool r = str_ends_with(head, sview(nv));
     gc_root_reset(&vm.heap, rm);
     return value_bool(r);
 }
@@ -12649,6 +12686,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
     def_method(vm, vm.object_proto, "propertyIsEnumerable", &nat_property_is_enumerable);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
+    def_method(vm, vm.object_proto, "valueOf", &nat_object_valueof);
     {
         // __proto__: a get/set accessor, so it follows the prototype chain
         JsNative* pg = js_new_native(&vm.heap, &nat_proto_get, "__proto__");
