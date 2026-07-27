@@ -2781,6 +2781,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* start = null;
                     if value_is_object(v) {
                         start = value_as_object(v).proto;
+                    } else if value_is_map(v) {
+                        start = value_as_map(v).proto;
+                    } else if value_is_generator(v) {
+                        start = vm.generator_proto;
+                    } else if value_is_bigint(v) {
+                        start = vm.bigint_proto;
                     } else if value_is_function(v) || value_is_native(v) {
                         // a function has a chain too: its [[Prototype]], which
                         // defaults to Function.prototype. Constructors linked

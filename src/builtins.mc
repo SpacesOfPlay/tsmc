@@ -3793,9 +3793,9 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
         vm_throw_error(vm, ERR_TYPE, "Do not know how to serialize a BigInt");
         return false;
     }
-    if value_is_map(v) {
-        // a Map or Set has no enumerable own properties, so it serializes as
-        // an empty object rather than being skipped
+    if value_is_map(v) || value_is_generator(v) {
+        // a Map, Set or generator has no enumerable own properties, so it
+        // serializes as an empty object rather than being skipped
         str_buf_add(sb, "{}");
         return true;
     }
@@ -5112,16 +5112,36 @@ private Value nat_all_rej(void* vmp, Value callee, Value thisv, Value* args, i32
     return value_undefined();
 }
 
+// A combinator takes any iterable, not only an array. Maps, sets and
+// generators are their own cell kinds, so they are drained the way Array.from
+// does rather than being refused for not being arrays. Returns false (with an
+// error pending) when the value cannot be iterated.
+private bool combinator_list(VM* vm, Value* list, str what) {
+    if value_is_array(*list) { return true; }
+    if value_is_object(*list) || value_is_map(*list)
+        || value_is_generator(*list) || value_is_string(*list) {
+        Value[1] fa = { *list };
+        Value conv = nat_array_from(cast(void*, vm), value_undefined(), value_undefined(), &fa[0], 1);
+        if vm.has_pending { return false; }
+        if value_is_array(conv) {
+            *list = conv;
+            return true;
+        }
+    }
+    vm_throw_error(vm, ERR_TYPE, what);
+    return false;
+}
+
 private Value nat_promise_all(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value list = arg_at(args, argc, 0);
-    if !value_is_array(list) {
-        vm_throw_error(vm, ERR_TYPE, "Promise.all expects an array");
+    if !combinator_list(vm, &list, "Promise.all expects an iterable") {
         return value_undefined();
     }
     JsObject* items = value_as_object(list);
     i32 n = items.elen;
     i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, list);
     Value p = vm_promise_new(vm);
     gc_root(&vm.heap, p);
     JsObject* st = js_new_object(&vm.heap, null);
@@ -5176,12 +5196,12 @@ private Value nat_race_settle(void* vmp, Value callee, Value thisv, Value* args,
 private Value nat_promise_race(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value list = arg_at(args, argc, 0);
-    if !value_is_array(list) {
-        vm_throw_error(vm, ERR_TYPE, "Promise.race expects an array");
+    if !combinator_list(vm, &list, "Promise.race expects an iterable") {
         return value_undefined();
     }
     JsObject* items = value_as_object(list);
     i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, list);
     Value p = vm_promise_new(vm);
     gc_root(&vm.heap, p);
     for i32 i = 0; i < items.elen; i++ {
@@ -5304,13 +5324,17 @@ private Value nat_any_rej(void* vmp, Value callee, Value thisv, Value* args, i32
 // wiring each element's promise to the given fulfill/reject natives.
 // `any` inverts the empty/settle semantics via `is_any`.
 private Value promise_combine(VM* vm, Value list, NativeFn onful, NativeFn onrej, bool is_any) {
-    if !value_is_array(list) {
-        vm_throw_error(vm, ERR_TYPE, "Promise combinator expects an array");
+    // any iterable is accepted, not just an array — a set or generator is its
+    // own cell kind, so it is drained through the same conversion Array.from uses
+    Value listv = list;
+    if !combinator_list(vm, &listv, "Promise combinator expects an iterable") {
         return value_undefined();
     }
-    JsObject* items = value_as_object(list);
+    JsObject* items = value_as_object(listv);
     i32 n = items.elen;
     i32 rm = gc_root_mark(&vm.heap);
+    // a converted list is only reachable from here, so it is rooted for the run
+    gc_root(&vm.heap, listv);
     Value p = vm_promise_new(vm);
     gc_root(&vm.heap, p);
     JsObject* st = js_new_object(&vm.heap, null);
