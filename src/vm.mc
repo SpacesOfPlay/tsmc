@@ -922,10 +922,13 @@ Value vm_make_error(VM* vm, i32 kind, str msg) {
         GcString* ns = gc_new_string(&vm.heap, vm_error_kind_name(kind));
         js_set_prop(e, vm.atom_name, value_cell(&ns.head));
     }
+    // message and stack are not enumerated, so Object.keys of an error is empty
     GcString* ms = gc_new_string(&vm.heap, msg);
-    js_set_prop(e, vm.atom_message, value_cell(&ms.head));
+    props_set_desc(&e.props, vm.atom_message, value_cell(&ms.head),
+        PROP_WRITABLE | PROP_CONFIGURABLE);
     Value stack = vm_error_stack(vm, vm_error_kind_name(kind), msg, msg.len > 0);
-    js_set_prop(e, atom_intern(&vm.atoms, "stack"), stack);
+    props_set_desc(&e.props, atom_intern(&vm.atoms, "stack"), stack,
+        PROP_WRITABLE | PROP_CONFIGURABLE);
     return vpop(vm);
 }
 

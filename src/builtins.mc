@@ -2896,6 +2896,12 @@ private Value uri_decode(VM* vm, Value thisv, Value* args, i32 argc, bool compon
                 str_buf_add(&sb, one);
             }
             i += 3;
+        } else if c == '%' {
+            // a '%' not followed by two hex digits is malformed input
+            str_buf_free(&sb);
+            gc_root_reset(&vm.heap, rm);
+            vm_throw_error(vm, ERR_URI, "URI malformed");
+            return value_undefined();
         } else {
             str one;
             one.data = s.data + i;
@@ -3228,7 +3234,10 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     VM* vm = as_vm(vmp);
     f64 v = num_this(vm, thisv);
     i32 d = to_int_arg(arg_at(args, argc, 0));
-    if d < 0 { d = 0; }
+    if d < 0 || d > 100 {
+        vm_throw_error(vm, ERR_RANGE, "toFixed() digits argument must be between 0 and 100");
+        return value_undefined();
+    }
     if d > 20 { d = 20; }
     f64 inf = 1.0e308 * 10.0;
     f64 av = fabs(v);
@@ -4461,7 +4470,8 @@ private Value error_ctor_impl(VM* vm, Value thisv, Value* args, i32 argc, i32 ki
     if !value_is_undefined(mv) {
         Value ms = js_to_string_value(vm, mv);
         gc_root(&vm.heap, ms);
-        js_set_prop(target, vm.atom_message, ms);
+        props_set_desc(&target.props, vm.atom_message, ms,
+            PROP_WRITABLE | PROP_CONFIGURABLE);
         msg = sview(ms);
         has_msg = true;
     }
@@ -4469,7 +4479,10 @@ private Value error_ctor_impl(VM* vm, Value thisv, Value* args, i32 argc, i32 ki
     Value optv = arg_at(args, argc, 1);
     if value_is_object(optv) {
         Prop* ce = props_entry(&value_as_object(optv).props, bi_atom(vm, "cause"));
-        if ce != null { js_set_prop(target, bi_atom(vm, "cause"), ce.val); }
+        if ce != null {
+            props_set_desc(&target.props, bi_atom(vm, "cause"), ce.val,
+                PROP_WRITABLE | PROP_CONFIGURABLE);
+        }
     }
     // .stack, using the error's resolved name
     Value namev = value_undefined();
@@ -4477,7 +4490,8 @@ private Value error_ctor_impl(VM* vm, Value thisv, Value* args, i32 argc, i32 ki
     str nm = "Error";
     if value_is_string(namev) { nm = sview(namev); }
     Value stack = vm_error_stack(vm, nm, msg, has_msg);
-    js_set_prop(target, bi_atom(vm, "stack"), stack);
+    props_set_desc(&target.props, bi_atom(vm, "stack"), stack,
+        PROP_WRITABLE | PROP_CONFIGURABLE);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&target.head);
 }
@@ -6412,6 +6426,24 @@ private void append_replacement(VM* vm, str_buf* sb, str tmpl, str subject, i32*
                 i += 2;
                 continue;
             }
+            if n == 96 {
+                // $` — the part of the subject before the match
+                str before;
+                before.data = subject.data;
+                before.len = *(caps + 0);
+                str_buf_add(sb, before);
+                i += 2;
+                continue;
+            }
+            if n == 39 {
+                // $' — the part of the subject after the match
+                str after;
+                after.data = subject.data + *(caps + 1);
+                after.len = subject.len - *(caps + 1);
+                str_buf_add(sb, after);
+                i += 2;
+                continue;
+            }
             if n >= '0' && n <= '9' {
                 i32 nd = n;
                 i32 g = nd - '0';
@@ -6561,6 +6593,29 @@ private Value nat_str_replace_x(void* vmp, Value callee, Value thisv, Value* arg
     return str_replace_impl(vm, thisv, args, argc, false);
 }
 
+// Extends String.prototype.replaceAll to accept a RegExp, which must be global.
+private Value nat_str_replaceall_x(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value pat = arg_at(args, argc, 0);
+    if vm_is_regexp(vm, pat) {
+        Value g;
+        bool is_global = js_get_prop(value_as_object(pat), bi_atom(vm, "global"), &g)
+            && value_is_true(g);
+        if !is_global {
+            vm_throw_error(vm, ERR_TYPE,
+                "replaceAll must be called with a global RegExp");
+            return value_undefined();
+        }
+        i32 rm = gc_root_mark(&vm.heap);
+        Value sv2 = js_to_string_value(vm, thisv);
+        gc_root(&vm.heap, sv2);
+        Value r = regexp_replace(vm, sv2, pat, arg_at(args, argc, 1));
+        gc_root_reset(&vm.heap, rm);
+        return r;
+    }
+    return str_replace_impl(vm, thisv, args, argc, true);
+}
+
 private Value nat_str_split_x(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value sep = arg_at(args, argc, 0);
@@ -6579,7 +6634,18 @@ private Value nat_str_split_x(void* vmp, Value callee, Value thisv, Value* args,
     i32 last = 0;
     i32 pos = 0;
     i32 n = 0;
-    while pos <= s.len {
+    // an explicit limit caps the number of entries produced
+    i32 limit = 0 - 1;
+    Value lv = arg_at(args, argc, 1);
+    if !value_is_undefined(lv) {
+        limit = to_int_arg(lv);
+        if limit < 0 { limit = 0; }
+    }
+    i32 ngrp = regex_ngroups(prog);
+    // the search stops before the end, so a separator matching there adds no
+    // trailing empty entry
+    while pos < s.len {
+        if limit >= 0 && n >= limit { break; }
         if !regex_exec(prog, s, pos, caps) { break; }
         i32 ms = *(caps + 0);
         i32 me = *(caps + 1);
@@ -6592,13 +6658,29 @@ private Value nat_str_split_x(void* vmp, Value callee, Value thisv, Value* args,
         part.len = ms - last;
         js_array_set(out, n, new_str(vm, part));
         n++;
+        // a capturing separator contributes its groups to the result
+        for i32 g = 1; g <= ngrp; g++ {
+            if limit >= 0 && n >= limit { break; }
+            i32 gs = *(caps + 2 * g);
+            if gs < 0 {
+                js_array_set(out, n, value_undefined());
+            } else {
+                str cs;
+                cs.data = s.data + gs;
+                cs.len = *(caps + 2 * g + 1) - gs;
+                js_array_set(out, n, new_str(vm, cs));
+            }
+            n++;
+        }
         last = me;
         pos = me > pos ? me : pos + 1;
     }
-    str tail;
-    tail.data = s.data + last;
-    tail.len = s.len - last;
-    js_array_set(out, n, new_str(vm, tail));
+    if limit < 0 || n < limit {
+        str tail;
+        tail.data = s.data + last;
+        tail.len = s.len - last;
+        js_array_set(out, n, new_str(vm, tail));
+    }
     free(caps);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&out.head);
@@ -12773,7 +12855,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.string_proto, "padStart", &nat_str_padstart);
     def_method(vm, vm.string_proto, "padEnd", &nat_str_padend);
     def_method(vm, vm.string_proto, "replace", &nat_str_replace_x);
-    def_method(vm, vm.string_proto, "replaceAll", &nat_str_replaceall);
+    def_method(vm, vm.string_proto, "replaceAll", &nat_str_replaceall_x);
     def_method(vm, vm.string_proto, "toString", &nat_str_tostring);
     def_method(vm, vm.string_proto, "valueOf", &nat_str_tostring);
     def_method(vm, vm.string_proto, "at", &nat_str_at);
@@ -12898,12 +12980,22 @@ void builtins_install(VM* vm) {
     props_set_desc(&ee_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_EVAL].head), 0);
     JsNative* ue_ctor = def_global_fn(vm, "URIError", &nat_urierror_ctor);
     props_set_desc(&ue_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_URI].head), 0);
+    // each error prototype points back at its own constructor, so
+    // `err.constructor` names the specific type rather than plain Error
+    link_ctor(vm, vm.error_protos[ERR_ERROR], err_ctor);
+    link_ctor(vm, vm.error_protos[ERR_TYPE], te_ctor);
+    link_ctor(vm, vm.error_protos[ERR_RANGE], re_ctor);
+    link_ctor(vm, vm.error_protos[ERR_REF], fe_ctor);
+    link_ctor(vm, vm.error_protos[ERR_SYNTAX], se_ctor);
+    link_ctor(vm, vm.error_protos[ERR_EVAL], ee_ctor);
+    link_ctor(vm, vm.error_protos[ERR_URI], ue_ctor);
     for i32 i = 0; i < ERR_KIND_COUNT; i++ {
         JsObject* ep = vm.error_protos[i];
+        // name and message live on the prototype and are not enumerated
         Value nm = new_str(vm, vm_error_kind_name(i));
-        js_set_prop(ep, vm.atom_name, nm);
+        props_set_desc(&ep.props, vm.atom_name, nm, PROP_WRITABLE | PROP_CONFIGURABLE);
         Value em = new_str(vm, "");
-        js_set_prop(ep, vm.atom_message, em);
+        props_set_desc(&ep.props, vm.atom_message, em, PROP_WRITABLE | PROP_CONFIGURABLE);
         def_method(vm, ep, "toString", &nat_error_tostring);
     }
 
