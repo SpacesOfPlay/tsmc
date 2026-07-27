@@ -290,6 +290,23 @@ private str num_key_text(Compiler* co, f64 num) {
     return r;
 }
 
+// An accessor's function is named "get x" / "set x". Built in the arena so it
+// outlives this call as the function's inferred name.
+private str accessor_name(Compiler* co, str prefix, Node* key) {
+    str none = "";
+    if key == null { return none; }
+    if key.kind != N_IDENT && key.kind != N_STRING { return none; }
+    string s = format("{} {}", prefix, key.name);
+    str view = s;
+    u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
+    memcpy(copy, view.data, view.len);
+    free(s);
+    str r;
+    r.data = copy;
+    r.len = view.len;
+    return r;
+}
+
 private i32 num_key_const(Compiler* co, f64 num) {
     i64 iv = cast(i64, num);
     string s;
@@ -1376,6 +1393,8 @@ private void compile_expr(Compiler* co, Node* n) {
                     i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
                     ch_op_u16(ch, aop, 1);   // object-literal accessors are enumerable
                 } else {
+                    str an = accessor_name(co, (p.flags & NF_GETTER) != 0 ? "get" : "set", p.a);
+                    if an.len > 0 { infer_name(p.b, an); }
                     compile_expr(co, p.b);
                     i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
                     ch_op_u16(ch, aop, prop_key_const(co, p.a));
@@ -2081,6 +2100,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
                 }
                 ch_op(ch, OP_POP);
             } else if is_acc {
+                str an = accessor_name(co, (m.flags & NF_GETTER) != 0 ? "get" : "set", m.a);
+                if an.len > 0 { infer_name(m.b, an); }
                 compile_function(co, m.b, false);
                 i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
                 ch_op_u16(ch, aop, prop_key_const(co, m.a));

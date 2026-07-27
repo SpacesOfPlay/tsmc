@@ -3793,6 +3793,12 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
         vm_throw_error(vm, ERR_TYPE, "Do not know how to serialize a BigInt");
         return false;
     }
+    if value_is_map(v) {
+        // a Map or Set has no enumerable own properties, so it serializes as
+        // an empty object rather than being skipped
+        str_buf_add(sb, "{}");
+        return true;
+    }
     if value_is_null(v) {
         str_buf_add(sb, "null");
         return true;
@@ -4413,6 +4419,23 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
     w.env0 = thisv;
     w.env1 = arg_at(args, argc, 0);
     w.env2 = value_cell(&pre.head);
+    vm_push(vm, value_cell(&w.head));
+    // a bound function reports "bound <target>" and the target's remaining arity
+    Value tn;
+    str base = "";
+    if vm_get_prop_value(vm, thisv, vm.atom_name, &tn) && value_is_string(tn) { base = sview(tn); }
+    string bn = format("bound {}", base);
+    Value bnv = new_str(vm, bn);
+    free(bn);
+    props_set_desc(&w.props, vm.atom_name, bnv, PROP_CONFIGURABLE);
+    Value tl;
+    i32 blen = 0;
+    if vm_get_prop_value(vm, thisv, vm.atom_length, &tl) && value_is_number(tl) {
+        blen = cast(i32, js_to_number(tl)) - n;
+        if blen < 0 { blen = 0; }
+    }
+    props_set_desc(&w.props, vm.atom_length, value_int(blen), PROP_CONFIGURABLE);
+    vm_pop(vm);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&w.head);
 }

@@ -2778,15 +2778,32 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     Value protov = ensure_prototype(vm, ctor);
                     bool r = false;
-                    if value_is_object(v) && value_is_object(protov) {
+                    JsObject* start = null;
+                    if value_is_object(v) {
+                        start = value_as_object(v).proto;
+                    } else if value_is_function(v) || value_is_native(v) {
+                        // a function has a chain too: its [[Prototype]], which
+                        // defaults to Function.prototype. Constructors linked
+                        // by static inheritance are stepped over, since the
+                        // right-hand side is always a .prototype object.
+                        Value cur = value_undefined();
+                        if value_is_function(v) { cur = value_as_function(v).fproto; }
+                        while value_is_function(cur) || value_is_native(cur) {
+                            Value nxt = value_undefined();
+                            if value_is_function(cur) { nxt = value_as_function(cur).fproto; }
+                            cur = nxt;
+                        }
+                        if value_is_object(cur) { start = value_as_object(cur); }
+                        else if !value_is_null(cur) { start = vm.function_proto; }
+                    }
+                    if value_is_object(protov) {
                         JsObject* proto = value_as_object(protov);
-                        JsObject* cur = value_as_object(v).proto;
-                        while cur != null {
-                            if cur == proto {
+                        while start != null {
+                            if start == proto {
                                 r = true;
                                 break;
                             }
-                            cur = cur.proto;
+                            start = start.proto;
                         }
                     }
                     vm.sp -= 2;
