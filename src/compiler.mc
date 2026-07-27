@@ -2425,7 +2425,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     i32 saved_slots = fs.cur_slots;
 
     compile_expr(co, n.b);
-    ch_op(ch, OP_GET_ITER);
+    ch_op(ch, OP_GET_AITER);
     i32 t_iter = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_iter);
     ch_op(ch, OP_POP);

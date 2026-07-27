@@ -189,6 +189,12 @@ struct VM {
     u32 sym_iterator_id;
     Value sym_to_primitive;  // well-known Symbol.toPrimitive
     u32 sym_to_primitive_id;
+    Value sym_async_iterator; // well-known Symbol.asyncIterator
+    u32 sym_async_iterator_id;
+    Value sym_to_string_tag; // well-known Symbol.toStringTag
+    u32 sym_to_string_tag_id;
+    Value sym_has_instance;  // well-known Symbol.hasInstance
+    u32 sym_has_instance_id;
     u32 atom_pstate;
     u32 atom_pvalue;
     u32 atom_pcbs;
@@ -367,6 +373,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     gc_mark_value(h, vm.sym_iterator);
     gc_mark_value(h, vm.sym_to_primitive);
+    gc_mark_value(h, vm.sym_async_iterator);
+    gc_mark_value(h, vm.sym_to_string_tag);
+    gc_mark_value(h, vm.sym_has_instance);
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.gen != null { gc_mark_cell(h, &fr.gen.head); }
@@ -1646,6 +1655,17 @@ bool prop_enumerable(VM* vm, Prop* pr) {
     return vm_enumerable_key(vm, pr.key);
 }
 
+// Object.assign and object spread copy own enumerable properties *including*
+// symbol-keyed ones, unlike Object.keys/for-in. Only the internal %-hidden
+// atoms stay out.
+bool prop_copyable(VM* vm, Prop* pr) {
+    if (pr.flags & PROP_ENUMERABLE) == 0 { return false; }
+    if (pr.key & 0x80000000) != 0 { return true; }
+    str nm = atom_name(&vm.atoms, pr.key);
+    if nm.len > 0 && *(nm.data) == '%' { return false; }
+    return true;
+}
+
 // --- globals ------------------------------------------------------------------------
 
 void vm_set_global(VM* vm, str name, Value v) {
@@ -2137,6 +2157,12 @@ void vm_init(VM* vm) {
     vm.sym_iterator_id = 0;
     vm.sym_to_primitive = value_undefined();
     vm.sym_to_primitive_id = 0;
+    vm.sym_async_iterator = value_undefined();
+    vm.sym_async_iterator_id = 0;
+    vm.sym_to_string_tag = value_undefined();
+    vm.sym_to_string_tag_id = 0;
+    vm.sym_has_instance = value_undefined();
+    vm.sym_has_instance_id = 0;
     vm.atom_pstate = atom_intern(&vm.atoms, "%state");
     vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
     vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
@@ -2151,12 +2177,23 @@ void vm_init(VM* vm) {
     vm_install_globals(vm);
     // Well-known symbols: allocated up front so their ids are stable and
     // shared as property keys.
-    Value itsym = vm_new_symbol(vm, value_undefined());
+    // Their descriptions are the spec-visible names, so `String(Symbol.iterator)`
+    // reads "Symbol(Symbol.iterator)".
+    Value itsym = vm_new_wellknown_symbol(vm, "Symbol.iterator");
     vm.sym_iterator = itsym;
     vm.sym_iterator_id = value_as_symbol(itsym).id;
-    Value tpsym = vm_new_symbol(vm, value_undefined());
+    Value tpsym = vm_new_wellknown_symbol(vm, "Symbol.toPrimitive");
     vm.sym_to_primitive = tpsym;
     vm.sym_to_primitive_id = value_as_symbol(tpsym).id;
+    Value aisym = vm_new_wellknown_symbol(vm, "Symbol.asyncIterator");
+    vm.sym_async_iterator = aisym;
+    vm.sym_async_iterator_id = value_as_symbol(aisym).id;
+    Value ttsym = vm_new_wellknown_symbol(vm, "Symbol.toStringTag");
+    vm.sym_to_string_tag = ttsym;
+    vm.sym_to_string_tag_id = value_as_symbol(ttsym).id;
+    Value hisym = vm_new_wellknown_symbol(vm, "Symbol.hasInstance");
+    vm.sym_has_instance = hisym;
+    vm.sym_has_instance_id = value_as_symbol(hisym).id;
 }
 
 void vm_destroy(VM* vm) {
@@ -2791,6 +2828,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_INSTANCEOF: {
+                if instanceof_hook(vm) { break case; }
                 Value ctor = vpeek(vm, 0);
                 Value v = vpeek(vm, 1);
                 if !value_is_callable(ctor) {
@@ -3413,7 +3451,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
-                        if !prop_enumerable(vm, pr) { continue; }
+                        if !prop_copyable(vm, pr) { continue; }
                         Value pv = pr.val;
                         if value_is_accessor(pv) {
                             if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
@@ -3434,7 +3472,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* ex = value_as_object(exv);
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
-                        if !prop_enumerable(vm, pr) { continue; }
+                        if !prop_copyable(vm, pr) { continue; }
                         bool skip = false;
                         for i32 j = 0; j < ex.elen; j++ {
                             Value kv = js_array_get(ex, j);
@@ -3611,6 +3649,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm.sp--;
                     vpush(vm, it);
                 }
+            }
+            case OP_GET_AITER: {
+                do_get_aiter(vm);
             }
             case OP_ITER_NEXT: {
                 Value iter = vpeek(vm, 0);
@@ -3821,6 +3862,36 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     return arr;
 }
 
+// A Symbol.hasInstance method on the right-hand side decides `instanceof`, and
+// applies to plain objects too, not just callables. Returns false when there is
+// none and the ordinary prototype-chain walk should run instead. Kept out of the
+// interpreter loop so its locals stay off that frame.
+// Takes [value, ctor] off the stack and pushes the boolean result itself, so
+// the interpreter loop needs no locals of its own for this path.
+private bool instanceof_hook(VM* vm) {
+    Value ctor = vpeek(vm, 0);
+    if !value_is_object(ctor) && !value_is_function(ctor) && !value_is_native(ctor) {
+        return false;
+    }
+    Value hi;
+    if !vm_get_prop_value(vm, ctor, vm.sym_has_instance_id, &hi) { return false; }
+    if !value_is_callable(hi) { return false; }
+    Value v = vpeek(vm, 1);
+    Value r = vm_call_value(vm, hi, ctor, &v, 1);
+    vm.sp -= 2;
+    vpush(vm, value_bool(js_truthy(r)));
+    return true;
+}
+
+// Likewise kept out of the loop: `for await`'s iterator acquisition.
+private void do_get_aiter(VM* vm) {
+    Value it;
+    if vm_get_async_iterator(vm, vpeek(vm, 0), &it) {
+        vm.sp--;
+        vpush(vm, it);
+    }
+}
+
 // --- iterator protocol --------------------------------------------------
 
 // v stays rooted by the caller; false = threw.
@@ -3895,6 +3966,23 @@ bool vm_get_iterator(VM* vm, Value v, Value* out) {
     Value dummy = value_undefined();
     *out = vm_call_value(vm, m, v, &dummy, 0);
     return !vm.has_pending;
+}
+
+// `for await` prefers Symbol.asyncIterator and falls back to the sync
+// Symbol.iterator, whose yielded values the loop awaits individually.
+bool vm_get_async_iterator(VM* vm, Value v, Value* out) {
+    if is_nullish(v) {
+        vm_throw_error(vm, ERR_TYPE, "value is not async iterable");
+        return false;
+    }
+    Value m;
+    if !vm_get_prop_value(vm, v, vm.sym_async_iterator_id, &m) { return false; }
+    if value_is_callable(m) {
+        Value dummy = value_undefined();
+        *out = vm_call_value(vm, m, v, &dummy, 0);
+        return !vm.has_pending;
+    }
+    return vm_get_iterator(vm, v, out);
 }
 
 // iter stays rooted by the caller; consume outputs before allocating.
@@ -4690,6 +4778,12 @@ Value vm_new_symbol(VM* vm, Value desc) {
     return v;
 }
 
+// A well-known symbol, described by its spec name.
+Value vm_new_wellknown_symbol(VM* vm, str name) {
+    GcString* d = gc_new_string(&vm.heap, name);
+    return vm_new_symbol(vm, value_cell(&d.head));
+}
+
 u32 vm_atom(VM* vm, str name) {
     return atom_intern(&vm.atoms, name);
 }
@@ -4698,6 +4792,9 @@ JsObject* vm_generator_proto(VM* vm) { return vm.generator_proto; }
 JsObject* vm_promise_proto(VM* vm) { return vm.promise_proto; }
 u32 vm_sym_iterator_id(VM* vm) { return vm.sym_iterator_id; }
 u32 vm_sym_to_primitive_id(VM* vm) { return vm.sym_to_primitive_id; }
+u32 vm_sym_async_iterator_id(VM* vm) { return vm.sym_async_iterator_id; }
+u32 vm_sym_to_string_tag_id(VM* vm) { return vm.sym_to_string_tag_id; }
+u32 vm_sym_has_instance_id(VM* vm) { return vm.sym_has_instance_id; }
 
 // --- regex integration ---------------------------------------------------
 

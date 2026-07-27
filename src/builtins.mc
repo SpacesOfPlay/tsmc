@@ -335,7 +335,7 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
             }
         }
         for i32 i = 0; i < src.props.len; i++ {
-            if !prop_enumerable(vm, src.props.items + i) { continue; }
+            if !prop_copyable(vm, src.props.items + i) { continue; }
             u32 pk = (src.props.items + i).key;
             Value pv = (src.props.items + i).val;
             if value_is_accessor(pv) {
@@ -923,6 +923,14 @@ private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* a
         if proto_chain_has(o, vm.regexp_proto) { tag = "RegExp"; }
         else if proto_chain_has(o, vm.date_proto) { tag = "Date"; }
         else if proto_chain_has(o, vm.error_protos[ERR_ERROR]) { tag = "Error"; }
+    }
+    // A string-valued Symbol.toStringTag anywhere on the chain wins over the
+    // builtin tag; this is how Map/Set/Promise/Math/JSON get theirs too.
+    if !bi_nullish(thisv) {
+        Value tv;
+        if vm_get_prop_value(vm, thisv, vm_sym_to_string_tag_id(vm), &tv) && value_is_string(tv) {
+            tag = sview(tv);
+        }
     }
     str_buf sb;
     str_buf_init(&sb);
@@ -6845,6 +6853,12 @@ const u8 METHOD_ATTRS = PROP_WRITABLE | PROP_CONFIGURABLE;
 private void def_method(VM* vm, JsObject* obj, str name, NativeFn f) {
     JsNative* n = js_new_native(&vm.heap, f, name);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
+}
+
+// A builtin's Symbol.toStringTag: non-enumerable and non-writable, but
+// configurable, as the spec defines them.
+private void def_tag(VM* vm, JsObject* obj, str tag) {
+    props_set_desc(&obj.props, vm_sym_to_string_tag_id(vm), new_str(vm, tag), PROP_CONFIGURABLE);
 }
 
 private JsNative* def_global_fn(VM* vm, str name, NativeFn f) {
@@ -12806,7 +12820,24 @@ private Value nat_reflect_ownkeys(void* vmp, Value callee, Value thisv, Value* a
     if o != null && (o.obj_flags & OBJF_PROXY) != 0 {
         return value_cell(&proxy_own_keys(vm, cast(JsProxy*, o)).head);
     }
-    return nat_object_getownnames(vmp, callee, thisv, args, argc);
+    // string keys first, then symbol keys, as the spec orders them
+    Value names = nat_object_getownnames(vmp, callee, thisv, args, argc);
+    if vm.has_pending { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, names);
+    Value syms = nat_object_getownsymbols(vmp, callee, thisv, args, argc);
+    if vm.has_pending {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    gc_root(&vm.heap, syms);
+    JsObject* na = value_as_object(names);
+    JsObject* sa = value_as_object(syms);
+    for i32 i = 0; i < sa.elen; i++ {
+        js_array_set(na, na.elen, js_array_get(sa, i));
+    }
+    gc_root_reset(&vm.heap, rm);
+    return names;
 }
 
 private Value nat_reflect_getownpropdesc(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -13095,6 +13126,7 @@ void builtins_install(VM* vm) {
     // Math
     JsObject* math_obj = js_new_object(&vm.heap, vm.object_proto);
     vm_set_global(vm, "Math", value_cell(&math_obj.head));
+    def_tag(vm, math_obj, "Math");
     def_value(vm, math_obj, "PI", value_number(PI));
     def_value(vm, math_obj, "E", value_number(E));
     def_method(vm, math_obj, "floor", &nat_math_floor);
@@ -13142,6 +13174,7 @@ void builtins_install(VM* vm) {
     // JSON
     JsObject* json_obj = js_new_object(&vm.heap, vm.object_proto);
     vm_set_global(vm, "JSON", value_cell(&json_obj.head));
+    def_tag(vm, json_obj, "JSON");
     def_method(vm, json_obj, "stringify", &nat_json_stringify);
     def_method(vm, json_obj, "parse", &nat_json_parse);
 
@@ -13209,6 +13242,9 @@ void builtins_install(VM* vm) {
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
     props_set(&symbol_ctor.props, bi_atom(vm, "toPrimitive"), vm.sym_to_primitive);
+    props_set(&symbol_ctor.props, bi_atom(vm, "asyncIterator"), vm.sym_async_iterator);
+    props_set(&symbol_ctor.props, bi_atom(vm, "toStringTag"), vm.sym_to_string_tag);
+    props_set(&symbol_ctor.props, bi_atom(vm, "hasInstance"), vm.sym_has_instance);
     def_static(vm, symbol_ctor, "for", &nat_symbol_for);
     def_static(vm, symbol_ctor, "keyFor", &nat_symbol_key_for);
     vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
@@ -13216,6 +13252,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.symbol_proto, "toString", &nat_symbol_tostring);
     def_method(vm, vm.symbol_proto, "valueOf", &nat_symbol_valueof);
     def_accessor(vm, vm.symbol_proto, "description", &nat_symbol_description);
+    def_tag(vm, vm.symbol_proto, "Symbol");
     link_ctor(vm, vm.symbol_proto, symbol_ctor);
 
     // BigInt
@@ -13227,15 +13264,18 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.bigint_proto, "toLocaleString", &nat_bigint_tostring);
     link_ctor(vm, vm.bigint_proto, bigint_ctor);
 
-    // Array/String iterators via Symbol.iterator
+    // Array/String iterators via Symbol.iterator. Array.prototype[Symbol.iterator]
+    // and Array.prototype.values are one and the same function object.
     u32 iter_id = vm_sym_iterator_id(vm);
-    JsNative* arr_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
+    JsNative* arr_it = js_new_native(&vm.heap, &nat_arr_symiter, "values");
     js_set_prop(vm.array_proto, iter_id, value_cell(&arr_it.head));
+    props_set_desc(&vm.array_proto.props, bi_atom(vm, "values"), value_cell(&arr_it.head), METHOD_ATTRS);
     JsNative* str_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
     js_set_prop(vm.string_proto, iter_id, value_cell(&str_it.head));
 
     // Generator.prototype
     vm.generator_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.generator_proto, "Generator");
     def_method(vm, vm.generator_proto, "next", &nat_gen_next);
     def_method(vm, vm.generator_proto, "return", &nat_gen_return);
     def_method(vm, vm.generator_proto, "throw", &nat_gen_throw);
@@ -13244,6 +13284,7 @@ void builtins_install(VM* vm) {
 
     // Promise
     vm.promise_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.promise_proto, "Promise");
     JsNative* promise_ctor = def_global_fn(vm, "Promise", &nat_promise_ctor);
     props_set_desc(&promise_ctor.props, vm.atom_prototype, value_cell(&vm.promise_proto.head), 0);
     def_static(vm, promise_ctor, "resolve", &nat_promise_resolve);
@@ -13258,6 +13299,7 @@ void builtins_install(VM* vm) {
 
     // Map
     vm.map_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.map_proto, "Map");
     JsNative* map_ctor = def_global_fn(vm, "Map", &nat_map_ctor);
     props_set_desc(&map_ctor.props, vm.atom_prototype, value_cell(&vm.map_proto.head), 0);
     def_method(vm, vm.map_proto, "set", &nat_map_set);
@@ -13275,6 +13317,7 @@ void builtins_install(VM* vm) {
 
     // Set
     vm.set_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.set_proto, "Set");
     JsNative* set_ctor = def_global_fn(vm, "Set", &nat_set_ctor);
     props_set_desc(&set_ctor.props, vm.atom_prototype, value_cell(&vm.set_proto.head), 0);
     def_method(vm, vm.set_proto, "add", &nat_set_add);
@@ -13291,6 +13334,7 @@ void builtins_install(VM* vm) {
 
     // WeakMap / WeakSet (keys held weakly; get/has/delete reuse Map's)
     vm.weakmap_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.weakmap_proto, "WeakMap");
     JsNative* weakmap_ctor = def_global_fn(vm, "WeakMap", &nat_weakmap_ctor);
     props_set_desc(&weakmap_ctor.props, vm.atom_prototype, value_cell(&vm.weakmap_proto.head), 0);
     def_method(vm, vm.weakmap_proto, "set", &nat_weakmap_set);
@@ -13300,6 +13344,7 @@ void builtins_install(VM* vm) {
     link_ctor(vm, vm.weakmap_proto, weakmap_ctor);
 
     vm.weakset_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.weakset_proto, "WeakSet");
     JsNative* weakset_ctor = def_global_fn(vm, "WeakSet", &nat_weakset_ctor);
     props_set_desc(&weakset_ctor.props, vm.atom_prototype, value_cell(&vm.weakset_proto.head), 0);
     def_method(vm, vm.weakset_proto, "add", &nat_weakset_add);

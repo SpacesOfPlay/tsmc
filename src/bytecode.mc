@@ -96,6 +96,7 @@ enum Op {
 
     OP_YIELD,        // suspend the generator frame; top is the value
     OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
+    OP_GET_AITER,    // [v] -> iterator via Symbol.asyncIterator, else Symbol.iterator
     OP_ITER_NEXT,    // [iter] -> [value, done]
     // Array destructuring drives the iterator through these. The u16 operand
     // is the local slot holding the "exhausted" flag, so a spent iterator is
