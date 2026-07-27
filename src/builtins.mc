@@ -12891,6 +12891,28 @@ private Value nat_reflect_apply(void* vmp, Value callee, Value thisv, Value* arg
     return r;
 }
 
+private Value nat_reflect_isextensible(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) {
+        vm_throw_error(vm, ERR_TYPE, "Reflect.isExtensible called on non-object");
+        return value_undefined();
+    }
+    return value_bool((value_as_object(ov).obj_flags & OBJF_NONEXT) == 0);
+}
+
+private Value nat_reflect_preventext(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) {
+        vm_throw_error(vm, ERR_TYPE, "Reflect.preventExtensions called on non-object");
+        return value_undefined();
+    }
+    JsObject* o = value_as_object(ov);
+    o.obj_flags = o.obj_flags | OBJF_NONEXT;
+    return value_bool(true);
+}
+
 private Value nat_reflect_construct(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value target = arg_at(args, argc, 0);
@@ -12935,6 +12957,8 @@ private void install_proxy_reflect(VM* vm) {
     def_method(vm, reflect, "defineProperty", &nat_reflect_defineproperty);
     def_method(vm, reflect, "apply", &nat_reflect_apply);
     def_method(vm, reflect, "construct", &nat_reflect_construct);
+    def_method(vm, reflect, "isExtensible", &nat_reflect_isextensible);
+    def_method(vm, reflect, "preventExtensions", &nat_reflect_preventext);
     vm_set_global(vm, "Reflect", value_cell(&reflect.head));
     gc_root_reset(&vm.heap, rm);
 }

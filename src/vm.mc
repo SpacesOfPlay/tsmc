@@ -1122,8 +1122,28 @@ Value proxy_construct(VM* vm, JsProxy* p, Value* argstart, i32 argc, Value new_t
     i32 tr = proxy_trap(vm, p, "construct", &trap);
     if tr < 0 { return value_undefined(); }
     if tr == 0 {
-        vm_throw_error(vm, ERR_TYPE, "proxy construct without a trap is not supported");
-        return value_undefined();
+        // no trap: construct the target, as `new` on it directly would
+        if !value_is_callable(p.target) {
+            vm_throw_error(vm, ERR_TYPE, "proxy target is not a constructor");
+            return value_undefined();
+        }
+        i32 crm = gc_root_mark(&vm.heap);
+        JsObject* cproto = vm.object_proto;
+        Value cpv;
+        if vm_get_prop_value(vm, p.target, vm.atom_prototype, &cpv) && value_is_object(cpv) {
+            cproto = value_as_object(cpv);
+        }
+        JsObject* cinst = js_new_object(&vm.heap, cproto);
+        Value cinstv = value_cell(&cinst.head);
+        gc_root(&vm.heap, cinstv);
+        vm.pending_new_target = new_target;
+        Value cres = vm_call_value(vm, p.target, cinstv, argstart, argc);
+        vm.pending_new_target = value_undefined();
+        gc_root_reset(&vm.heap, crm);
+        if vm.has_pending { return value_undefined(); }
+        // a constructor returning an object replaces the fresh instance
+        if value_is_reference(cres) { return cres; }
+        return cinstv;
     }
     i32 rm = gc_root_mark(&vm.heap);
     Value arr = args_to_array(vm, argstart, argc);
