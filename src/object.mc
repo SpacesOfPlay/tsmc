@@ -164,6 +164,16 @@ void props_set_desc(PropList* p, u32 key, Value v, u8 flags) {
     ignore props_append(p, key, v, flags);
 }
 
+// Positions changed under the caller (a reorder); rebuild the key->position
+// index if one is live.
+void props_reindex(PropList* p) {
+    if p.idx == null { return; }
+    intmap_free<i32>(p.idx);
+    free(p.idx);
+    p.idx = null;
+    if p.len >= PROPS_INDEX_MIN { props_build_index(p); }
+}
+
 bool props_remove(PropList* p, u32 key) {
     for i32 i = 0; i < p.len; i++ {
         if (p.items + i).key == key {

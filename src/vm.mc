@@ -1640,6 +1640,74 @@ private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, 
     if is_getter { ac.get = fnv; } else { ac.set = fnv; }
 }
 
+// True when the atom spells a canonical array index ("0", "1", ...
+// "4294967294"): decimal digits, no sign, no leading zero, in range.
+bool vm_key_array_index(VM* vm, u32 key, u32* out) {
+    if (key & 0x80000000) != 0 { return false; }
+    str nm = atom_name(&vm.atoms, key);
+    if nm.len == 0 || nm.len > 10 { return false; }
+    if *(nm.data) == '0' && nm.len > 1 { return false; }
+    u64 v = 0;
+    for i32 i = 0; i < nm.len; i++ {
+        u8 c = *(nm.data + i);
+        if c < cast(u8, '0') || c > cast(u8, '9') { return false; }
+        v = v * 10 + cast(u64, c - cast(u8, '0'));
+    }
+    if v > 4294967294 { return false; }
+    *out = cast(u32, v);
+    return true;
+}
+
+// Own property order per spec: array-index keys in ascending numeric order,
+// then every other key in insertion order. Reorders the list in place so the
+// enumeration sites can keep their plain loops. The scan is a no-op unless the
+// object actually holds out-of-order index keys, which is the common case.
+void vm_props_order(VM* vm, PropList* p) {
+    i32 nidx = 0;
+    bool ordered = true;
+    bool seen_other = false;
+    u32 prev = 0;
+    for i32 i = 0; i < p.len; i++ {
+        u32 iv = 0;
+        if vm_key_array_index(vm, (p.items + i).key, &iv) {
+            if seen_other || (nidx > 0 && iv < prev) { ordered = false; }
+            prev = iv;
+            nidx++;
+        } else {
+            seen_other = true;
+        }
+    }
+    if nidx == 0 || ordered { return; }
+
+    Prop* out = alloc<Prop>(p.len);
+    i32 n = 0;
+    // index keys first, kept sorted as they are inserted
+    for i32 i = 0; i < p.len; i++ {
+        u32 iv = 0;
+        if !vm_key_array_index(vm, (p.items + i).key, &iv) { continue; }
+        i32 at = n;
+        while at > 0 {
+            u32 pv = 0;
+            ignore vm_key_array_index(vm, (out + at - 1).key, &pv);
+            if pv <= iv { break; }
+            *(out + at) = *(out + at - 1);
+            at--;
+        }
+        *(out + at) = *(p.items + i);
+        n++;
+    }
+    // then the rest, in insertion order
+    for i32 i = 0; i < p.len; i++ {
+        u32 iv = 0;
+        if vm_key_array_index(vm, (p.items + i).key, &iv) { continue; }
+        *(out + n) = *(p.items + i);
+        n++;
+    }
+    for i32 i = 0; i < p.len; i++ { *(p.items + i) = *(out + i); }
+    free(out);
+    props_reindex(p);
+}
+
 // Symbol keys and %-hidden atoms stay out of enumeration.
 bool vm_enumerable_key(VM* vm, u32 key) {
     if (key & 0x80000000) != 0 { return false; }
@@ -1948,6 +2016,7 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
             i32 n = 0;
             str_buf tmp;
             str_buf_init(&tmp);
+            vm_props_order(vm, &o.props);
             for i32 i = 0; i < o.props.len; i++ {
                 u32 key = (o.props.items + i).key;
                 if !prop_enumerable(vm, o.props.items + i) { continue; }
@@ -3284,7 +3353,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_array(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 && idx < value_as_object(objv).elen {
-                        js_array_set(value_as_object(objv), idx, value_undefined());
+                        // leaves a hole, not undefined: `1 in a` goes false and
+                        // the iteration methods skip the slot
+                        js_array_set(value_as_object(objv), idx, value_hole());
                     }
                 } else if value_is_object(objv) {
                     JsObject* dob = value_as_object(objv);
@@ -3449,6 +3520,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             js_set_prop(d, a2, vm_ta_get(vm, s, i));
                         }
                     }
+                    vm_props_order(vm, &s.props);
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
                         if !prop_copyable(vm, pr) { continue; }
@@ -3470,6 +3542,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_object(src) && value_is_object(exv) {
                     JsObject* s = value_as_object(src);
                     JsObject* ex = value_as_object(exv);
+                    vm_props_order(vm, &s.props);
                     for i32 i = 0; i < s.props.len; i++ {
                         Prop* pr = s.props.items + i;
                         if !prop_copyable(vm, pr) { continue; }
@@ -3841,6 +3914,7 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     }
     PropList* props = value_props(objv);
     if props != null {
+        vm_props_order(vm, props);
         for i32 i = 0; i < props.len; i++ {
             if !prop_enumerable(vm, props.items + i) { continue; }
             u32 pk = (props.items + i).key;
@@ -4176,17 +4250,10 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
     JsObject* p = value_as_object(pv);
     Value* st = props_get(&p.props, vm.atom_pstate);
     if st == null || value_as_int(*st) != 0 { return; }
-    if !rejected && vm_is_promise(vm, v) {
-        // adopt the inner promise's eventual state
-        JsNative* onf = js_new_native(&vm.heap, &nat_adopt_ful, "adopt");
-        onf.env0 = pv;
-        vpush(vm, value_cell(&onf.head));
-        JsNative* onr = js_new_native(&vm.heap, &nat_adopt_rej, "adopt");
-        onr.env0 = pv;
-        Value onfv = vpop(vm);
-        ignore vm_promise_then(vm, v, onfv, value_cell(&onr.head));
-        return;
-    }
+    // A native promise is assimilated through the same thenable job as any
+    // other thenable rather than adopted directly: the job is the tick that
+    // makes `resolve(aPromise)` settle one turn later than a plain value, as
+    // the specified ordering requires.
     if !rejected && value_is_object(v) {
         // any object with a callable `then` is assimilated: the call itself
         // happens in a job, so the extra tick matches the specified ordering

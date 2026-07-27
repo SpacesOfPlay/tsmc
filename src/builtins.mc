@@ -213,6 +213,7 @@ private Value nat_object_values(void* vmp, Value callee, Value thisv, Value* arg
                 n++;
             }
         }
+        vm_props_order(vm, &o.props);
         for i32 i = 0; i < o.props.len; i++ {
             if !prop_enumerable(vm, o.props.items + i) { continue; }
             Value pv = (o.props.items + i).val;
@@ -279,6 +280,7 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
                 n++;
             }
         }
+        vm_props_order(vm, &o.props);
         for i32 i = 0; i < o.props.len; i++ {
             if !prop_enumerable(vm, o.props.items + i) { continue; }
             u32 pk = (o.props.items + i).key;
@@ -334,6 +336,7 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
                 js_array_set(t, i, js_array_get(src, i));
             }
         }
+        vm_props_order(vm, &src.props);
         for i32 i = 0; i < src.props.len; i++ {
             if !prop_copyable(vm, src.props.items + i) { continue; }
             u32 pk = (src.props.items + i).key;
@@ -407,6 +410,7 @@ private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value
         }
         // all own string keys, enumerable or not, minus symbols and the
         // engine's %-internal slots
+        vm_props_order(vm, props);
         for i32 i = 0; i < props.len; i++ {
             u32 key = (props.items + i).key;
             if (key & 0x80000000) != 0 { continue; }
@@ -3124,6 +3128,7 @@ private Value struct_clone(VM* vm, Value v, Vec<u64>* keys, Vec<Value>* clones) 
         gc_root(&vm.heap, rv);
         vec_push(keys, id);
         vec_push(clones, rv);
+        vm_props_order(vm, &o.props);
         for i32 i = 0; i < o.props.len; i++ {
             if !prop_enumerable(vm, o.props.items + i) { continue; }
             u32 pk = (o.props.items + i).key;
@@ -3920,6 +3925,7 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
             gc_root(&vm.heap, value_cell(&pkeys.head));
         }
         // array replacer restricts (and orders) keys; otherwise own order
+        if ctx.allow == null && pkeys == null { vm_props_order(vm, &o.props); }
         i32 count = ctx.allow != null ? ctx.allow.len : (pkeys != null ? pkeys.elen : o.props.len);
         for i32 i = 0; i < count; i++ {
             u32 key = 0;
@@ -5400,7 +5406,9 @@ private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args,
     Value cbfn = arg_at(args, argc, 0);
     if !value_is_callable(cbfn) { return value_int(0); }
     f64 delay = argc > 1 ? js_to_number(*(args + 1)) : 0.0;
-    if delay != delay || delay < 0.0 { delay = 0.0; }
+    // a delay below 1ms is clamped up, so a 0ms and a 1ms timer share a
+    // deadline and fire in registration order
+    if delay != delay || delay < 1.0 { delay = 1.0; }
     return value_int(vm_add_timer(vm, cbfn, delay));
 }
 
