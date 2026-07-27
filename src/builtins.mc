@@ -3780,6 +3780,10 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
     if value_is_undefined(v) || value_is_callable(v) || value_is_hole(v) {
         return false;
     }
+    if value_is_bigint(v) {
+        vm_throw_error(vm, ERR_TYPE, "Do not know how to serialize a BigInt");
+        return false;
+    }
     if value_is_null(v) {
         str_buf_add(sb, "null");
         return true;
@@ -4742,8 +4746,8 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
         if vm_get_prop_value(vm, src, vm.atom_length, &lv) { len = cast(i32, js_to_number(lv)); }
     }
     if i >= len {
-        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
         js_set_prop(r, vm_atom(vm, "value"), value_undefined());
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
     } else {
         me.env1 = value_int(i + 1);
         i32 kind = value_is_int(me.env2) ? value_as_int(me.env2) : 0;
@@ -4777,8 +4781,8 @@ private Value nat_arr_iter_next(void* vmp, Value callee, Value thisv, Value* arg
             outv = value_cell(&pair.head);
             vm.sp -= 2;
         }
-        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
         js_set_prop(r, vm_atom(vm, "value"), outv);
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
     }
     return vm_pop_ret(vm, value_cell(&r.head));
 }
@@ -8214,8 +8218,8 @@ private Value nat_ta_iter_next(void* vmp, Value callee, Value thisv, Value* args
     JsObject* o = value_as_object(src);
     i32 len = ta_len(vm, o);
     if i >= len {
-        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
         js_set_prop(r, vm_atom(vm, "value"), value_undefined());
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
     } else {
         me.env1 = value_int(i + 1);
         i32 kind = value_as_int(me.env2);
@@ -8232,8 +8236,8 @@ private Value nat_ta_iter_next(void* vmp, Value callee, Value thisv, Value* args
             outv = value_cell(&pair.head);
             vm.sp -= 2;
         }
-        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
         js_set_prop(r, vm_atom(vm, "value"), outv);
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
     }
     return vm_pop_ret(vm, value_cell(&r.head));
 }

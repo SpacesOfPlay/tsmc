@@ -2468,6 +2468,11 @@ private void compile_for_of(Compiler* co, Node* n) {
     i32 t_iter = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_iter);
     ch_op(ch, OP_POP);
+    // tracks exhaustion, so a loop left early still releases the iterator
+    i32 t_done = alloc_slot(fs);
+    ch_op(ch, OP_FALSE);
+    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op(ch, OP_POP);
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
@@ -2481,6 +2486,9 @@ private void compile_for_of(Compiler* co, Node* n) {
     i32 lcond = ch_pos(ch);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
     ch_op(ch, OP_ITER_NEXT);       // [value, done]
+    ch_op(ch, OP_DUP);
+    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op(ch, OP_POP);
     i32 jend = ch_jump(ch, OP_JUMPT);
 
     for i32 i = bind_start; i < bind_end; i++ {
@@ -2504,6 +2512,9 @@ private void compile_for_of(Compiler* co, Node* n) {
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the final value under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
+    // leaving early (a break) closes the iterator; an exhausted one is left be
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
