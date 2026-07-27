@@ -5901,8 +5901,17 @@ private f64 date_parse_iso(str s) {
 private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* d;
-    if value_is_object(thisv) { d = value_as_object(thisv); }
-    else { d = js_new_object(&vm.heap, vm_date_proto(vm)); }
+    if !value_is_object(thisv) {
+        // called as a function rather than a constructor: the current time as
+        // a string, with any arguments ignored
+        JsObject* tmp = js_new_object(&vm.heap, vm_date_proto(vm));
+        vm_push(vm, value_cell(&tmp.head));
+        js_set_prop(tmp, bi_atom(vm, "%t"), js_number_value(vm_now_millis(vm)));
+        Value r = nat_date_tostring(vmp, callee, value_cell(&tmp.head), null, 0);
+        vm_pop(vm);
+        return r;
+    }
+    d = value_as_object(thisv);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&d.head));
     f64 t;
@@ -5976,6 +5985,85 @@ private Value nat_date_getms(void* vmp, Value callee, Value thisv, Value* args, 
     return value_int(date_decompose(date_ms(as_vm(vmp), thisv)).ms);
 }
 
+// --- Date setters ---
+//
+// Each writes the object's stored time and returns the new value. Fields are
+// recomposed through date_compose, which normalises out-of-range values the
+// way the specification does (month 12 rolls into the next year, and so on).
+// tsmc keeps dates in UTC, so the local and UTC setters share an implementation.
+
+private Value date_store(VM* vm, Value thisv, f64 t) {
+    if value_is_object(thisv) {
+        js_set_prop(value_as_object(thisv), bi_atom(vm, "%t"), js_number_value(t));
+    }
+    return js_number_value(t);
+}
+
+// field: 0 year, 1 month, 2 day, 3 hour, 4 minute, 5 second, 6 millisecond.
+// Later arguments fill the fields below it, as the specification allows.
+private Value date_set_field(VM* vm, Value thisv, Value* args, i32 argc, i32 field) {
+    f64 cur = date_ms(vm, thisv);
+    if cur != cur {
+        // an invalid date stays invalid unless the whole time is replaced
+        return date_store(vm, thisv, cur);
+    }
+    DateParts p = date_decompose(cur);
+    i64 y = p.year;
+    i32 mo = p.month;
+    i32 day = p.day;
+    i32 hr = p.hour;
+    i32 mi = p.min;
+    i32 se = p.sec;
+    i32 ms = p.ms;
+    for i32 i = 0; i < argc; i++ {
+        i32 slot = field + i;
+        if slot > 6 { break; }
+        f64 a = js_to_number(*(args + i));
+        if a != a {
+            return date_store(vm, thisv, 0.0 / 0.0);
+        }
+        i32 v = cast(i32, a);
+        if slot == 0 { y = date_year_expand(cast(i64, a)); }
+        else if slot == 1 { mo = v; }
+        else if slot == 2 { day = v; }
+        else if slot == 3 { hr = v; }
+        else if slot == 4 { mi = v; }
+        else if slot == 5 { se = v; }
+        else { ms = v; }
+    }
+    return date_store(vm, thisv, date_compose(y, mo, day, hr, mi, se, ms));
+}
+
+private Value nat_date_settime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return date_store(vm, thisv, js_to_number(arg_at(args, argc, 0)));
+}
+private Value nat_date_setfullyear(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 0);
+}
+private Value nat_date_setmonth(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 1);
+}
+private Value nat_date_setdate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 2);
+}
+private Value nat_date_sethours(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 3);
+}
+private Value nat_date_setminutes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 4);
+}
+private Value nat_date_setseconds(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 5);
+}
+private Value nat_date_setms(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return date_set_field(as_vm(vmp), thisv, args, argc, 6);
+}
+// Dates are held in UTC, so there is no offset to report.
+private Value nat_date_tzoffset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(0);
+}
+
 private void pad2(str_buf* sb, i32 v) {
     if v < 10 { str_buf_add(sb, "0"); }
     string s = format("{}", v);
@@ -5983,9 +6071,23 @@ private void pad2(str_buf* sb, i32 v) {
     free(s);
 }
 
+// toJSON reports an invalid date as null rather than throwing, unlike
+// toISOString which it otherwise defers to.
+private Value nat_date_tojson(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64 t = date_ms(vm, thisv);
+    if t != t { return value_null(); }
+    return nat_date_toiso(vmp, callee, thisv, args, argc);
+}
+
 private Value nat_date_toiso(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    DateParts d = date_decompose(date_ms(vm, thisv));
+    f64 t0 = date_ms(vm, thisv);
+    if t0 != t0 {
+        vm_throw_error(vm, ERR_RANGE, "Invalid time value");
+        return value_undefined();
+    }
+    DateParts d = date_decompose(t0);
     str_buf sb;
     str_buf_init(&sb);
     string y = format("{}", d.year);
@@ -7927,8 +8029,9 @@ private Value nat_ta_ctor(void* vmp, Value callee, Value thisv, Value* args, i32
         if len < 0 { len = 0; }
         return ta_make(vm, kind, ab, boff, len);
     }
-    if value_is_object(a0) {
-        // Copy from an array, typed array, iterable, or array-like.
+    // Copy from an array, typed array, array-like, or any iterable. Maps, sets
+    // and generators are their own cell kinds, so they are named explicitly.
+    if value_is_object(a0) || value_is_map(a0) || value_is_generator(a0) {
         Value[1] fa = { a0 };
         Value arr = nat_array_from(vmp, callee, value_undefined(), &fa[0], 1);
         if vm.has_pending { return value_undefined(); }
@@ -8034,6 +8137,62 @@ private Value nat_ta_reverse(void* vmp, Value callee, Value thisv, Value* args, 
         vm_ta_set(vm, o, i, b);
         vm_ta_set(vm, o, len - 1 - i, a);
     }
+    return thisv;
+}
+
+// Typed arrays sort numerically by default, unlike Array.prototype.sort which
+// compares string forms. Insertion sort keeps it stable and in place.
+private Value nat_ta_sort(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    Value cmp = arg_at(args, argc, 0);
+    bool has_cmp = value_is_callable(cmp);
+    i32 len = ta_len(vm, o);
+    for i32 i = 1; i < len; i++ {
+        Value cur = vm_ta_get(vm, o, i);
+        i32 j = i - 1;
+        while j >= 0 {
+            Value prev = vm_ta_get(vm, o, j);
+            bool after = false;
+            if has_cmp {
+                Value[2] ca = { prev, cur };
+                Value r = vm_call_value(vm, cmp, value_undefined(), &ca[0], 2);
+                if vm.has_pending { return value_undefined(); }
+                after = js_to_number(r) > 0.0;
+            } else {
+                f64 a = js_to_number(prev);
+                f64 b = js_to_number(cur);
+                after = a > b;
+            }
+            if !after { break; }
+            vm_ta_set(vm, o, j + 1, prev);
+            j--;
+        }
+        vm_ta_set(vm, o, j + 1, cur);
+    }
+    return thisv;
+}
+
+private Value nat_ta_copywithin(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    i32 len = ta_len(vm, o);
+    i32 tgt = rel_index(to_int_sat(arg_at(args, argc, 0)), len);
+    i32 src = rel_index(to_int_sat(arg_at(args, argc, 1)), len);
+    i32 end = len;
+    if !value_is_undefined(arg_at(args, argc, 2)) {
+        end = rel_index(to_int_sat(arg_at(args, argc, 2)), len);
+    }
+    i32 count = end - src;
+    if count > len - tgt { count = len - tgt; }
+    if count <= 0 { return thisv; }
+    // copy through a buffer so overlapping ranges stay correct
+    Value* tmp = alloc<Value>(count);
+    for i32 i = 0; i < count; i++ { *(tmp + i) = vm_ta_get(vm, o, src + i); }
+    for i32 i = 0; i < count; i++ { vm_ta_set(vm, o, tgt + i, *(tmp + i)); }
+    free(tmp);
     return thisv;
 }
 
@@ -8578,6 +8737,8 @@ private void typedarray_install(VM* vm) {
     def_method(vm, vm.ta_proto, "every", &nat_ta_every);
     def_method(vm, vm.ta_proto, "at", &nat_ta_at);
     def_method(vm, vm.ta_proto, "reverse", &nat_ta_reverse);
+    def_method(vm, vm.ta_proto, "sort", &nat_ta_sort);
+    def_method(vm, vm.ta_proto, "copyWithin", &nat_ta_copywithin);
     def_method(vm, vm.ta_proto, "keys", &nat_ta_keys);
     def_method(vm, vm.ta_proto, "values", &nat_ta_values);
     def_method(vm, vm.ta_proto, "entries", &nat_ta_entries);
@@ -13168,8 +13329,24 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.date_proto, "getUTCMinutes", &nat_date_getminutes);
     def_method(vm, vm.date_proto, "getUTCSeconds", &nat_date_getseconds);
     def_method(vm, vm.date_proto, "getUTCMilliseconds", &nat_date_getms);
+    def_method(vm, vm.date_proto, "setTime", &nat_date_settime);
+    def_method(vm, vm.date_proto, "setFullYear", &nat_date_setfullyear);
+    def_method(vm, vm.date_proto, "setMonth", &nat_date_setmonth);
+    def_method(vm, vm.date_proto, "setDate", &nat_date_setdate);
+    def_method(vm, vm.date_proto, "setHours", &nat_date_sethours);
+    def_method(vm, vm.date_proto, "setMinutes", &nat_date_setminutes);
+    def_method(vm, vm.date_proto, "setSeconds", &nat_date_setseconds);
+    def_method(vm, vm.date_proto, "setMilliseconds", &nat_date_setms);
+    def_method(vm, vm.date_proto, "setUTCFullYear", &nat_date_setfullyear);
+    def_method(vm, vm.date_proto, "setUTCMonth", &nat_date_setmonth);
+    def_method(vm, vm.date_proto, "setUTCDate", &nat_date_setdate);
+    def_method(vm, vm.date_proto, "setUTCHours", &nat_date_sethours);
+    def_method(vm, vm.date_proto, "setUTCMinutes", &nat_date_setminutes);
+    def_method(vm, vm.date_proto, "setUTCSeconds", &nat_date_setseconds);
+    def_method(vm, vm.date_proto, "setUTCMilliseconds", &nat_date_setms);
+    def_method(vm, vm.date_proto, "getTimezoneOffset", &nat_date_tzoffset);
     def_method(vm, vm.date_proto, "toISOString", &nat_date_toiso);
-    def_method(vm, vm.date_proto, "toJSON", &nat_date_toiso);
+    def_method(vm, vm.date_proto, "toJSON", &nat_date_tojson);
     def_method(vm, vm.date_proto, "toString", &nat_date_tostring);
     def_method(vm, vm.date_proto, "toDateString", &nat_date_todatestring);
     def_method(vm, vm.date_proto, "toTimeString", &nat_date_totimestring);
