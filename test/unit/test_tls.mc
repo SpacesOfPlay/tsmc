@@ -86,8 +86,10 @@ private bool drive_handshake(ptls_t* cli, ptls_t* srv) {
     i32 cli_r2 = ptls_handshake(cli, &cli_buf, cast(void*, srv_buf.base), &cli_in_2, null);
     if cli_r2 != 0 && cli_r2 != 514 { return false; }
 
-    bool cli_done = false;
-    if cli_in_2 < srv_buf.off {
+    // The client may consume the server's whole flight in one call, or stop
+    // partway and need a second with the remainder; accept either shape.
+    bool cli_done = ptls_handshake_is_complete(cli) != 0;
+    if !cli_done && cli_in_2 < srv_buf.off {
         u64 remain = srv_buf.off - cli_in_2;
         u8* rest = srv_buf.base + cli_in_2;
         cli_buf.off = 0;

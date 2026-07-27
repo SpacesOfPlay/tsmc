@@ -2415,6 +2415,7 @@ i32 ptls_buffer__adjust_quic_blocksize(ptls_buffer_t* buf, u64 body_size) {
 i32 ptls_buffer__adjust_asn1_blocksize(ptls_buffer_t* buf, u64 body_size) {
     fprintf(c_stderr, "unimplemented\n");
     abort();
+    return 0;   // LOCAL (tsmc): unreachable; abort() does not return
 }
 i32 ptls_buffer_push_asn1_ubigint(ptls_buffer_t* buf, void* bignum, u64 size) {
     u8* p = bignum;
@@ -2703,6 +2704,7 @@ i32 buffer_encrypt_record(ptls_buffer_t* buf, u64 rec_start, st_ptls_traffic_pro
     ptls_clear_memory(buf.base + rec_start, bodylen + 5);
     buf.off = rec_start;
     ret = buffer_push_encrypted_records(buf, type, tmpbuf, bodylen, enc);
+    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
 }
 }
 private {
@@ -8313,6 +8315,7 @@ i32 client_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
     }
     tls.state = PTLS_STATE_CLIENT_EXPECT_ENCRYPTED_EXTENSIONS;
     ret = 512 + 2;
+    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
 }
 }
 private {
@@ -9357,6 +9360,7 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
         }
         if !(0 != 0) { break; }
     }
+    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
 }
 }
 private {
@@ -10388,6 +10392,7 @@ i32 select_negotiated_group(ptls_key_exchange_algorithm_t** selected, ptls_key_e
                 if !(0 != 0) { break; }
     }
     ret = 40;
+    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
 }
 }
 private {

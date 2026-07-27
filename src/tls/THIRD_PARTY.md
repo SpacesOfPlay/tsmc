@@ -40,6 +40,23 @@ One local *removal*: a leftover debug print in `ed25519_pl_verify_cert_cb`
 was deleted — it fired on every successful handshake and polluted stderr.
 Re-delete it on re-export.
 
+Five local *added returns* in `picotls_lib.mc`, each marked `LOCAL (tsmc)`.
+The generator drops the C epilogue `Exit: ... return ret;`, so these
+functions fell off the end and returned an indeterminate value; minc now
+rejects that. Restore them on re-export:
+
+| function | added |
+|----------|-------|
+| `ptls_buffer__adjust_asn1_blocksize` | `return 0;` (unreachable, after `abort()`) |
+| `buffer_encrypt_record` | `return ret;` |
+| `client_handle_hello` | `return ret;` |
+| `send_certificate_verify` | `return ret;` |
+| `select_negotiated_group` | `return ret;` |
+
+Not cosmetic: `client_handle_hello` ends with `ret = PTLS_ERROR_IN_PROGRESS`,
+so returning it lets the client process the server's whole flight in one
+`ptls_handshake` call instead of stopping after ServerHello.
+
 - `ecdsa_p256_accept_verify_cert_cb` (`picotls_bridges_p256.mc`) and
   `rsa_pss_accept_verify_cert_cb` (`picotls_bridges_rsa.mc`): the pinned
   verify callbacks minus the SPKI-pin comparison (accept any cert, still
