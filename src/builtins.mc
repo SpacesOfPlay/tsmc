@@ -344,7 +344,9 @@ private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* arg
             if value_is_accessor(pv) {
                 if !vm_get_prop_value(vm, sv2, pk, &pv) { return value_undefined(); }
             }
-            js_set_prop(t, pk, pv);
+            // assign goes through [[Set]], so a setter on the target (or its
+            // prototype) runs; object spread defines instead and does not
+            if !vm_set_prop_value(vm, tv, pk, pv) { return value_undefined(); }
         }
     }
     return tv;
@@ -964,6 +966,25 @@ private JsObject* this_array(VM* vm, Value thisv) {
 // throws) if the receiver is neither an array nor array-like.
 private JsObject* this_arraylike(VM* vm, Value thisv) {
     if value_is_array(thisv) { return value_as_object(thisv); }
+    // a string receiver is array-like too: Array.prototype.map.call('ab', f)
+    if value_is_string(thisv) {
+        str s = sview(thisv);
+        i32 rm = gc_root_mark(&vm.heap);
+        JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&a.head));
+        i32 off = 0;
+        while off < s.len {
+            i32 n;
+            ignore utf8_decode(s, off, &n);
+            str piece;
+            piece.data = s.data + off;
+            piece.len = n;
+            js_array_set(a, a.elen, new_str(vm, piece));
+            off += n;
+        }
+        gc_root_reset(&vm.heap, rm);
+        return a;
+    }
     if value_is_object(thisv) {
         Value lv;
         if vm_get_prop_value(vm, thisv, vm.atom_length, &lv) {
@@ -1627,7 +1648,8 @@ private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) 
         if skip_holes && !js_array_has(a, i) { continue; }
         Value e = js_array_get(a, i);
         Value[3] cargs = { e, value_int(i), thisv };
-        Value r = vm_call_value(vm, fun, value_undefined(), &cargs[0], 3);
+        // these methods take an optional thisArg for the callback
+        Value r = vm_call_value(vm, fun, arg_at(args, argc, 1), &cargs[0], 3);
         if vm.has_pending {
             gc_root_reset(&vm.heap, rm);
             return value_undefined();
