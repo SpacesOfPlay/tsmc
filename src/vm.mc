@@ -3740,6 +3740,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_CATCH_ENTER: {
                 catch_enter(vm);
             }
+            case OP_ITER_SEND: {
+                do_iter_send(vm);
+            }
             case OP_ITER_NEXT: {
                 Value iter = vpeek(vm, 0);
                 Value val;
@@ -3979,6 +3982,18 @@ private void catch_enter(VM* vm) {
     vm_throw_return(vm, vpop(vm));
 }
 
+// [iter, sent] -> [value, done]. Out of the loop for the same frame reason.
+private void do_iter_send(VM* vm) {
+    Value sent = vpeek(vm, 0);
+    Value iter = vpeek(vm, 1);
+    Value val;
+    bool done = false;
+    if !vm_iter_send(vm, iter, sent, &val, &done) { return; }
+    vm.sp -= 2;
+    vpush(vm, val);
+    vpush(vm, value_bool(done));
+}
+
 // Likewise kept out of the loop: `for await`'s iterator acquisition.
 private void do_get_aiter(VM* vm) {
     Value it;
@@ -4083,15 +4098,30 @@ bool vm_get_async_iterator(VM* vm, Value v, Value* out) {
 
 // iter stays rooted by the caller; consume outputs before allocating.
 bool vm_iter_next(VM* vm, Value iter, Value* val, bool* done) {
+    Value dummy = value_undefined();
+    return iter_next_impl(vm, iter, &dummy, 0, val, done);
+}
+
+// yield* forwards whatever its own resume was sent into the delegate's next().
+bool vm_iter_send(VM* vm, Value iter, Value sent, Value* val, bool* done) {
+    return iter_next_impl(vm, iter, &sent, 1, val, done);
+}
+
+private bool iter_next_impl(VM* vm, Value iter, Value* nargs, i32 nargc, Value* val, bool* done) {
     Value m;
     if !vm_get_prop_value(vm, iter, vm.atom_next, &m) { return false; }
     if !value_is_callable(m) {
         vm_throw_error(vm, ERR_TYPE, "iterator has no next method");
         return false;
     }
-    Value dummy = value_undefined();
-    Value r = vm_call_value(vm, m, iter, &dummy, 0);
+    Value r = vm_call_value(vm, m, iter, nargs, nargc);
     if vm.has_pending { return false; }
+    // A non-object result has no `done` to read, which would otherwise read as
+    // falsy and spin the consuming loop forever.
+    if !value_is_object(r) {
+        vm_throw_error(vm, ERR_TYPE, "iterator result is not an object");
+        return false;
+    }
     vpush(vm, r);
     Value dv = value_undefined();
     Value vv = value_undefined();
@@ -4154,6 +4184,11 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
 // is_return closes the generator: it unwinds through the finally blocks and
 // comes back as the generator's return value.
 Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, bool is_return) {
+    // Closing a delegate runs nested inside the outer generator's own return
+    // completion, so this flag has to be saved rather than simply cleared.
+    bool saved_unwind_return = vm.unwind_return;
+    vm.unwind_return = false;
+    defer { vm.unwind_return = saved_unwind_return; }
     if g.state == GEN_RUNNING {
         vm_throw_error(vm, ERR_TYPE, "generator is already running");
         return value_undefined();

@@ -1700,22 +1700,46 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         if (n.flags & NF_DELEGATE) != 0 {
-            // yield*: iterate the operand, yielding each value; the
-            // expression result is the inner iterator's return value
+            // yield*: iterate the operand, yielding each value; the expression
+            // result is the inner iterator's return value. Whatever resumes
+            // this generator is sent on into the delegate's next().
             compile_expr(co, n.a);
             ch_op(ch, OP_GET_ITER);
             i32 t_it = alloc_slot(co.cur);
             ch_op_u16(ch, OP_SETLOCAL, t_it);
             ch_op(ch, OP_POP);
+            i32 t_sent = alloc_slot(co.cur);
+            ch_op(ch, OP_UNDEF);
+            ch_op_u16(ch, OP_SETLOCAL, t_sent);
+            ch_op(ch, OP_POP);
+            // never set: the delegate is only left early, so it always wants
+            // closing when this unwinds
+            i32 t_done = alloc_slot(co.cur);
+            ch_op(ch, OP_FALSE);
+            ch_op_u16(ch, OP_SETLOCAL, t_done);
+            ch_op(ch, OP_POP);
+            // an abrupt resume (a throw, or the return completion from
+            // .return()) unwinds into the handler below, which closes the
+            // delegate before carrying on
+            i32 jclose = ch_jump(ch, OP_TRY_PUSH);
             i32 lstart = ch_pos(ch);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op(ch, OP_ITER_NEXT);       // [value, done]
+            ch_op_u16(ch, OP_GETLOCAL, t_sent);
+            ch_op(ch, OP_ITER_SEND);       // [value, done]
             i32 jdone = ch_jump(ch, OP_JUMPT);
-            ch_op(ch, OP_YIELD);           // yield value; discard resume input
+            ch_op(ch, OP_YIELD);           // yield value; keep the resume input
+            ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_JUMP, lstart);
             ch_patch(ch, jdone);           // [value] — the final iterator value
-            co.cur.cur_slots--;
+            ch_op(ch, OP_TRY_POP);
+            i32 jend = ch_jump(ch, OP_JUMP);
+            ch_patch(ch, jclose);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+            ch_op(ch, OP_THROW);
+            ch_patch(ch, jend);
+            co.cur.cur_slots -= 3;
             return;
         }
         if n.a != null {

@@ -49,6 +49,7 @@ T('gen-return-inside-finally-yield', () => { function* g() { try { yield 1; } fi
 T('gen-done-after-return', () => { function* g() { yield 1; yield 2; } const it = g(); it.next(); it.return(); return JSON.stringify(it.next()); });
 T('gen-return-before-start', () => { const o = []; function* g() { try { yield 1; } finally { o.push('cleanup'); } } const it = g(); const r = it.return(7); return [r.value, r.done, o.length]; });
 T('gen-throw-before-start', () => { function* g() { try { yield 1; } catch (e) { return 'caught'; } } const it = g(); try { return JSON.stringify(it.throw(new Error('x'))); } catch (e) { return 'THREW:' + e.constructor.name; } });
+T('gen-delegate-return-closes-inner', () => { const o = []; function* inner() { try { yield 1; yield 2; } finally { o.push('inner-cleanup'); } } function* outer() { yield* inner(); } const it = outer(); it.next(); it.return(9); return o; });
 T('gen-nested-finally', () => { const o = []; function* g() { try { try { yield 1; } finally { o.push('inner'); } } finally { o.push('outer'); } } const it = g(); it.next(); it.return(); return o; });
 T('gen-destructure-closes', () => { const o = []; function* g() { try { yield 1; yield 2; yield 3; } finally { o.push('cleanup'); } } const [a] = g(); return [a, o]; });
 T('gen-spread-completes', () => { const o = []; function* g() { try { yield 1; } finally { o.push('cleanup'); } } const a = [...g()]; return [a, o]; });
@@ -60,7 +61,3 @@ T('iter-close-on-return', () => { const o = []; const it = { [Symbol.iterator]: 
 T('iter-no-close-on-normal', () => { const o = []; const it = { [Symbol.iterator]: () => { let i = 0; return { next: () => i++ < 1 ? { value: i, done: false } : { done: true }, return: () => { o.push('closed'); return { done: true }; } }; } }; for (const x of it) {} return o; });
 
 console.log(rows.join('\n'));
-
-// Not asserted: `yield*` does not forward a return completion to the
-// delegated iterator, so closing the outer generator leaves the inner one's
-// `finally` unrun.
