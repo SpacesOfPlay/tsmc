@@ -4977,6 +4977,10 @@ u32 vm_sym_has_instance_id(VM* vm) { return vm.sym_has_instance_id; }
 
 // Builds a RegExp object; throws SyntaxError on a bad pattern.
 Value vm_new_regexp(VM* vm, str source, str flags) {
+    if !regex_flags_valid(flags) {
+        vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression flags");
+        return value_undefined();
+    }
     RegexProg* prog = regex_compile(source, flags);
     if prog == null {
         vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression");
@@ -4987,7 +4991,8 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
     vpush(vm, value_cell(&re.head));
     js_set_prop(re, vm.atom_rx, value_int(idx));
-    GcString* src = gc_new_string(&vm.heap, source);
+    // an empty pattern reports "(?:)" so String(re) stays a valid literal
+    GcString* src = gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)");
     js_set_prop(re, vm.atom_source, value_cell(&src.head));
     GcString* flg = gc_new_string(&vm.heap, flags);
     js_set_prop(re, vm.atom_flags, value_cell(&flg.head));

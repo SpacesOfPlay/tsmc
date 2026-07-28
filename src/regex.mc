@@ -99,6 +99,11 @@ struct RxParser {
     bool unicode;           // the /u flag: code-point mode
     Vec<RxClass> classes;   // owns range arrays until moved into prog
     Vec<RxGroupName> gnames;
+    // \k<name> nodes awaiting resolution: the group may be declared later
+    Vec<RxNodePtr> kpend;
+    // every (?<name>) in the pattern, collected up front so a \k<...>
+    // naming no group can stay a literal escape
+    Vec<str> declared;
 }
 
 private u8 px_at(RxParser* p, i32 i) {
@@ -605,6 +610,25 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             n.a = g;
             return n;
         }
+        if e == 'k' && px_at(p, p.pos + 1) == '<' {
+            i32 nstart = p.pos + 2;
+            i32 nend = nstart;
+            while nend < p.src.len && *(p.src.data + nend) != cast(u8, '>') { nend++; }
+            // Under /u, and in any pattern that declares a named group, this is
+            // a backreference and an unknown name is a SyntaxError. Only a
+            // non-unicode pattern with no named group at all keeps the Annex B
+            // reading, where `\k` is an identity escape and the rest is literal.
+            bool is_ref = p.unicode || p.declared.len > 0;
+            if is_ref && nend < p.src.len {
+                p.pos = nend + 1;
+                RxNode* n = rx_node(RN_BACKREF);
+                n.a = -1;
+                n.b = nstart;
+                n.c = nend - nstart;
+                vec_push(&p.kpend, n);
+                return n;
+            }
+        }
         if (e == 'p' || e == 'P') && p.unicode && px_at(p, p.pos + 1) == '{' {
             Vec<RxRange> rs = vec_new<RxRange>(8);
             bool ok = parse_uniprop(p, &rs, e == 'P');
@@ -874,6 +898,61 @@ private void emit_node(Vec<RxInst>* code, RxNode* n) {
 // --- compile --------------------------------------------------------------
 
 // Returns null on parse error.
+// Collects the names of every (?<name>) group, skipping character classes and
+// escapes so a "(?<" inside one is not mistaken for a group. Lookbehind
+// ((?<= and (?<!) is not a named group.
+private void scan_group_names(str pat, Vec<str>* out) {
+    bool in_class = false;
+    i32 i = 0;
+    while i < pat.len {
+        u8 c = *(pat.data + i);
+        if c == cast(u8, 92) { i += 2; continue; }   // backslash
+        if in_class {
+            if c == cast(u8, ']') { in_class = false; }
+            i++;
+            continue;
+        }
+        if c == cast(u8, '[') { in_class = true; i++; continue; }
+        if c == cast(u8, '(') && i + 2 < pat.len
+            && *(pat.data + i + 1) == cast(u8, '?') && *(pat.data + i + 2) == cast(u8, '<') {
+            u8 d = i + 3 < pat.len ? *(pat.data + i + 3) : 0;
+            if d != cast(u8, '=') && d != cast(u8, '!') {
+                i32 s = i + 3;
+                i32 e = s;
+                while e < pat.len && *(pat.data + e) != cast(u8, '>') { e++; }
+                str nm;
+                nm.data = pat.data + s;
+                nm.len = e - s;
+                vec_push(out, nm);
+                i = e;
+                continue;
+            }
+        }
+        i++;
+    }
+}
+
+// The flag set is exactly "dgimsuvy", each at most once.
+bool regex_flags_valid(str flags) {
+    i32 seen = 0;
+    for i32 i = 0; i < flags.len; i++ {
+        u8 c = *(flags.data + i);
+        i32 bit = 0;
+        if c == cast(u8, 'd') { bit = 1; }
+        else if c == cast(u8, 'g') { bit = 2; }
+        else if c == cast(u8, 'i') { bit = 4; }
+        else if c == cast(u8, 'm') { bit = 8; }
+        else if c == cast(u8, 's') { bit = 16; }
+        else if c == cast(u8, 'u') { bit = 32; }
+        else if c == cast(u8, 'v') { bit = 64; }
+        else if c == cast(u8, 'y') { bit = 128; }
+        else { return false; }
+        if (seen & bit) != 0 { return false; }
+        seen = seen | bit;
+    }
+    return true;
+}
+
 RegexProg* regex_compile(str pattern, str flags) {
     RxParser p;
     p.src = pattern;
@@ -886,9 +965,28 @@ RegexProg* regex_compile(str pattern, str flags) {
     }
     vec_init<RxClass>(&p.classes, 4);
     vec_init<RxGroupName>(&p.gnames, 2);
+    vec_init<RxNodePtr>(&p.kpend, 2);
+    vec_init<str>(&p.declared, 2);
+    scan_group_names(pattern, &p.declared);
     Vec<RxNodePtr> stack = vec_new<RxNodePtr>(8);
     RxNode* root = parse_alt(&p, &stack);
     vec_free(&stack);
+    // Resolve \k<name> now that every named group has been seen, so a
+    // reference may point forward as well as back.
+    for i32 i = 0; i < p.kpend.len; i++ {
+        RxNode* kn = vec_get(&p.kpend, i);
+        str want;
+        want.data = p.src.data + kn.b;
+        want.len = kn.c;
+        bool found = false;
+        for i32 j = 0; j < p.gnames.len; j++ {
+            RxGroupName gn = vec_get(&p.gnames, j);
+            if str_equal(gn.name, want) { kn.a = gn.idx; found = true; break; }
+        }
+        if !found { p.failed = true; }
+    }
+    vec_free(&p.kpend);
+    vec_free(&p.declared);
     if p.failed || p.pos != pattern.len {
         free_node(root);
         for i32 i = 0; i < p.classes.len; i++ {

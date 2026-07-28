@@ -6546,6 +6546,14 @@ private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args
     Value re = str_regexp_arg(vm, arg_at(args, argc, 0));
     if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
     gc_root(&vm.heap, re);
+    // matchAll insists on /g: a non-global regex would loop on one match
+    Value arg0 = arg_at(args, argc, 0);
+    if value_is_object(arg0) && vm_regexp_prog(vm, arg0) != null
+        && !regex_is_global(vm_regexp_prog(vm, arg0)) {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "matchAll requires a global regular expression");
+        return value_undefined();
+    }
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     gc_root(&vm.heap, value_cell(&out.head));
     js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
