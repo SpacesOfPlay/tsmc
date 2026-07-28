@@ -133,6 +133,29 @@ private u32 bi_atom(VM* vm, str name) {
     return atom_intern(&vm.atoms, name);
 }
 
+// One UTF-8 sequence at byte `i` into `*cp`; returns how many bytes it took.
+// Mirrors bi_utf8_encode.
+private i32 bi_utf8_decode(str s, i32 i, u32* cp) {
+    u32 c = cast(u32, *(s.data + i));
+    *cp = c;
+    if c < 0x80 { return 1; }
+    if (c & 0xE0) == 0xC0 && i + 1 < s.len {
+        *cp = ((c & 0x1F) << 6) | cast(u32, *(s.data + i + 1) & 0x3F);
+        return 2;
+    }
+    if (c & 0xF0) == 0xE0 && i + 2 < s.len {
+        *cp = ((c & 0x0F) << 12) | (cast(u32, *(s.data + i + 1) & 0x3F) << 6)
+            | cast(u32, *(s.data + i + 2) & 0x3F);
+        return 3;
+    }
+    if i + 3 < s.len {
+        *cp = ((c & 0x07) << 18) | (cast(u32, *(s.data + i + 1) & 0x3F) << 12)
+            | (cast(u32, *(s.data + i + 2) & 0x3F) << 6) | cast(u32, *(s.data + i + 3) & 0x3F);
+        return 4;
+    }
+    return 1;
+}
+
 private i32 bi_utf8_encode(u8* dst, u32 cp) {
     if cp < 0x80 {
         *dst = cast(u8, cp);
@@ -8029,6 +8052,7 @@ const i32 ENC_BASE64 = 2;
 const i32 ENC_BASE64URL = 3;
 const i32 ENC_LATIN1 = 4;
 const i32 ENC_ASCII = 5;
+const i32 ENC_UTF16LE = 6;
 
 private bool ci_eq(str a, str b) {
     if a.len != b.len { return false; }
@@ -8042,16 +8066,37 @@ private bool ci_eq(str a, str b) {
     return true;
 }
 
-private i32 buf_parse_enc(Value v, i32 dflt) {
-    if !value_is_string(v) { return dflt; }
-    str s = sview(v);
+// The encoding id for a name, or -1 when it names none.
+private i32 buf_enc_id(str s) {
     if ci_eq(s, "utf8") || ci_eq(s, "utf-8") { return ENC_UTF8; }
     if ci_eq(s, "hex") { return ENC_HEX; }
     if ci_eq(s, "base64") { return ENC_BASE64; }
     if ci_eq(s, "base64url") { return ENC_BASE64URL; }
     if ci_eq(s, "latin1") || ci_eq(s, "binary") { return ENC_LATIN1; }
     if ci_eq(s, "ascii") { return ENC_ASCII; }
-    return dflt;
+    if ci_eq(s, "utf16le") || ci_eq(s, "utf-16le") || ci_eq(s, "ucs2")
+        || ci_eq(s, "ucs-2") { return ENC_UTF16LE; }
+    return -1;
+}
+
+private i32 buf_parse_enc(Value v, i32 dflt) {
+    if !value_is_string(v) { return dflt; }
+    i32 id = buf_enc_id(sview(v));
+    return id < 0 ? dflt : id;
+}
+
+// An unnamed encoding is a mistake in the caller, not something to fall back
+// from: silently treating it as UTF-8 would corrupt the bytes.
+private i32 buf_enc_arg(VM* vm, Value v, i32 dflt) {
+    if !value_is_string(v) { return dflt; }
+    i32 id = buf_enc_id(sview(v));
+    if id < 0 {
+        string m = format("Unknown encoding: {}", sview(v));
+        vm_throw_error(vm, ERR_TYPE, m);
+        free(m);
+        return -1;
+    }
+    return id;
 }
 
 // Byte 0-255 at index i (0 for holes / out of range).
@@ -8168,22 +8213,9 @@ private void hex_decode(str_buf* out, str s) {
 private void str_low_bytes(str_buf* out, str s, i32 mask) {
     i32 i = 0;
     while i < s.len {
-        u8 c = *(s.data + i);
-        i32 cp = c;
-        i32 adv = 1;
-        if c >= 0x80 {
-            if (c & 0xE0) == 0xC0 {
-                cp = ((c & 0x1F) << 6) | (*(s.data + i + 1) & 0x3F);
-                adv = 2;
-            } else if (c & 0xF0) == 0xE0 {
-                cp = ((c & 0x0F) << 12) | ((*(s.data + i + 1) & 0x3F) << 6) | (*(s.data + i + 2) & 0x3F);
-                adv = 3;
-            } else {
-                cp = ((c & 0x07) << 18) | ((*(s.data + i + 1) & 0x3F) << 12) | ((*(s.data + i + 2) & 0x3F) << 6) | (*(s.data + i + 3) & 0x3F);
-                adv = 4;
-            }
-        }
-        str_buf_add_byte(out, cast(u8, cp & mask));
+        u32 cp = 0;
+        i32 adv = bi_utf8_decode(s, i, &cp);
+        str_buf_add_byte(out, cast(u8, cast(i32, cp) & mask));
         i += adv;
     }
 }
@@ -8200,6 +8232,28 @@ private void str_to_bytes(str_buf* out, str s, i32 enc) {
         str_low_bytes(out, s, 0xFF);
     } else if enc == ENC_ASCII {
         str_low_bytes(out, s, 0x7F);
+    } else if enc == ENC_UTF16LE {
+        // two bytes per UTF-16 code unit, low byte first; a code point above
+        // the BMP occupies the surrogate pair it is stored as
+        i32 i = 0;
+        while i < s.len {
+            u32 cp = 0;
+            i32 adv = bi_utf8_decode(s, i, &cp);
+            if adv <= 0 { break; }
+            if cp > 0xFFFF {
+                u32 x = cp - 0x10000;
+                u32 hi = 0xD800 + (x >> 10);
+                u32 lo = 0xDC00 + (x & 0x3FF);
+                str_buf_add_byte(out, cast(u8, hi & 0xFF));
+                str_buf_add_byte(out, cast(u8, (hi >> 8) & 0xFF));
+                str_buf_add_byte(out, cast(u8, lo & 0xFF));
+                str_buf_add_byte(out, cast(u8, (lo >> 8) & 0xFF));
+            } else {
+                str_buf_add_byte(out, cast(u8, cp & 0xFF));
+                str_buf_add_byte(out, cast(u8, (cp >> 8) & 0xFF));
+            }
+            i += adv;
+        }
     }
 }
 
@@ -8207,12 +8261,46 @@ private void str_to_bytes(str_buf* out, str s, i32 enc) {
 private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
     str_buf sb;
     str_buf_init(&sb);
-    if enc == ENC_UTF8 || enc == ENC_LATIN1 || enc == ENC_ASCII {
+    if enc == ENC_UTF8 {
+        i32 i = start;
+        while i < end {
+            i32 c = buf_byte(b, i);
+            i32 need = 0;
+            i32 cp = 0;
+            if c < 0x80 { need = 0; cp = c; }
+            else if (c & 0xE0) == 0xC0 { need = 1; cp = c & 0x1F; }
+            else if (c & 0xF0) == 0xE0 { need = 2; cp = c & 0x0F; }
+            else if (c & 0xF8) == 0xF0 { need = 3; cp = c & 0x07; }
+            else { need = -1; }
+            bool ok = need >= 0 && i + need < end;
+            if ok {
+                for i32 k = 1; k <= need; k++ {
+                    i32 cc = buf_byte(b, i + k);
+                    if (cc & 0xC0) != 0x80 { ok = false; break; }
+                    cp = (cp << 6) | (cc & 0x3F);
+                }
+            }
+            // overlong forms, surrogates and out-of-range values are as
+            // malformed as a bad continuation byte
+            if ok && need == 1 && cp < 0x80 { ok = false; }
+            if ok && need == 2 && cp < 0x800 { ok = false; }
+            if ok && need == 3 && cp < 0x10000 { ok = false; }
+            if ok && (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { ok = false; }
+            u8[4] tmp;
+            if ok {
+                i32 n = bi_utf8_encode(&tmp[0], cast(u32, cp));
+                str_buf_add_bytes(&sb, &tmp[0], n);
+                i += need + 1;
+            } else {
+                i32 n = bi_utf8_encode(&tmp[0], cast(u32, 0xFFFD));
+                str_buf_add_bytes(&sb, &tmp[0], n);
+                i++;
+            }
+        }
+    } else if enc == ENC_LATIN1 || enc == ENC_ASCII {
         for i32 i = start; i < end; i++ {
             i32 by = buf_byte(b, i);
-            if enc == ENC_UTF8 {
-                str_buf_add_byte(&sb, cast(u8, by));
-            } else if enc == ENC_ASCII {
+            if enc == ENC_ASCII {
                 u8[4] tmp;
                 i32 n = bi_utf8_encode(&tmp[0], cast(u32, by & 0x7F));
                 str_buf_add_bytes(&sb, &tmp[0], n);
@@ -8229,6 +8317,24 @@ private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
             str_buf_add_byte(&sb, *(alpha.data + (by >> 4)));
             str_buf_add_byte(&sb, *(alpha.data + (by & 0xF)));
         }
+    } else if enc == ENC_UTF16LE {
+        i32 i = start;
+        while i + 1 < end {
+            u32 unit = cast(u32, buf_byte(b, i)) | (cast(u32, buf_byte(b, i + 1)) << 8);
+            i += 2;
+            u32 cp = unit;
+            // a leading surrogate joins the trailing one that follows it
+            if unit >= 0xD800 && unit <= 0xDBFF && i + 1 < end {
+                u32 lo = cast(u32, buf_byte(b, i)) | (cast(u32, buf_byte(b, i + 1)) << 8);
+                if lo >= 0xDC00 && lo <= 0xDFFF {
+                    cp = 0x10000 + ((unit - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 2;
+                }
+            }
+            u8[4] tmp;
+            i32 n = bi_utf8_encode(&tmp[0], cp);
+            str_buf_add_bytes(&sb, &tmp[0], n);
+        }
     } else {
         b64_encode(&sb, b, start, end, enc == ENC_BASE64URL);
     }
@@ -8244,7 +8350,8 @@ private Value nat_buffer_from(void* vmp, Value callee, Value thisv, Value* args,
     VM* vm = as_vm(vmp);
     Value src = arg_at(args, argc, 0);
     if value_is_string(src) {
-        i32 enc = buf_parse_enc(arg_at(args, argc, 1), ENC_UTF8);
+        i32 enc = buf_enc_arg(vm, arg_at(args, argc, 1), ENC_UTF8);
+        if enc < 0 { return value_undefined(); }
         str_buf sb;
         str_buf_init(&sb);
         str_to_bytes(&sb, sview(src), enc);
@@ -8263,7 +8370,20 @@ private Value nat_buffer_from(void* vmp, Value callee, Value thisv, Value* args,
         }
         return value_cell(&b.head);
     }
-    vm_throw_error(vm, ERR_TYPE, "Buffer.from expects a string or array");
+    // a typed array contributes its bytes, copied rather than shared: only the
+    // ArrayBuffer overload aliases its source
+    if vm_is_typed_array(src) {
+        JsObject* ta = value_as_object(src);
+        i32 n = ta_len(vm, ta);
+        JsObject* b = buf_new(vm, n);
+        for i32 i = 0; i < n; i++ {
+            Value e = vm_ta_get(vm, ta, i);
+            i32 by = value_is_number(e) ? (cast(i32, cast(i64, js_to_number(e))) & 0xFF) : 0;
+            js_array_set(b, i, value_number(cast(f64, by)));
+        }
+        return value_cell(&b.head);
+    }
+    vm_throw_error(vm, ERR_TYPE, "Buffer.from expects a string, array or typed array");
     return value_undefined();
 }
 
@@ -8343,7 +8463,8 @@ private Value nat_buf_to_string(void* vmp, Value callee, Value thisv, Value* arg
     VM* vm = as_vm(vmp);
     if !value_is_object(thisv) { return new_str(vm, ""); }
     JsObject* b = value_as_object(thisv);
-    i32 enc = buf_parse_enc(arg_at(args, argc, 0), ENC_UTF8);
+    i32 enc = buf_enc_arg(vm, arg_at(args, argc, 0), ENC_UTF8);
+    if enc < 0 { return value_undefined(); }
     i32 len = b.elen;
     Value sv = arg_at(args, argc, 1);
     Value ev = arg_at(args, argc, 2);
@@ -8452,21 +8573,30 @@ private Value nat_buf_write(void* vmp, Value callee, Value thisv, Value* args, i
     JsObject* b = value_as_object(thisv);
     Value sv = arg_at(args, argc, 0);
     if !value_is_string(sv) { return value_number(0.0); }
-    i32 offset = value_is_undefined(arg_at(args, argc, 1)) ? 0 : to_int_arg(arg_at(args, argc, 1));
+    // write(str, [offset], [length], [encoding]) -- any of the three trailing
+    // arguments may be left out, so a string in the offset slot is the encoding
+    Value a1 = arg_at(args, argc, 1);
+    Value a2 = arg_at(args, argc, 2);
+    Value a3 = arg_at(args, argc, 3);
+    VM* vm = as_vm(vmp);
+    i32 enc = ENC_UTF8;
+    i32 offset = 0;
+    i32 lenarg = -1;
+    if value_is_string(a1) {
+        enc = buf_enc_arg(vm, a1, ENC_UTF8);
+    } else {
+        offset = value_is_undefined(a1) ? 0 : to_int_arg(a1);
+        if value_is_string(a2) { enc = buf_enc_arg(vm, a2, ENC_UTF8); }
+        else {
+            if !value_is_undefined(a2) { lenarg = to_int_arg(a2); }
+            enc = buf_enc_arg(vm, a3, ENC_UTF8);
+        }
+    }
+    if enc < 0 { return value_undefined(); }
     if offset < 0 { offset = 0; }
     i32 avail = b.elen - offset;
     if avail < 0 { avail = 0; }
-    // write(str, offset, length, encoding) or write(str, offset, encoding)
-    i32 maxlen = avail;
-    i32 enc = ENC_UTF8;
-    Value a2 = arg_at(args, argc, 2);
-    Value a3 = arg_at(args, argc, 3);
-    if value_is_number(a2) {
-        maxlen = to_int_arg(a2);
-        enc = buf_parse_enc(a3, ENC_UTF8);
-    } else {
-        enc = buf_parse_enc(a2, ENC_UTF8);
-    }
+    i32 maxlen = lenarg >= 0 ? lenarg : avail;
     if maxlen > avail { maxlen = avail; }
     str_buf sb;
     str_buf_init(&sb);
@@ -8480,25 +8610,49 @@ private Value nat_buf_write(void* vmp, Value callee, Value thisv, Value* args, i
 }
 
 // Byte position of a number or substring needle, or -1.
-private i32 buf_find(VM* vm, JsObject* b, Value needle, i32 begin, i32 enc) {
+private i32 buf_find_dir(VM* vm, JsObject* b, Value needle, i32 begin, i32 enc, bool last) {
     i32 len = b.elen;
     if begin < 0 { begin = len + begin; }
     if begin < 0 { begin = 0; }
     if value_is_number(needle) {
         i32 by = cast(i32, cast(i64, js_to_number(needle))) & 0xFF;
+        if last {
+            i32 from_i = begin > len - 1 ? len - 1 : begin;
+            for i32 i = from_i; i >= 0; i-- {
+                if buf_byte(b, i) == by { return i; }
+            }
+            return -1;
+        }
         for i32 i = begin; i < len; i++ {
             if buf_byte(b, i) == by { return i; }
         }
         return -1;
     }
-    if !value_is_string(needle) { return -1; }
     str_buf sb;
     str_buf_init(&sb);
-    str_to_bytes(&sb, sview(needle), enc);
+    if value_is_string(needle) {
+        str_to_bytes(&sb, sview(needle), enc);
+    } else if value_is_object(needle) && (value_as_object(needle).obj_flags & OBJF_ARRAY) != 0 {
+        // a Buffer (or any byte array) is matched by its contents
+        JsObject* nb = value_as_object(needle);
+        for i32 i = 0; i < nb.elen; i++ { str_buf_add_byte(&sb, cast(u8, buf_byte(nb, i))); }
+    } else {
+        str_buf_free(&sb);
+        return -1;
+    }
     i32 nl = sb.len;
     i32 found = -1;
     if nl == 0 {
         found = begin <= len ? begin : len;
+    } else if last {
+        i32 start_i = begin > len - nl ? len - nl : begin;
+        for i32 i = start_i; i >= 0; i-- {
+            bool ok = true;
+            for i32 j = 0; j < nl; j++ {
+                if buf_byte(b, i + j) != cast(i32, *(sb.data + j)) { ok = false; break; }
+            }
+            if ok { found = i; break; }
+        }
     } else {
         for i32 i = begin; i + nl <= len; i++ {
             bool ok = true;
@@ -8517,7 +8671,18 @@ private Value nat_buf_index_of(void* vmp, Value callee, Value thisv, Value* args
     JsObject* b = value_as_object(thisv);
     i32 begin = value_is_undefined(arg_at(args, argc, 1)) ? 0 : to_int_arg(arg_at(args, argc, 1));
     i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
-    return value_number(cast(f64, buf_find(vm, b, arg_at(args, argc, 0), begin, enc)));
+    return value_number(cast(f64, buf_find_dir(vm, b, arg_at(args, argc, 0), begin, enc, false)));
+}
+
+// Searching backwards; the offset defaults to the last position rather than
+// the first, so an absent argument scans the whole buffer.
+private Value nat_buf_last_index_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* b = value_as_object(thisv);
+    i32 begin = value_is_undefined(arg_at(args, argc, 1))
+        ? b.elen : to_int_arg(arg_at(args, argc, 1));
+    i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
+    return value_number(cast(f64, buf_find_dir(vm, b, arg_at(args, argc, 0), begin, enc, true)));
 }
 
 private Value nat_buf_includes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -8525,7 +8690,7 @@ private Value nat_buf_includes(void* vmp, Value callee, Value thisv, Value* args
     JsObject* b = value_as_object(thisv);
     i32 begin = value_is_undefined(arg_at(args, argc, 1)) ? 0 : to_int_arg(arg_at(args, argc, 1));
     i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
-    return value_bool(buf_find(vm, b, arg_at(args, argc, 0), begin, enc) >= 0);
+    return value_bool(buf_find_dir(vm, b, arg_at(args, argc, 0), begin, enc, false) >= 0);
 }
 
 private Value nat_buf_to_json(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -9985,6 +10150,219 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__net_ref", &nat_net_ref);
 }
 
+// --- Buffer: numeric accessors ----------------------------------------------
+//
+// One pair of helpers covers every fixed-width integer accessor: the width in
+// bytes, the byte order, and whether the top bit is a sign. Reads and writes
+// are range-checked, because silently reading past the end would hand back a
+// plausible number built from bytes that are not there.
+
+unsafe_union BufF32 { u32 i; f32 f; }
+unsafe_union BufF64 { u64 i; f64 f; }
+
+private bool buf_range_ok(VM* vm, JsObject* b, i32 off, i32 width) {
+    if off < 0 || width < 0 || off + width > b.elen {
+        vm_throw_error(vm, ERR_RANGE, "Attempt to access memory outside buffer bounds");
+        return false;
+    }
+    return true;
+}
+
+// Reads `width` bytes as an unsigned integer. Up to 6 bytes, which is what
+// node allows for the variable-width accessors and enough for any of the
+// fixed ones.
+private i64 buf_read_uint(JsObject* b, i32 off, i32 width, bool be) {
+    i64 v = 0;
+    for i32 i = 0; i < width; i++ {
+        i32 idx = be ? off + i : off + width - 1 - i;
+        v = (v << 8) | cast(i64, buf_byte(b, idx));
+    }
+    return v;
+}
+
+// Sign-extends an unsigned value of `width` bytes.
+private i64 buf_sign(i64 v, i32 width) {
+    i64 bits = cast(i64, width) * 8;
+    i64 top = cast(i64, 1) << (bits - 1);
+    if (v & top) != 0 { v = v - (top << 1); }
+    return v;
+}
+
+private void buf_write_uint(JsObject* b, i32 off, i32 width, bool be, i64 v) {
+    for i32 i = 0; i < width; i++ {
+        i32 idx = be ? off + width - 1 - i : off + i;
+        js_array_set(b, idx, value_number(cast(f64, v & 255)));
+        v = v >> 8;
+    }
+}
+
+// The accessor set is generated from a descriptor kept in the native's env0:
+// width | (be << 8) | (signed << 16).
+private Value buf_read_fixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    i32 width = desc & 0xFF;
+    bool be = (desc & 0x100) != 0;
+    bool sgn = (desc & 0x10000) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 0));
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    i64 v = buf_read_uint(b, off, width, be);
+    if sgn { v = buf_sign(v, width); }
+    return value_number(cast(f64, v));
+}
+
+private Value buf_write_fixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    i32 width = desc & 0xFF;
+    bool be = (desc & 0x100) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 1));
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    f64 raw = js_to_number(arg_at(args, argc, 0));
+    buf_write_uint(b, off, width, be, cast(i64, raw));
+    return value_number(cast(f64, off + width));
+}
+
+// The variable-width accessors take the width as an argument instead.
+private Value buf_read_var(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    bool be = (desc & 0x100) != 0;
+    bool sgn = (desc & 0x10000) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 0));
+    i32 width = to_int_arg(arg_at(args, argc, 1));
+    if width < 1 || width > 6 {
+        vm_throw_error(vm, ERR_RANGE, "byteLength must be >= 1 and <= 6");
+        return value_undefined();
+    }
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    i64 v = buf_read_uint(b, off, width, be);
+    if sgn { v = buf_sign(v, width); }
+    return value_number(cast(f64, v));
+}
+
+private Value buf_write_var(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    bool be = (desc & 0x100) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 1));
+    i32 width = to_int_arg(arg_at(args, argc, 2));
+    if width < 1 || width > 6 {
+        vm_throw_error(vm, ERR_RANGE, "byteLength must be >= 1 and <= 6");
+        return value_undefined();
+    }
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    buf_write_uint(b, off, width, be, cast(i64, js_to_number(arg_at(args, argc, 0))));
+    return value_number(cast(f64, off + width));
+}
+
+private Value buf_read_float(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    i32 width = desc & 0xFF;
+    bool be = (desc & 0x100) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 0));
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    i64 bits = buf_read_uint(b, off, width, be);
+    if width == 4 {
+        BufF32 u;
+        u.i = cast(u32, bits);
+        return value_number(cast(f64, u.f));
+    }
+    BufF64 u;
+    u.i = cast(u64, bits);
+    return value_number(u.f);
+}
+
+private Value buf_write_float(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 desc = value_as_int(value_as_native(callee).env0);
+    i32 width = desc & 0xFF;
+    bool be = (desc & 0x100) != 0;
+    i32 off = to_int_arg(arg_at(args, argc, 1));
+    if !buf_range_ok(vm, b, off, width) { return value_undefined(); }
+    f64 x = js_to_number(arg_at(args, argc, 0));
+    i64 bits = 0;
+    if width == 4 {
+        BufF32 u;
+        u.f = cast(f32, x);
+        bits = cast(i64, cast(u64, u.i));
+    } else {
+        BufF64 u;
+        u.f = x;
+        bits = cast(i64, u.i);
+    }
+    buf_write_uint(b, off, width, be, bits);
+    return value_number(cast(f64, off + width));
+}
+
+// Reverses each group of `n` bytes in place, for callers moving between byte
+// orders. The length must be a whole number of groups.
+private Value buf_swap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* b = value_as_object(thisv);
+    i32 n = value_as_int(value_as_native(callee).env0);
+    if (b.elen % n) != 0 {
+        vm_throw_error(vm, ERR_RANGE, "Buffer size must be a multiple of the element size");
+        return value_undefined();
+    }
+    i32 g = 0;
+    while g < b.elen {
+        for i32 i = 0; i < n / 2; i++ {
+            Value lo = js_array_get(b, g + i);
+            Value hi = js_array_get(b, g + n - 1 - i);
+            js_array_set(b, g + i, hi);
+            js_array_set(b, g + n - 1 - i, lo);
+        }
+        g += n;
+    }
+    return thisv;
+}
+
+// Installs one numeric accessor. The descriptor rides in env0 so a single
+// implementation covers every width, byte order and signedness.
+private void def_buf_num(VM* vm, str name, NativeFn f, i32 width, bool be, bool sgn) {
+    JsNative* n = js_new_native(&vm.heap, f, name);
+    n.env0 = value_int(width | (be ? 0x100 : 0) | (sgn ? 0x10000 : 0));
+    props_set_desc(&vm.buffer_proto.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
+}
+
+private void def_buf_swap(VM* vm, str name, i32 group) {
+    JsNative* n = js_new_native(&vm.heap, &buf_swap, name);
+    n.env0 = value_int(group);
+    props_set_desc(&vm.buffer_proto.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
+}
+
+private Value nat_buffer_compare_static(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value a = arg_at(args, argc, 0);
+    Value b = arg_at(args, argc, 1);
+    if !is_buffer(vm, a) || !is_buffer(vm, b) {
+        vm_throw_error(vm, ERR_TYPE, "Buffer.compare expects two buffers");
+        return value_undefined();
+    }
+    return nat_buf_compare(vmp, callee, a, &b, 1);
+}
+
+private Value nat_buffer_is_encoding(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value v = arg_at(args, argc, 0);
+    if !value_is_string(v) { return value_bool(false); }
+    return value_bool(buf_enc_id(sview(v)) >= 0);
+}
+
 private void buffer_install(VM* vm) {
     vm.buffer_proto = js_new_object(&vm.heap, vm.array_proto);
     JsNative* ctor = def_global_fn(vm, "Buffer", &nat_buffer_ctor);
@@ -10007,6 +10385,7 @@ private void buffer_install(VM* vm) {
     def_method(vm, vm.buffer_proto, "fill", &nat_buf_fill);
     def_method(vm, vm.buffer_proto, "write", &nat_buf_write);
     def_method(vm, vm.buffer_proto, "indexOf", &nat_buf_index_of);
+    def_method(vm, vm.buffer_proto, "lastIndexOf", &nat_buf_last_index_of);
     def_method(vm, vm.buffer_proto, "includes", &nat_buf_includes);
     def_method(vm, vm.buffer_proto, "toJSON", &nat_buf_to_json);
     def_method(vm, vm.buffer_proto, "readUInt8", &nat_buf_read_u8);
@@ -10020,6 +10399,54 @@ private void buffer_install(VM* vm) {
     def_method(vm, vm.buffer_proto, "readUInt32BE", &nat_buf_read_u32be);
     def_method(vm, vm.buffer_proto, "writeUInt32LE", &nat_buf_write_u32le);
     def_method(vm, vm.buffer_proto, "writeUInt32BE", &nat_buf_write_u32be);
+
+    // The signed and floating-point accessors, plus the variable-width pair,
+    // all share one implementation; the descriptor in env0 says which.
+    def_buf_num(vm, "readInt8", &buf_read_fixed, 1, false, true);
+    def_buf_num(vm, "writeInt8", &buf_write_fixed, 1, false, true);
+    def_buf_num(vm, "readInt16LE", &buf_read_fixed, 2, false, true);
+    def_buf_num(vm, "readInt16BE", &buf_read_fixed, 2, true, true);
+    def_buf_num(vm, "writeInt16LE", &buf_write_fixed, 2, false, true);
+    def_buf_num(vm, "writeInt16BE", &buf_write_fixed, 2, true, true);
+    def_buf_num(vm, "readInt32LE", &buf_read_fixed, 4, false, true);
+    def_buf_num(vm, "readInt32BE", &buf_read_fixed, 4, true, true);
+    def_buf_num(vm, "writeInt32LE", &buf_write_fixed, 4, false, true);
+    def_buf_num(vm, "writeInt32BE", &buf_write_fixed, 4, true, true);
+    def_buf_num(vm, "readFloatLE", &buf_read_float, 4, false, false);
+    def_buf_num(vm, "readFloatBE", &buf_read_float, 4, true, false);
+    def_buf_num(vm, "writeFloatLE", &buf_write_float, 4, false, false);
+    def_buf_num(vm, "writeFloatBE", &buf_write_float, 4, true, false);
+    def_buf_num(vm, "readDoubleLE", &buf_read_float, 8, false, false);
+    def_buf_num(vm, "readDoubleBE", &buf_read_float, 8, true, false);
+    def_buf_num(vm, "writeDoubleLE", &buf_write_float, 8, false, false);
+    def_buf_num(vm, "writeDoubleBE", &buf_write_float, 8, true, false);
+    def_buf_num(vm, "readUIntLE", &buf_read_var, 0, false, false);
+    def_buf_num(vm, "readUIntBE", &buf_read_var, 0, true, false);
+    def_buf_num(vm, "readIntLE", &buf_read_var, 0, false, true);
+    def_buf_num(vm, "readIntBE", &buf_read_var, 0, true, true);
+    def_buf_num(vm, "writeUIntLE", &buf_write_var, 0, false, false);
+    def_buf_num(vm, "writeUIntBE", &buf_write_var, 0, true, false);
+    def_buf_num(vm, "writeIntLE", &buf_write_var, 0, false, true);
+    def_buf_num(vm, "writeIntBE", &buf_write_var, 0, true, true);
+    // the existing unsigned fixed-width accessors gain their range checks by
+    // being re-registered through the same path
+    def_buf_num(vm, "readUInt8", &buf_read_fixed, 1, false, false);
+    def_buf_num(vm, "writeUInt8", &buf_write_fixed, 1, false, false);
+    def_buf_num(vm, "readUInt16LE", &buf_read_fixed, 2, false, false);
+    def_buf_num(vm, "readUInt16BE", &buf_read_fixed, 2, true, false);
+    def_buf_num(vm, "writeUInt16LE", &buf_write_fixed, 2, false, false);
+    def_buf_num(vm, "writeUInt16BE", &buf_write_fixed, 2, true, false);
+    def_buf_num(vm, "readUInt32LE", &buf_read_fixed, 4, false, false);
+    def_buf_num(vm, "readUInt32BE", &buf_read_fixed, 4, true, false);
+    def_buf_num(vm, "writeUInt32LE", &buf_write_fixed, 4, false, false);
+    def_buf_num(vm, "writeUInt32BE", &buf_write_fixed, 4, true, false);
+
+    def_buf_swap(vm, "swap16", 2);
+    def_buf_swap(vm, "swap32", 4);
+    def_buf_swap(vm, "swap64", 8);
+    def_static(vm, ctor, "compare", &nat_buffer_compare_static);
+    def_static(vm, ctor, "isEncoding", &nat_buffer_is_encoding);
+    props_set_desc(&ctor.props, bi_atom(vm, "poolSize"), value_number(8192.0), PROP_DEFAULT);
 }
 
 // --- TextEncoder / TextDecoder ----------------------------------------------
