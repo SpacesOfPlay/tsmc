@@ -124,6 +124,8 @@ struct FnTemplate {
     bool has_rest;       // last param collects surplus arguments
     bool is_gen;         // calls build a generator object
     bool is_async;       // calls build generator state + promise
+    bool is_class;       // a class constructor: reachable only via `new`/super()
+    bool not_ctor;       // arrow/method/generator/async: `new` is a TypeError
     bool needs_arguments; // references `arguments`; build it at call time
     u8* code;
     i32 code_len;
@@ -244,6 +246,8 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
     t.has_rest = has_rest;
     t.is_gen = is_gen;
     t.is_async = is_async;
+    t.is_class = false;
+    t.not_ctor = is_gen || is_async;
     if name.len > 0 {
         u8* nb = alloc<u8>(name.len);
         memcpy(nb, name.data, name.len);

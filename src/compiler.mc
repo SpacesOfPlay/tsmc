@@ -1923,6 +1923,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
         fs.is_gen, fs.is_async);
     t.needs_arguments = fs.needs_arguments;
+    // arrows and shorthand methods have no [[Construct]]; the class ctor is
+    // parsed as a method, so compile_class_expr clears this again for it
+    if (f.flags & (NF_ARROW | NF_METHOD)) != 0 { t.not_ctor = true; }
     t.src_name = co.src_name;
     // Function.length: count leading params up to the first with a
     // default value or the rest parameter.
@@ -1987,10 +1990,14 @@ private Node* build_default_ctor(Compiler* co, bool derived) {
     return f;
 }
 
+// Method or field is syntax, not the initializer's type: `m() {}` is a method,
+// while `m = function () {}` and `m = () => {}` are fields that happen to hold a
+// function — own properties on the instance, and an arrow there closes over the
+// constructor's `this`. The parser marks the method form with NF_METHOD.
 private bool member_is_field(Node* m) {
     if m.kind != N_CLASS_MEMBER { return false; }
     if (m.flags & NF_STATIC) != 0 { return false; }
-    if m.b != null && m.b.kind == N_FUNCTION { return false; }
+    if m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0 { return false; }
     return true;
 }
 
@@ -2059,6 +2066,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
         ctor_fn = build_default_ctor(co, derived);
     }
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
+    ct.is_class = true;
+    ct.not_ctor = false;
     if c.name.len > 0 { tmpl_set_name(ct, c.name); }
     vec_push(&ch.subs, ct);
     ch_op_u16(ch, OP_CLOSURE, ch.subs.len - 1);

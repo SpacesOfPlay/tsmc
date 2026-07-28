@@ -3061,20 +3061,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value fnv;
                 Value thisv;
                 if op == OP_NEW {
-                    fnv = vpeek(vm, argc);
-                    if !value_is_callable(fnv) {
-                        vm_throw_error(vm, ERR_TYPE, "not a constructor");
-                    } else {
-                        Value protov = ensure_prototype(vm, fnv);
-                        JsObject* proto = null;
-                        if value_is_object(protov) { proto = value_as_object(protov); }
-                        JsObject* inst = js_new_object(&vm.heap, proto);
-                        for i32 i = vm.sp; i > vm.sp - argc; i-- {
-                            *(vm.stack + i) = *(vm.stack + i - 1);
-                        }
-                        *(vm.stack + vm.sp - argc) = value_cell(&inst.head);
-                        vm.sp++;
-                    }
+                    new_instance(vm, argc);
                 }
                 if !vm.has_pending {
                     fnv = vpeek(vm, argc + 1);
@@ -3088,7 +3075,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else if value_is_function(fnv) {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
-                        if ft.is_gen {
+                        if call_kind_error(vm, ft, op) {
+                            // threw: not constructable, or a class called bare
+                        } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
                             vpush(vm, gv);
                         } else if ft.is_async {
@@ -3992,6 +3981,53 @@ private void do_iter_send(VM* vm) {
     vm.sp -= 2;
     vpush(vm, val);
     vpush(vm, value_bool(done));
+}
+
+// Builds the fresh `this` for OP_NEW and splices it in under the arguments. A
+// constructor whose prototype chain reaches Array.prototype gets a real array
+// exotic object, so a subclassed Array still satisfies Array.isArray and
+// serialises as an array.
+private void new_instance(VM* vm, i32 argc) {
+    Value fnv = vpeek(vm, argc);
+    if !value_is_callable(fnv) {
+        vm_throw_error(vm, ERR_TYPE, "not a constructor");
+        return;
+    }
+    Value protov = ensure_prototype(vm, fnv);
+    JsObject* proto = null;
+    if value_is_object(protov) { proto = value_as_object(protov); }
+    bool as_array = false;
+    JsObject* p = proto;
+    while p != null {
+        if p == vm.array_proto { as_array = true; break; }
+        p = p.proto;
+    }
+    JsObject* inst;
+    if as_array {
+        inst = js_new_array(&vm.heap, proto);
+    } else {
+        inst = js_new_object(&vm.heap, proto);
+    }
+    for i32 i = vm.sp; i > vm.sp - argc; i-- {
+        *(vm.stack + i) = *(vm.stack + i - 1);
+    }
+    *(vm.stack + vm.sp - argc) = value_cell(&inst.head);
+    vm.sp++;
+}
+
+// `new` on an arrow, shorthand method, generator or async function is a
+// TypeError, and a class constructor is reachable only through `new` or
+// super(). Returns true when it threw.
+private bool call_kind_error(VM* vm, FnTemplate* ft, i32 op) {
+    if op == OP_NEW && ft.not_ctor {
+        vm_throw_error(vm, ERR_TYPE, "not a constructor");
+        return true;
+    }
+    if op == OP_CALL && ft.is_class {
+        vm_throw_error(vm, ERR_TYPE, "class constructor cannot be invoked without 'new'");
+        return true;
+    }
+    return false;
 }
 
 // Likewise kept out of the loop: `for await`'s iterator acquisition.
