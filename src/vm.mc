@@ -425,7 +425,7 @@ private i32 f64_to_i32(f64 v) {
 // Bytes of the whitespace run starting at i, or 0. Covers the whole of the
 // spec's StrWhiteSpace, not just the ASCII blanks: NBSP, the BOM, the line
 // separators and the Zs category all count when converting a string.
-private i32 num_ws_len(str s, i32 i) {
+i32 js_ws_len(str s, i32 i) {
     u8 c = *(s.data + i);
     if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 { return 1; }
     if c == 0xC2 && i + 1 < s.len && *(s.data + i + 1) == 0xA0 { return 2; }      // NBSP
@@ -447,15 +447,15 @@ private f64 vm_str_to_num(str s) {
     i32 a = 0;
     i32 b = s.len;
     while a < b {
-        i32 w = num_ws_len(s, a);
+        i32 w = js_ws_len(s, a);
         if w == 0 { break; }
         a += w;
     }
     while b > a {
         i32 tw = 0;
-        if num_ws_len(s, b - 1) == 1 { tw = 1; }
-        else if b - 2 >= a && num_ws_len(s, b - 2) == 2 { tw = 2; }
-        else if b - 3 >= a && num_ws_len(s, b - 3) == 3 { tw = 3; }
+        if js_ws_len(s, b - 1) == 1 { tw = 1; }
+        else if b - 2 >= a && js_ws_len(s, b - 2) == 2 { tw = 2; }
+        else if b - 3 >= a && js_ws_len(s, b - 3) == 3 { tw = 3; }
         if tw > 0 {
             b -= tw;
         } else {

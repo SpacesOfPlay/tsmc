@@ -990,6 +990,10 @@ private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* a
         if proto_chain_has(o, vm.regexp_proto) { tag = "RegExp"; }
         else if proto_chain_has(o, vm.date_proto) { tag = "Date"; }
         else if proto_chain_has(o, vm.error_protos[ERR_ERROR]) { tag = "Error"; }
+        // a boxed primitive reports the wrapped type
+        else if proto_chain_has(o, vm.string_proto) { tag = "String"; }
+        else if proto_chain_has(o, vm.number_proto) { tag = "Number"; }
+        else if proto_chain_has(o, vm.boolean_proto) { tag = "Boolean"; }
     }
     // A string-valued Symbol.toStringTag anywhere on the chain wins over the
     // builtin tag; this is how Map/Set/Promise/Math/JSON get theirs too.
@@ -2082,6 +2086,21 @@ private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args,
         JsObject* o = value_as_object(thisv);
         set_wrapped_prim(vm, o, p);
         props_set_desc(&o.props, bi_atom(vm, "length"), value_int(value_as_string(p).u16len), 0);
+        // the code units are own enumerable index properties, so the wrapper
+        // indexes, spreads and enumerates like the string it holds
+        str sv = sview(p);
+        i32 off = 0;
+        i32 idx = 0;
+        while off < sv.len {
+            i32 n;
+            ignore utf8_decode(sv, off, &n);
+            str one;
+            one.data = sv.data + off;
+            one.len = n;
+            props_set_desc(&o.props, index_atom(vm, idx), new_str(vm, one), PROP_ENUMERABLE);
+            off += n;
+            idx++;
+        }
         return thisv;
     }
     return p;
@@ -2280,15 +2299,27 @@ private Value nat_str_lastindexof(void* vmp, Value callee, Value thisv, Value* a
     GcString* hg = value_as_string(sv2);
     str hay = gc_string_view(hg);
     str needle = sview(nv);
+    bool ascii = hg.u16len == hg.len;
+    // the optional second argument caps where a match may start; NaN, which an
+    // unparsable value gives, means no cap
+    i32 limit = 2147483647;
+    Value pv = arg_at(args, argc, 1);
+    if !value_is_undefined(pv) {
+        f64 pf = js_to_number(pv);
+        if pf == pf {
+            if pf < 0.0 { limit = 0; }
+            else if pf < 2147483647.0 { limit = cast(i32, pf); }
+        }
+    }
     i32 best = -1;
     i32 i = 0;
     while true {
         i32 f = str_find_from(hay, needle, i);
         if f < 0 { break; }
+        if (ascii ? f : u16_byte_to_unit(hay, f)) > limit { break; }
         best = f;
         i = f + 1;
     }
-    bool ascii = hg.u16len == hg.len;
     i32 r = best < 0 ? -1 : (ascii ? best : u16_byte_to_unit(hay, best));
     gc_root_reset(&vm.heap, rm);
     return value_int(r);
@@ -2400,18 +2431,50 @@ private Value nat_str_substring(void* vmp, Value callee, Value thisv, Value* arg
 
 // Case-maps one code point: ASCII plus the Latin-1 letters. Beyond
 // Latin-1 (Greek, Cyrillic, ...) is left unmapped — a documented gap.
+// Simple one-to-one case mapping over the scripts whose alphabets are plain
+// offset ranges: ASCII, Latin-1, Greek and Cyrillic. Anything outside them is
+// returned unchanged, since the full mapping needs Unicode tables.
 private i32 case_map_cp(i32 cp, bool upper) {
     if upper {
         if cp >= 'a' && cp <= 'z' { return cp - 32; }
         if cp >= 0xE0 && cp <= 0xFE && cp != 0xF7 { return cp - 0x20; }
-        if cp == 0xFF { return 0x178; }   // ÿ -> Ÿ
-        if cp == 0xB5 { return 0x39C; }   // µ -> Μ (Greek Mu)
+        if cp == 0xFF { return 0x178; }
+        if cp == 0xB5 { return 0x39C; }              // micro sign -> Greek Mu
+        if cp >= 0x3B1 && cp <= 0x3C1 { return cp - 0x20; }   // Greek alpha..rho
+        if cp == 0x3C2 { return 0x3A3; }             // final sigma -> Sigma
+        if cp >= 0x3C3 && cp <= 0x3CB { return cp - 0x20; }   // sigma..upsilon-dia
+        // the accented (tonos) vowels sit apart from their capitals
+        if cp == 0x3AC { return 0x386; }
+        if cp >= 0x3AD && cp <= 0x3AF { return cp + 0x25; }
+        if cp == 0x3CC { return 0x38C; }
+        if cp >= 0x3CD && cp <= 0x3CE { return cp - 0x3F; }
+        if cp >= 0x430 && cp <= 0x44F { return cp - 0x20; }   // Cyrillic a..ya
+        if cp >= 0x450 && cp <= 0x45F { return cp - 0x50; }   // Cyrillic ie..dzhe
         return cp;
     }
     if cp >= 'A' && cp <= 'Z' { return cp + 32; }
     if cp >= 0xC0 && cp <= 0xDE && cp != 0xD7 { return cp + 0x20; }
-    if cp == 0x178 { return 0xFF; }       // Ÿ -> ÿ
+    if cp == 0x178 { return 0xFF; }
+    if cp >= 0x391 && cp <= 0x3A1 { return cp + 0x20; }       // Greek Alpha..Rho
+    if cp >= 0x3A3 && cp <= 0x3AB { return cp + 0x20; }       // Sigma..Upsilon-dia
+    if cp == 0x386 { return 0x3AC; }
+    if cp >= 0x388 && cp <= 0x38A { return cp - 0x25; }
+    if cp == 0x38C { return 0x3CC; }
+    if cp >= 0x38E && cp <= 0x38F { return cp + 0x3F; }
+    if cp >= 0x410 && cp <= 0x42F { return cp + 0x20; }       // Cyrillic A..Ya
+    if cp >= 0x400 && cp <= 0x40F { return cp + 0x50; }       // Cyrillic IE..DZHE
     return cp;
+}
+
+// Whether the code point at `off` continues a word, which decides whether a
+// capital Sigma lowercases to its final form.
+private bool greek_letter_follows(str s, i32 off) {
+    if off >= s.len { return false; }
+    i32 n;
+    i32 cp = utf8_decode(s, off, &n);
+    if cp >= 'a' && cp <= 'z' { return true; }
+    if cp >= 'A' && cp <= 'Z' { return true; }
+    return cp >= 0x386 && cp <= 0x3CE;
 }
 
 private Value str_case_map(VM* vm, Value thisv, bool upper) {
@@ -2429,6 +2492,8 @@ private Value str_case_map(VM* vm, Value thisv, bool upper) {
         if upper && cp == 0xDF {          // ß -> SS
             wtf8_put_cp(&sb, 'S');
             wtf8_put_cp(&sb, 'S');
+        } else if !upper && cp == 0x3A3 && !greek_letter_follows(s, off) {
+            wtf8_put_cp(&sb, 0x3C2);      // word-final Sigma -> final sigma
         } else {
             wtf8_put_cp(&sb, case_map_cp(cp, upper));
         }
@@ -2486,12 +2551,80 @@ private Value nat_str_localecompare(void* vmp, Value callee, Value thisv, Value*
 
 // Unicode normalization is a no-op: already-composed input (the common
 // case) round-trips unchanged.
+// Not a real normalisation: the mapping tables are not carried. The form
+// argument is still validated, so a bad one is the RangeError it should be
+// rather than a silent pass-through.
 private Value nat_str_normalize(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return js_to_string_value(as_vm(vmp), thisv);
+    VM* vm = as_vm(vmp);
+    Value fv = arg_at(args, argc, 0);
+    if !value_is_undefined(fv) {
+        Value fs = js_to_string_value(vm, fv);
+        if vm.has_pending { return value_undefined(); }
+        str f = sview(fs);
+        if !str_equal(f, "NFC") && !str_equal(f, "NFD")
+            && !str_equal(f, "NFKC") && !str_equal(f, "NFKD") {
+            vm_throw_error(vm, ERR_RANGE, "form must be NFC, NFD, NFKC or NFKD");
+            return value_undefined();
+        }
+    }
+    return js_to_string_value(vm, thisv);
 }
 
 private bool is_ws_byte(u8 c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12;
+}
+
+// Narrows [a, b) past the whitespace the spec recognises, which is more than
+// the ASCII blanks: NBSP, the BOM, the line separators and the Zs category.
+private void trim_bounds(str s, i32* pa, i32* pb, bool left, bool right) {
+    i32 a = *pa;
+    i32 b = *pb;
+    if left {
+        while a < b {
+            i32 w = js_ws_len(s, a);
+            if w == 0 || a + w > b { break; }
+            a += w;
+        }
+    }
+    if right {
+        while b > a {
+            i32 w = 0;
+            if js_ws_len(s, b - 1) == 1 { w = 1; }
+            else if b - 2 >= a && js_ws_len(s, b - 2) == 2 { w = 2; }
+            else if b - 3 >= a && js_ws_len(s, b - 3) == 3 { w = 3; }
+            if w == 0 { break; }
+            b -= w;
+        }
+    }
+    *pa = a;
+    *pb = b;
+}
+
+// Well-formedness is the absence of an unpaired surrogate, which the WTF-8
+// helpers already detect and repair.
+private Value nat_str_iswellformed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    bool ok = !wtf8_has_surrogate(sview(sv2));
+    gc_root_reset(&vm.heap, rm);
+    return value_bool(ok);
+}
+
+// Each unpaired surrogate becomes U+FFFD.
+private Value nat_str_towellformed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv2 = js_to_string_value(vm, thisv);
+    gc_root(&vm.heap, sv2);
+    str_buf sb;
+    str_buf_init(&sb);
+    wtf8_sanitize_into(&sb, sview(sv2));
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
 }
 
 private Value nat_str_trim(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2502,8 +2635,7 @@ private Value nat_str_trim(void* vmp, Value callee, Value thisv, Value* args, i3
     str s = sview(sv2);
     i32 a = 0;
     i32 b = s.len;
-    while a < b && is_ws_byte(*(s.data + a)) { a++; }
-    while b > a && is_ws_byte(*(s.data + b - 1)) { b--; }
+    trim_bounds(s, &a, &b, true, true);
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -2751,8 +2883,7 @@ private Value str_trim_side(VM* vm, Value thisv, bool left, bool right) {
     str s = sview(sv2);
     i32 a = 0;
     i32 b = s.len;
-    if left { while a < b && is_ws_byte(*(s.data + a)) { a++; } }
-    if right { while b > a && is_ws_byte(*(s.data + b - 1)) { b--; } }
+    trim_bounds(s, &a, &b, left, right);
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -13437,6 +13568,8 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.string_proto, "substr", &nat_str_substr);
     def_method(vm, vm.string_proto, "localeCompare", &nat_str_localecompare);
     def_method(vm, vm.string_proto, "normalize", &nat_str_normalize);
+    def_method(vm, vm.string_proto, "isWellFormed", &nat_str_iswellformed);
+    def_method(vm, vm.string_proto, "toWellFormed", &nat_str_towellformed);
     def_method(vm, vm.string_proto, "toLocaleUpperCase", &nat_str_toupper);
     def_method(vm, vm.string_proto, "toLocaleLowerCase", &nat_str_tolower);
     def_method(vm, vm.string_proto, "split", &nat_str_split_x);
