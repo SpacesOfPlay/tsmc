@@ -1,4 +1,9 @@
 // Property descriptors, enumerability, freeze/seal/extensibility.
+//
+// .mjs on purpose: tsmc runs strict, where a write that a descriptor or an
+// integrity level forbids is a TypeError rather than the sloppy-mode silent
+// no-op. node only agrees when it treats the file as a module.
+const attempt = (f) => { try { f(); return 'ok'; } catch (e) { return 'THROW:' + e.constructor.name; } };
 
 // defineProperty: non-enumerable hides from keys/JSON/for-in
 const o1 = {};
@@ -14,26 +19,24 @@ const o2 = {};
 Object.defineProperty(o2, "r", { get() { return 42; }, enumerable: true });
 console.log(o2.r);
 
-// non-writable data property ignores writes
+// a write to a non-writable data property is refused
 const o3 = {};
 Object.defineProperty(o3, "w", { value: 1, writable: false });
-o3.w = 99;
-console.log(o3.w);
+console.log(attempt(() => { o3.w = 99; }), o3.w);
 
 // freeze / seal / preventExtensions
 const f = Object.freeze({ a: 1 });
-f.a = 2;
-f.b = 3;
+console.log(attempt(() => { f.a = 2; }), attempt(() => { f.b = 3; }));
 console.log(f.a, f.b, Object.isFrozen(f), Object.isSealed(f));
 
 const s = Object.seal({ a: 1 });
 s.a = 2;
-s.b = 3;
+console.log(attempt(() => { s.b = 3; }));
 console.log(s.a, s.b, Object.isSealed(s), Object.isFrozen(s));
 
 const p = {};
 Object.preventExtensions(p);
-p.x = 1;
+console.log(attempt(() => { p.x = 1; }));
 console.log(p.x, Object.isExtensible(p), Object.isExtensible({}));
 
 // getOwnPropertyDescriptor

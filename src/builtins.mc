@@ -358,7 +358,18 @@ private Value nat_object_create(void* vmp, Value callee, Value thisv, Value* arg
     JsObject* proto = null;
     if value_is_object(pv) { proto = value_as_object(pv); }
     JsObject* o = js_new_object(&vm.heap, proto);
-    return value_cell(&o.head);
+    Value ov = value_cell(&o.head);
+    // a second argument is a property-descriptor map, applied as defineProperties
+    Value props = arg_at(args, argc, 1);
+    if !value_is_undefined(props) {
+        i32 rm = gc_root_mark(&vm.heap);
+        gc_root(&vm.heap, ov);
+        Value[2] a2 = { ov, props };
+        ignore nat_object_defineproperties(vmp, callee, thisv, &a2[0], 2);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return ov;
 }
 
 private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -454,6 +465,10 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
     Value pv = arg_at(args, argc, 1);
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
+        if (o.obj_flags & OBJF_NONEXT) != 0 {
+            vm_throw_error(as_vm(vmp), ERR_TYPE, "cannot change the prototype of a non-extensible object");
+            return value_undefined();
+        }
         if value_is_object(pv) {
             o.proto = value_as_object(pv);
         } else if value_is_null(pv) {
@@ -546,10 +561,53 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
         vm_throw_error(vm, ERR_TYPE, "property description must be an object");
         return value_undefined();
     }
+    Value tmp0;
+
+    // A descriptor is either data or accessor, never both.
+    bool wants_accessor = desc_has(vm, desc, "get") || desc_has(vm, desc, "set");
+    if wants_accessor && (desc_has(vm, desc, "value") || desc_has(vm, desc, "writable")) {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "descriptor cannot be both data and accessor");
+        return value_undefined();
+    }
 
     // start from the existing attributes, or all-false for a new property
     Prop* existing = props_entry(props, key);
     u8 flags = existing != null ? existing.flags : 0;
+
+    if existing == null {
+        // a new property needs an extensible object
+        if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_NONEXT) != 0 {
+            gc_root_reset(&vm.heap, rm);
+            vm_throw_error(vm, ERR_TYPE, "cannot define property on a non-extensible object");
+            return value_undefined();
+        }
+    } else if (existing.flags & PROP_CONFIGURABLE) == 0 {
+        // A non-configurable property admits almost no change: only turning a
+        // writable data property read-only, or rewriting its value while it is
+        // still writable.
+        bool bad = desc_has(vm, desc, "configurable") || wants_accessor
+            || value_is_accessor(existing.val);
+        if desc_has(vm, desc, "enumerable") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "enumerable"), &tmp0);
+            if js_truthy(tmp0) != ((existing.flags & PROP_ENUMERABLE) != 0) { bad = true; }
+        }
+        if (existing.flags & PROP_WRITABLE) == 0 {
+            if desc_has(vm, desc, "writable") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "writable"), &tmp0);
+                if js_truthy(tmp0) { bad = true; }
+            }
+            if desc_has(vm, desc, "value") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "value"), &tmp0);
+                if !js_strict_eq(tmp0, existing.val) { bad = true; }
+            }
+        }
+        if bad {
+            gc_root_reset(&vm.heap, rm);
+            vm_throw_error(vm, ERR_TYPE, "cannot redefine non-configurable property");
+            return value_undefined();
+        }
+    }
 
     Value tmp;
     if desc_has(vm, desc, "enumerable") {
@@ -768,7 +826,7 @@ private Value nat_object_freeze(void* vmp, Value callee, Value thisv, Value* arg
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
         object_lock_props(o, PROP_WRITABLE | PROP_CONFIGURABLE);
-        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+        o.obj_flags = o.obj_flags | OBJF_NONEXT | OBJF_SEALED | OBJF_FROZEN;
     }
     return ov;
 }
@@ -778,7 +836,7 @@ private Value nat_object_seal(void* vmp, Value callee, Value thisv, Value* args,
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
         object_lock_props(o, PROP_CONFIGURABLE);
-        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+        o.obj_flags = o.obj_flags | OBJF_NONEXT | OBJF_SEALED;
     }
     return ov;
 }
@@ -805,6 +863,8 @@ private Value nat_object_isfrozen(void* vmp, Value callee, Value thisv, Value* a
     if !value_is_object(ov) { return value_bool(true); }
     JsObject* o = value_as_object(ov);
     if (o.obj_flags & OBJF_NONEXT) == 0 { return value_bool(false); }
+    // elements carry no attributes, so an array leans on the object-level flag
+    if o.elen > 0 && (o.obj_flags & OBJF_FROZEN) == 0 { return value_bool(false); }
     return value_bool(object_all_locked(o, PROP_WRITABLE | PROP_CONFIGURABLE));
 }
 
@@ -813,6 +873,7 @@ private Value nat_object_issealed(void* vmp, Value callee, Value thisv, Value* a
     if !value_is_object(ov) { return value_bool(true); }
     JsObject* o = value_as_object(ov);
     if (o.obj_flags & OBJF_NONEXT) == 0 { return value_bool(false); }
+    if o.elen > 0 && (o.obj_flags & OBJF_SEALED) == 0 { return value_bool(false); }
     return value_bool(object_all_locked(o, PROP_CONFIGURABLE));
 }
 
@@ -1323,6 +1384,10 @@ private Value nat_arr_push(void* vmp, Value callee, Value thisv, Value* args, i3
     if needs_generic_array(thisv) { return arr_push_generic(vm, thisv, args, argc); }
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
+    if argc > 0 && (a.obj_flags & OBJF_NONEXT) != 0 {
+        vm_throw_error(vm, ERR_TYPE, "cannot add to a non-extensible array");
+        return value_undefined();
+    }
     for i32 i = 0; i < argc; i++ {
         js_array_set(a, a.elen, *(args + i));
     }

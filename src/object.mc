@@ -36,6 +36,10 @@ const i32 OBJF_NONEXT = 2;   // not extensible (Object.preventExtensions)
 const i32 OBJF_TYPEDARRAY = 4;   // a TypedArray view (element access reads bytes)
 const i32 OBJF_PROXY = 8;    // a Proxy: fundamental ops route through the handler
 const i32 OBJF_PROXY_REVOKED = 16;   // a revoked Proxy: every operation throws
+// Integrity level, needed on top of the per-property bits because an array's
+// elements live outside the property table and carry no attributes.
+const i32 OBJF_SEALED = 32;
+const i32 OBJF_FROZEN = 64;
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.

@@ -1443,6 +1443,14 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             // a string-numeric key (e.g. arr["1"] = x) writes the element part
             i32 idx = ta_atom_index(vm, a);
             if idx >= 0 {
+                if (o.obj_flags & OBJF_FROZEN) != 0 {
+                    vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property of a frozen array");
+                    return false;
+                }
+                if idx >= o.elen && (o.obj_flags & OBJF_NONEXT) != 0 {
+                    vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible array");
+                    return false;
+                }
                 js_array_set(o, idx, v);
                 return true;
             }
@@ -1466,22 +1474,33 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
                         ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                         return !vm.has_pending;
                     }
-                    return true;   // getter-only property: write ignored
+                    // strict mode throughout, so a failed write is an error
+                    // rather than the sloppy-mode silent no-op
+                    vm_throw_error(vm, ERR_TYPE, "cannot set property which has only a getter");
+                    return false;
                 }
                 if cur == o {
-                    // non-writable own data property: write is ignored
-                    if (pe.flags & PROP_WRITABLE) == 0 { return true; }
+                    if (pe.flags & PROP_WRITABLE) == 0 {
+                        vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
+                        return false;
+                    }
                     pe.val = v;
                     return true;
                 }
-                // inherited non-writable data property blocks the write
-                if (pe.flags & PROP_WRITABLE) == 0 { return true; }
+                // an inherited non-writable data property blocks the write
+                if (pe.flags & PROP_WRITABLE) == 0 {
+                    vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
+                    return false;
+                }
                 break;
             }
             cur = cur.proto;
         }
         // a fresh property cannot be added to a non-extensible object
-        if (o.obj_flags & OBJF_NONEXT) != 0 { return true; }
+        if (o.obj_flags & OBJF_NONEXT) != 0 {
+            vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible object");
+            return false;
+        }
         js_set_prop(o, a, v);
         return true;
     }
@@ -1495,7 +1514,8 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
                 ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                 return !vm.has_pending;
             }
-            return true;   // getter-only property: write ignored
+            vm_throw_error(vm, ERR_TYPE, "cannot set property which has only a getter");
+            return false;
         }
         if value_is_function(objv) { props_set(&value_as_function(objv).props, a, v); }
         else { props_set(&value_as_native(objv).props, a, v); }
@@ -3290,6 +3310,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_array(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
+                        if !array_index_writable(vm, value_as_object(objv), idx) { break case; }
                         js_array_set(value_as_object(objv), idx, v);
                         vm.sp -= 3;
                         vpush(vm, v);
@@ -3346,49 +3367,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_DELPROP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                Value objv = vpeek(vm, 0);
-                bool r = true;
-                if value_is_object(objv) {
-                    JsObject* o = value_as_object(objv);
-                    if (o.obj_flags & OBJF_PROXY) != 0 {
-                        r = proxy_delete(vm, cast(JsProxy*, o), a);
-                        if vm.has_pending { break case; }
-                    } else {
-                        // deleting an absent property succeeds; only a
-                        // non-configurable own property refuses
-                        Prop* pe = props_entry(&o.props, a);
-                        if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
-                            r = false;
-                        } else {
-                            ignore js_delete_prop(o, a);
-                        }
-                    }
+                if delete_key(vm, vpeek(vm, 0), a) {
+                    vm.sp--;
+                    vpush(vm, value_bool(true));
                 }
-                vm.sp--;
-                vpush(vm, value_bool(r));
             }
             case OP_DELINDEX: {
-                Value key = vpeek(vm, 0);
-                Value objv = vpeek(vm, 1);
-                bool r = true;
-                if value_is_array(objv) {
-                    i32 idx = val_to_index(key);
-                    if idx >= 0 && idx < value_as_object(objv).elen {
-                        // leaves a hole, not undefined: `1 in a` goes false and
-                        // the iteration methods skip the slot
-                        js_array_set(value_as_object(objv), idx, value_hole());
-                    }
-                } else if value_is_object(objv) {
-                    JsObject* dob = value_as_object(objv);
-                    if (dob.obj_flags & OBJF_PROXY) != 0 {
-                        r = proxy_delete(vm, cast(JsProxy*, dob), key_to_atom(vm, key));
-                        if vm.has_pending { break case; }
-                    } else {
-                        r = js_delete_prop(dob, key_to_atom(vm, key));
-                    }
+                if delete_index(vm, vpeek(vm, 1), vpeek(vm, 0)) {
+                    vm.sp -= 2;
+                    vpush(vm, value_bool(true));
                 }
-                vm.sp -= 2;
-                vpush(vm, value_bool(r));
             }
             case OP_TRY_PUSH: {
                 i32 target = rd_u16(code, ip);
@@ -3982,6 +3970,58 @@ private bool instanceof_hook(VM* vm) {
     vm.sp -= 2;
     vpush(vm, value_bool(js_truthy(r)));
     return true;
+}
+
+// An element store blocked by the array's integrity level. Throws and returns
+// false when it is; kept out of the interpreter loop for frame size.
+private bool array_index_writable(VM* vm, JsObject* a, i32 idx) {
+    if (a.obj_flags & OBJF_FROZEN) != 0 {
+        vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property of a frozen array");
+        return false;
+    }
+    if idx >= a.elen && (a.obj_flags & OBJF_NONEXT) != 0 {
+        vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible array");
+        return false;
+    }
+    return true;
+}
+
+// `delete`, shared by the named and computed forms. Removing an absent
+// property succeeds; a non-configurable one is a TypeError under strict mode,
+// which is the only mode here. Returns false when it threw.
+private bool delete_key(VM* vm, Value objv, u32 a) {
+    if !value_is_object(objv) { return true; }
+    JsObject* o = value_as_object(objv);
+    if (o.obj_flags & OBJF_PROXY) != 0 {
+        ignore proxy_delete(vm, cast(JsProxy*, o), a);
+        return !vm.has_pending;
+    }
+    Prop* pe = props_entry(&o.props, a);
+    if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
+        vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
+        return false;
+    }
+    ignore js_delete_prop(o, a);
+    return true;
+}
+
+// The computed form. An array index clears the slot to a hole rather than
+// removing a property, so `1 in a` goes false and the iteration methods skip it.
+private bool delete_index(VM* vm, Value objv, Value key) {
+    if value_is_array(objv) {
+        JsObject* a = value_as_object(objv);
+        i32 idx = val_to_index(key);
+        if idx >= 0 && idx < a.elen {
+            if (a.obj_flags & OBJF_SEALED) != 0 {
+                vm_throw_error(vm, ERR_TYPE, "cannot delete from a sealed array");
+                return false;
+            }
+            js_array_set(a, idx, value_hole());
+        }
+        return true;
+    }
+    if !value_is_object(objv) { return true; }
+    return delete_key(vm, objv, key_to_atom(vm, key));
 }
 
 // A return completion is not catchable: hand it straight back to the unwinder,
