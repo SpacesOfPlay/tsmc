@@ -3266,6 +3266,48 @@ private Value nat_parsefloat(void* vmp, Value callee, Value thisv, Value* args, 
     return js_number_value(js_string_to_number(slice));
 }
 
+// The digits of av written out to `d` decimal places, with no point: "0.615"
+// at d=2 gives "61". Works from the value's correctly-rounded significant
+// digits, so the rounding follows the double's real value. Beyond the 17
+// digits a double carries the tail is zeros, where a bignum expansion would
+// keep going. Caller frees.
+private string tofixed_digits(f64 av, i32 d) {
+    if av == 0.0 { return format("{}", 0); }
+    u8[24] sd;
+    i32 e = decimal_sig(av, 17, &sd[0]);   // digit i has place value 10^(e-i)
+    i32 keep = e + d + 1;                  // digits down to 10^-d
+    if keep <= 0 {
+        // below half of the last kept place, unless it rounds up into it
+        if keep == 0 && sd[0] >= cast(u8, '5') { return format("{}", 1); }
+        return format("{}", 0);
+    }
+    u8[40] out;
+    i32 n = 0;
+    while n < keep && n < 40 {
+        out[n] = n < 17 ? sd[n] : cast(u8, '0');
+        n++;
+    }
+    bool round_up = keep < 17 && sd[keep] >= cast(u8, '5');
+    if round_up {
+        i32 i = n - 1;
+        while i >= 0 {
+            if out[i] < cast(u8, '9') { out[i] = cast(u8, out[i] + 1); break; }
+            out[i] = '0';
+            i--;
+        }
+        if i < 0 && n < 39 {
+            // carried past the leading digit: "999" -> "1000"
+            for i32 k = n; k > 0; k-- { out[k] = out[k - 1]; }
+            out[0] = '1';
+            n++;
+        }
+    }
+    str s;
+    s.data = &out[0];
+    s.len = n;
+    return format("{}", s);
+}
+
 private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     f64 v = num_this(vm, thisv);
@@ -3277,15 +3319,25 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     if d > 20 { d = 20; }
     f64 inf = 1.0e308 * 10.0;
     f64 av = fabs(v);
-    if v != v || v == inf || v == -inf || av >= 1.0e15 {
+    if v != v || v == inf || v == -inf || av >= 1.0e21 {
         return js_to_string_value(vm, js_number_value(v));
     }
-    f64 scale = pow(10.0, d);
-    i64 scaled = cast(i64, floor(av * scale + 0.5));
-    string digits = format("{}", scaled);
+    // Scaling into an i64 keeps the most precision, but only while the product
+    // stays inside the range where a double still counts integers exactly;
+    // past that (large d) fall back to the value's significant digits, which
+    // costs a little accuracy but never produces garbage.
+    f64 scale = pow(10.0, cast(f64, d));
+    string digits;
+    if av * scale < 9.0e15 {
+        digits = format("{}", cast(i64, floor(av * scale + 0.5)));
+    } else {
+        digits = tofixed_digits(av, d);
+    }
     str_buf sb;
     str_buf_init(&sb);
-    if v < 0.0 && scaled != 0 { str_buf_add(&sb, "-"); }
+    // the sign survives a value that rounds to zero: (-0.001).toFixed(2) is
+    // "-0.00", though -0 itself is not negative
+    if v < 0.0 { str_buf_add(&sb, "-"); }
     str dg = digits;
     if dg.len <= d {
         str_buf_add(&sb, "0.");
@@ -3350,6 +3402,52 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
         one.data = &buf[i];
         one.len = 1;
         str_buf_add(&sb, one);
+    }
+    // Fractional digits. Enough are generated to cover the mantissa, then the
+    // tail is rounded with a carry and trailing zeros are dropped — which is
+    // what collapses a repeating expansion such as 1/3 in base 3 to "0.1".
+    f64 frac = fabs(v) - cast(f64, cast(i64, fabs(v)));
+    if frac > 0.0 {
+        i32 limit = 0;
+        f64 acc = 1.0;
+        while acc < 9.0e15 && limit < 60 {
+            acc = acc * cast(f64, radix);
+            limit++;
+        }
+        u8[80] fd;
+        i32 nfd = 0;
+        i32 sig = 0;   // leading zeros cost no precision, so they do not count
+        while sig < limit && nfd < 76 && frac > 0.0 {
+            frac = frac * cast(f64, radix);
+            i32 d = cast(i32, frac);
+            if d >= radix { d = radix - 1; }
+            fd[nfd] = cast(u8, d);
+            nfd++;
+            if d != 0 || sig > 0 { sig++; }
+            frac = frac - cast(f64, d);
+        }
+        if frac >= 0.5 {
+            i32 i = nfd - 1;
+            while i >= 0 {
+                i32 d = cast(i32, fd[i]) + 1;
+                if d < radix { fd[i] = cast(u8, d); break; }
+                fd[i] = 0;
+                i--;
+            }
+        }
+        while nfd > 0 && fd[nfd - 1] == 0 { nfd--; }
+        if nfd > 0 {
+            str_buf_add(&sb, ".");
+            for i32 i = 0; i < nfd; i++ {
+                i32 d = cast(i32, fd[i]);
+                u8 c = 0;
+                if d < 10 { c = cast(u8, d + '0'); } else { c = cast(u8, d - 10 + 'a'); }
+                str one;
+                one.data = &c;
+                one.len = 1;
+                str_buf_add(&sb, one);
+            }
+        }
     }
     Value r = new_str(vm, str_buf_to_str(&sb));
     str_buf_free(&sb);
@@ -13154,8 +13252,6 @@ void builtins_install(VM* vm) {
     def_static(vm, number_ctor, "isFinite", &nat_num_isfinite);
     def_static(vm, number_ctor, "isSafeInteger", &nat_num_issafeinteger);
     def_static(vm, number_ctor, "isNaN", &nat_num_isnan);
-    def_static(vm, number_ctor, "parseInt", &nat_parseint);
-    def_static(vm, number_ctor, "parseFloat", &nat_parsefloat);
     // Numeric constants: spec attributes are all off (non-writable,
     // non-enumerable, non-configurable). MIN_VALUE is the smallest
     // positive denormal double.
@@ -13289,8 +13385,12 @@ void builtins_install(VM* vm) {
     ignore def_global_fn(vm, "unescape", &nat_unescape);
     ignore def_global_fn(vm, "decodeURIComponent", &nat_decode_uri_comp);
     ignore def_global_fn(vm, "decodeURI", &nat_decode_uri);
-    ignore def_global_fn(vm, "parseInt", &nat_parseint);
-    ignore def_global_fn(vm, "parseFloat", &nat_parsefloat);
+    // Number.parseInt and the global parseInt are the same function object,
+    // as are the parseFloat pair
+    JsNative* g_pi = def_global_fn(vm, "parseInt", &nat_parseint);
+    props_set_desc(&number_ctor.props, bi_atom(vm, "parseInt"), value_cell(&g_pi.head), METHOD_ATTRS);
+    JsNative* g_pf = def_global_fn(vm, "parseFloat", &nat_parsefloat);
+    props_set_desc(&number_ctor.props, bi_atom(vm, "parseFloat"), value_cell(&g_pf.head), METHOD_ATTRS);
     ignore def_global_fn(vm, "isNaN", &nat_global_isnan);
     ignore def_global_fn(vm, "isFinite", &nat_global_isfinite);
 

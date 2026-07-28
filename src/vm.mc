@@ -420,21 +420,42 @@ private i32 f64_to_i32(f64 v) {
     return cast(i32, cast(i64, v));
 }
 
+// Bytes of the whitespace run starting at i, or 0. Covers the whole of the
+// spec's StrWhiteSpace, not just the ASCII blanks: NBSP, the BOM, the line
+// separators and the Zs category all count when converting a string.
+private i32 num_ws_len(str s, i32 i) {
+    u8 c = *(s.data + i);
+    if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 { return 1; }
+    if c == 0xC2 && i + 1 < s.len && *(s.data + i + 1) == 0xA0 { return 2; }      // NBSP
+    if i + 2 >= s.len { return 0; }
+    u8 d = *(s.data + i + 1);
+    u8 e = *(s.data + i + 2);
+    if c == 0xEF && d == 0xBB && e == 0xBF { return 3; }                          // BOM
+    if c == 0xE1 && d == 0x9A && e == 0x80 { return 3; }                          // U+1680
+    if c == 0xE3 && d == 0x80 && e == 0x80 { return 3; }                          // U+3000
+    if c == 0xE2 {
+        // U+2000..U+200A, U+2028, U+2029, U+202F, U+205F
+        if d == 0x80 && ((e >= 0x80 && e <= 0x8A) || e == 0xA8 || e == 0xA9 || e == 0xAF) { return 3; }
+        if d == 0x81 && e == 0x9F { return 3; }
+    }
+    return 0;
+}
+
 private f64 vm_str_to_num(str s) {
     i32 a = 0;
     i32 b = s.len;
     while a < b {
-        u8 c = *(s.data + a);
-        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 {
-            a++;
-        } else {
-            break;
-        }
+        i32 w = num_ws_len(s, a);
+        if w == 0 { break; }
+        a += w;
     }
     while b > a {
-        u8 c = *(s.data + b - 1);
-        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 {
-            b--;
+        i32 tw = 0;
+        if num_ws_len(s, b - 1) == 1 { tw = 1; }
+        else if b - 2 >= a && num_ws_len(s, b - 2) == 2 { tw = 2; }
+        else if b - 3 >= a && num_ws_len(s, b - 3) == 3 { tw = 3; }
+        if tw > 0 {
+            b -= tw;
         } else {
             break;
         }
