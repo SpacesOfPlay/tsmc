@@ -6445,6 +6445,121 @@ private bool ds_digits(str s, i32* i, i32 count, i32* out) {
 // A date-only string and one with a trailing Z are UTC; a time without an
 // offset is also treated as UTC (the interpreter has no local zone).
 // Returns NaN when the whole string is not consumed or a field is invalid.
+// Month names, long or abbreviated, for the legacy date forms.
+private i32 month_from_name(str s, i32 i, i32 end) {
+    if i + 3 > end { return -1; }
+    u8 a = ascii_lower_byte(*(s.data + i));
+    u8 b = ascii_lower_byte(*(s.data + i + 1));
+    u8 c = ascii_lower_byte(*(s.data + i + 2));
+    if a == 'j' && b == 'a' && c == 'n' { return 0; }
+    if a == 'f' && b == 'e' && c == 'b' { return 1; }
+    if a == 'm' && b == 'a' && c == 'r' { return 2; }
+    if a == 'a' && b == 'p' && c == 'r' { return 3; }
+    if a == 'm' && b == 'a' && c == 'y' { return 4; }
+    if a == 'j' && b == 'u' && c == 'n' { return 5; }
+    if a == 'j' && b == 'u' && c == 'l' { return 6; }
+    if a == 'a' && b == 'u' && c == 'g' { return 7; }
+    if a == 's' && b == 'e' && c == 'p' { return 8; }
+    if a == 'o' && b == 'c' && c == 't' { return 9; }
+    if a == 'n' && b == 'o' && c == 'v' { return 10; }
+    if a == 'd' && b == 'e' && c == 'c' { return 11; }
+    return -1;
+}
+
+private u8 ascii_lower_byte(u8 c) {
+    if c >= 'A' && c <= 'Z' { return cast(u8, c + 32); }
+    return c;
+}
+
+// The legacy date forms the web relies on, chiefly RFC 2822 as used by HTTP
+// Date headers ("Tue, 01 Jan 2020 00:00:00 GMT") and the "December 17, 1995"
+// spelling. Fields may appear in either order; an absent zone reads as UTC,
+// which is the only zone this runtime keeps.
+private f64 date_parse_legacy(str s) {
+    f64 nan = 0.0 / 0.0;
+    i32 i = 0;
+    i32 end = s.len;
+    i32 month = -1;
+    i32 day = -1;
+    i64 year = -1000000;
+    i32 hour = 0;
+    i32 mi = 0;
+    i32 sec = 0;
+    i32 off_min = 0;
+    bool have_time = false;
+    while i < end {
+        u8 c = *(s.data + i);
+        if c == ' ' || c == ',' || c == '(' || c == ')' || c == '-' { i++; continue; }
+        if c >= '0' && c <= '9' {
+            i32 start = i;
+            i32 v = 0;
+            while i < end && *(s.data + i) >= '0' && *(s.data + i) <= '9' {
+                v = v * 10 + cast(i32, *(s.data + i) - '0');
+                i++;
+            }
+            i32 ndig = i - start;
+            if i < end && *(s.data + i) == ':' {
+                // a clock time
+                hour = v;
+                i++;
+                if !ds_digits(s, &i, 2, &mi) { return nan; }
+                if i < end && *(s.data + i) == ':' {
+                    i++;
+                    if !ds_digits(s, &i, 2, &sec) { return nan; }
+                }
+                have_time = true;
+            } else if ndig >= 3 {
+                year = cast(i64, v);
+            } else if day < 0 {
+                // a one or two digit number in the first numeric position is
+                // the day, even out of range: the check below rejects it
+                day = v;
+            } else if year == -1000000 {
+                year = date_year_expand(cast(i64, v));
+            }
+            continue;
+        }
+        i32 m = month_from_name(s, i, end);
+        if m >= 0 {
+            month = m;
+            while i < end && ((*(s.data + i) >= 'a' && *(s.data + i) <= 'z')
+                || (*(s.data + i) >= 'A' && *(s.data + i) <= 'Z') || *(s.data + i) == '.') { i++; }
+            continue;
+        }
+        // a zone: GMT / UT / UTC / Z, optionally followed by an offset
+        u8 lc = ascii_lower_byte(c);
+        if lc == 'g' || lc == 'u' || lc == 'z' {
+            while i < end && ((*(s.data + i) >= 'a' && *(s.data + i) <= 'z')
+                || (*(s.data + i) >= 'A' && *(s.data + i) <= 'Z')) { i++; }
+            continue;
+        }
+        if c == '+' {
+            i++;
+            i32 oh = 0;
+            i32 om = 0;
+            if !ds_digits(s, &i, 2, &oh) { return nan; }
+            if i < end && *(s.data + i) == ':' { i++; }
+            if !ds_digits(s, &i, 2, &om) { return nan; }
+            off_min = oh * 60 + om;
+            continue;
+        }
+        // an alphabetic run that names nothing (a weekday) is skipped
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+            while i < end && ((*(s.data + i) >= 'a' && *(s.data + i) <= 'z')
+                || (*(s.data + i) >= 'A' && *(s.data + i) <= 'Z') || *(s.data + i) == '.') { i++; }
+            continue;
+        }
+        return nan;
+    }
+    if month < 0 || year == -1000000 { return nan; }
+    if day < 0 { day = 1; }
+    if month > 11 || day < 1 || day > 31 { return nan; }
+    if hour > 24 || mi > 59 || sec > 59 { return nan; }
+    ignore have_time;
+    f64 t = date_compose(year, month, day, hour, mi, sec, 0);
+    return t - cast(f64, off_min) * 60000.0;
+}
+
 private f64 date_parse_iso(str s) {
     f64 nan = 0.0 / 0.0;
     i32 i = 0;
@@ -6452,7 +6567,7 @@ private f64 date_parse_iso(str s) {
     while i < end && *(s.data + i) == ' ' { i++; }
     while end > i && *(s.data + end - 1) == ' ' { end--; }
     i32 year = 0;
-    if !ds_digits(s, &i, 4, &year) { return nan; }
+    if !ds_digits(s, &i, 4, &year) { return date_parse_legacy(s); }
     i32 month = 1;
     i32 day = 1;
     i32 hour = 0;
@@ -6508,7 +6623,7 @@ private f64 date_parse_iso(str s) {
             }
         }
     }
-    if i != end { return nan; }
+    if i != end { return date_parse_legacy(s); }
     if month < 1 || month > 12 || day < 1 || day > 31 { return nan; }
     if hour > 24 || min > 59 || sec > 59 { return nan; }
     f64 t = date_compose(cast(i64, year), month - 1, day, hour, min, sec, ms);
@@ -6537,7 +6652,12 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
     } else if argc == 1 {
         // new Date(string) parses; new Date(number|Date) is a time value
         if value_is_string(*(args)) { t = date_parse_iso(sview(*(args))); }
-        else { t = js_to_number(*(args)); }
+        else if value_is_object(*(args))
+            && props_get(&value_as_object(*(args)).props, bi_atom(vm, "%t")) != null {
+            // another Date contributes its time value directly, without the
+            // ToPrimitive that would otherwise stringify it
+            t = date_ms(vm, *(args));
+        } else { t = js_to_number(*(args)); }
     } else {
         i64 y = date_year_expand(cast(i64, js_to_number(*(args))));
         i32 mo = to_int_arg(arg_at(args, argc, 1));
@@ -6548,7 +6668,7 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
         i32 mms = argc > 6 ? to_int_arg(*(args + 6)) : 0;
         t = date_compose(y, mo, day, hr, mi, se, mms);
     }
-    js_set_prop(d, bi_atom(vm, "%t"), value_number(t));
+    js_set_prop(d, bi_atom(vm, "%t"), value_number(date_clip(t)));
     gc_root_reset(&vm.heap, rm);
     return value_cell(&d.head);
 }
@@ -6609,7 +6729,16 @@ private Value nat_date_getms(void* vmp, Value callee, Value thisv, Value* args, 
 // way the specification does (month 12 rolls into the next year, and so on).
 // tsmc keeps dates in UTC, so the local and UTC setters share an implementation.
 
-private Value date_store(VM* vm, Value thisv, f64 t) {
+// TimeClip: a time value is a whole number of milliseconds within
+// +/-8.64e15; anything outside that, or fractional, is clipped.
+private f64 date_clip(f64 t) {
+    if t != t { return t; }
+    if t > 8.64e15 || t < -8.64e15 { return 0.0 / 0.0; }
+    return t < 0.0 ? 0.0 - floor(0.0 - t) : floor(t);
+}
+
+private Value date_store(VM* vm, Value thisv, f64 t0) {
+    f64 t = date_clip(t0);
     if value_is_object(thisv) {
         js_set_prop(value_as_object(thisv), bi_atom(vm, "%t"), js_number_value(t));
     }
@@ -6621,8 +6750,10 @@ private Value date_store(VM* vm, Value thisv, f64 t) {
 private Value date_set_field(VM* vm, Value thisv, Value* args, i32 argc, i32 field) {
     f64 cur = date_ms(vm, thisv);
     if cur != cur {
-        // an invalid date stays invalid unless the whole time is replaced
-        return date_store(vm, thisv, cur);
+        // Setting the year revives an invalid date, the other fields having
+        // nothing to build on; every other setter leaves it invalid.
+        if field != 0 { return date_store(vm, thisv, cur); }
+        cur = 0.0;
     }
     DateParts p = date_decompose(cur);
     i64 y = p.year;
@@ -6707,12 +6838,23 @@ private Value nat_date_toiso(void* vmp, Value callee, Value thisv, Value* args, 
     DateParts d = date_decompose(t0);
     str_buf sb;
     str_buf_init(&sb);
-    string y = format("{}", d.year);
-    if d.year < 1000 { str_buf_add(&sb, "0"); }
-    if d.year < 100 { str_buf_add(&sb, "0"); }
-    if d.year < 10 { str_buf_add(&sb, "0"); }
-    str_buf_add(&sb, y);
-    free(y);
+    // A year outside 0..9999 uses the expanded six-digit signed form.
+    if d.year < 0 || d.year > 9999 {
+        i64 ay = d.year < 0 ? 0 - d.year : d.year;
+        str_buf_add(&sb, d.year < 0 ? "-" : "+");
+        string ys = format("{}", ay);
+        str yv = ys;
+        for i32 i = yv.len; i < 6; i++ { str_buf_add(&sb, "0"); }
+        str_buf_add(&sb, yv);
+        free(ys);
+    } else {
+        string y = format("{}", d.year);
+        if d.year < 1000 { str_buf_add(&sb, "0"); }
+        if d.year < 100 { str_buf_add(&sb, "0"); }
+        if d.year < 10 { str_buf_add(&sb, "0"); }
+        str_buf_add(&sb, y);
+        free(y);
+    }
     str_buf_add(&sb, "-");
     pad2(&sb, d.month + 1);
     str_buf_add(&sb, "-");
