@@ -5078,6 +5078,58 @@ private Value nat_return_this(void* vmp, Value callee, Value thisv, Value* args,
     return thisv;
 }
 
+// A live Map/Set iterator. It holds the collection rather than a snapshot, so
+// an entry deleted before the walk reaches it is skipped, and one appended
+// during the walk is still visited — the storage is append-only with a liveness
+// flag per slot, which is exactly what that needs.
+private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    JsMap* mp = value_as_map(me.env0);
+    i32 i = value_as_int(me.env1);
+    while i < mp.len && !*(mp.live + i) { i++; }
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&r.head));
+    if i >= mp.len {
+        me.env1 = value_int(i);
+        js_set_prop(r, vm_atom(vm, "value"), value_undefined());
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(true));
+    } else {
+        Value key = *(mp.keys + i);
+        Value val = mp.is_set ? key : *(mp.vals + i);
+        me.env1 = value_int(i + 1);
+        i32 kind = value_as_int(me.env2);
+        Value out = key;
+        if kind == 1 { out = val; }
+        else if kind == 2 {
+            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+            js_array_set(pair, 0, key);
+            js_array_set(pair, 1, val);
+            out = value_cell(&pair.head);
+        }
+        js_set_prop(r, vm_atom(vm, "value"), out);
+        js_set_prop(r, vm_atom(vm, "done"), value_bool(false));
+    }
+    vm_pop(vm);
+    return value_cell(&r.head);
+}
+
+// kind: 0 keys, 1 values, 2 entries
+private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* it = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&it.head));
+    JsNative* nx = js_new_native(&vm.heap, &nat_map_iter_next, "next");
+    nx.env0 = value_cell(&mp.head);
+    nx.env1 = value_int(0);
+    nx.env2 = value_int(kind);
+    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
+    js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&it.head);
+}
+
 private Value make_index_iterator(VM* vm, Value src, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, src);
@@ -5697,6 +5749,9 @@ private i32 map_find(JsMap* mp, Value key) {
 }
 
 private void map_put(JsMap* mp, Value key, Value val) {
+    // -0 is stored as +0, so a key read back out is never negative zero;
+    // lookup already treats the two as the same (SameValueZero)
+    if value_is_double(key) && value_as_f64(key) == 0.0 { key = value_number(0.0); }
     i32 at = map_find(mp, key);
     if at >= 0 {
         *(mp.vals + at) = val;
@@ -5731,6 +5786,12 @@ private JsMap* this_map(VM* vm, Value thisv) {
 }
 
 private Value make_map(VM* vm, Value thisv, Value iterable, bool is_set) {
+    // a plain call arrives with no receiver; `new` always builds one first
+    if !value_is_object(thisv) {
+        vm_throw_error(vm, ERR_TYPE, is_set ? "Constructor Set requires 'new'"
+                                            : "Constructor Map requires 'new'");
+        return value_undefined();
+    }
     JsObject* base = is_set ? vm_set_proto(vm) : vm_map_proto(vm);
     JsMap* mp = js_new_map(&vm.heap, base, is_set);
     // `new Subclass(...)` arrives with a receiver already built from the
@@ -5755,6 +5816,11 @@ private Value make_map(VM* vm, Value thisv, Value iterable, bool is_set) {
             } else if value_is_array(e) {
                 JsObject* pair = value_as_object(e);
                 map_put(mp, js_array_get(pair, 0), js_array_get(pair, 1));
+            } else {
+                // a Map entry has to be an object to read [0] and [1] from
+                gc_root_reset(&vm.heap, rm);
+                vm_throw_error(vm, ERR_TYPE, "iterator value is not an entry object");
+                return value_undefined();
             }
         }
     } else {
@@ -5773,6 +5839,9 @@ private Value make_map(VM* vm, Value thisv, Value iterable, bool is_set) {
                 } else if value_is_array(e) {
                     JsObject* pair = value_as_object(e);
                     map_put(mp, js_array_get(pair, 0), js_array_get(pair, 1));
+                } else {
+                    vm_throw_error(vm, ERR_TYPE, "iterator value is not an entry object");
+                    break;
                 }
             }
         }
@@ -5888,7 +5957,7 @@ private Value nat_weakmap_set(void* vmp, Value callee, Value thisv, Value* args,
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
     Value k = arg_at(args, argc, 0);
-    if !value_is_reference(k) {
+    if !value_is_reference(k) && !value_is_symbol(k) {
         vm_throw_error(vm, ERR_TYPE, "Invalid value used as weak map key");
         return value_undefined();
     }
@@ -5940,57 +6009,32 @@ private Value nat_map_foreach(void* vmp, Value callee, Value thisv, Value* args,
         Value key = *(mp.keys + i);
         Value val = mp.is_set ? key : *(mp.vals + i);
         Value[3] ca = { val, key, thisv };
-        ignore vm_call_value(vm, fun, value_undefined(), &ca[0], 3);
+        ignore vm_call_value(vm, fun, arg_at(args, argc, 1), &ca[0], 3);
         if vm.has_pending { break; }
     }
     gc_root_reset(&vm.heap, rm);
     return value_undefined();
 }
 
-// Snapshot entries into an array (keys, values, or [k,v] pairs).
-private Value map_collect(VM* vm, JsMap* mp, i32 mode) {
-    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
-    i32 rm = gc_root_mark(&vm.heap);
-    gc_root(&vm.heap, value_cell(&arr.head));
-    i32 n = 0;
-    for i32 i = 0; i < mp.len; i++ {
-        if !*(mp.live + i) { continue; }
-        Value key = *(mp.keys + i);
-        if mode == 0 {
-            js_array_set(arr, n, key);
-        } else if mode == 1 {
-            js_array_set(arr, n, mp.is_set ? key : *(mp.vals + i));
-        } else {
-            JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
-            js_array_set(arr, n, value_cell(&pair.head));
-            js_array_set(pair, 0, key);
-            js_array_set(pair, 1, mp.is_set ? key : *(mp.vals + i));
-        }
-        n++;
-    }
-    gc_root_reset(&vm.heap, rm);
-    return value_cell(&arr.head);
-}
-
 private Value nat_map_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 0), 0);
+    return make_map_iterator(vm, mp, 0);
 }
 
 private Value nat_map_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 1), 0);
+    return make_map_iterator(vm, mp, 1);
 }
 
 private Value nat_map_entries(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
     if mp == null { return value_undefined(); }
-    return make_index_iterator(vm, map_collect(vm, mp, 2), 0);
+    return make_map_iterator(vm, mp, 2);
 }
 
 // --- Date -------------------------------------------------------------------------------
