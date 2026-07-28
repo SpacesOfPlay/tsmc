@@ -11985,8 +11985,10 @@ private JsObject* ee_events(VM* vm, Value thisv, bool create) {
     return e;
 }
 
-private JsObject* ee_list(VM* vm, JsObject* events, str name, bool create) {
-    u32 atom = atom_intern(&vm.atoms, name);
+// Listener lists hang off the hidden %events object, keyed by the event's
+// property atom rather than its string form -- a Symbol names an event just as
+// well as a string, and stringifying one throws.
+private JsObject* ee_list(VM* vm, JsObject* events, u32 atom, bool create) {
     Value a;
     if js_get_prop(events, atom, &a) && value_is_array(a) { return value_as_object(a); }
     if !create { return null; }
@@ -12012,12 +12014,37 @@ private bool ee_remove_match(JsObject* list, Value target) {
 // Adds `fn` to the listener array for arg[0]'s event; front-inserts when
 // `prepend`. Shared by on/prependListener (and the once variants via `fn`
 // being a wrapper).
+// Fires 'newListener' / 'removeListener' on the emitter itself. Dispatched
+// directly rather than through emit, so registering a meta listener does not
+// recurse through the same path that is announcing it.
+private void ee_emit_meta(VM* vm, Value thisv, str which, Value name, Value cb) {
+    JsObject* events = ee_events(vm, thisv, false);
+    if events == null { return; }
+    JsObject* list = ee_list(vm, events, bi_atom(vm, which), false);
+    if list == null || list.elen == 0 { return; }
+    i32 n = list.elen;
+    JsObject* snap = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&snap.head));
+    for i32 i = 0; i < n; i++ { js_array_set(snap, i, js_array_get(list, i)); }
+    Value[2] a = { name, cb };
+    for i32 i = 0; i < n; i++ {
+        ignore vm_call_value(vm, js_array_get(snap, i), thisv, &a[0], 2);
+        if vm.has_pending { break; }
+    }
+    vm_pop(vm);
+}
+
 private Value ee_add(VM* vm, Value thisv, Value* args, i32 argc, Value cb, bool prepend) {
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
     vm_push(vm, cb);
+    str sk;
+    u32 natom = reflect_key(vm, namev, &sk);
+    // announced before the listener is in place, as node does, so a handler
+    // sees the count it is about to change
+    ee_emit_meta(vm, thisv, "newListener", namev, cb);
     JsObject* events = ee_events(vm, thisv, true);
-    JsObject* list = ee_list(vm, events, sview(namev), true);
+    JsObject* list = ee_list(vm, events, natom, true);
     if prepend {
         for i32 i = list.elen; i > 0; i-- { js_array_set(list, i, js_array_get(list, i - 1)); }
         js_array_set(list, 0, cb);
@@ -12063,6 +12090,9 @@ private Value ee_make_once(VM* vm, Value thisv, Value namev, Value cb) {
     w.env0 = thisv;
     w.env1 = namev;
     w.env2 = cb;
+    // rawListeners hands out the wrapper, so it carries the original for
+    // callers that need to recognise it
+    props_set_desc(&w.props, bi_atom(vm, "listener"), cb, PROP_DEFAULT);
     vm_pop(vm);
     vm_pop(vm);
     return value_cell(&w.head);
@@ -12075,7 +12105,7 @@ private Value nat_ee_once(void* vmp, Value callee, Value thisv, Value* args, i32
         vm_throw_error(vm, ERR_TYPE, "listener must be a function");
         return value_undefined();
     }
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
     Value w = ee_make_once(vm, thisv, namev, cb);
     vm_push(vm, w);
@@ -12092,7 +12122,7 @@ private Value nat_ee_prepend_once(void* vmp, Value callee, Value thisv, Value* a
         vm_throw_error(vm, ERR_TYPE, "listener must be a function");
         return value_undefined();
     }
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
     Value w = ee_make_once(vm, thisv, namev, cb);
     vm_push(vm, w);
@@ -12110,7 +12140,8 @@ private Value nat_ee_once_wrap(void* vmp, Value callee, Value thisv, Value* args
     // detach this wrapper before firing (fires exactly once)
     JsObject* events = ee_events(vm, emitter, false);
     if events != null {
-        JsObject* list = ee_list(vm, events, sview(w.env1), false);
+        str sk;
+        JsObject* list = ee_list(vm, events, reflect_key(vm, w.env1, &sk), false);
         if list != null { ignore ee_remove_match(list, callee); }
     }
     return vm_call_value(vm, cb, thisv, args, argc);
@@ -12119,12 +12150,15 @@ private Value nat_ee_once_wrap(void* vmp, Value callee, Value thisv, Value* args
 private Value nat_ee_off(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value cb = arg_at(args, argc, 1);
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
     JsObject* events = ee_events(vm, thisv, false);
     if events != null {
-        JsObject* list = ee_list(vm, events, sview(namev), false);
-        if list != null { ignore ee_remove_match(list, cb); }
+        str sk;
+        JsObject* list = ee_list(vm, events, reflect_key(vm, namev, &sk), false);
+        if list != null && ee_remove_match(list, cb) {
+            ee_emit_meta(vm, thisv, "removeListener", namev, cb);
+        }
     }
     vm_pop(vm);
     return thisv;
@@ -12132,12 +12166,14 @@ private Value nat_ee_off(void* vmp, Value callee, Value thisv, Value* args, i32 
 
 private Value nat_ee_emit(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
+    str sk;
+    u32 natom = reflect_key(vm, namev, &sk);
     JsObject* events = ee_events(vm, thisv, false);
-    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    JsObject* list = events != null ? ee_list(vm, events, natom, false) : null;
     if list == null || list.elen == 0 {
-        bool is_error = str_equal(sview(namev), "error");
+        bool is_error = natom == bi_atom(vm, "error");
         vm_pop(vm);
         if is_error {
             Value errv = arg_at(args, argc, 1);
@@ -12164,12 +12200,14 @@ private Value nat_ee_emit(void* vmp, Value callee, Value thisv, Value* args, i32
 }
 
 private Value nat_ee_listeners_impl(VM* vm, Value thisv, Value* args, i32 argc, bool raw) {
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
+    str sk;
+    u32 natom = reflect_key(vm, namev, &sk);
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     vm_push(vm, value_cell(&out.head));
     JsObject* events = ee_events(vm, thisv, false);
-    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    JsObject* list = events != null ? ee_list(vm, events, natom, false) : null;
     if list != null {
         for i32 i = 0; i < list.elen; i++ {
             Value e = js_array_get(list, i);
@@ -12191,10 +12229,12 @@ private Value nat_ee_raw_listeners(void* vmp, Value callee, Value thisv, Value* 
 
 private Value nat_ee_listener_count(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    Value namev = js_to_string_value(vm, arg_at(args, argc, 0));
+    Value namev = arg_at(args, argc, 0);
     vm_push(vm, namev);
+    str sk;
     JsObject* events = ee_events(vm, thisv, false);
-    JsObject* list = events != null ? ee_list(vm, events, sview(namev), false) : null;
+    JsObject* list = events != null
+        ? ee_list(vm, events, reflect_key(vm, namev, &sk), false) : null;
     i32 c = list != null ? list.elen : 0;
     vm_pop(vm);
     return value_number(cast(f64, c));
@@ -12207,18 +12247,15 @@ private Value nat_ee_event_names(void* vmp, Value callee, Value thisv, Value* ar
     JsObject* events = ee_events(vm, thisv, false);
     i32 n = 0;
     if events != null {
-        JsObject* keys = vm_own_keys(vm, value_cell(&events.head));
-        vm_push(vm, value_cell(&keys.head));
-        for i32 i = 0; i < keys.elen; i++ {
-            Value kv = js_array_get(keys, i);
-            Value av;
-            if js_get_prop(events, atom_intern(&vm.atoms, sview(kv)), &av)
-                && value_is_array(av) && value_as_object(av).elen > 0 {
-                js_array_set(out, n, kv);
-                n++;
-            }
+        // walked directly rather than through the own-keys helper, which
+        // reports string keys only: a Symbol names an event too
+        for i32 i = 0; i < events.props.len; i++ {
+            Prop* pr = events.props.items + i;
+            if !value_is_array(pr.val) { continue; }
+            if value_as_object(pr.val).elen == 0 { continue; }
+            js_array_set(out, n, atom_to_key(vm, pr.key));
+            n++;
         }
-        vm_pop(vm);
     }
     Value r = value_cell(&out.head);
     vm_pop(vm);
@@ -12236,9 +12273,9 @@ private Value nat_ee_remove_all(void* vmp, Value callee, Value thisv, Value* arg
             JsObject* fresh = js_new_object(&vm.heap, null);
             props_set_desc(&self.props, bi_atom(vm, "%events"), value_cell(&fresh.head), 0);
         } else {
-            Value ns = js_to_string_value(vm, namev);
-            vm_push(vm, ns);
-            JsObject* list = ee_list(vm, events, sview(ns), false);
+            vm_push(vm, namev);
+            str sk;
+            JsObject* list = ee_list(vm, events, reflect_key(vm, namev, &sk), false);
             if list != null { js_array_set_length(list, 0); }
             vm_pop(vm);
         }
@@ -12266,6 +12303,21 @@ private Value nat_ee_get_max(void* vmp, Value callee, Value thisv, Value* args, 
     return value_number(10.0);
 }
 
+// Points `name` at the function already installed as `existing`.
+private void ee_alias(VM* vm, JsObject* proto, str name, str existing) {
+    Value v;
+    if !js_get_prop(proto, bi_atom(vm, existing), &v) { return; }
+    props_set_desc(&proto.props, bi_atom(vm, name), v, METHOD_ATTRS);
+}
+
+// EventEmitter.listenerCount(emitter, name): the pre-method spelling, still
+// used by plenty of code.
+private Value nat_ee_static_count(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value em = arg_at(args, argc, 0);
+    if !value_is_object(em) { return value_number(0.0); }
+    return nat_ee_listener_count(vmp, callee, em, args + 1, argc > 0 ? argc - 1 : 0);
+}
+
 private JsObject* build_events_module(VM* vm) {
     JsObject* proto = js_new_object(&vm.heap, vm.object_proto);
     vm_push(vm, value_cell(&proto.head));
@@ -12274,11 +12326,13 @@ private JsObject* build_events_module(VM* vm) {
     props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&proto.head), 0);
     link_ctor(vm, proto, ctor);
 
+    // addListener and off are the same function object as on and
+    // removeListener, not merely equivalent ones
     def_method(vm, proto, "on", &nat_ee_on);
-    def_method(vm, proto, "addListener", &nat_ee_on);
     def_method(vm, proto, "once", &nat_ee_once);
-    def_method(vm, proto, "off", &nat_ee_off);
     def_method(vm, proto, "removeListener", &nat_ee_off);
+    ee_alias(vm, proto, "addListener", "on");
+    ee_alias(vm, proto, "off", "removeListener");
     def_method(vm, proto, "emit", &nat_ee_emit);
     def_method(vm, proto, "removeAllListeners", &nat_ee_remove_all);
     def_method(vm, proto, "listeners", &nat_ee_listeners);
@@ -12292,6 +12346,7 @@ private JsObject* build_events_module(VM* vm) {
 
     props_set_desc(&ctor.props, bi_atom(vm, "EventEmitter"), value_cell(&ctor.head), PROP_DEFAULT);
     props_set_desc(&ctor.props, bi_atom(vm, "defaultMaxListeners"), value_number(10.0), PROP_DEFAULT);
+    def_static(vm, ctor, "listenerCount", &nat_ee_static_count);
 
     // namespace: default = the EventEmitter class (require('events') is the
     // class in Node), plus a named EventEmitter export.

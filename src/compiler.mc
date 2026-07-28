@@ -3050,11 +3050,26 @@ private void compile_stmt(Compiler* co, Node* n) {
 
 // --- entry ---------------------------------------------------------------------------------
 
+// The top level binds `this` the same way a function does, so an arrow
+// written there captures it lexically. Without this an arrow at the top level
+// has nothing to capture and falls back to reading the frame's receiver,
+// which lets call/apply/bind supply one -- an arrow must never take one.
+private void bind_toplevel_this(Compiler* co, FScope* fs) {
+    if strmap_get<i32>(&fs.inner, "this") == null { return; }
+    i32 bi = declare(co, "this", true, false);
+    CBind b = vec_get(&fs.binds, bi);
+    ch_op(&fs.ch, OP_THIS);
+    ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
+    ch_op(&fs.ch, OP_POP);
+    if b.is_cell { ch_op_u16(&fs.ch, OP_CELLIFY, b.slot); }
+}
+
 FnTemplate* compile_program(Compiler* co, Node* prog) {
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
     scan_inner(&fs.inner, prog, true);
+    bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     compile_block_stmts(co, &prog.kids);
     ch_op(&fs.ch, OP_UNDEF);
@@ -3087,6 +3102,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     }
     for i32 i = 0; i < 5; i++ { ch_op_u16(&fs.ch, OP_CELLIFY, vec_get(&pslots, i)); }
     vec_free(&pslots);
+    bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     compile_block_stmts(co, &prog.kids);
     ch_op(&fs.ch, OP_UNDEF);
@@ -3201,6 +3217,10 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     for i32 i = 0; i < n_deps; i++ {
         ch_op_u16(&fs.ch, OP_CELLIFY, vec_get(&mod_slots, i));
     }
+
+    // after the parameter slots: declaring anything before them would shift
+    // the dependency namespaces the evaluator passes in slot order
+    bind_toplevel_this(co, &fs);
 
     co.in_module = true;
     strmap_free<ModImport>(&co.mod_imports);

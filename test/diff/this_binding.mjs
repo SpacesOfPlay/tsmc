@@ -81,4 +81,29 @@ T('this-in-object-shorthand', () => { const o = { tag: 'o', m: function () { ret
 T('this-after-detach-reattach', () => { const a = { tag: 'a', m() { return this.tag; } }; const b = { tag: 'b' }; b.m = a.m; return b.m(); });
 T('this-in-nested-arrow-chain', () => { const o = { tag: 'o', m() { return (() => (() => this.tag)())(); } }; return o.m(); });
 
+// --- an arrow never takes a receiver ---
+// An arrow has no `this` binding of its own, so call/apply/bind cannot give it
+// one: it keeps the `this` of the scope it was written in. A top-level arrow
+// has no enclosing function to capture from, which is the case most likely to
+// fall through to reading the frame's receiver instead.
+const target = { tag: 'target' };
+const topArrow = () => this;
+T('arrow-call-ignored', () => topArrow.call(target) === target);
+T('arrow-apply-ignored', () => topArrow.apply(target) === target);
+T('arrow-bind-ignored', () => topArrow.bind(target)() === target);
+T('arrow-call-value', () => String(topArrow.call(target)));
+T('arrow-as-method-ignores-receiver', () => {
+  const holder = { tag: 'holder', m: topArrow };
+  return holder.m() === holder;
+});
+T('arrow-in-function-keeps-outer', () => {
+  function outer() { return () => this; }
+  const a = outer.call({ tag: 'outer' });
+  return a.call(target).tag;
+});
+T('nested-arrow-call-ignored', () => {
+  const mk = () => () => this;
+  return mk()().call === undefined ? 'n/a' : String(mk()());
+});
+
 console.log(rows.join('\n'));
