@@ -117,6 +117,7 @@ struct VM {
     Vec<TmplPtr> troots;   // owned root templates; consts are GC roots
     Value pending;
     bool has_pending;
+    bool unwind_return;   // the pending value is a return completion, not a throw
     u32 atom_length;
     u32 atom_prototype;
     u32 atom_name;
@@ -883,6 +884,15 @@ bool js_loose_eq(Value a, Value b) {
 void vm_throw(VM* vm, Value v) {
     vm.pending = v;
     vm.has_pending = true;
+}
+
+// A return completion, used to close a suspended generator: it unwinds like a
+// throw so `finally` blocks run, but `catch` clauses decline it (see
+// OP_CATCH_ENTER) and the generator boundary turns it back into a return.
+void vm_throw_return(VM* vm, Value v) {
+    vm.pending = v;
+    vm.has_pending = true;
+    vm.unwind_return = true;
 }
 
 // Builds an Error `.stack`: a "Name: message" header, then one
@@ -2156,6 +2166,7 @@ void vm_init(VM* vm) {
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;
+    vm.unwind_return = false;
     vm.atom_length = atom_intern(&vm.atoms, "length");
     vm.atom_prototype = atom_intern(&vm.atoms, "prototype");
     vm.atom_name = atom_intern(&vm.atoms, "name");
@@ -3726,6 +3737,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GET_AITER: {
                 do_get_aiter(vm);
             }
+            case OP_CATCH_ENTER: {
+                catch_enter(vm);
+            }
             case OP_ITER_NEXT: {
                 Value iter = vpeek(vm, 0);
                 Value val;
@@ -3957,6 +3971,14 @@ private bool instanceof_hook(VM* vm) {
     return true;
 }
 
+// A return completion is not catchable: hand it straight back to the unwinder,
+// which will still run any enclosing finally. Kept out of the loop so its
+// temporaries stay off that frame.
+private void catch_enter(VM* vm) {
+    if !vm.unwind_return { return; }
+    vm_throw_return(vm, vpop(vm));
+}
+
 // Likewise kept out of the loop: `for await`'s iterator acquisition.
 private void do_get_aiter(VM* vm) {
     Value it;
@@ -4126,6 +4148,12 @@ private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
 // is the yielded or returned value; g.state distinguishes. A throw
 // leaves pending set.
 Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
+    return vm_gen_resume_mode(vm, g, input, is_throw, false);
+}
+
+// is_return closes the generator: it unwinds through the finally blocks and
+// comes back as the generator's return value.
+Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, bool is_return) {
     if g.state == GEN_RUNNING {
         vm_throw_error(vm, ERR_TYPE, "generator is already running");
         return value_undefined();
@@ -4166,11 +4194,13 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     nf.gen = g;
     vm.fp++;
     g.state = GEN_RUNNING;
-    if !from_start && !is_throw {
+    if !from_start && !is_throw && !is_return {
         vpush(vm, input);
     }
     if is_throw {
         vm_throw(vm, input);
+    } else if is_return {
+        vm_throw_return(vm, input);
     }
     vm.exec_depth++;
     i32 st = vm_execute(vm, vm.fp);
@@ -4178,6 +4208,15 @@ Value vm_gen_resume(VM* vm, JsGenerator* g, Value input, bool is_throw) {
     if st != 0 {
         g.state = GEN_DONE;
         vm.sp = entry_sp;
+        // a return completion that ran the finally blocks and reached the top
+        // of the generator becomes its return value again
+        if vm.unwind_return {
+            vm.unwind_return = false;
+            vm.has_pending = false;
+            Value rv = vm.pending;
+            vm.pending = value_undefined();
+            return rv;
+        }
         return value_undefined();
     }
     Value res = vpop(vm);

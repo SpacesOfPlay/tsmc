@@ -4927,12 +4927,30 @@ private Value nat_gen_next(void* vmp, Value callee, Value thisv, Value* args, i3
     return r;
 }
 
+// Resumes a suspended generator with a return completion so its `finally`
+// blocks run before it closes. A generator that has not started, or is already
+// done, has nothing to unwind and just reports the value.
 private Value nat_gen_return(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    if value_is_generator(thisv) {
-        value_as_generator(thisv).state = GEN_DONE;
+    if !value_is_generator(thisv) {
+        return gen_result(vm, arg_at(args, argc, 0), true);
     }
-    return gen_result(vm, arg_at(args, argc, 0), true);
+    JsGenerator* g = value_as_generator(thisv);
+    if g.state == GEN_DONE || g.state == GEN_START {
+        g.state = GEN_DONE;
+        return gen_result(vm, arg_at(args, argc, 0), true);
+    }
+    vm_push(vm, thisv);
+    Value res = vm_gen_resume_mode(vm, g, arg_at(args, argc, 0), false, true);
+    if vm.has_pending {
+        vm_pop(vm);
+        return value_undefined();
+    }
+    vm_push(vm, res);
+    // a `finally` that yields leaves the generator suspended and running again
+    Value r = gen_result(vm, res, g.state == GEN_DONE);
+    vm.sp -= 2;
+    return r;
 }
 
 private Value nat_gen_throw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {

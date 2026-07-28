@@ -68,6 +68,8 @@ enum Op {
 
     OP_TRY_PUSH,     // u16 catch target
     OP_TRY_POP,
+    OP_CATCH_ENTER,  // at a catch target: re-throw a return completion instead
+                     // of binding it, so only `finally` sees it
     OP_THROW,
 
     OP_SETPROTO,     // [obj, proto] pops proto, keeps obj

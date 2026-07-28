@@ -50,6 +50,14 @@ struct LoopCtx {
     i32 fin_depth;
 }
 
+// Cleanup an early exit (return, or a break/continue crossing it) has to run:
+// either a source-level `finally` block, or closing a for-of iterator.
+struct FinEntry {
+    Node* fin;        // null means "close the iterator in iter_slot"
+    i32 iter_slot;
+    i32 done_slot;
+}
+
 struct FScope {
     FScope* parent;
     Chunk ch;
@@ -67,7 +75,7 @@ struct FScope {
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
-    Vec<NodePtr> finallys;
+    Vec<FinEntry> finallys;
     i32 loop_id_counter;
 }
 
@@ -151,7 +159,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
-    vec_init<NodePtr>(&fs.finallys, 4);
+    vec_init<FinEntry>(&fs.finallys, 4);
     fs.loop_id_counter = 1;
 }
 
@@ -2157,9 +2165,18 @@ private void inline_finallys(Compiler* co, i32 down_to) {
     FScope* fs = co.cur;
     i32 saved = fs.finallys.len;
     for i32 i = fs.finallys.len - 1; i >= down_to; i-- {
-        Node* fin = vec_get(&fs.finallys, i);
+        FinEntry fe = vec_get(&fs.finallys, i);
         fs.finallys.len = i;
-        compile_stmt(co, fin);
+        if fe.fin != null {
+            compile_stmt(co, fe.fin);
+        } else {
+            // leaving the loop's protected region, so its handler goes too;
+            // the close is net zero on the stack, so a return value underneath
+            // survives
+            ch_op(&fs.ch, OP_TRY_POP);
+            ch_op_u16(&fs.ch, OP_GETLOCAL, fe.iter_slot);
+            ch_op_u16(&fs.ch, OP_ITER_CLOSE, fe.done_slot);
+        }
     }
     fs.finallys.len = saved;
 }
@@ -2503,6 +2520,12 @@ private void compile_for_of(Compiler* co, Node* n) {
     }
     i32 bind_end = fs.binds.len;
 
+    // A `return`, or a break/continue aimed at an enclosing loop, leaves without
+    // reaching the close below, so it is registered as pending cleanup. Pushed
+    // before the loop context, so this loop's own break does not double-close.
+    vec_push(&fs.finallys, FinEntry{ .fin = null, .iter_slot = t_iter, .done_slot = t_done });
+    // and a throw out of the body unwinds here, closing before it propagates
+    i32 jclose = ch_jump(ch, OP_TRY_PUSH);
     LoopCtx lc = make_loop_ctx(co, true);
     i32 lcond = ch_pos(ch);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
@@ -2533,9 +2556,18 @@ private void compile_for_of(Compiler* co, Node* n) {
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the final value under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
+    ignore vec_pop(&fs.finallys);
     // leaving early (a break) closes the iterator; an exhausted one is left be
+    ch_op(ch, OP_TRY_POP);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
     ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+    i32 jdone = ch_jump(ch, OP_JUMP);
+    ch_patch(ch, jclose);
+    // the thrown value is on the stack; close, then let it carry on
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+    ch_op(ch, OP_THROW);
+    ch_patch(ch, jdone);
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
@@ -2742,7 +2774,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_TRY {
         Node* fin = null;
         if n.c != null { fin = n.c; }
-        if fin != null { vec_push(&fs.finallys, fin); }
+        if fin != null { vec_push(&fs.finallys, FinEntry{ .fin = fin, .iter_slot = 0, .done_slot = 0 }); }
         i32 jtry = ch_jump(ch, OP_TRY_PUSH);
         compile_stmt(co, n.a);
         ch_op(ch, OP_TRY_POP);
@@ -2757,8 +2789,11 @@ private void compile_stmt(Compiler* co, Node* n) {
             i32 jfin = -1;
             if fin != null {
                 jfin = ch_jump(ch, OP_TRY_PUSH);
-                vec_push(&fs.finallys, fin);
+                vec_push(&fs.finallys, FinEntry{ .fin = fin, .iter_slot = 0, .done_slot = 0 });
             }
+            // after the finally's TRY_PUSH, so a declined return completion
+            // still unwinds through this try's finally
+            ch_op(ch, OP_CATCH_ENTER);
             fs.depth++;
             i32 saved_binds = fs.binds.len;
             i32 saved_slots = fs.cur_slots;

@@ -16,9 +16,6 @@ T('generator-spread-drops-return', () => { function* g() { yield 1; return 99; }
 T('generator-arg-to-next', () => { function* g() { const x = yield 1; yield x * 2; } const it = g(); it.next(); return it.next(5).value; });
 T('generator-throw', () => { function* g() { try { yield 1; } catch (e) { return 'caught'; } } const it = g(); it.next(); return it.throw(new Error()).value; });
 T('generator-return-method', () => { function* g() { yield 1; yield 2; } const it = g(); it.next(); return [it.return(9), it.next()]; });
-// Not asserted: `it.return()` should resume the generator with a return
-// completion so a `finally` block runs. tsmc marks it done without resuming,
-// which needs a third resume mode through the generator machinery to fix.
 T('generator-delegate', () => { function* a() { yield 1; yield 2; } function* b() { yield* a(); yield 3; } return [...b()]; });
 T('generator-delegate-value', () => { function* a() { yield 1; return 'inner'; } function* b() { const r = yield* a(); yield r; } return [...b()]; });
 T('generator-delegate-string', () => { function* g() { yield* 'ab'; } return [...g()]; });
