@@ -861,9 +861,25 @@ private void emit_node(Vec<RxInst>* code, RxNode* n) {
         if n.b < 0 {
             emit_quant_child(code, n.child, RN_STAR, greedy);
         } else {
+            // The optional tail is nested rather than laid out as a sequence of
+            // independent `?` copies: skipping one copy skips every later one.
+            // Both accept the same language, but a sequence lets the matcher
+            // choose any subset of the copies, so a failing tail explores
+            // C(count, length) paths where nesting explores `count`. That
+            // difference is what makes an ordinary bound like {1,50} exhaust
+            // the step limit and report no match.
+            Vec<i32> splits = vec_new<i32>(4);
             for i32 i = n.a; i < n.b; i++ {
-                emit_quant_child(code, n.child, RN_QUEST, greedy);
+                vec_push(&splits, emit(code, I_SPLIT, 0, 0, 0));
+                emit_node(code, n.child);
             }
+            i32 after = code.len;
+            for i32 i = 0; i < splits.len; i++ {
+                i32 sp = vec_get(&splits, i);
+                if greedy { patch_x(code, sp, sp + 1); patch_y(code, sp, after); }
+                else { patch_x(code, sp, after); patch_y(code, sp, sp + 1); }
+            }
+            vec_free(&splits);
         }
         return;
     }
