@@ -32,7 +32,11 @@ class TLSSocket extends EventEmitter {
     const st = __tls_pump(this._id);
     if (st & T_ERR) {
       const why = __tls_verify_error(this._id);
-      this._fail(why ? 'certificate verify failed: ' + why : 'TLS error');
+      if (why) this._fail('certificate verify failed: ' + why);
+      else {
+        const what = __tls_error_text(this._id);
+        this._fail(what ? 'TLS error: ' + what : 'TLS error');
+      }
       return;
     }
     if (this._connecting && __tls_established(this._id)) {
@@ -137,6 +141,11 @@ function createServer(opts, onSecure) {
     tsock._connecting = true;
     __net_set_owner(sock._id, tsock);
     tsock.on('secureConnect', () => server.emit('secureConnection', tsock));
+    // A handshake that fails must take down one connection, not the server.
+    // 'error' with no listener throws, and nothing has had the chance to
+    // attach one yet, so the failure is reported as 'tlsClientError' — an
+    // ordinary event, safely ignorable — the way Node reports it.
+    tsock.on('error', (e) => server.emit('tlsClientError', e, tsock));
   });
   raw.on('error', (e) => server.emit('error', e));
   raw.on('listening', () => server.emit('listening'));

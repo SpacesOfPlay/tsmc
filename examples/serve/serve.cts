@@ -177,6 +177,16 @@ function main(): void {
       )
     : http.createServer(listener);
 
+  // A handshake the client walks away from is one connection's problem, not
+  // the server's. Browsers do exactly this with the self-signed demo
+  // certificate until you accept it, so say so rather than fail silently.
+  server.on('tlsClientError', (err: any) => {
+    process.stderr.write('tls: ' + ((err && err.message) || String(err)) + '\n');
+  });
+  server.on('clientError', (err: any) => {
+    process.stderr.write('connection: ' + ((err && err.message) || String(err)) + '\n');
+  });
+
   server.listen(opts.port, opts.host, () => {
     const scheme = opts.tls ? 'https' : 'http';
     const addr = server.address();

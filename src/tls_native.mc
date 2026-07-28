@@ -276,6 +276,7 @@ struct TlsSession {
     u8[16384] cipher_in;      // inbound ciphertext awaiting decrypt
     i32 cipher_in_len;
     i32 chain_err;            // X509_V_* when the failure was cert validation
+    i32 tls_err;              // the picotls result that failed the handshake
     bool checked_connect;     // confirmed the non-blocking TCP connect
     bool started;
     bool is_server;           // accepted connection: no connect, no ClientHello
@@ -334,6 +335,7 @@ private i32 tls_feed(TlsSession* s) {
             i32 r = ptls_handshake(s.tls, &s.sendbuf, input, &consumed, null);
             if r != 0 && r != 514 {
                 s.failed = true;
+                s.tls_err = r;
                 // certificate rejections carry a specific reason
                 if g_last_chain_err != 0 { s.chain_err = g_last_chain_err; g_last_chain_err = 0; }
                 return flags | TLS_ERR;
@@ -394,7 +396,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
             s.started = true;
             u64 c = 0;
             i32 r = ptls_handshake(s.tls, &s.sendbuf, null, &c, null);
-            if r != 0 && r != 514 { s.failed = true; return TLS_ERR; }
+            if r != 0 && r != 514 { s.failed = true; s.tls_err = r; return TLS_ERR; }
         }
     }
     if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
@@ -449,6 +451,39 @@ bool tls_failed(TlsSession* s) { return s.failed; }
 
 // X509_V_* code when the failure was certificate validation, else 0.
 i32 tls_chain_error(TlsSession* s) { return s.chain_err; }
+
+// The result that failed the handshake, or 0. Alerts carry their alert number
+// plus a class: 0 when we raised it, 256 when the peer sent it. Anything at
+// 512 or above is an internal failure rather than an alert.
+i32 tls_error_code(TlsSession* s) { return s.tls_err; }
+
+// Short name for an alert, for the message on a failed handshake.
+str tls_alert_str(i32 alert) {
+    if alert == 0 { return "close notify"; }
+    if alert == 10 { return "unexpected message"; }
+    if alert == 20 { return "bad record MAC"; }
+    if alert == 40 { return "handshake failure"; }
+    if alert == 42 { return "bad certificate"; }
+    if alert == 43 { return "unsupported certificate"; }
+    if alert == 44 { return "certificate revoked"; }
+    if alert == 45 { return "certificate expired"; }
+    if alert == 46 { return "certificate unknown"; }
+    if alert == 47 { return "illegal parameter"; }
+    if alert == 48 { return "unknown CA"; }
+    if alert == 49 { return "access denied"; }
+    if alert == 50 { return "decode error"; }
+    if alert == 51 { return "decrypt error"; }
+    if alert == 70 { return "protocol version"; }
+    if alert == 80 { return "internal error"; }
+    if alert == 90 { return "user canceled"; }
+    if alert == 109 { return "missing extension"; }
+    if alert == 110 { return "unsupported extension"; }
+    if alert == 112 { return "unrecognized name"; }
+    if alert == 115 { return "unknown PSK identity"; }
+    if alert == 116 { return "certificate required"; }
+    if alert == 120 { return "no application protocol"; }
+    return "alert";
+}
 
 // --- server: ECDSA-P256 X.509 certificate ----------------------------------
 

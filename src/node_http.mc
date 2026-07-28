@@ -146,6 +146,10 @@ function serveConnection(server, socket) {
 
   socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
   socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
+  // A connection that breaks mid-request is that connection's problem: report
+  // it as 'clientError' and drop the socket. Left unhandled, 'error' would
+  // throw out of the event loop and end the server.
+  socket.on('error', (e) => { server.emit('clientError', e, socket); socket.destroy(); });
 
   function pump() {
     if (state === 'head') {
@@ -189,6 +193,10 @@ class Server extends EventEmitter {
     this._net = make((sock) => serveConnection(this, sock));
     this._net.on('error', (e) => this.emit('error', e));
     this._net.on('listening', () => this.emit('listening'));
+    // Node's https.Server is a tls.Server, so a handshake failure surfaces on
+    // the server the caller holds. Here the TLS server is wrapped, so forward
+    // it; a plain net server never emits this.
+    this._net.on('tlsClientError', (e, sock) => this.emit('tlsClientError', e, sock));
   }
   listen(port, host, cb) {
     if (typeof port === 'function') { cb = port; port = 0; host = undefined; }

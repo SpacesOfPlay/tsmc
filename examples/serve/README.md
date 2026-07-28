@@ -13,6 +13,17 @@ npm install
 
 Options: `--root DIR --port N --host H --http --cert FILE --key FILE`.
 
+The certificate is self-signed, so a browser shows a warning on first visit —
+click through it ("Advanced" → "Accept the Risk and Continue" in Firefox). Until
+you do, the browser aborts the handshake and the server logs a line like
+`tls: TLS error: peer alert: bad certificate`; that is the browser declining an
+untrusted certificate, not a handshake fault. A client told to trust the file
+validates it fully:
+
+```
+curl --cacert serve.cert.pem https://localhost:8443/
+```
+
 ## What it exercises
 
 Three things at once, which is the point of the example:
