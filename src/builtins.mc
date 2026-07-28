@@ -10580,10 +10580,16 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     return value_undefined();
 }
 
+// Existence is decided by the same stat the fs.stat family uses, rather than
+// the file_exists builtin. On Windows that builtin intermittently reported a
+// present file as absent -- rare enough to read as a flaky test, but it makes a
+// server serve the wrong page now and then, since a missing index.md silently
+// becomes a directory listing. file_stamp has not reproduced the fault, and
+// this keeps existsSync and statSync answering from one source.
 private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    bool ok = file_exists(path);
+    bool ok = file_stamp(path).ok;
     vm_pop(vm);
     return value_bool(ok);
 }

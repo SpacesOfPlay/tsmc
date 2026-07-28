@@ -1,0 +1,9 @@
+{
+  "name": "tsmc-example-serve",
+  "private": true,
+  "description": "HTTPS content server example for tsmc",
+  "dependencies": {
+    "js-yaml": "4.1.0",
+    "markdown-it": "14.1.0"
+  }
+}

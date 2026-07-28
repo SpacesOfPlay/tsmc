@@ -4,3 +4,4 @@ vendor/
 *.exe
 *.obj
 *.tmp
+node_modules/
