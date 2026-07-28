@@ -10126,33 +10126,213 @@ private str path_arg(VM* vm, Value* args, i32 argc, i32 i) {
     return sview(sv);
 }
 
-// Trailing separators removed, but a lone root (or "C:\") is kept.
-private i32 path_trim_end(str p) {
+// --- path flavours ----------------------------------------------------------
+//
+// `path` follows the host, and path.posix / path.win32 expose the other
+// flavour so a program can manipulate foreign paths deliberately. The two
+// differ only in what separates segments and what can start a root, so one
+// implementation serves all three: every path native carries its flavour in
+// env0 and reads it back through pf_of.
+
+when os(windows) {
+    private bool pf_host() { return true; }
+}
+else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
+    private bool pf_host() { return false; }
+}
+else {
+    // No arm for this target. Add a `when os(...)` arm above rather
+    // than assuming another platform's path conventions.
+    tsmc_unsupported_target__add_a_when_os_arm _unsupported_pathflavour;
+}
+
+private bool pf_is_sep(bool win, u8 c) {
+    if c == '/' { return true; }
+    return win && c == cast(u8, 92);
+}
+private u8 pf_sep_ch(bool win) { return win ? cast(u8, 92) : cast(u8, '/'); }
+private str pf_sep_str(bool win) { return win ? "\\" : "/"; }
+private str pf_delim_str(bool win) { return win ? ";" : ":"; }
+
+private bool pf_of(Value callee) {
+    if !value_is_native(callee) { return pf_host(); }
+    Value f = value_as_native(callee).env0;
+    if !value_is_int(f) { return pf_host(); }
+    return value_as_int(f) != 0;
+}
+
+// A path argument must be a string. Coercing instead would turn a stray
+// number into a path segment and hide the mistake.
+private bool pf_str_arg(VM* vm, Value v, str who) {
+    if value_is_string(v) { return true; }
+    string m = format("The \"{}\" argument must be of type string", who);
+    vm_throw_error(vm, ERR_TYPE, m);
+    free(m);
+    return false;
+}
+
+private bool pf_letter(u8 c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+private bool pf_absolute(bool win, str p) {
+    if p.len == 0 { return false; }
+    if pf_is_sep(win, *(p.data)) { return true; }
+    if win && p.len >= 3 && pf_letter(*(p.data))
+        && *(p.data + 1) == ':' && pf_is_sep(win, *(p.data + 2)) { return true; }
+    return false;
+}
+
+// Length of the root prefix: "/", "C:\", or a UNC "\\server\share\".
+private i32 pf_root_len(bool win, str p) {
+    if p.len == 0 { return 0; }
+    if win {
+        if p.len >= 2 && pf_is_sep(win, *(p.data)) && pf_is_sep(win, *(p.data + 1)) {
+            i32 i = 2;
+            while i < p.len && !pf_is_sep(win, *(p.data + i)) { i++; }
+            if i < p.len { i++; }
+            while i < p.len && !pf_is_sep(win, *(p.data + i)) { i++; }
+            if i < p.len { i++; }
+            return i;
+        }
+        if p.len >= 3 && pf_letter(*(p.data)) && *(p.data + 1) == ':'
+            && pf_is_sep(win, *(p.data + 2)) { return 3; }
+    }
+    if pf_is_sep(win, *(p.data)) { return 1; }
+    return 0;
+}
+
+// Trailing separators removed, but a lone root is kept.
+private i32 pf_trim_end(bool win, str p) {
     i32 end = p.len;
-    while end > 1 && path_is_sep(*(p.data + end - 1)) { end--; }
+    while end > 1 && pf_is_sep(win, *(p.data + end - 1)) { end--; }
     return end;
 }
 
-private i32 path_last_sep(str p, i32 end) {
+private i32 pf_last_sep(bool win, str p, i32 end) {
     i32 last = -1;
     for i32 i = 0; i < end; i++ {
-        if path_is_sep(*(p.data + i)) { last = i; }
+        if pf_is_sep(win, *(p.data + i)) { last = i; }
     }
     return last;
 }
 
+// The prefix no segment can be taken from. Beyond pf_root_len this covers the
+// drive-relative "C:" form, which names a directory on that drive rather than
+// the first segment of a relative path.
+private i32 pf_floor(bool win, str p) {
+    i32 rl = pf_root_len(win, p);
+    if rl > 0 { return rl; }
+    if win && p.len >= 2 && pf_letter(*(p.data)) && *(p.data + 1) == ':' { return 2; }
+    return 0;
+}
+
+// basename stops at the drive prefix only, not at a whole UNC root: node reads
+// the share name as the basename of "\\server\share\" even though parse calls
+// the same text the root. Matching that means two different floors.
+private i32 pf_base_floor(bool win, str p) {
+    if win && p.len >= 2 && pf_letter(*(p.data)) && *(p.data + 1) == ':' { return 2; }
+    return 0;
+}
+
+// Where the extension of a basename starts, or -1. A leading dot names a
+// hidden file rather than an extension, and a basename of exactly ".."
+// refers to the parent directory rather than carrying one.
+private i32 pf_ext_dot(str base) {
+    i32 dot = -1;
+    for i32 i = 0; i < base.len; i++ {
+        if *(base.data + i) == '.' { dot = i; }
+    }
+    if dot < 1 { return -1; }
+    if base.len == 2 && *(base.data) == '.' && *(base.data + 1) == '.' { return -1; }
+    return dot;
+}
+
+// Collapses `.`/`..`/duplicate separators, preserving an absolute root, a
+// Windows drive prefix, and a trailing separator.
+private void pf_norm_into(str_buf* out, str p, bool win) {
+    i32 mark = out.len;
+    i32 n = p.len;
+    str root;
+    root.data = p.data;
+    root.len = 0;
+    i32 i = 0;
+    // A UNC root names a server and a share and is carried across whole: its
+    // leading double separator is part of the root, not a duplicate to fold.
+    bool unc = win && n >= 2 && pf_is_sep(win, *(p.data)) && pf_is_sep(win, *(p.data + 1));
+    if unc {
+        root.len = pf_root_len(win, p);
+        i = root.len;
+    } else if win && n >= 2 && pf_letter(*(p.data)) && *(p.data + 1) == ':' {
+        root.len = 2;
+        i = 2;
+    }
+    bool is_abs = unc || (i < n && pf_is_sep(win, *(p.data + i)));
+    Vec<str> segs = vec_new<str>(8);
+    while i < n {
+        while i < n && pf_is_sep(win, *(p.data + i)) { i++; }
+        i32 start = i;
+        while i < n && !pf_is_sep(win, *(p.data + i)) { i++; }
+        str seg;
+        seg.data = p.data + start;
+        seg.len = i - start;
+        if seg.len == 0 { /* trailing */ }
+        else if seg.len == 1 && *(seg.data) == '.' { /* skip */ }
+        else if seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.' {
+            if segs.len > 0 {
+                str top = vec_get(&segs, segs.len - 1);
+                bool top_dd = top.len == 2 && *(top.data) == '.' && *(top.data + 1) == '.';
+                if !top_dd { segs.len = segs.len - 1; }
+                else if !is_abs { vec_push(&segs, seg); }
+            } else if !is_abs { vec_push(&segs, seg); }
+        }
+        else { vec_push(&segs, seg); }
+    }
+    if unc {
+        // separators inside the root are normalised too, so "//srv/share/"
+        // and "\\srv\share\" come out the same
+        for i32 k = 0; k < root.len; k++ {
+            u8 c = *(root.data + k);
+            str_buf_add_byte(out, pf_is_sep(win, c) ? pf_sep_ch(win) : c);
+        }
+        if root.len > 0 && !pf_is_sep(win, *(root.data + root.len - 1)) {
+            str_buf_add_byte(out, pf_sep_ch(win));
+        }
+    } else {
+        if root.len > 0 { str_buf_add(out, root); }
+        if is_abs { str_buf_add_byte(out, pf_sep_ch(win)); }
+    }
+    for i32 k = 0; k < segs.len; k++ {
+        if k > 0 { str_buf_add_byte(out, pf_sep_ch(win)); }
+        str_buf_add(out, vec_get(&segs, k));
+    }
+    bool had_trail = n > 0 && pf_is_sep(win, *(p.data + n - 1));
+    if had_trail && segs.len > 0 { str_buf_add_byte(out, pf_sep_ch(win)); }
+    if out.len == mark { str_buf_add(out, "."); }
+    vec_free(&segs);
+}
+
 private Value nat_path_dirname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    str p = path_arg(vm, args, argc, 0);
-    i32 end = path_trim_end(p);
-    i32 last = path_last_sep(p, end);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
+    vm_push(vm, pv);
+    str p = sview(pv);
+    i32 floor = pf_floor(win, p);
+    i32 end = pf_trim_end(win, p);
+    i32 last = pf_last_sep(win, p, end);
+    str d;
+    d.data = p.data;
     Value r;
-    if last < 0 { r = new_str(vm, "."); }
+    if floor > 0 && (end <= floor || last < floor) {
+        // nothing above the root to name, so the root is its own parent
+        d.len = floor;
+        r = new_str(vm, d);
+    } else if last < 0 { r = new_str(vm, "."); }
     else {
         // last == 0 keeps the input's own leading separator (Node preserves
         // separator style; "/" -> "/", "\\" -> "\\").
-        str d;
-        d.data = p.data;
         d.len = last == 0 ? 1 : last;
         r = new_str(vm, d);
     }
@@ -10162,13 +10342,24 @@ private Value nat_path_dirname(void* vmp, Value callee, Value thisv, Value* args
 
 private Value nat_path_basename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    str p = path_arg(vm, args, argc, 0);
-    i32 end = path_trim_end(p);
-    i32 last = path_last_sep(p, end);
-    str base;
-    base.data = p.data + (last + 1);
-    base.len = end - (last + 1);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
     Value ev = arg_at(args, argc, 1);
+    if !value_is_undefined(ev) && !pf_str_arg(vm, ev, "suffix") { return value_undefined(); }
+    vm_push(vm, pv);
+    str p = sview(pv);
+    i32 end = pf_trim_end(win, p);
+    i32 last = pf_last_sep(win, p, end);
+    // the root is never part of a basename, so a path that is only a root has
+    // none at all
+    i32 start = last + 1;
+    i32 floor = pf_base_floor(win, p);
+    if start < floor { start = floor; }
+    if end < start { end = start; }
+    str base;
+    base.data = p.data + start;
+    base.len = end - start;
     if value_is_string(ev) {
         str ext = sview(ev);
         if ext.len > 0 && ext.len < base.len {
@@ -10186,98 +10377,42 @@ private Value nat_path_basename(void* vmp, Value callee, Value thisv, Value* arg
 
 private Value nat_path_extname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    str p = path_arg(vm, args, argc, 0);
-    i32 end = path_trim_end(p);
-    i32 start = path_last_sep(p, end) + 1;
-    i32 dot = -1;
-    for i32 i = start; i < end; i++ {
-        if *(p.data + i) == '.' { dot = i; }
-    }
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
+    vm_push(vm, pv);
+    str p = sview(pv);
+    i32 end = pf_trim_end(win, p);
+    i32 start = pf_last_sep(win, p, end) + 1;
+    str base;
+    base.data = p.data + start;
+    base.len = end - start;
+    i32 dot = pf_ext_dot(base);
     str e;
-    if dot <= start { e.data = p.data; e.len = 0; }   // no dot, or leading dot only
-    else { e.data = p.data + dot; e.len = end - dot; }
+    if dot < 0 { e.data = p.data; e.len = 0; }
+    else { e.data = base.data + dot; e.len = base.len - dot; }
     Value r = new_str(vm, e);
     vm_pop(vm);
     return r;
 }
 
-private bool path_absolute(str p) {
-    if p.len == 0 { return false; }
-    if path_is_sep(*(p.data)) { return true; }
-    when os(windows) {
-        // drive-absolute: "C:\" or "C:/"
-        if p.len >= 3 {
-            u8 c0 = *(p.data);
-            bool letter = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
-            if letter && *(p.data + 1) == ':' && path_is_sep(*(p.data + 2)) { return true; }
-        }
-    }
-    return false;
-}
-
 private Value nat_path_isabsolute(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    str p = path_arg(vm, args, argc, 0);
-    bool r = path_absolute(p);
-    vm_pop(vm);
-    return value_bool(r);
-}
-
-// Normalizes a path (collapse `.`/`..`/duplicate separators), preserving
-// an absolute root, a Windows drive prefix, and a trailing separator.
-private void path_norm_into(str_buf* out, str p) {
-    i32 mark = out.len;
-    i32 n = p.len;
-    str root;
-    root.data = p.data;
-    root.len = 0;
-    i32 i = 0;
-    when os(windows) {
-        if n >= 2 {
-            u8 c0 = *(p.data);
-            bool letter = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
-            if letter && *(p.data + 1) == ':' { root.len = 2; i = 2; }
-        }
-    }
-    bool is_abs = i < n && path_is_sep(*(p.data + i));
-    Vec<str> segs = vec_new<str>(8);
-    while i < n {
-        while i < n && path_is_sep(*(p.data + i)) { i++; }
-        i32 start = i;
-        while i < n && !path_is_sep(*(p.data + i)) { i++; }
-        str seg;
-        seg.data = p.data + start;
-        seg.len = i - start;
-        if seg.len == 0 { /* trailing */ }
-        else if seg.len == 1 && *(seg.data) == '.' { /* skip */ }
-        else if seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.' {
-            if segs.len > 0 {
-                str top = vec_get(&segs, segs.len - 1);
-                bool top_dd = top.len == 2 && *(top.data) == '.' && *(top.data + 1) == '.';
-                if !top_dd { segs.len = segs.len - 1; }
-                else if !is_abs { vec_push(&segs, seg); }
-            } else if !is_abs { vec_push(&segs, seg); }
-        }
-        else { vec_push(&segs, seg); }
-    }
-    if root.len > 0 { str_buf_add(out, root); }
-    if is_abs { str_buf_add_byte(out, path_sep_ch()); }
-    for i32 k = 0; k < segs.len; k++ {
-        if k > 0 { str_buf_add_byte(out, path_sep_ch()); }
-        str_buf_add(out, vec_get(&segs, k));
-    }
-    bool had_trail = n > 0 && path_is_sep(*(p.data + n - 1));
-    if had_trail && segs.len > 0 { str_buf_add_byte(out, path_sep_ch()); }
-    if out.len == mark { str_buf_add(out, "."); }
-    vec_free(&segs);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
+    return value_bool(pf_absolute(win, sview(pv)));
 }
 
 private Value nat_path_normalize(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    str p = path_arg(vm, args, argc, 0);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
+    vm_push(vm, pv);
     str_buf out;
     str_buf_init(&out);
-    path_norm_into(&out, p);
+    pf_norm_into(&out, sview(pv), win);
     Value r = new_str(vm, str_buf_to_str(&out));
     str_buf_free(&out);
     vm_pop(vm);
@@ -10286,17 +10421,17 @@ private Value nat_path_normalize(void* vmp, Value callee, Value thisv, Value* ar
 
 private Value nat_path_join(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    for i32 i = 0; i < argc; i++ {
+        if !pf_str_arg(vm, arg_at(args, argc, i), "path") { return value_undefined(); }
+    }
     str_buf raw;
     str_buf_init(&raw);
-    i32 pushed = 0;
     bool any = false;
     for i32 i = 0; i < argc; i++ {
-        Value sv = js_to_string_value(vm, arg_at(args, argc, i));
-        vm_push(vm, sv);
-        pushed++;
-        str s = sview(sv);
+        str s = sview(arg_at(args, argc, i));
         if s.len > 0 {
-            if any { str_buf_add_byte(&raw, path_sep_ch()); }
+            if any { str_buf_add_byte(&raw, pf_sep_ch(win)); }
             str_buf_add(&raw, s);
             any = true;
         }
@@ -10304,88 +10439,108 @@ private Value nat_path_join(void* vmp, Value callee, Value thisv, Value* args, i
     str_buf out;
     str_buf_init(&out);
     if !any { str_buf_add(&out, "."); }
-    else { path_norm_into(&out, str_buf_to_str(&raw)); }
+    else { pf_norm_into(&out, str_buf_to_str(&raw), win); }
     Value r = new_str(vm, str_buf_to_str(&out));
     str_buf_free(&out);
     str_buf_free(&raw);
-    for i32 i = 0; i < pushed; i++ { vm_pop(vm); }
     return r;
 }
 
-private Value nat_path_resolve(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
+// Accumulates the arguments right-to-left semantics of resolve: a later
+// absolute path discards everything before it, and what is left is anchored
+// at the current directory.
+private void pf_resolve_into(VM* vm, str_buf* out, bool win, Value* args, i32 argc) {
     str_buf acc;
     str_buf_init(&acc);
     bool have_abs = false;
-    i32 pushed = 0;
     for i32 i = 0; i < argc; i++ {
-        Value sv = js_to_string_value(vm, arg_at(args, argc, i));
-        vm_push(vm, sv);
-        pushed++;
-        str s = sview(sv);
+        str s = sview(arg_at(args, argc, i));
         if s.len == 0 { continue; }
-        if path_absolute(s) {
+        if pf_absolute(win, s) {
             acc.len = 0;
             str_buf_add(&acc, s);
             have_abs = true;
         } else {
-            if acc.len > 0 { str_buf_add_byte(&acc, path_sep_ch()); }
+            if acc.len > 0 { str_buf_add_byte(&acc, pf_sep_ch(win)); }
             str_buf_add(&acc, s);
         }
     }
-    // still relative -> prepend cwd
+    Value cwd = os_cwd_str(vm);
+    vm_push(vm, cwd);
+    str c = sview(cwd);
+    str_buf pre;
+    str_buf_init(&pre);
     if !have_abs {
-        Value cwd = os_cwd_str(vm);
-        vm_push(vm, cwd);
-        pushed++;
-        str c = sview(cwd);
-        str_buf pre;
-        str_buf_init(&pre);
         str_buf_add(&pre, c);
-        if acc.len > 0 { str_buf_add_byte(&pre, path_sep_ch()); str_buf_add(&pre, str_buf_to_str(&acc)); }
-        acc.len = 0;
-        str_buf_add(&acc, str_buf_to_str(&pre));
-        str_buf_free(&pre);
+        if acc.len > 0 { str_buf_add_byte(&pre, pf_sep_ch(win)); str_buf_add(&pre, str_buf_to_str(&acc)); }
+    } else {
+        str a = str_buf_to_str(&acc);
+        // A root-relative path ("\x") names the root of the current drive, so
+        // it still needs that drive from the current directory.
+        bool rooted_no_drive = win && a.len > 0 && pf_is_sep(win, *(a.data))
+            && !(a.len >= 2 && pf_is_sep(win, *(a.data + 1)));
+        if rooted_no_drive && c.len >= 2 && pf_letter(*(c.data)) && *(c.data + 1) == ':' {
+            str drive;
+            drive.data = c.data;
+            drive.len = 2;
+            str_buf_add(&pre, drive);
+        }
+        str_buf_add(&pre, a);
+    }
+    pf_norm_into(out, str_buf_to_str(&pre), win);
+    str_buf_free(&pre);
+    str_buf_free(&acc);
+    vm_pop(vm);
+}
+
+private Value nat_path_resolve(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    for i32 i = 0; i < argc; i++ {
+        if !pf_str_arg(vm, arg_at(args, argc, i), "path") { return value_undefined(); }
     }
     str_buf out;
     str_buf_init(&out);
-    path_norm_into(&out, str_buf_to_str(&acc));
+    pf_resolve_into(vm, &out, win, args, argc);
     Value r = new_str(vm, str_buf_to_str(&out));
     str_buf_free(&out);
-    str_buf_free(&acc);
-    for i32 i = 0; i < pushed; i++ { vm_pop(vm); }
     return r;
 }
 
 private Value nat_path_parse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !pf_str_arg(vm, pv, "path") { return value_undefined(); }
     JsObject* o = js_new_object(&vm.heap, vm.object_proto);
     vm_push(vm, value_cell(&o.head));
-    str p = path_arg(vm, args, argc, 0);
-    i32 end = path_trim_end(p);
-    i32 last = path_last_sep(p, end);
-    // dir
+    vm_push(vm, pv);
+    str p = sview(pv);
+    i32 end = pf_trim_end(win, p);
+    i32 last = pf_last_sep(win, p, end);
     str dir;
     if last < 0 { dir.data = p.data; dir.len = 0; }
     else if last == 0 { dir.data = p.data; dir.len = 1; }
     else { dir.data = p.data; dir.len = last; }
-    // base
+    // unlike basename, parse counts a whole UNC root as the root, so a path
+    // that is only a root has no base at all
+    i32 bstart = last + 1;
+    i32 bfloor = pf_floor(win, p);
+    if bstart < bfloor { bstart = bfloor; }
+    if end < bstart { end = bstart; }
     str base;
-    base.data = p.data + (last + 1);
-    base.len = end - (last + 1);
-    // ext / name
-    i32 dot = -1;
-    for i32 i = 0; i < base.len; i++ { if *(base.data + i) == '.' { dot = i; } }
+    base.data = p.data + bstart;
+    base.len = end - bstart;
+    i32 dot = pf_ext_dot(base);
     str ext;
     str name;
-    if dot <= 0 { ext.data = base.data; ext.len = 0; name = base; }
+    if dot < 0 { ext.data = base.data; ext.len = 0; name = base; }
     else { ext.data = base.data + dot; ext.len = base.len - dot; name.data = base.data; name.len = dot; }
     str root;
     root.data = p.data;
-    root.len = path_absolute(p) ? 1 : 0;
-    when os(windows) {
-        if p.len >= 3 && path_absolute(p) && *(p.data + 1) == ':' { root.len = 3; }
-    }
+    root.len = pf_root_len(win, p);
+    // a UNC root is also the directory it names
+    if root.len > dir.len { dir.len = root.len; }
     def_value_enum(vm, o, "root", new_str(vm, root));
     def_value_enum(vm, o, "dir", new_str(vm, dir));
     def_value_enum(vm, o, "base", new_str(vm, base));
@@ -10394,6 +10549,184 @@ private Value nat_path_parse(void* vmp, Value callee, Value thisv, Value* args, 
     vm_pop(vm);   // p's string
     Value r = value_cell(&o.head);
     vm_pop(vm);   // o
+    return r;
+}
+
+// Reads a string-valued field, or an empty view when absent.
+private str pf_field(VM* vm, JsObject* o, str name, Value* keep) {
+    str empty;
+    empty.data = null;
+    empty.len = 0;
+    Value v;
+    if !js_get_prop(o, bi_atom(vm, name), &v) { return empty; }
+    if !value_is_string(v) { return empty; }
+    *keep = v;
+    return sview(v);
+}
+
+private Value nat_path_format(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) {
+        vm_throw_error(vm, ERR_TYPE, "The \"pathObject\" argument must be of type object");
+        return value_undefined();
+    }
+    vm_push(vm, ov);
+    JsObject* o = value_as_object(ov);
+    Value k1 = value_undefined();
+    Value k2 = value_undefined();
+    Value k3 = value_undefined();
+    Value k4 = value_undefined();
+    Value k5 = value_undefined();
+    str root = pf_field(vm, o, "root", &k1);
+    str dir = pf_field(vm, o, "dir", &k2);
+    str base = pf_field(vm, o, "base", &k3);
+    str name = pf_field(vm, o, "name", &k4);
+    str ext = pf_field(vm, o, "ext", &k5);
+    str_buf out;
+    str_buf_init(&out);
+    // `dir` wins over `root`, and `base` over the name/ext pair
+    str head = dir.len > 0 ? dir : root;
+    str_buf_add(&out, head);
+    // a directory that is exactly the root already ends in a separator
+    bool same = head.len == root.len && root.len > 0;
+    if same {
+        for i32 i = 0; i < root.len; i++ {
+            if *(head.data + i) != *(root.data + i) { same = false; break; }
+        }
+    }
+    if head.len > 0 && !same { str_buf_add_byte(&out, pf_sep_ch(win)); }
+    if base.len > 0 { str_buf_add(&out, base); }
+    else { str_buf_add(&out, name); str_buf_add(&out, ext); }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    vm_pop(vm);
+    return r;
+}
+
+private bool pf_seg_eq(bool win, str a, str b) {
+    if a.len != b.len { return false; }
+    for i32 i = 0; i < a.len; i++ {
+        u8 ca = *(a.data + i);
+        u8 cb = *(b.data + i);
+        if win {
+            if ca >= 'A' && ca <= 'Z' { ca = cast(u8, ca + 32); }
+            if cb >= 'A' && cb <= 'Z' { cb = cast(u8, cb + 32); }
+        }
+        if ca != cb { return false; }
+    }
+    return true;
+}
+
+private void pf_split(bool win, str p, i32 begin, Vec<str>* segs) {
+    i32 i = begin;
+    while i < p.len {
+        while i < p.len && pf_is_sep(win, *(p.data + i)) { i++; }
+        i32 start = i;
+        while i < p.len && !pf_is_sep(win, *(p.data + i)) { i++; }
+        if i > start {
+            str seg;
+            seg.data = p.data + start;
+            seg.len = i - start;
+            vec_push(segs, seg);
+        }
+    }
+}
+
+private Value nat_path_relative(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    Value fv = arg_at(args, argc, 0);
+    Value tv = arg_at(args, argc, 1);
+    if !pf_str_arg(vm, fv, "from") { return value_undefined(); }
+    if !pf_str_arg(vm, tv, "to") { return value_undefined(); }
+    vm_push(vm, fv);
+    vm_push(vm, tv);
+    str_buf fb;
+    str_buf_init(&fb);
+    pf_resolve_into(vm, &fb, win, &fv, 1);
+    str_buf tb;
+    str_buf_init(&tb);
+    pf_resolve_into(vm, &tb, win, &tv, 1);
+    str f = str_buf_to_str(&fb);
+    str t = str_buf_to_str(&tb);
+    str_buf out;
+    str_buf_init(&out);
+    str froot;
+    froot.data = f.data;
+    froot.len = pf_root_len(win, f);
+    str troot;
+    troot.data = t.data;
+    troot.len = pf_root_len(win, t);
+    if !pf_seg_eq(win, froot, troot) {
+        // different roots (another drive or share): nothing relative connects
+        // them, so the destination is the answer
+        str_buf_add(&out, t);
+    } else {
+        Vec<str> fs = vec_new<str>(8);
+        Vec<str> ts = vec_new<str>(8);
+        pf_split(win, f, froot.len, &fs);
+        pf_split(win, t, troot.len, &ts);
+        i32 common = 0;
+        while common < fs.len && common < ts.len
+            && pf_seg_eq(win, vec_get(&fs, common), vec_get(&ts, common)) { common++; }
+        bool first = true;
+        for i32 i = common; i < fs.len; i++ {
+            if !first { str_buf_add_byte(&out, pf_sep_ch(win)); }
+            str_buf_add(&out, "..");
+            first = false;
+        }
+        for i32 i = common; i < ts.len; i++ {
+            if !first { str_buf_add_byte(&out, pf_sep_ch(win)); }
+            str_buf_add(&out, vec_get(&ts, i));
+            first = false;
+        }
+        vec_free(&fs);
+        vec_free(&ts);
+    }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    str_buf_free(&fb);
+    str_buf_free(&tb);
+    vm_pop(vm);
+    vm_pop(vm);
+    return r;
+}
+
+// The \\?\ form, which lifts the legacy length limit on Windows paths. The
+// posix flavour has no such notion and hands the argument back untouched.
+private Value nat_path_tonamespaced(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    bool win = pf_of(callee);
+    Value pv = arg_at(args, argc, 0);
+    if !win || !value_is_string(pv) { return pv; }
+    if sview(pv).len == 0 { return pv; }
+    vm_push(vm, pv);
+    str_buf res;
+    str_buf_init(&res);
+    pf_resolve_into(vm, &res, win, &pv, 1);
+    str p = str_buf_to_str(&res);
+    str_buf out;
+    str_buf_init(&out);
+    if p.len >= 3 && pf_is_sep(win, *(p.data)) && pf_is_sep(win, *(p.data + 1))
+        && *(p.data + 2) != '?' {
+        str rest;
+        rest.data = p.data + 2;
+        rest.len = p.len - 2;
+        str_buf_add(&out, "\\\\?\\UNC\\");
+        str_buf_add(&out, rest);
+    } else if p.len >= 3 && pf_letter(*(p.data)) && *(p.data + 1) == ':'
+        && pf_is_sep(win, *(p.data + 2)) {
+        str_buf_add(&out, "\\\\?\\");
+        str_buf_add(&out, p);
+    } else {
+        str_buf_add(&out, sview(pv));
+    }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    str_buf_free(&res);
+    vm_pop(vm);
     return r;
 }
 
@@ -10965,19 +11298,60 @@ private JsObject* build_fs_module(VM* vm) {
     return ns;
 }
 
+// One flavour's worth of functions. `win` rides along in each native's env0,
+// so the same implementations serve path, path.posix and path.win32.
+private void def_path_fn(VM* vm, JsObject* mod, JsObject* ns, str name, NativeFn f, bool win) {
+    JsNative* n = js_new_native(&vm.heap, f, name);
+    n.env0 = value_int(win ? 1 : 0);
+    Value v = value_cell(&n.head);
+    props_set_desc(&mod.props, bi_atom(vm, name), v, PROP_DEFAULT);
+    if ns != null { props_set_desc(&ns.props, bi_atom(vm, name), v, PROP_DEFAULT); }
+}
+
+private void fill_path_module(VM* vm, JsObject* mod, JsObject* ns, bool win) {
+    def_path_fn(vm, mod, ns, "join", &nat_path_join, win);
+    def_path_fn(vm, mod, ns, "resolve", &nat_path_resolve, win);
+    def_path_fn(vm, mod, ns, "normalize", &nat_path_normalize, win);
+    def_path_fn(vm, mod, ns, "dirname", &nat_path_dirname, win);
+    def_path_fn(vm, mod, ns, "basename", &nat_path_basename, win);
+    def_path_fn(vm, mod, ns, "extname", &nat_path_extname, win);
+    def_path_fn(vm, mod, ns, "isAbsolute", &nat_path_isabsolute, win);
+    def_path_fn(vm, mod, ns, "parse", &nat_path_parse, win);
+    def_path_fn(vm, mod, ns, "format", &nat_path_format, win);
+    def_path_fn(vm, mod, ns, "relative", &nat_path_relative, win);
+    def_path_fn(vm, mod, ns, "toNamespacedPath", &nat_path_tonamespaced, win);
+    // Each string is stored before the next is allocated: a fresh GC string
+    // held only in a local is unrooted, so allocating another can collect it.
+    Value sepv = new_str(vm, pf_sep_str(win));
+    props_set_desc(&mod.props, bi_atom(vm, "sep"), sepv, PROP_DEFAULT);
+    if ns != null { props_set_desc(&ns.props, bi_atom(vm, "sep"), sepv, PROP_DEFAULT); }
+    Value delv = new_str(vm, pf_delim_str(win));
+    props_set_desc(&mod.props, bi_atom(vm, "delimiter"), delv, PROP_DEFAULT);
+    if ns != null { props_set_desc(&ns.props, bi_atom(vm, "delimiter"), delv, PROP_DEFAULT); }
+}
+
 private JsObject* build_path_module(VM* vm) {
     JsObject* mod;
     JsObject* ns = new_node_module(vm, &mod);
-    def_node_export(vm, mod, ns, "join", &nat_path_join);
-    def_node_export(vm, mod, ns, "resolve", &nat_path_resolve);
-    def_node_export(vm, mod, ns, "normalize", &nat_path_normalize);
-    def_node_export(vm, mod, ns, "dirname", &nat_path_dirname);
-    def_node_export(vm, mod, ns, "basename", &nat_path_basename);
-    def_node_export(vm, mod, ns, "extname", &nat_path_extname);
-    def_node_export(vm, mod, ns, "isAbsolute", &nat_path_isabsolute);
-    def_node_export(vm, mod, ns, "parse", &nat_path_parse);
-    def_node_value(vm, mod, ns, "sep", new_str(vm, path_sep_str()));
-    def_node_value(vm, mod, ns, "delimiter", new_str(vm, path_delim_str()));
+    fill_path_module(vm, mod, ns, pf_host());
+
+    // The two flavours are reachable from each other and from the host
+    // module, and each names itself, so path.posix.posix === path.posix.
+    JsObject* px = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&px.head));
+    fill_path_module(vm, px, null, false);
+    JsObject* w32 = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&w32.head));
+    fill_path_module(vm, w32, null, true);
+    Value pxv = value_cell(&px.head);
+    Value w32v = value_cell(&w32.head);
+    for i32 i = 0; i < 3; i++ {
+        JsObject* target = i == 0 ? mod : (i == 1 ? px : w32);
+        props_set_desc(&target.props, bi_atom(vm, "posix"), pxv, PROP_DEFAULT);
+        props_set_desc(&target.props, bi_atom(vm, "win32"), w32v, PROP_DEFAULT);
+    }
+    props_set_desc(&ns.props, bi_atom(vm, "posix"), pxv, PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, "win32"), w32v, PROP_DEFAULT);
     return ns;
 }
 
