@@ -2479,6 +2479,11 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     i32 t_iter = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_iter);
     ch_op(ch, OP_POP);
+    // tracks exhaustion, so a loop left early still releases the iterator
+    i32 t_done = alloc_slot(fs);
+    ch_op(ch, OP_FALSE);
+    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op(ch, OP_POP);
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
@@ -2488,6 +2493,11 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     }
     i32 bind_end = fs.binds.len;
 
+    // Same cleanup shape as the synchronous loop: a return or an outward
+    // break/continue closes through the pending-finally list, a throw closes
+    // through the handler below, and this loop's own break closes at the exit.
+    vec_push(&fs.finallys, FinEntry{ .fin = null, .iter_slot = t_iter, .done_slot = t_done });
+    i32 jclose = ch_jump(ch, OP_TRY_PUSH);
     LoopCtx lc = make_loop_ctx(co, true);
     i32 lcond = ch_pos(ch);
     // result = await iter.next()
@@ -2495,9 +2505,13 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
     ch_op_u16(ch, OP_CALL, 0);
     ch_op(ch, OP_YIELD);
+    ch_op(ch, OP_ITER_CHECK);
     // if result.done: break (leaving result on the stack for the pop)
     ch_op(ch, OP_DUP);
     ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+    ch_op(ch, OP_DUP);
+    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op(ch, OP_POP);
     i32 jend = ch_jump(ch, OP_JUMPT);
     // value = await result.value
     ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
@@ -2520,6 +2534,17 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the result object under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
+    ignore vec_pop(&fs.finallys);
+    ch_op(ch, OP_TRY_POP);
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+    i32 jdone = ch_jump(ch, OP_JUMP);
+    ch_patch(ch, jclose);
+    // the thrown value is on the stack; close, then let it carry on
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+    ch_op(ch, OP_THROW);
+    ch_patch(ch, jdone);
 
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;

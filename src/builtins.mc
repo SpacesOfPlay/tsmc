@@ -984,7 +984,19 @@ private Value nat_object_tostring(void* vmp, Value callee, Value thisv, Value* a
     else if value_is_bool(thisv) { tag = "Boolean"; }
     else if value_is_bigint(thisv) { tag = "BigInt"; }
     else if value_is_symbol(thisv) { tag = "Symbol"; }
-    else if value_is_function(thisv) || value_is_native(thisv) { tag = "Function"; }
+    else if value_is_function(thisv) || value_is_native(thisv) {
+        tag = "Function";
+        // the four function kinds report themselves apart, which is how
+        // `toString.call(f) === '[object AsyncFunction]'` detects one
+        if value_is_function(thisv) {
+            FnTemplate* ft = value_as_function(thisv).tmpl;
+            if ft != null {
+                if ft.is_gen && ft.is_async { tag = "AsyncGeneratorFunction"; }
+                else if ft.is_gen { tag = "GeneratorFunction"; }
+                else if ft.is_async { tag = "AsyncFunction"; }
+            }
+        }
+    }
     else if value_is_object(thisv) {
         JsObject* o = value_as_object(thisv);
         if proto_chain_has(o, vm.regexp_proto) { tag = "RegExp"; }
@@ -5570,6 +5582,28 @@ private Value nat_reject_fn(void* vmp, Value callee, Value thisv, Value* args, i
     return value_undefined();
 }
 
+// Promise.withResolvers: the promise plus its two settle functions, so the
+// pair can be handed out without keeping them in an executor closure.
+private Value nat_promise_withresolvers(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value p = vm_promise_new(vm);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, p);
+    JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    res.env0 = p;
+    gc_root(&vm.heap, value_cell(&res.head));
+    JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    rej.env0 = p;
+    gc_root(&vm.heap, value_cell(&rej.head));
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    gc_root(&vm.heap, value_cell(&o.head));
+    js_set_prop(o, vm_atom(vm, "promise"), p);
+    js_set_prop(o, vm_atom(vm, "resolve"), value_cell(&res.head));
+    js_set_prop(o, vm_atom(vm, "reject"), value_cell(&rej.head));
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&o.head);
+}
+
 private Value nat_promise_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value executor = arg_at(args, argc, 0);
@@ -5642,7 +5676,10 @@ private Value nat_promise_catch(void* vmp, Value callee, Value thisv, Value* arg
     return vm_promise_then(vm, thisv, value_undefined(), arg_at(args, argc, 0));
 }
 
-// finally: run the callback on both paths, forwarding the settlement.
+// finally, fulfilled path: run the callback, then pass the value through.
+// The value comes back wrapped in a settled promise rather than returned
+// directly, because the handler is specified to await the callback's result
+// before forwarding -- that is the extra tick a `finally` costs a chain.
 private Value nat_finally_pass(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsNative* me = value_as_native(callee);
@@ -5651,7 +5688,30 @@ private Value nat_finally_pass(void* vmp, Value callee, Value thisv, Value* args
         ignore vm_call_value(vm, me.env0, value_undefined(), &dummy, 0);
         if vm.has_pending { return value_undefined(); }
     }
-    return arg_at(args, argc, 0);
+    Value v = arg_at(args, argc, 0);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, v);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, v, false);
+    gc_root_reset(&vm.heap, rm);
+    return p;
+}
+
+// finally, rejected path: run the callback, then re-throw. Returning the
+// reason instead would make the handler a successful one and turn the
+// rejection into a fulfilment, silently swallowing the error.
+private Value nat_finally_throw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    if value_is_callable(me.env0) {
+        Value dummy = value_undefined();
+        ignore vm_call_value(vm, me.env0, value_undefined(), &dummy, 0);
+        // a throw from the callback replaces the original reason
+        if vm.has_pending { return value_undefined(); }
+    }
+    vm_throw(vm, arg_at(args, argc, 0));
+    return value_undefined();
 }
 
 private Value nat_promise_finally(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5665,7 +5725,10 @@ private Value nat_promise_finally(void* vmp, Value callee, Value thisv, Value* a
     JsNative* onf = js_new_native(&vm.heap, &nat_finally_pass, "finally");
     onf.env0 = cb;
     gc_root(&vm.heap, value_cell(&onf.head));
-    Value r = vm_promise_then(vm, thisv, value_cell(&onf.head), value_cell(&onf.head));
+    JsNative* onr = js_new_native(&vm.heap, &nat_finally_throw, "finally");
+    onr.env0 = cb;
+    gc_root(&vm.heap, value_cell(&onr.head));
+    Value r = vm_promise_then(vm, thisv, value_cell(&onf.head), value_cell(&onr.head));
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -14103,6 +14166,7 @@ void builtins_install(VM* vm) {
     def_static(vm, promise_ctor, "allSettled", &nat_promise_allsettled);
     def_static(vm, promise_ctor, "any", &nat_promise_any);
     def_static(vm, promise_ctor, "race", &nat_promise_race);
+    def_static(vm, promise_ctor, "withResolvers", &nat_promise_withresolvers);
     def_method(vm, vm.promise_proto, "then", &nat_promise_then);
     def_method(vm, vm.promise_proto, "catch", &nat_promise_catch);
     def_method(vm, vm.promise_proto, "finally", &nat_promise_finally);

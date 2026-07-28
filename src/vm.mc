@@ -987,6 +987,15 @@ private Value ensure_prototype(VM* vm, Value fnv) {
     if props == null { return value_undefined(); }
     Value* p = props_get(props, vm.atom_prototype);
     if p != null { return *p; }
+    // Only something that can be `new`ed, or a generator whose results need an
+    // object to inherit from, has a .prototype at all. An arrow, a shorthand
+    // method and a plain async function have none -- not an empty one.
+    if value_is_function(fnv) {
+        FnTemplate* ft0 = value_as_function(fnv).tmpl;
+        if ft0 != null && !ft0.is_gen && (ft0.not_ctor || ft0.is_async) {
+            return value_undefined();
+        }
+    }
     JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
     // An ordinary function's .prototype carries a non-enumerable back-reference,
     // so `new Fn().constructor` resolves. A generator's .prototype has no such
@@ -1010,6 +1019,19 @@ private Value ensure_prototype(VM* vm, Value fnv) {
 
 // objv stays rooted by the caller; false means an error was thrown.
 // --- Proxy: route fundamental operations through the handler traps ---------
+
+// An atom as message text; the result is owned by the caller. A symbol atom
+// indexes the symbol table, not the name table, so it must never reach
+// atom_name -- the high bit makes the index negative and the read runs off
+// the end of the table.
+string vm_atom_display(VM* vm, u32 a) {
+    if (a & 0x80000000) == 0 { return format("{}", atom_name(&vm.atoms, a)); }
+    Value sv = vec_get(&vm.symbols, a & 0x7fffffff);
+    if !value_is_symbol(sv) { return format("Symbol()"); }
+    Value d = value_as_symbol(sv).desc;
+    if !value_is_string(d) { return format("Symbol()"); }
+    return format("Symbol({})", gc_string_view(value_as_string(d)));
+}
 
 // A property-key atom back to its key Value: a Symbol for a symbol atom
 // (high bit set), else a string.
@@ -1306,10 +1328,11 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     }
     if is_nullish(objv) {
         str which = value_is_null(objv) ? "null" : "undefined";
-        string msg = format("Cannot read properties of {} (reading '{}')",
-            which, atom_name(&vm.atoms, a));
+        string kn = vm_atom_display(vm, a);
+        string msg = format("Cannot read properties of {} (reading '{}')", which, kn);
         vm_throw_error(vm, ERR_TYPE, msg);
         free(msg);
+        free(kn);
         return false;
     }
     if value_is_number(objv) {
@@ -3777,6 +3800,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 iter_close(vm, fr.base + dslot);
             }
+            case OP_ITER_CHECK: {
+                iter_check_result(vm);
+            }
             case OP_REGEX: {
                 Value srcv = *(t.consts + rd_u16(code, ip));
                 ip += 2;
@@ -4155,6 +4181,14 @@ private void iter_rest(VM* vm, i32 di) {
     vpush(vm, res);
 }
 
+// Leaves the result in place; a non-object one means the iterator broke its
+// protocol, and accepting it would let `done` read as undefined forever.
+private void iter_check_result(VM* vm) {
+    if !value_is_object(vpeek(vm, 0)) {
+        vm_throw_error(vm, ERR_TYPE, "iterator result is not an object");
+    }
+}
+
 private void iter_close(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
     if !js_truthy(*(vm.stack + di)) {
@@ -4436,6 +4470,15 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
     // other thenable rather than adopted directly: the job is the tick that
     // makes `resolve(aPromise)` settle one turn later than a plain value, as
     // the specified ordering requires.
+    // resolving a promise with itself is a cycle it could never escape, so it
+    // rejects rather than waiting on a settlement that cannot arrive
+    if !rejected && value_same_bits(v, pv) {
+        Value e = vm_make_error(vm, ERR_TYPE, "Chaining cycle detected for promise #<Promise>");
+        vpush(vm, e);
+        vm_promise_settle(vm, pv, e, true);
+        vm.sp--;
+        return;
+    }
     if !rejected && value_is_object(v) {
         // any object with a callable `then` is assimilated: the call itself
         // happens in a job, so the extra tick matches the specified ordering

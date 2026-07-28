@@ -107,6 +107,9 @@ enum Op {
     OP_ITER_STEP,    // u16 done slot; [iter] -> value (undefined once done)
     OP_ITER_REST,    // u16 done slot; [iter] -> array of the remaining values
     OP_ITER_CLOSE,   // u16 done slot; [iter] -> ; calls return() unless done
+    // for-await reads next()'s result directly rather than through
+    // OP_ITER_NEXT, so it needs the same "must be an object" check.
+    OP_ITER_CHECK,   // [result] -> [result]; TypeError if not an object
     OP_REGEX         // u16 source const, u16 flags const -> RegExp object
 }
 

@@ -51,3 +51,23 @@ console.log('fn symbol key:', fn[S], Object.getOwnPropertySymbols(fn).length);
 // the well-known iterator symbol still works as a key
 const iterable = { [Symbol.iterator]() { let i = 0; return { next: () => ({ value: i, done: i++ >= 2 }) }; } };
 console.log('iterator:', JSON.stringify([...iterable]));
+
+// Reading a symbol key off null or undefined must report the symbol by name.
+// The message names the key, and a symbol key is not stored in the same table
+// as a string one, so this path is easy to get wrong.
+function readErr(recv, key) {
+  try { return recv[key], 'no-throw'; } catch (e) { return e.constructor.name + ': ' + e.message; }
+}
+// Symbol.iterator gets a bespoke wording in node, so only the type is compared
+function readErrType(recv, key) {
+  try { return recv[key], 'no-throw'; } catch (e) { return e.constructor.name; }
+}
+console.log('null[wellknown]:', readErrType(null, Symbol.iterator));
+console.log('undefined[wellknown]:', readErr(undefined, Symbol.asyncIterator));
+console.log('null[described]:', readErr(null, Symbol('mine')));
+console.log('null[undescribed]:', readErr(null, Symbol()));
+console.log('null[string]:', readErr(null, 'plain'));
+console.log('undefined[string]:', readErr(undefined, 'plain'));
+console.log('null[method call]:', (() => {
+  try { return null[Symbol.iterator](), 'no-throw'; } catch (e) { return e.constructor.name; }
+})());
