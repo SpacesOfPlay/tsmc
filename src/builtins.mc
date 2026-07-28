@@ -4127,7 +4127,8 @@ private Value nat_math_min(void* vmp, Value callee, Value thisv, Value* args, i3
     for i32 i = 0; i < argc; i++ {
         f64 v = js_to_number(*(args + i));
         if v != v { return value_number(v); }
-        if v < best { best = v; }
+        // -0 counts as smaller than +0, which `<` alone does not distinguish
+        if v < best || (v == 0.0 && best == 0.0 && 1.0 / v < 0.0) { best = v; }
     }
     return js_number_value(best);
 }
@@ -4137,7 +4138,8 @@ private Value nat_math_max(void* vmp, Value callee, Value thisv, Value* args, i3
     for i32 i = 0; i < argc; i++ {
         f64 v = js_to_number(*(args + i));
         if v != v { return value_number(v); }
-        if v > best { best = v; }
+        // +0 counts as larger than -0
+        if v > best || (v == 0.0 && best == 0.0 && 1.0 / best < 0.0) { best = v; }
     }
     return js_number_value(best);
 }

@@ -110,6 +110,10 @@ enum Op {
     // for-await reads next()'s result directly rather than through
     // OP_ITER_NEXT, so it needs the same "must be an object" check.
     OP_ITER_CHECK,   // [result] -> [result]; TypeError if not an object
+    // A tagged template's strings array and its .raw are handed to the tag
+    // frozen, so a tag cannot alter what a later evaluation of the same site
+    // sees.
+    OP_FREEZE,       // [obj] -> [obj]; freezes in place
     OP_REGEX         // u16 source const, u16 flags const -> RegExp object
 }
 

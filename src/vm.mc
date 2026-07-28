@@ -2750,7 +2750,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_int(a) && value_is_int(b) {
                     i64 s = cast(i64, value_as_int(a)) * value_as_int(b);
                     vm.sp -= 2;
-                    if s >= -2147483648 && s <= 2147483647 {
+                    if s == 0 && (value_as_int(a) < 0 || value_as_int(b) < 0) {
+                        // a zero product with one negative factor is -0, which
+                        // the integer representation cannot hold
+                        vpush(vm, value_number(-0.0));
+                    } else if s >= -2147483648 && s <= 2147483647 {
                         vpush(vm, value_int(cast(i32, s)));
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
@@ -3532,7 +3536,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_OBJ_SPREAD: {
                 Value src = vpeek(vm, 0);
                 Value dstv = vpeek(vm, 1);
-                if value_is_object(dstv) && value_is_object(src) {
+                if value_is_object(dstv) && value_is_string(src) {
+                    spread_string_into(vm, value_as_object(dstv), src);
+                } else if value_is_object(dstv) && value_is_object(src) {
                     JsObject* d = value_as_object(dstv);
                     JsObject* s = value_as_object(src);
                     if (s.obj_flags & OBJF_PROXY) != 0 {
@@ -3802,6 +3808,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_ITER_CHECK: {
                 iter_check_result(vm);
+            }
+            case OP_FREEZE: {
+                freeze_top(vm);
             }
             case OP_REGEX: {
                 Value srcv = *(t.consts + rd_u16(code, ip));
@@ -4183,6 +4192,38 @@ private void iter_rest(VM* vm, i32 di) {
 
 // Leaves the result in place; a non-object one means the iterator broke its
 // protocol, and accepting it would let `done` read as undefined forever.
+// Spreading a primitive string copies its characters as index properties.
+// Every other primitive has no own enumerable property and contributes
+// nothing, which is why only this one needs unwrapping.
+private void spread_string_into(VM* vm, JsObject* d, Value sv) {
+    GcString* g = value_as_string(sv);
+    str view = gc_string_view(g);
+    for i32 i = 0; i < g.u16len; i++ {
+        str_buf sb;
+        str_buf_init(&sb);
+        u16_slice_into(&sb, view, i, i + 1);
+        GcString* ch1 = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+        str_buf_free(&sb);
+        vpush(vm, value_cell(&ch1.head));
+        string ks = format("{}", i);
+        js_set_prop(d, atom_intern(&vm.atoms, ks), value_cell(&ch1.head));
+        free(ks);
+        vm.sp--;
+    }
+}
+
+private void freeze_top(VM* vm) {
+    Value v = vpeek(vm, 0);
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        for i32 i = 0; i < o.props.len; i++ {
+            Prop* pr = o.props.items + i;
+            pr.flags = pr.flags & cast(u8, ~(PROP_WRITABLE | PROP_CONFIGURABLE));
+        }
+        o.obj_flags = o.obj_flags | OBJF_NONEXT | OBJF_SEALED | OBJF_FROZEN;
+    }
+}
+
 private void iter_check_result(VM* vm) {
     if !value_is_object(vpeek(vm, 0)) {
         vm_throw_error(vm, ERR_TYPE, "iterator result is not an object");

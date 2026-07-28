@@ -837,6 +837,9 @@ private Node* parse_primary(Parser* p) {
         advance(p);
         Node* e = parse_expression(p);
         expect(p, TOK_RPAREN, "expected ')'");
+        // parentheses end an optional chain: in `(a?.b).c` the outer access is
+        // its own reference and runs even when the inner one short-circuited
+        e.flags |= NF_PARENED;
         return e;
     }
     if k == TOK_TEMPLATE_FULL || k == TOK_TEMPLATE_HEAD {

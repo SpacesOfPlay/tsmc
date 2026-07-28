@@ -1097,6 +1097,9 @@ private void compile_update(Compiler* co, Node* n) {
 private bool chain_has_opt(Node* n) {
     while n != null && (n.kind == N_MEMBER || n.kind == N_INDEX || n.kind == N_CALL) {
         if (n.flags & NF_OPT_CHAIN) != 0 { return true; }
+        // a parenthesised sub-expression is the end of the chain, so an
+        // optional link inside it does not make this access optional
+        if n.a != null && (n.a.flags & NF_PARENED) != 0 { return false; }
         if n.kind == N_CALL && n.a != null
             && (n.a.kind == N_MEMBER || n.a.kind == N_INDEX)
             && (n.a.flags & NF_OPT_CHAIN) != 0 {
@@ -1107,11 +1110,19 @@ private bool chain_has_opt(Node* n) {
     return false;
 }
 
+// The object part of a chain link. A parenthesised sub-expression is a
+// complete chain of its own, so it is compiled separately and gets its own nil
+// exit instead of sharing the enclosing one.
+private void emit_chain_base(Compiler* co, Node* n, Vec<i32>* nils) {
+    if (n.flags & NF_PARENED) != 0 { compile_expr(co, n); return; }
+    emit_chain(co, n, nils);
+}
+
 private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
     Chunk* ch = &co.cur.ch;
     i32 k = n.kind;
     if k == N_MEMBER && n.a.kind != N_SUPER {
-        emit_chain(co, n.a, nils);
+        emit_chain_base(co, n.a, nils);
         if (n.flags & NF_OPT_CHAIN) != 0 {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
@@ -1121,7 +1132,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
         return;
     }
     if k == N_INDEX {
-        emit_chain(co, n.a, nils);
+        emit_chain_base(co, n.a, nils);
         if (n.flags & NF_OPT_CHAIN) != 0 {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
@@ -1132,7 +1143,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
     if k == N_CALL {
         Node* callee = n.a;
         if callee.kind == N_MEMBER && callee.a.kind != N_SUPER {
-            emit_chain(co, callee.a, nils);
+            emit_chain_base(co, callee.a, nils);
             if (callee.flags & NF_OPT_CHAIN) != 0 {
                 vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
             }
@@ -1140,14 +1151,14 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
                 ? private_key_const(co, callee.name) : name_const(co, callee.name);
             ch_op_u16(ch, OP_GETMETHOD, mk);
         } else if callee.kind == N_INDEX {
-            emit_chain(co, callee.a, nils);
+            emit_chain_base(co, callee.a, nils);
             if (callee.flags & NF_OPT_CHAIN) != 0 {
                 vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
             }
             compile_expr(co, callee.b);
             ch_op(ch, OP_GETMETHOD_DYN);
         } else {
-            emit_chain(co, callee, nils);
+            emit_chain_base(co, callee, nils);
             if (n.flags & NF_OPT_CHAIN) != 0 {
                 vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
             }
@@ -1175,6 +1186,32 @@ private void compile_opt_chain(Compiler* co, Node* n) {
         ch_patch(ch, vec_pop(&nils));
     }
     ch_op(ch, OP_UNDEF);
+    ch_patch(ch, jend);
+    vec_free(&nils);
+}
+
+// `delete a?.b.c` deletes through the chain like an ordinary delete, except
+// that a nullish link abandons the whole thing and reports success -- there
+// was nothing to remove. Only the last link is a delete; everything before it
+// is an ordinary read, which is what emit_chain already produces.
+private void compile_delete_opt(Compiler* co, Node* t) {
+    Chunk* ch = &co.cur.ch;
+    Vec<i32> nils = vec_new<i32>(4);
+    emit_chain_base(co, t.a, &nils);
+    if (t.flags & NF_OPT_CHAIN) != 0 {
+        vec_push(&nils, ch_jump(ch, OP_JUMP_NULLISH));
+    }
+    if t.kind == N_MEMBER {
+        ch_op_u16(ch, OP_DELPROP, name_const(co, t.name));
+    } else {
+        compile_expr(co, t.b);
+        ch_op(ch, OP_DELINDEX);
+    }
+    i32 jend = ch_jump(ch, OP_JUMP);
+    while nils.len > 0 {
+        ch_patch(ch, vec_pop(&nils));
+    }
+    ch_op(ch, OP_TRUE);
     ch_patch(ch, jend);
     vec_free(&nils);
 }
@@ -1510,8 +1547,10 @@ private void compile_expr(Compiler* co, Node* n) {
             }
         }
         ch_op_u16(ch, OP_NEWARR, nq);
+        ch_op(ch, OP_FREEZE);
         ch_op_u16(ch, OP_SETPROP, name_const(co, "raw"));
         ch_op(ch, OP_POP);
+        ch_op(ch, OP_FREEZE);
         // substitution expressions as the remaining arguments
         i32 nsub = 0;
         for i32 i = 0; i < tmpl.kids.len; i++ {
@@ -1571,17 +1610,21 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_FALSE);
                 return;
             }
-            if t.kind == N_MEMBER && (t.flags & (NF_OPT_CHAIN | NF_PRIVATE)) == 0 {
+            if (t.kind == N_MEMBER || t.kind == N_INDEX) && chain_has_opt(t) {
+                compile_delete_opt(co, t);
+            } else if t.kind == N_MEMBER {
                 compile_expr(co, t.a);
                 ch_op_u16(ch, OP_DELPROP, name_const(co, t.name));
-            } else if t.kind == N_INDEX && (t.flags & NF_OPT_CHAIN) == 0 {
+            } else if t.kind == N_INDEX {
                 compile_expr(co, t.a);
                 compile_expr(co, t.b);
                 ch_op(ch, OP_DELINDEX);
             } else {
+                // deleting anything that is not a property reference is
+                // vacuously successful, but the operand is still evaluated
                 compile_expr(co, t);
                 ch_op(ch, OP_POP);
-                ch_op(ch, OP_FALSE);
+                ch_op(ch, OP_TRUE);
             }
             return;
         }
