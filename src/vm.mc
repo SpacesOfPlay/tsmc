@@ -129,7 +129,7 @@ struct VM {
     JsObject* number_proto;
     JsObject* boolean_proto;
     JsObject* function_proto;
-    JsObject*[7] error_protos;   // indexed by ERR_* (size = ERR_KIND_COUNT)
+    JsObject*[8] error_protos;   // indexed by ERR_* (size = ERR_KIND_COUNT)
     u64 rng;
     JsObject* generator_proto;
     JsObject* promise_proto;
@@ -213,7 +213,8 @@ const i32 ERR_REF = 3;
 const i32 ERR_SYNTAX = 4;
 const i32 ERR_EVAL = 5;
 const i32 ERR_URI = 6;
-const i32 ERR_KIND_COUNT = 7;   // must match the error_protos array size
+const i32 ERR_AGGREGATE = 7;
+const i32 ERR_KIND_COUNT = 8;   // must match the error_protos array size
 
 str vm_error_kind_name(i32 kind) {
     if kind == ERR_TYPE { return "TypeError"; }
@@ -222,6 +223,7 @@ str vm_error_kind_name(i32 kind) {
     if kind == ERR_SYNTAX { return "SyntaxError"; }
     if kind == ERR_EVAL { return "EvalError"; }
     if kind == ERR_URI { return "URIError"; }
+    if kind == ERR_AGGREGATE { return "AggregateError"; }
     return "Error";
 }
 

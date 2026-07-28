@@ -4791,6 +4791,40 @@ private Value nat_urierror_ctor(void* vmp, Value callee, Value thisv, Value* arg
     return error_ctor_impl(as_vm(vmp), thisv, args, argc, ERR_URI);
 }
 
+// AggregateError(errors, message, options): the errors iterable becomes an own
+// non-enumerable `errors` array, and the remaining arguments behave as they do
+// for any other error.
+private Value nat_aggregateerror_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* list = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&list.head));
+    Value errsv = arg_at(args, argc, 0);
+    if !bi_nullish(errsv) {
+        Value it;
+        if vm_get_iterator(vm, errsv, &it) {
+            gc_root(&vm.heap, it);
+            while true {
+                Value e;
+                bool done;
+                if !vm_iter_next(vm, it, &e, &done) { break; }
+                if done { break; }
+                js_array_set(list, list.elen, e);
+            }
+        }
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    }
+    // the message and options arguments sit one slot along
+    Value[2] rest = { arg_at(args, argc, 1), arg_at(args, argc, 2) };
+    Value r = error_ctor_impl(vm, thisv, &rest[0], 2, ERR_AGGREGATE);
+    if value_is_object(r) {
+        props_set_desc(&value_as_object(r).props, bi_atom(vm, "errors"),
+            value_cell(&list.head), PROP_WRITABLE | PROP_CONFIGURABLE);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
 private Value nat_error_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     if !value_is_object(thisv) { return new_str(vm, "Error"); }
@@ -4806,10 +4840,15 @@ private Value nat_error_tostring(void* vmp, Value callee, Value thisv, Value* ar
     if value_is_string(mv) { msg = sview(mv); }
     str_buf sb;
     str_buf_init(&sb);
-    str_buf_add(&sb, name);
-    if msg.len > 0 {
-        str_buf_add(&sb, ": ");
+    // an empty name yields the bare message, and vice versa
+    if name.len == 0 {
         str_buf_add(&sb, msg);
+    } else {
+        str_buf_add(&sb, name);
+        if msg.len > 0 {
+            str_buf_add(&sb, ": ");
+            str_buf_add(&sb, msg);
+        }
     }
     Value r = new_str(vm, str_buf_to_str(&sb));
     str_buf_free(&sb);
@@ -5595,11 +5634,12 @@ private void any_reject_all(VM* vm, Value pv, Value errsv) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, pv);
     gc_root(&vm.heap, errsv);
-    JsObject* agg = js_new_object(&vm.heap, vm.error_protos[ERR_ERROR]);
+    JsObject* agg = js_new_object(&vm.heap, vm.error_protos[ERR_AGGREGATE]);
     gc_root(&vm.heap, value_cell(&agg.head));
-    js_set_prop(agg, vm.atom_name, new_str(vm, "AggregateError"));
-    js_set_prop(agg, vm.atom_message, new_str(vm, "All promises were rejected"));
-    js_set_prop(agg, vm_atom(vm, "errors"), errsv);
+    props_set_desc(&agg.props, vm.atom_message, new_str(vm, "All promises were rejected"),
+        PROP_WRITABLE | PROP_CONFIGURABLE);
+    props_set_desc(&agg.props, vm_atom(vm, "errors"), errsv,
+        PROP_WRITABLE | PROP_CONFIGURABLE);
     vm_promise_settle(vm, pv, value_cell(&agg.head), true);
     gc_root_reset(&vm.heap, rm);
 }
@@ -13512,6 +13552,9 @@ void builtins_install(VM* vm) {
     props_set_desc(&ee_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_EVAL].head), 0);
     JsNative* ue_ctor = def_global_fn(vm, "URIError", &nat_urierror_ctor);
     props_set_desc(&ue_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_URI].head), 0);
+    JsNative* ae_ctor = def_global_fn(vm, "AggregateError", &nat_aggregateerror_ctor);
+    props_set_desc(&ae_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_AGGREGATE].head), 0);
+    link_ctor(vm, vm.error_protos[ERR_AGGREGATE], ae_ctor);
     // each error prototype points back at its own constructor, so
     // `err.constructor` names the specific type rather than plain Error
     link_ctor(vm, vm.error_protos[ERR_ERROR], err_ctor);
