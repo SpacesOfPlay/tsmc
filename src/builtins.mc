@@ -1133,7 +1133,7 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
             Value e = js_array_get(s, i);
             if value_is_callable(fun) {
                 Value[2] cargs = { e, value_int(i) };
-                e = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                e = vm_call_value(vm, fun, arg_at(args, argc, 2), &cargs[0], 2);
                 if vm.has_pending {
                     gc_root_reset(&vm.heap, rm);
                     return value_undefined();
@@ -1156,7 +1156,7 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
             if value_is_callable(fun) {
                 gc_root(&vm.heap, cs);
                 Value[2] cargs = { cs, value_int(idx) };
-                cs = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                cs = vm_call_value(vm, fun, arg_at(args, argc, 2), &cargs[0], 2);
                 if vm.has_pending {
                     gc_root_reset(&vm.heap, rm);
                     return value_undefined();
@@ -1189,7 +1189,7 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
                 gc_root(&vm.heap, val);
                 if value_is_callable(fun) {
                     Value[2] cargs = { val, value_int(n) };
-                    val = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                    val = vm_call_value(vm, fun, arg_at(args, argc, 2), &cargs[0], 2);
                     if vm.has_pending {
                         gc_root_reset(&vm.heap, rm);
                         return value_undefined();
@@ -1213,7 +1213,7 @@ private Value nat_array_from(void* vmp, Value callee, Value thisv, Value* args, 
                 ignore vm_get_prop_value(vm, src, ka, &e);
                 if value_is_callable(fun) {
                     Value[2] cargs = { e, value_int(i) };
-                    e = vm_call_value(vm, fun, value_undefined(), &cargs[0], 2);
+                    e = vm_call_value(vm, fun, arg_at(args, argc, 2), &cargs[0], 2);
                     if vm.has_pending {
                         gc_root_reset(&vm.heap, rm);
                         return value_undefined();
@@ -1612,7 +1612,15 @@ private Value nat_arr_includes(void* vmp, Value callee, Value thisv, Value* args
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
     Value needle = arg_at(args, argc, 0);
-    for i32 i = 0; i < a.elen; i++ {
+    // the optional second argument is where the search starts; negative counts
+    // back from the end
+    i32 begin = 0;
+    if !value_is_undefined(arg_at(args, argc, 1)) {
+        begin = to_int_sat(arg_at(args, argc, 1));
+        if begin < 0 { begin = a.elen + begin; }
+        if begin < 0 { begin = 0; }
+    }
+    for i32 i = begin; i < a.elen; i++ {
         Value e = js_array_get(a, i);
         if js_strict_eq(e, needle) { return value_bool(true); }
         // SameValueZero: NaN matches NaN
@@ -1906,6 +1914,7 @@ private Value nat_arr_findlastindex(void* vmp, Value callee, Value thisv, Value*
 // Flattens one level (arrays only) into dst.
 private void flatten_into(VM* vm, JsObject* src, JsObject* dst, i32 depth) {
     for i32 i = 0; i < src.elen; i++ {
+        if !js_array_has(src, i) { continue; }   // flat drops holes
         Value e = js_array_get(src, i);
         if depth > 0 && value_is_array(e) {
             flatten_into(vm, value_as_object(e), dst, depth - 1);
@@ -2023,6 +2032,105 @@ private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i3
         *(a.elems + j + 1) = key;
     }
     return thisv;
+}
+
+// toSpliced(start, deleteCount, ...items): splice against a copy, leaving the
+// receiver untouched.
+private Value nat_arr_tospliced(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = this_arraylike(vm, thisv);
+    if a == null { return value_undefined(); }
+    i32 len = a.elen;
+    i32 start = argc > 0 ? to_int_sat(*(args)) : 0;
+    if start < 0 { start = len + start; }
+    if start < 0 { start = 0; }
+    if start > len { start = len; }
+    i32 del = len - start;
+    if argc > 1 { del = to_int_sat(*(args + 1)); }
+    if del < 0 { del = 0; }
+    if del > len - start { del = len - start; }
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&r.head));
+    for i32 i = 0; i < start; i++ { js_array_set(r, r.elen, js_array_get(a, i)); }
+    for i32 i = 2; i < argc; i++ { js_array_set(r, r.elen, *(args + i)); }
+    for i32 i = start + del; i < len; i++ { js_array_set(r, r.elen, js_array_get(a, i)); }
+    gc_root_reset(&vm.heap, rm);
+    return value_cell(&r.head);
+}
+
+// Object.groupBy / Map.groupBy: the callback names a group per element.
+private Value group_by(VM* vm, Value* args, i32 argc, bool as_map) {
+    Value src = arg_at(args, argc, 0);
+    Value fun = arg_at(args, argc, 1);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* outo = null;
+    JsMap* outm = null;
+    Value outv;
+    if as_map {
+        outm = js_new_map(&vm.heap, vm_map_proto(vm), false);
+        outv = value_cell(&outm.head);
+    } else {
+        outo = js_new_object(&vm.heap, null);   // null prototype, as specified
+        outv = value_cell(&outo.head);
+    }
+    gc_root(&vm.heap, outv);
+    Value it;
+    if !vm_get_iterator(vm, src, &it) {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    gc_root(&vm.heap, it);
+    i32 idx = 0;
+    while true {
+        Value e;
+        bool done;
+        if !vm_iter_next(vm, it, &e, &done) { break; }
+        if done { break; }
+        gc_root(&vm.heap, e);
+        Value[2] ca = { e, value_int(idx) };
+        Value k = vm_call_value(vm, fun, value_undefined(), &ca[0], 2);
+        if vm.has_pending { break; }
+        gc_root(&vm.heap, k);
+        if as_map {
+            i32 at = map_find(outm, k);
+            if at < 0 {
+                JsObject* bucket = js_new_array(&vm.heap, vm.array_proto);
+                js_array_set(bucket, 0, e);
+                map_put(outm, k, value_cell(&bucket.head));
+            } else {
+                Value bv = *(outm.vals + at);
+                js_array_set(value_as_object(bv), value_as_object(bv).elen, e);
+            }
+        } else {
+            str sk;
+            u32 key = reflect_key(vm, k, &sk);
+            Value bv;
+            if js_get_prop(outo, key, &bv) && value_is_array(bv) {
+                js_array_set(value_as_object(bv), value_as_object(bv).elen, e);
+            } else {
+                JsObject* bucket = js_new_array(&vm.heap, vm.array_proto);
+                js_array_set(bucket, 0, e);
+                js_set_prop(outo, key, value_cell(&bucket.head));
+            }
+        }
+        idx++;
+    }
+    gc_root_reset(&vm.heap, rm);
+    if vm.has_pending { return value_undefined(); }
+    return outv;
+}
+
+private Value nat_object_groupby(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return group_by(as_vm(vmp), args, argc, false);
+}
+
+private Value nat_map_groupby(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return group_by(as_vm(vmp), args, argc, true);
 }
 
 private Value nat_arr_tosorted(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -13466,6 +13574,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "getOwnPropertyDescriptors", &nat_object_getownpropdescs);
     def_static(vm, object_ctor, "is", &nat_object_is);
     def_static(vm, object_ctor, "hasOwn", &nat_object_hasown);
+    def_static(vm, object_ctor, "groupBy", &nat_object_groupby);
     def_static(vm, object_ctor, "freeze", &nat_object_freeze);
     def_static(vm, object_ctor, "isFrozen", &nat_object_isfrozen);
     def_static(vm, object_ctor, "seal", &nat_object_seal);
@@ -13528,6 +13637,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "copyWithin", &nat_arr_copywithin);
     def_method(vm, vm.array_proto, "lastIndexOf", &nat_arr_lastindexof);
     def_method(vm, vm.array_proto, "toSorted", &nat_arr_tosorted);
+    def_method(vm, vm.array_proto, "toSpliced", &nat_arr_tospliced);
     def_method(vm, vm.array_proto, "toReversed", &nat_arr_toreversed);
     def_method(vm, vm.array_proto, "with", &nat_arr_with);
     def_method(vm, vm.array_proto, "values", &nat_arr_values);
@@ -13792,6 +13902,7 @@ void builtins_install(VM* vm) {
     vm.map_proto = js_new_object(&vm.heap, vm.object_proto);
     def_tag(vm, vm.map_proto, "Map");
     JsNative* map_ctor = def_global_fn(vm, "Map", &nat_map_ctor);
+    def_static(vm, map_ctor, "groupBy", &nat_map_groupby);
     props_set_desc(&map_ctor.props, vm.atom_prototype, value_cell(&vm.map_proto.head), 0);
     def_method(vm, vm.map_proto, "set", &nat_map_set);
     def_method(vm, vm.map_proto, "get", &nat_map_get);
