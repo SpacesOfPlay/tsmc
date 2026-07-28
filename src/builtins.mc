@@ -13295,6 +13295,27 @@ private void usp_init_from(VM* vm, JsObject* o, Value init) {
                 vm_pop(vm);
             }
         }
+    } else if value_is_map(init) || value_is_generator(init) {
+        // a Map or a generator is its own cell kind rather than an object, so
+        // it is drained through the iterator protocol like Array.from does
+        Value conv = init;
+        if combinator_list(vm, &conv, "URLSearchParams expects an iterable") {
+            JsObject* a = value_as_object(conv);
+            vm_push(vm, conv);
+            for i32 i = 0; i < a.elen; i++ {
+                Value e = js_array_get(a, i);
+                if !value_is_array(e) { continue; }
+                JsObject* ep = value_as_object(e);
+                Value k = js_to_string_value(vm, js_array_get(ep, 0));
+                vm_push(vm, k);
+                Value v = js_to_string_value(vm, js_array_get(ep, 1));
+                vm_push(vm, v);
+                usp_push_pair(vm, pairs, k, v);
+                vm_pop(vm);
+                vm_pop(vm);
+            }
+            vm_pop(vm);
+        }
     } else if value_is_object(init) {
         JsObject* other = usp_pairs(vm, init);
         if other != null {
@@ -13393,6 +13414,7 @@ private Value nat_usp_append(void* vmp, Value callee, Value thisv, Value* args, 
     if pairs != null { usp_push_pair(vm, pairs, k, v); }
     vm_pop(vm);
     vm_pop(vm);
+    usp_sync(vm, thisv);
     return value_undefined();
 }
 
@@ -13417,6 +13439,7 @@ private Value nat_usp_delete(void* vmp, Value callee, Value thisv, Value* args, 
     JsObject* pairs = usp_pairs(vm, thisv);
     if pairs != null { usp_remove(pairs, namev); }
     vm_pop(vm);
+    usp_sync(vm, thisv);
     return value_undefined();
 }
 
@@ -13448,6 +13471,7 @@ private Value nat_usp_set(void* vmp, Value callee, Value thisv, Value* args, i32
     }
     vm_pop(vm);
     vm_pop(vm);
+    usp_sync(vm, thisv);
     return value_undefined();
 }
 
@@ -13488,6 +13512,7 @@ private Value nat_usp_sort(void* vmp, Value callee, Value thisv, Value* args, i3
             js_array_set(pairs, j + 1, cur);
         }
     }
+    usp_sync(vm, thisv);
     return value_undefined();
 }
 
@@ -13667,113 +13692,611 @@ private void url_append_authority(str_buf* b, UrlParts* p, str port) {
     if port.len > 0 { str_buf_add_byte(b, cast(u8, ':')); str_buf_add(b, port); }
 }
 
-private JsObject* build_url(VM* vm, UrlParts* p) {
-    JsObject* o = js_new_object(&vm.heap, vm.url_proto);
-    vm_push(vm, value_cell(&o.head));
-    str port = p.port;
-    if is_default_port(p.scheme, port) { port.len = 0; }
-
-    str_buf b;
-    str_buf_init(&b);
-    str_buf_add(&b, p.scheme);
-    str_buf_add_byte(&b, cast(u8, ':'));
-    def_value_enum(vm, o, "protocol", new_str(vm, str_buf_to_str(&b)));
-    str_buf_free(&b);
-
-    def_value_enum(vm, o, "username", new_str(vm, p.user));
-    def_value_enum(vm, o, "password", new_str(vm, p.pass));
-    def_value_enum(vm, o, "hostname", new_str(vm, p.host));
-    def_value_enum(vm, o, "port", new_str(vm, port));
-
-    str_buf hb;
-    str_buf_init(&hb);
-    str_buf_add(&hb, p.host);
-    if port.len > 0 { str_buf_add_byte(&hb, cast(u8, ':')); str_buf_add(&hb, port); }
-    def_value_enum(vm, o, "host", new_str(vm, str_buf_to_str(&hb)));
-    str_buf_free(&hb);
-
-    str pathname = p.path;
-    if p.has_authority && p.path.len == 0 { pathname = "/"; }
-    def_value_enum(vm, o, "pathname", new_str(vm, pathname));
-
-    str_buf sb;
-    str_buf_init(&sb);
-    if p.has_query { str_buf_add_byte(&sb, cast(u8, '?')); str_buf_add(&sb, p.query); }
-    def_value_enum(vm, o, "search", new_str(vm, str_buf_to_str(&sb)));
-    str_buf_free(&sb);
-
-    str_buf fb;
-    str_buf_init(&fb);
-    if p.has_hash { str_buf_add_byte(&fb, cast(u8, '#')); str_buf_add(&fb, p.hash); }
-    def_value_enum(vm, o, "hash", new_str(vm, str_buf_to_str(&fb)));
-    str_buf_free(&fb);
-
-    str_buf ob;
-    str_buf_init(&ob);
-    if is_origin_scheme(p.scheme) {
-        str_buf_add(&ob, p.scheme);
-        str_buf_add(&ob, "://");
-        str_buf_add(&ob, p.host);
-        if port.len > 0 { str_buf_add_byte(&ob, cast(u8, ':')); str_buf_add(&ob, port); }
-    } else { str_buf_add(&ob, "null"); }
-    def_value_enum(vm, o, "origin", new_str(vm, str_buf_to_str(&ob)));
-    str_buf_free(&ob);
-
-    str_buf hf;
-    str_buf_init(&hf);
-    str_buf_add(&hf, p.scheme);
-    str_buf_add_byte(&hf, cast(u8, ':'));
-    if p.has_authority { str_buf_add(&hf, "//"); url_append_authority(&hf, p, port); }
-    str_buf_add(&hf, pathname);
-    if p.has_query { str_buf_add_byte(&hf, cast(u8, '?')); str_buf_add(&hf, p.query); }
-    if p.has_hash { str_buf_add_byte(&hf, cast(u8, '#')); str_buf_add(&hf, p.hash); }
-    def_value_enum(vm, o, "href", new_str(vm, str_buf_to_str(&hf)));
-    str_buf_free(&hf);
-
-    JsObject* sp = usp_new(vm);
-    vm_push(vm, value_cell(&sp.head));
-    usp_parse_query(vm, usp_pairs(vm, value_cell(&sp.head)), p.query);
-    def_value_enum(vm, o, "searchParams", value_cell(&sp.head));
-    vm_pop(vm);
-
-    vm_pop(vm);
-    return o;
-}
-
-private Value nat_url_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
-    Value h;
-    if value_is_object(thisv) && js_get_prop(value_as_object(thisv), bi_atom(vm, "href"), &h) { return h; }
-    return new_str(vm, "");
-}
-
-// Collapses `.`/`..`/duplicate `/` in a URL path (always `/`-separated),
-// preserving a leading slash and a trailing slash.
+// Removes `.` and `..` segments from a URL path. An EMPTY segment is left
+// alone: "//p" and "/p" are different paths, unlike in a file system. A `.`
+// or `..` in final position still leaves the path ending in a separator.
 private void url_path_norm(str_buf* out, str p) {
     bool abs = p.len > 0 && *(p.data) == '/';
     Vec<str> segs = vec_new<str>(8);
-    i32 i = 0;
-    while i < p.len {
-        while i < p.len && *(p.data + i) == '/' { i++; }
+    str empty;
+    empty.data = p.data;
+    empty.len = 0;
+    i32 i = abs ? 1 : 0;
+    while true {
         i32 start = i;
         while i < p.len && *(p.data + i) != '/' { i++; }
         str seg;
         seg.data = p.data + start;
         seg.len = i - start;
-        if seg.len == 0 { }
-        else if seg.len == 1 && *(seg.data) == '.' { }
-        else if seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.' {
+        bool last = i >= p.len;
+        bool dot = seg.len == 1 && *(seg.data) == '.';
+        bool dd = seg.len == 2 && *(seg.data) == '.' && *(seg.data + 1) == '.';
+        if dd {
             if segs.len > 0 { segs.len = segs.len - 1; }
+            if last { vec_push(&segs, empty); }
+        } else if dot {
+            if last { vec_push(&segs, empty); }
+        } else {
+            vec_push(&segs, seg);
         }
-        else { vec_push(&segs, seg); }
+        if last { break; }
+        i++;
     }
     if abs { str_buf_add_byte(out, cast(u8, '/')); }
     for i32 k = 0; k < segs.len; k++ {
         if k > 0 { str_buf_add_byte(out, cast(u8, '/')); }
         str_buf_add(out, vec_get(&segs, k));
     }
-    if p.len > 0 && *(p.data + p.len - 1) == '/' && segs.len > 0 { str_buf_add_byte(out, cast(u8, '/')); }
     vec_free(&segs);
+}
+
+// --- URL: a live object, not a snapshot -------------------------------------
+//
+// The components live in hidden `%` slots (which stay out of enumeration) and
+// every public property is an accessor over them. Assigning to one is
+// therefore visible through all the others -- including searchParams, which
+// writes its serialisation back into the query.
+
+private bool url_special(str scheme) {
+    return is_origin_scheme(scheme) || str_equal(scheme, "file");
+}
+
+// Percent-encode sets. They differ only in which ASCII punctuation is
+// allowed to stand; everything outside printable ASCII is always escaped.
+const i32 PCT_FRAG = 0;
+const i32 PCT_QUERY = 1;
+const i32 PCT_PATH = 2;
+const i32 PCT_USER = 3;
+
+private bool url_pct_needed(i32 kind, u8 c) {
+    if c <= 0x20 || c >= 0x7f { return true; }
+    if c == '"' || c == '<' || c == '>' { return true; }
+    if c == '`' { return kind != PCT_QUERY; }
+    if c == '#' { return kind != PCT_FRAG; }
+    if kind == PCT_PATH || kind == PCT_USER {
+        if c == '?' || c == '{' || c == '}' { return true; }
+    }
+    if kind == PCT_USER {
+        if c == '/' || c == ':' || c == ';' || c == '=' || c == '@'
+            || c == '[' || c == ']' || c == '^' || c == '|' { return true; }
+        if c == cast(u8, 92) { return true; }
+    }
+    return false;
+}
+
+// An existing %XX sequence is left alone rather than escaped again, so a
+// round trip through the parser does not keep growing the string.
+private void url_pct_into(str_buf* out, str s, i32 kind) {
+    str hexd = "0123456789ABCDEF";
+    i32 i = 0;
+    while i < s.len {
+        u8 c = *(s.data + i);
+        if c == '%' && i + 2 < s.len
+            && hex_val(*(s.data + i + 1)) >= 0 && hex_val(*(s.data + i + 2)) >= 0 {
+            str_buf_add_byte(out, c);
+            str_buf_add_byte(out, *(s.data + i + 1));
+            str_buf_add_byte(out, *(s.data + i + 2));
+            i += 3;
+        } else if url_pct_needed(kind, c) {
+            str_buf_add_byte(out, cast(u8, '%'));
+            str_buf_add_byte(out, *(hexd.data + (c >> 4)));
+            str_buf_add_byte(out, *(hexd.data + (c & 0xF)));
+            i++;
+        } else {
+            str_buf_add_byte(out, c);
+            i++;
+        }
+    }
+}
+
+private void url_lower_into(str_buf* out, str s) {
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c >= 'A' && c <= 'Z' { c = cast(u8, c + 32); }
+        str_buf_add_byte(out, c);
+    }
+}
+
+private str url_slot(VM* vm, JsObject* o, str name) {
+    str e;
+    e.data = null;
+    e.len = 0;
+    Value v;
+    if js_get_prop(o, bi_atom(vm, name), &v) && value_is_string(v) { return sview(v); }
+    return e;
+}
+
+private bool url_flag(VM* vm, JsObject* o, str name) {
+    Value v;
+    if !js_get_prop(o, bi_atom(vm, name), &v) { return false; }
+    return js_truthy(v);
+}
+
+private void url_put(VM* vm, JsObject* o, str name, str v) {
+    props_set_desc(&o.props, bi_atom(vm, name), new_str(vm, v), 0);
+}
+
+private void url_put_flag(VM* vm, JsObject* o, str name, bool b) {
+    props_set_desc(&o.props, bi_atom(vm, name), value_bool(b), 0);
+}
+
+// The port a URL reports: empty when it is the scheme's default.
+private str url_eff_port(VM* vm, JsObject* o) {
+    str port = url_slot(vm, o, "%po");
+    if is_default_port(url_slot(vm, o, "%sc"), port) { port.len = 0; }
+    return port;
+}
+
+private void url_authority_into(VM* vm, str_buf* b, JsObject* o) {
+    str user = url_slot(vm, o, "%us");
+    str pass = url_slot(vm, o, "%pw");
+    if user.len > 0 || pass.len > 0 {
+        str_buf_add(b, user);
+        if pass.len > 0 { str_buf_add_byte(b, cast(u8, ':')); str_buf_add(b, pass); }
+        str_buf_add_byte(b, cast(u8, '@'));
+    }
+    str_buf_add(b, url_slot(vm, o, "%ho"));
+    str port = url_eff_port(vm, o);
+    if port.len > 0 { str_buf_add_byte(b, cast(u8, ':')); str_buf_add(b, port); }
+}
+
+private void url_href_into(VM* vm, str_buf* b, JsObject* o) {
+    str_buf_add(b, url_slot(vm, o, "%sc"));
+    str_buf_add_byte(b, cast(u8, ':'));
+    if url_flag(vm, o, "%au") {
+        str_buf_add(b, "//");
+        url_authority_into(vm, b, o);
+    }
+    str_buf_add(b, url_slot(vm, o, "%pa"));
+    if url_flag(vm, o, "%hq") {
+        str_buf_add_byte(b, cast(u8, '?'));
+        str_buf_add(b, url_slot(vm, o, "%qy"));
+    }
+    if url_flag(vm, o, "%hf") {
+        str_buf_add_byte(b, cast(u8, '#'));
+        str_buf_add(b, url_slot(vm, o, "%fr"));
+    }
+}
+
+// Writes the parsed components into the object's slots, normalising as it
+// goes: scheme and host lower-cased, path collapsed, and each component
+// escaped for the place it will appear.
+private void url_store(VM* vm, JsObject* o, UrlParts* p) {
+    str_buf b;
+    str_buf_init(&b);
+    url_lower_into(&b, p.scheme);
+    url_put(vm, o, "%sc", str_buf_to_str(&b));
+    str_buf_free(&b);
+
+    str_buf hb;
+    str_buf_init(&hb);
+    url_lower_into(&hb, p.host);
+    url_put(vm, o, "%ho", str_buf_to_str(&hb));
+    str_buf_free(&hb);
+
+    str_buf ub;
+    str_buf_init(&ub);
+    url_pct_into(&ub, p.user, PCT_USER);
+    url_put(vm, o, "%us", str_buf_to_str(&ub));
+    str_buf_free(&ub);
+
+    str_buf pb;
+    str_buf_init(&pb);
+    url_pct_into(&pb, p.pass, PCT_USER);
+    url_put(vm, o, "%pw", str_buf_to_str(&pb));
+    str_buf_free(&pb);
+
+    url_put(vm, o, "%po", p.port);
+    url_put_flag(vm, o, "%au", p.has_authority);
+
+    str_buf nb;
+    str_buf_init(&nb);
+    str path = p.path;
+    if p.has_authority && path.len == 0 { path = "/"; }
+    str_buf norm;
+    str_buf_init(&norm);
+    if p.has_authority { url_path_norm(&norm, path); } else { str_buf_add(&norm, path); }
+    url_pct_into(&nb, str_buf_to_str(&norm), PCT_PATH);
+    url_put(vm, o, "%pa", str_buf_to_str(&nb));
+    str_buf_free(&norm);
+    str_buf_free(&nb);
+
+    str_buf qb;
+    str_buf_init(&qb);
+    url_pct_into(&qb, p.query, PCT_QUERY);
+    url_put(vm, o, "%qy", str_buf_to_str(&qb));
+    str_buf_free(&qb);
+    url_put_flag(vm, o, "%hq", p.has_query);
+
+    str_buf fb;
+    str_buf_init(&fb);
+    url_pct_into(&fb, p.hash, PCT_FRAG);
+    url_put(vm, o, "%fr", str_buf_to_str(&fb));
+    str_buf_free(&fb);
+    url_put_flag(vm, o, "%hf", p.has_hash);
+}
+
+private JsObject* build_url(VM* vm, UrlParts* p) {
+    JsObject* o = js_new_object(&vm.heap, vm.url_proto);
+    vm_push(vm, value_cell(&o.head));
+    url_store(vm, o, p);
+    vm_pop(vm);
+    return o;
+}
+
+// --- searchParams, kept in step with the query ------------------------------
+
+// Serialises a linked URLSearchParams back into its URL's query. Called after
+// every mutation, which is what makes u.searchParams.set(...) show up in
+// u.href.
+private void usp_sync(VM* vm, Value uspv) {
+    if !value_is_object(uspv) { return; }
+    Value ov;
+    if !js_get_prop(value_as_object(uspv), bi_atom(vm, "%url"), &ov) { return; }
+    if !value_is_object(ov) { return; }
+    JsObject* url = value_as_object(ov);
+    JsObject* pairs = usp_pairs(vm, uspv);
+    if pairs == null { return; }
+    str_buf b;
+    str_buf_init(&b);
+    for i32 i = 0; i < pairs.elen; i++ {
+        Value e = js_array_get(pairs, i);
+        if !value_is_array(e) { continue; }
+        JsObject* pr = value_as_object(e);
+        if b.len > 0 { str_buf_add_byte(&b, cast(u8, '&')); }
+        Value k = js_array_get(pr, 0);
+        Value v = js_array_get(pr, 1);
+        if value_is_string(k) { usp_encode(&b, sview(k)); }
+        str_buf_add_byte(&b, cast(u8, '='));
+        if value_is_string(v) { usp_encode(&b, sview(v)); }
+    }
+    url_put(vm, url, "%qy", str_buf_to_str(&b));
+    url_put_flag(vm, url, "%hq", b.len > 0);
+    str_buf_free(&b);
+}
+
+// Re-reads the query into an already-handed-out searchParams object, so a
+// direct assignment to .search or .href is visible through it.
+private void url_refresh_params(VM* vm, JsObject* o) {
+    Value spv;
+    if !js_get_prop(o, bi_atom(vm, "%sp"), &spv) { return; }
+    if !value_is_object(spv) { return; }
+    JsObject* pairs = usp_pairs(vm, spv);
+    if pairs == null { return; }
+    pairs.elen = 0;
+    usp_parse_query(vm, pairs, url_slot(vm, o, "%qy"));
+}
+
+private Value nat_url_get_searchparams(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) { return value_undefined(); }
+    JsObject* o = value_as_object(thisv);
+    Value spv;
+    if js_get_prop(o, bi_atom(vm, "%sp"), &spv) && value_is_object(spv) { return spv; }
+    JsObject* sp = usp_new(vm);
+    vm_push(vm, value_cell(&sp.head));
+    props_set_desc(&sp.props, bi_atom(vm, "%url"), thisv, 0);
+    usp_parse_query(vm, usp_pairs(vm, value_cell(&sp.head)), url_slot(vm, o, "%qy"));
+    props_set_desc(&o.props, bi_atom(vm, "%sp"), value_cell(&sp.head), 0);
+    vm_pop(vm);
+    return value_cell(&sp.head);
+}
+
+// --- accessors --------------------------------------------------------------
+
+private JsObject* url_this(Value thisv) {
+    if !value_is_object(thisv) { return null; }
+    return value_as_object(thisv);
+}
+
+private Value nat_url_get_protocol(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add(&b, url_slot(vm, o, "%sc"));
+    str_buf_add_byte(&b, cast(u8, ':'));
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_set_protocol(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    if s.len > 0 && *(s.data + s.len - 1) == ':' { s.len = s.len - 1; }
+    bool ok = s.len > 0;
+    for i32 i = 0; i < s.len; i++ {
+        if !url_scheme_char(*(s.data + i)) { ok = false; }
+    }
+    if ok {
+        str_buf b;
+        str_buf_init(&b);
+        url_lower_into(&b, s);
+        // a special scheme cannot become a non-special one, or the reverse:
+        // the authority would mean something different
+        if url_special(str_buf_to_str(&b)) == url_special(url_slot(vm, o, "%sc")) {
+            url_put(vm, o, "%sc", str_buf_to_str(&b));
+        }
+        str_buf_free(&b);
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_username(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    return o == null ? value_undefined() : new_str(vm, url_slot(vm, o, "%us"));
+}
+
+private Value nat_url_set_username(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str_buf b;
+    str_buf_init(&b);
+    url_pct_into(&b, sview(sv), PCT_USER);
+    url_put(vm, o, "%us", str_buf_to_str(&b));
+    str_buf_free(&b);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_password(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    return o == null ? value_undefined() : new_str(vm, url_slot(vm, o, "%pw"));
+}
+
+private Value nat_url_set_password(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str_buf b;
+    str_buf_init(&b);
+    url_pct_into(&b, sview(sv), PCT_USER);
+    url_put(vm, o, "%pw", str_buf_to_str(&b));
+    str_buf_free(&b);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_hostname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    return o == null ? value_undefined() : new_str(vm, url_slot(vm, o, "%ho"));
+}
+
+private Value nat_url_set_hostname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    if s.len > 0 {
+        str_buf b;
+        str_buf_init(&b);
+        url_lower_into(&b, s);
+        url_put(vm, o, "%ho", str_buf_to_str(&b));
+        str_buf_free(&b);
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_host(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add(&b, url_slot(vm, o, "%ho"));
+    str port = url_eff_port(vm, o);
+    if port.len > 0 { str_buf_add_byte(&b, cast(u8, ':')); str_buf_add(&b, port); }
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_set_host(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    i32 colon = -1;
+    for i32 i = 0; i < s.len; i++ { if *(s.data + i) == ':' { colon = i; } }
+    str hostpart = s;
+    str portpart;
+    portpart.data = s.data;
+    portpart.len = 0;
+    if colon >= 0 {
+        hostpart.len = colon;
+        portpart.data = s.data + colon + 1;
+        portpart.len = s.len - colon - 1;
+    }
+    if hostpart.len > 0 {
+        str_buf b;
+        str_buf_init(&b);
+        url_lower_into(&b, hostpart);
+        url_put(vm, o, "%ho", str_buf_to_str(&b));
+        str_buf_free(&b);
+        if colon >= 0 { url_put(vm, o, "%po", portpart); }
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_port(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    return o == null ? value_undefined() : new_str(vm, url_eff_port(vm, o));
+}
+
+private Value nat_url_set_port(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    bool digits = true;
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c < '0' || c > '9' { digits = false; }
+    }
+    if digits { url_put(vm, o, "%po", s); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_pathname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    return o == null ? value_undefined() : new_str(vm, url_slot(vm, o, "%pa"));
+}
+
+private Value nat_url_set_pathname(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    str_buf pre;
+    str_buf_init(&pre);
+    // a path under an authority always starts at its root
+    if url_flag(vm, o, "%au") && (s.len == 0 || *(s.data) != '/') {
+        str_buf_add_byte(&pre, cast(u8, '/'));
+    }
+    str_buf_add(&pre, s);
+    str_buf norm;
+    str_buf_init(&norm);
+    url_path_norm(&norm, str_buf_to_str(&pre));
+    str_buf enc;
+    str_buf_init(&enc);
+    url_pct_into(&enc, str_buf_to_str(&norm), PCT_PATH);
+    url_put(vm, o, "%pa", str_buf_to_str(&enc));
+    str_buf_free(&enc);
+    str_buf_free(&norm);
+    str_buf_free(&pre);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_search(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str q = url_slot(vm, o, "%qy");
+    // "?" on its own is not a query, so search reads empty even though href
+    // keeps the character
+    if !url_flag(vm, o, "%hq") || q.len == 0 { return new_str(vm, ""); }
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add_byte(&b, cast(u8, '?'));
+    str_buf_add(&b, q);
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_set_search(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    if s.len > 0 && *(s.data) == '?' { s.data = s.data + 1; s.len = s.len - 1; }
+    str_buf b;
+    str_buf_init(&b);
+    url_pct_into(&b, s, PCT_QUERY);
+    url_put(vm, o, "%qy", str_buf_to_str(&b));
+    url_put_flag(vm, o, "%hq", s.len > 0);
+    str_buf_free(&b);
+    url_refresh_params(vm, o);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str f = url_slot(vm, o, "%fr");
+    if !url_flag(vm, o, "%hf") || f.len == 0 { return new_str(vm, ""); }
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add_byte(&b, cast(u8, '#'));
+    str_buf_add(&b, f);
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_set_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    str s = sview(sv);
+    if s.len > 0 && *(s.data) == '#' { s.data = s.data + 1; s.len = s.len - 1; }
+    str_buf b;
+    str_buf_init(&b);
+    url_pct_into(&b, s, PCT_FRAG);
+    url_put(vm, o, "%fr", str_buf_to_str(&b));
+    url_put_flag(vm, o, "%hf", s.len > 0);
+    str_buf_free(&b);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_url_get_origin(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str scheme = url_slot(vm, o, "%sc");
+    if !is_origin_scheme(scheme) { return new_str(vm, "null"); }
+    str_buf b;
+    str_buf_init(&b);
+    str_buf_add(&b, scheme);
+    str_buf_add(&b, "://");
+    str_buf_add(&b, url_slot(vm, o, "%ho"));
+    str port = url_eff_port(vm, o);
+    if port.len > 0 { str_buf_add_byte(&b, cast(u8, ':')); str_buf_add(&b, port); }
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_get_href(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    str_buf b;
+    str_buf_init(&b);
+    url_href_into(vm, &b, o);
+    Value r = new_str(vm, str_buf_to_str(&b));
+    str_buf_free(&b);
+    return r;
+}
+
+private Value nat_url_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return nat_url_get_href(vmp, callee, thisv, args, argc);
 }
 
 private str url_heapcopy(str_buf* out) {
@@ -13786,6 +14309,52 @@ private str url_heapcopy(str_buf* out) {
     return r;
 }
 
+// Leading and trailing C0-or-space are trimmed off an input URL, and any tab
+// or newline anywhere inside it is dropped, before parsing sees it. Both are
+// required: URLs routinely arrive wrapped across lines.
+private str url_clean_input(str s) {
+    i32 b = 0;
+    i32 e = s.len;
+    while b < e && *(s.data + b) <= 0x20 { b++; }
+    while e > b && *(s.data + e - 1) <= 0x20 { e--; }
+    str_buf out;
+    str_buf_init(&out);
+    for i32 i = b; i < e; i++ {
+        u8 c = *(s.data + i);
+        if c == 0x09 || c == 0x0a || c == 0x0d { continue; }
+        str_buf_add_byte(&out, c);
+    }
+    str r = url_heapcopy(&out);
+    str_buf_free(&out);
+    return r;
+}
+
+// In a special scheme a backslash separates path segments just as a slash
+// does, so it is folded before the path is split.
+private str url_fold_backslash(str s) {
+    str_buf out;
+    str_buf_init(&out);
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        str_buf_add_byte(&out, c == cast(u8, 92) ? cast(u8, '/') : c);
+    }
+    str r = url_heapcopy(&out);
+    str_buf_free(&out);
+    return r;
+}
+
+// True when the parse produced something usable: a special scheme other than
+// file needs a host to be meaningful.
+private bool url_parts_valid(UrlParts* p) {
+    str_buf sb;
+    str_buf_init(&sb);
+    url_lower_into(&sb, p.scheme);
+    str sc = str_buf_to_str(&sb);
+    bool ok = !(is_origin_scheme(sc) && p.host.len == 0);
+    str_buf_free(&sb);
+    return ok;
+}
+
 // Resolves `input` (a non-absolute reference) against base `bp`; returns a
 // heap-allocated absolute URL string (caller frees .data).
 private str resolve_relative(VM* vm, str input, UrlParts* bp) {
@@ -13793,7 +14362,13 @@ private str resolve_relative(VM* vm, str input, UrlParts* bp) {
     str_buf_init(&out);
     str port = bp.port;
     bool two = input.len >= 2 && *(input.data) == '/' && *(input.data + 1) == '/';
-    if two {
+    if input.len == 0 {
+        // an empty reference is the base without its fragment
+        str_buf_add(&out, bp.scheme); str_buf_add(&out, "://");
+        url_append_authority(&out, bp, port);
+        str_buf_add(&out, bp.path);
+        if bp.has_query { str_buf_add_byte(&out, cast(u8, '?')); str_buf_add(&out, bp.query); }
+    } else if two {
         str_buf_add(&out, bp.scheme);
         str_buf_add_byte(&out, cast(u8, ':'));
         str_buf_add(&out, input);
@@ -13840,45 +14415,113 @@ private str resolve_relative(VM* vm, str input, UrlParts* bp) {
     return r;
 }
 
+// Parses `input` (optionally against `base`) into `out`. `owned` receives a
+// heap string the parts view into, which the caller must free. Returns 0 on
+// success, 1 for a bad input, 2 for a bad base.
+private i32 url_parse_pair(VM* vm, Value inputv, Value basev, UrlParts* out, str* owned) {
+    owned.data = null;
+    owned.len = 0;
+    str cleaned = url_clean_input(sview(inputv));
+    str folded = url_fold_backslash(cleaned);
+    free(cleaned.data);
+    if parse_absolute(folded, out) && url_parts_valid(out) {
+        *owned = folded;
+        return 0;
+    }
+    if value_is_undefined(basev) || value_is_null(basev) {
+        free(folded.data);
+        return 1;
+    }
+    Value basestr = js_to_string_value(vm, basev);
+    vm_push(vm, basestr);
+    str bclean = url_clean_input(sview(basestr));
+    str bfold = url_fold_backslash(bclean);
+    free(bclean.data);
+    UrlParts bp;
+    if !parse_absolute(bfold, &bp) || !url_parts_valid(&bp) {
+        free(bfold.data);
+        free(folded.data);
+        vm_pop(vm);
+        return 2;
+    }
+    str resolved = resolve_relative(vm, folded, &bp);
+    free(bfold.data);
+    free(folded.data);
+    vm_pop(vm);
+    if !parse_absolute(resolved, out) || !url_parts_valid(out) {
+        free(resolved.data);
+        return 1;
+    }
+    *owned = resolved;
+    return 0;
+}
+
 private Value nat_url_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value inputv = js_to_string_value(vm, arg_at(args, argc, 0));
     vm_push(vm, inputv);
     UrlParts parts;
-    if parse_absolute(sview(inputv), &parts) {
-        JsObject* o = build_url(vm, &parts);
+    str owned;
+    i32 rc = url_parse_pair(vm, inputv, arg_at(args, argc, 1), &parts, &owned);
+    if rc != 0 {
         vm_pop(vm);
-        return value_cell(&o.head);
+        vm_throw_error(vm, ERR_TYPE, rc == 2 ? "Invalid base URL" : "Invalid URL");
+        return value_undefined();
     }
-    // relative reference — resolve against a base
-    Value basev = arg_at(args, argc, 1);
-    if value_is_undefined(basev) || value_is_null(basev) {
+    JsObject* o = build_url(vm, &parts);
+    free(owned.data);
+    vm_pop(vm);
+    return value_cell(&o.head);
+}
+
+// Assigning href re-parses from scratch, so every other component follows.
+private Value nat_url_set_href(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = url_this(thisv);
+    if o == null { return value_undefined(); }
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, sv);
+    UrlParts parts;
+    str owned;
+    i32 rc = url_parse_pair(vm, sv, value_undefined(), &parts, &owned);
+    if rc != 0 {
         vm_pop(vm);
         vm_throw_error(vm, ERR_TYPE, "Invalid URL");
         return value_undefined();
     }
-    Value basestr = js_to_string_value(vm, basev);
-    vm_push(vm, basestr);
-    UrlParts bp;
-    if !parse_absolute(sview(basestr), &bp) {
-        vm_pop(vm);
-        vm_pop(vm);
-        vm_throw_error(vm, ERR_TYPE, "Invalid base URL");
-        return value_undefined();
-    }
-    str resolved = resolve_relative(vm, sview(inputv), &bp);
-    UrlParts rp;
-    bool rok = parse_absolute(resolved, &rp);
-    Value ret = value_undefined();
-    if rok {
-        JsObject* o = build_url(vm, &rp);
-        ret = value_cell(&o.head);
-    }
-    free(resolved.data);
+    url_store(vm, o, &parts);
+    free(owned.data);
+    url_refresh_params(vm, o);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+// URL.canParse: the same work as the constructor, reported instead of thrown.
+private Value nat_url_canparse(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value inputv = js_to_string_value(vm, arg_at(args, argc, 0));
+    vm_push(vm, inputv);
+    UrlParts parts;
+    str owned;
+    i32 rc = url_parse_pair(vm, inputv, arg_at(args, argc, 1), &parts, &owned);
+    if rc == 0 { free(owned.data); }
+    vm_pop(vm);
+    return value_bool(rc == 0);
+}
+
+// A getter/setter pair (non-enumerable, configurable), as the URL components
+// need: reading one derives it from the slots, writing one updates them.
+private void def_get_set(VM* vm, JsObject* obj, str name, NativeFn getter, NativeFn setter) {
+    JsNative* g = js_new_native(&vm.heap, getter, name);
+    vm_push(vm, value_cell(&g.head));
+    JsNative* s = js_new_native(&vm.heap, setter, name);
+    vm_push(vm, value_cell(&s.head));
+    JsAccessor* ac = js_new_accessor(&vm.heap);
+    ac.get = value_cell(&g.head);
+    ac.set = value_cell(&s.head);
+    props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
     vm_pop(vm);
-    if !rok { vm_throw_error(vm, ERR_TYPE, "Invalid URL"); }
-    return ret;
 }
 
 private void url_install(VM* vm) {
@@ -13886,8 +14529,22 @@ private void url_install(VM* vm) {
     JsNative* ctor = def_global_fn(vm, "URL", &nat_url_ctor);
     props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&vm.url_proto.head), 0);
     link_ctor(vm, vm.url_proto, ctor);
+    def_static(vm, ctor, "canParse", &nat_url_canparse);
     def_method(vm, vm.url_proto, "toString", &nat_url_tostring);
     def_method(vm, vm.url_proto, "toJSON", &nat_url_tostring);
+    def_get_set(vm, vm.url_proto, "protocol", &nat_url_get_protocol, &nat_url_set_protocol);
+    def_get_set(vm, vm.url_proto, "username", &nat_url_get_username, &nat_url_set_username);
+    def_get_set(vm, vm.url_proto, "password", &nat_url_get_password, &nat_url_set_password);
+    def_get_set(vm, vm.url_proto, "host", &nat_url_get_host, &nat_url_set_host);
+    def_get_set(vm, vm.url_proto, "hostname", &nat_url_get_hostname, &nat_url_set_hostname);
+    def_get_set(vm, vm.url_proto, "port", &nat_url_get_port, &nat_url_set_port);
+    def_get_set(vm, vm.url_proto, "pathname", &nat_url_get_pathname, &nat_url_set_pathname);
+    def_get_set(vm, vm.url_proto, "search", &nat_url_get_search, &nat_url_set_search);
+    def_get_set(vm, vm.url_proto, "hash", &nat_url_get_hash, &nat_url_set_hash);
+    def_get_set(vm, vm.url_proto, "href", &nat_url_get_href, &nat_url_set_href);
+    def_accessor(vm, vm.url_proto, "origin", &nat_url_get_origin);
+    def_accessor(vm, vm.url_proto, "searchParams", &nat_url_get_searchparams);
+    def_tag(vm, vm.url_proto, "URL");
 }
 
 private void usp_install(VM* vm) {
@@ -13903,6 +14560,7 @@ private void usp_install(VM* vm) {
     def_method(vm, vm.usp_proto, "delete", &nat_usp_delete);
     def_method(vm, vm.usp_proto, "toString", &nat_usp_tostring);
     def_method(vm, vm.usp_proto, "sort", &nat_usp_sort);
+    def_tag(vm, vm.usp_proto, "URLSearchParams");
     def_method(vm, vm.usp_proto, "forEach", &nat_usp_foreach);
     def_method(vm, vm.usp_proto, "keys", &nat_usp_keys);
     def_method(vm, vm.usp_proto, "values", &nat_usp_values);
