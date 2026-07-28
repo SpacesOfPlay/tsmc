@@ -5051,14 +5051,15 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
     vec_push(&vm.regexps, prog);
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
     vpush(vm, value_cell(&re.head));
-    js_set_prop(re, vm.atom_rx, value_int(idx));
+    props_set_desc(&re.props, vm.atom_rx, value_int(idx), 0);
     // an empty pattern reports "(?:)" so String(re) stays a valid literal
     GcString* src = gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)");
-    js_set_prop(re, vm.atom_source, value_cell(&src.head));
+    props_set_desc(&re.props, vm.atom_source, value_cell(&src.head), 0);
     GcString* flg = gc_new_string(&vm.heap, flags);
-    js_set_prop(re, vm.atom_flags, value_cell(&flg.head));
-    js_set_prop(re, vm.atom_lastindex, value_int(0));
-    // the flag set, reported one property per flag as on RegExp.prototype
+    props_set_desc(&re.props, vm.atom_flags, value_cell(&flg.head), 0);
+    props_set_desc(&re.props, vm.atom_lastindex, value_int(0), PROP_WRITABLE);
+    // The flag set, one property per flag. All non-enumerable, so Object.keys
+    // and JSON.stringify see a RegExp as the empty object node reports.
     bool f_i = false;
     bool f_m = false;
     bool f_s = false;
@@ -5076,14 +5077,14 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
         if c == 'd' { f_d = true; }
         if c == 'v' { f_v = true; }
     }
-    js_set_prop(re, atom_intern(&vm.atoms, "global"), value_bool(prog.global));
-    js_set_prop(re, atom_intern(&vm.atoms, "ignoreCase"), value_bool(f_i));
-    js_set_prop(re, atom_intern(&vm.atoms, "multiline"), value_bool(f_m));
-    js_set_prop(re, atom_intern(&vm.atoms, "dotAll"), value_bool(f_s));
-    js_set_prop(re, atom_intern(&vm.atoms, "unicode"), value_bool(f_u));
-    js_set_prop(re, atom_intern(&vm.atoms, "sticky"), value_bool(f_y));
-    js_set_prop(re, atom_intern(&vm.atoms, "hasIndices"), value_bool(f_d));
-    js_set_prop(re, atom_intern(&vm.atoms, "unicodeSets"), value_bool(f_v));
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "global"), value_bool(prog.global), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "ignoreCase"), value_bool(f_i), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "multiline"), value_bool(f_m), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "dotAll"), value_bool(f_s), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "unicode"), value_bool(f_u), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "sticky"), value_bool(f_y), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "hasIndices"), value_bool(f_d), 0);
+    props_set_desc(&re.props, atom_intern(&vm.atoms, "unicodeSets"), value_bool(f_v), 0);
     return vpop(vm);
 }
 

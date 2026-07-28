@@ -3926,6 +3926,23 @@ private void json_escape_into(str_buf* sb, str s) {
             h.data = &hex[0];
             h.len = 2;
             str_buf_add(sb, h);
+        } else if c == 0xED && i + 2 < s.len
+            && (*(s.data + i + 1) & 0xE0) == 0xA0 {
+            // A lone surrogate is stored WTF-8 style; well-formed JSON text
+            // escapes it rather than emitting invalid UTF-8.
+            i32 cp = ((c & 0x0F) << 12) | ((*(s.data + i + 1) & 0x3F) << 6)
+                | (*(s.data + i + 2) & 0x3F);
+            str_buf_add(sb, "\\u");
+            u8[4] hx;
+            for i32 k = 0; k < 4; k++ {
+                i32 nib = (cp >> ((3 - k) * 4)) & 15;
+                hx[k] = nib < 10 ? cast(u8, nib + '0') : cast(u8, nib - 10 + 'a');
+            }
+            str h4;
+            h4.data = &hx[0];
+            h4.len = 4;
+            str_buf_add(sb, h4);
+            i += 2;
         } else {
             str one;
             one.data = s.data + i;
@@ -3983,6 +4000,24 @@ private Value json_transform(VM* vm, JsonCtx* ctx, Value holder, str key, Value 
     return v;
 }
 
+// A Number, String or Boolean wrapper yields its primitive; anything else is
+// left alone.
+private bool json_unwrap_boxed(VM* vm, Value v, Value* out) {
+    JsObject* o = value_as_object(v);
+    if (o.obj_flags & (OBJF_ARRAY | OBJF_PROXY | OBJF_TYPEDARRAY)) != 0 { return false; }
+    JsObject* p = o.proto;
+    if p != vm.number_proto && p != vm.string_proto && p != vm.boolean_proto { return false; }
+    Value f;
+    if !vm_get_prop_value(vm, v, bi_atom(vm, "valueOf"), &f) { return false; }
+    if !value_is_callable(f) { return false; }
+    Value dummy = value_undefined();
+    Value r = vm_call_value(vm, f, v, &dummy, 0);
+    if vm.has_pending { return false; }
+    if value_is_object(r) { return false; }
+    *out = r;
+    return true;
+}
+
 private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
     str gap = ctx.gap;
     if value_is_undefined(v) || value_is_callable(v) || value_is_hole(v) {
@@ -3991,6 +4026,12 @@ private bool json_write(VM* vm, str_buf* sb, Value v, JsonCtx* ctx, i32 depth) {
     if value_is_bigint(v) {
         vm_throw_error(vm, ERR_TYPE, "Do not know how to serialize a BigInt");
         return false;
+    }
+    // A boxed primitive serializes as the primitive it wraps.
+    if value_is_object(v) {
+        Value prim;
+        if json_unwrap_boxed(vm, v, &prim) { v = prim; }
+        if vm.has_pending { return false; }
     }
     if value_is_map(v) || value_is_generator(v) {
         // a Map, Set or generator has no enumerable own properties, so it
@@ -4430,20 +4471,29 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
         gc_root_reset(&vm.heap, rm);
         return value_cell(&obj.head);
     }
-    // number
+    // Number. JSON's grammar is stricter than JavaScript's: no leading plus,
+    // no leading zero, and every '.' and exponent must be followed by digits.
     i32 start = p.pos;
     if c == '-' { p.pos++; }
-    while p.pos < p.s.len {
-        u8 d = *(p.s.data + p.pos);
-        if (d >= '0' && d <= '9') || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-' {
-            p.pos++;
-        } else {
-            break;
-        }
-    }
-    if p.pos == start {
+    i32 istart = p.pos;
+    while p.pos < p.s.len && *(p.s.data + p.pos) >= '0' && *(p.s.data + p.pos) <= '9' { p.pos++; }
+    i32 ilen = p.pos - istart;
+    if ilen == 0 || (ilen > 1 && *(p.s.data + istart) == '0') {
         p.failed = true;
         return value_undefined();
+    }
+    if p.pos < p.s.len && *(p.s.data + p.pos) == '.' {
+        p.pos++;
+        i32 fstart = p.pos;
+        while p.pos < p.s.len && *(p.s.data + p.pos) >= '0' && *(p.s.data + p.pos) <= '9' { p.pos++; }
+        if p.pos == fstart { p.failed = true; return value_undefined(); }
+    }
+    if p.pos < p.s.len && (*(p.s.data + p.pos) == 'e' || *(p.s.data + p.pos) == 'E') {
+        p.pos++;
+        if p.pos < p.s.len && (*(p.s.data + p.pos) == '+' || *(p.s.data + p.pos) == '-') { p.pos++; }
+        i32 estart = p.pos;
+        while p.pos < p.s.len && *(p.s.data + p.pos) >= '0' && *(p.s.data + p.pos) <= '9' { p.pos++; }
+        if p.pos == estart { p.failed = true; return value_undefined(); }
     }
     str num;
     num.data = p.s.data + start;
