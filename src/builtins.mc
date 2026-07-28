@@ -8761,14 +8761,26 @@ private Value nat_ta_ctor(void* vmp, Value callee, Value thisv, Value* args, i32
         JsObject* ab = value_as_object(a0);
         i32 ablen = ab_len(vm, ab);
         i32 boff = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
-        if boff < 0 { boff = 0; }
+        // the offset has to land on an element boundary and inside the buffer
+        if boff < 0 || boff > ablen || (boff % esz) != 0 {
+            vm_throw_error(vm, ERR_RANGE, "start offset is outside the buffer or misaligned");
+            return value_undefined();
+        }
         i32 len;
         if argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) {
             len = to_int_arg(arg_at(args, argc, 2));
+            if len < 0 || boff + len * esz > ablen {
+                vm_throw_error(vm, ERR_RANGE, "length is outside the buffer");
+                return value_undefined();
+            }
         } else {
+            // without an explicit length the remainder must divide evenly
+            if ((ablen - boff) % esz) != 0 {
+                vm_throw_error(vm, ERR_RANGE, "buffer length is not a multiple of the element size");
+                return value_undefined();
+            }
             len = (ablen - boff) / esz;
         }
-        if len < 0 { len = 0; }
         return ta_make(vm, kind, ab, boff, len);
     }
     // Copy from an array, typed array, array-like, or any iterable. Maps, sets
@@ -9171,6 +9183,34 @@ private Value nat_ta_findindex(void* vmp, Value callee, Value thisv, Value* args
     return ta_iterate(as_vm(vmp), thisv, args, argc, IT_FINDINDEX);
 }
 
+// The reverse-scanning pair, walked directly since ta_iterate goes forwards.
+private Value ta_find_last(VM* vm, Value thisv, Value* args, i32 argc, bool want_index) {
+    JsObject* o = this_ta(vm, thisv);
+    if o == null { return value_undefined(); }
+    Value fun = arg_at(args, argc, 0);
+    if !value_is_callable(fun) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 n = ta_len(vm, o);
+    for i32 i = n - 1; i >= 0; i-- {
+        Value e = vm_ta_get(vm, o, i);
+        Value[3] ca = { e, value_int(i), thisv };
+        Value r = vm_call_value(vm, fun, arg_at(args, argc, 1), &ca[0], 3);
+        if vm.has_pending { return value_undefined(); }
+        if js_truthy(r) { return want_index ? value_int(i) : e; }
+    }
+    return want_index ? value_int(0 - 1) : value_undefined();
+}
+
+private Value nat_ta_findlast(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_find_last(as_vm(vmp), thisv, args, argc, false);
+}
+
+private Value nat_ta_findlastindex(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ta_find_last(as_vm(vmp), thisv, args, argc, true);
+}
+
 private Value ta_reduce_impl(VM* vm, Value thisv, Value* args, i32 argc, bool right) {
     JsObject* o = this_ta(vm, thisv);
     if o == null { return value_undefined(); }
@@ -9411,6 +9451,7 @@ private void dataview_install(VM* vm) {
     JsNative* ctor = def_global_fn(vm, "DataView", &nat_dataview_ctor);
     props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&vm.dataview_proto.head), 0);
     link_ctor(vm, vm.dataview_proto, ctor);
+    def_tag(vm, vm.dataview_proto, "DataView");
     def_accessor(vm, vm.dataview_proto, "buffer", &nat_dv_get_buffer);
     def_accessor(vm, vm.dataview_proto, "byteLength", &nat_dv_get_bytelength);
     def_accessor(vm, vm.dataview_proto, "byteOffset", &nat_dv_get_byteoffset);
@@ -9434,6 +9475,7 @@ private void install_one_ta(VM* vm, i32 kind, str name) {
     vm_set_global(vm, name, value_cell(&ctor.head));
     props_set_desc(&ctor.props, vm.atom_prototype, value_cell(&proto.head), 0);
     link_ctor(vm, proto, ctor);
+    def_tag(vm, proto, name);
     num_const(vm, ctor, "BYTES_PER_ELEMENT", cast(f64, ta_elem_size(kind)));
     def_value(vm, proto, "BYTES_PER_ELEMENT", value_int(ta_elem_size(kind)));
     JsNative* fromn = js_new_native(&vm.heap, &nat_ta_from, "from");
@@ -9447,6 +9489,7 @@ private void install_one_ta(VM* vm, i32 kind, str name) {
 private void typedarray_install(VM* vm) {
     // ArrayBuffer
     vm.arraybuffer_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.arraybuffer_proto, "ArrayBuffer");
     JsNative* abctor = def_global_fn(vm, "ArrayBuffer", &nat_arraybuffer_ctor);
     props_set_desc(&abctor.props, vm.atom_prototype, value_cell(&vm.arraybuffer_proto.head), 0);
     link_ctor(vm, vm.arraybuffer_proto, abctor);
@@ -9475,6 +9518,8 @@ private void typedarray_install(VM* vm) {
     def_method(vm, vm.ta_proto, "reduceRight", &nat_ta_reduceright);
     def_method(vm, vm.ta_proto, "find", &nat_ta_find);
     def_method(vm, vm.ta_proto, "findIndex", &nat_ta_findindex);
+    def_method(vm, vm.ta_proto, "findLast", &nat_ta_findlast);
+    def_method(vm, vm.ta_proto, "findLastIndex", &nat_ta_findlastindex);
     def_method(vm, vm.ta_proto, "some", &nat_ta_some);
     def_method(vm, vm.ta_proto, "every", &nat_ta_every);
     def_method(vm, vm.ta_proto, "at", &nat_ta_at);

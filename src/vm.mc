@@ -1611,11 +1611,17 @@ Value ta_read(u8* p, i32 kind) {
 void ta_write(u8* p, i32 kind, f64 num) {
     if kind == 8 { memcpy(p, cast(u8*, &num), cast(i64, 8)); return; }
     if kind == 7 { f32 f = cast(f32, num); memcpy(p, cast(u8*, &f), cast(i64, 4)); return; }
-    if kind == 2 {   // Uint8Clamped
+    if kind == 2 {   // Uint8Clamped: ties round to the even value
         i32 c;
         if num != num || num <= 0.0 { c = 0; }
         else if num >= 255.0 { c = 255; }
-        else { c = cast(i32, num + 0.5); }
+        else {
+            f64 fl = floor(num);
+            f64 frac = num - fl;
+            c = cast(i32, fl);
+            if frac > 0.5 { c = c + 1; }
+            else if frac == 0.5 && (c & 1) != 0 { c = c + 1; }
+        }
         *p = cast(u8, c);
         return;
     }
@@ -3018,10 +3024,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         // array elements and `length` live outside the property
                         // table; resolve through the atom so a string-form
                         // index ("0" in arr) answers like the numeric one
-                        i32 idx = (o.obj_flags & OBJF_ARRAY) != 0
+                        i32 idx = (o.obj_flags & (OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0
                             ? ta_atom_index(vm, a) : -1;
                         if (o.obj_flags & OBJF_ARRAY) != 0 && a == vm.atom_length {
                             r = true;
+                        } else if idx >= 0 && (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+                            // a view's elements are bytes, not properties
+                            r = idx < ta_prop_int(vm, o, vm.atom_ta_len);
                         } else if idx >= 0 {
                             r = js_array_has(o, idx);
                         } else {
