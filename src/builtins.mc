@@ -13015,9 +13015,23 @@ private bool proto_chain_has(Value v, JsObject* target) {
     return false;
 }
 
-private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
+// Structural equality, as assert.deepStrictEqual and util.isDeepStrictEqual
+// define it. `seen` holds the pairs currently being compared, so a pair of
+// structures that refer to themselves the same way compares equal instead of
+// recursing until the depth guard gives up and calls them different.
+private bool deep_equal_seen(VM* vm, Value a, Value b, i32 depth, Vec<u64>* seen) {
     if depth > 200 { return false; }
     if js_same_value(a, b) { return true; }
+
+    // a pair already under comparison is taken as equal: the question is
+    // whether assuming so leads to a contradiction elsewhere, and nothing here
+    // has found one
+    if value_is_cell(a) && value_is_cell(b) {
+        for i32 i = 0; i + 1 < seen.len; i += 2 {
+            if vec_get(seen, i) == a.bits && vec_get(seen, i + 1) == b.bits { return true; }
+        }
+    }
+
     // both dates: compare time value
     if proto_chain_has(a, vm.date_proto) && proto_chain_has(b, vm.date_proto) {
         Value ta;
@@ -13027,6 +13041,25 @@ private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
         bool hb = js_get_prop(value_as_object(b), tatom, &tb);
         if ha && hb { return js_to_number(ta) == js_to_number(tb); }
     }
+
+    // regular expressions carry their meaning in source and flags, neither of
+    // which is an enumerable property, so the walk below would call any two
+    // of them equal
+    bool are = proto_chain_has(a, vm.regexp_proto);
+    bool bre = proto_chain_has(b, vm.regexp_proto);
+    if are || bre {
+        if !are || !bre { return false; }
+        Value asrc;
+        Value bsrc;
+        Value afl;
+        Value bfl;
+        ignore vm_get_prop_value(vm, a, bi_atom(vm, "source"), &asrc);
+        ignore vm_get_prop_value(vm, b, bi_atom(vm, "source"), &bsrc);
+        ignore vm_get_prop_value(vm, a, bi_atom(vm, "flags"), &afl);
+        ignore vm_get_prop_value(vm, b, bi_atom(vm, "flags"), &bfl);
+        return js_same_value(asrc, bsrc) && js_same_value(afl, bfl);
+    }
+
     // Maps and Sets compare by contents, not identity: their entries live in
     // their own storage, so the property walk below would call any two of them
     // equal
@@ -13040,25 +13073,53 @@ private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
             if !ma.live[i] { continue; }
             i32 j = map_find(mb, ma.keys[i]);
             if j < 0 { return false; }
-            if !ma.is_set && !deep_equal(vm, ma.vals[i], mb.vals[j], depth + 1) {
+            if !ma.is_set && !deep_equal_seen(vm, ma.vals[i], mb.vals[j], depth + 1, seen) {
                 return false;
             }
         }
         return true;
     }
-    bool aarr = value_is_array(a);
-    bool barr = value_is_array(b);
-    if aarr != barr { return false; }
-    if aarr {
+
+    // A typed array's elements are bytes in a buffer, not properties. Same
+    // view type (hence same prototype), same length, same contents.
+    bool ata = vm_is_typed_array(a);
+    bool bta = vm_is_typed_array(b);
+    if ata || bta {
+        if !ata || !bta { return false; }
         JsObject* ao = value_as_object(a);
         JsObject* bo = value_as_object(b);
-        if ao.elen != bo.elen { return false; }
-        for i32 i = 0; i < ao.elen; i++ {
-            if !deep_equal(vm, js_array_get(ao, i), js_array_get(bo, i), depth + 1) { return false; }
+        if ao.proto != bo.proto { return false; }
+        i32 alen = ta_len(vm, ao);
+        if alen != ta_len(vm, bo) { return false; }
+        for i32 i = 0; i < alen; i++ {
+            if !js_same_value(vm_ta_get(vm, ao, i), vm_ta_get(vm, bo, i)) { return false; }
         }
         return true;
     }
+
+    bool aarr = value_is_array(a);
+    bool barr = value_is_array(b);
+    if aarr != barr { return false; }
     if value_is_object(a) && value_is_object(b) {
+        // strict deep equality includes the prototype: two classes with the
+        // same fields are still two different types
+        if value_as_object(a).proto != value_as_object(b).proto { return false; }
+    }
+    if value_is_cell(a) && value_is_cell(b) {
+        vec_push(seen, a.bits);
+        vec_push(seen, b.bits);
+    }
+    bool result = false;
+    if aarr {
+        JsObject* ao = value_as_object(a);
+        JsObject* bo = value_as_object(b);
+        result = ao.elen == bo.elen;
+        for i32 i = 0; result && i < ao.elen; i++ {
+            if !deep_equal_seen(vm, js_array_get(ao, i), js_array_get(bo, i), depth + 1, seen) {
+                result = false;
+            }
+        }
+    } else if value_is_object(a) && value_is_object(b) {
         i32 rm = gc_root_mark(&vm.heap);
         JsObject* ak = vm_own_keys(vm, a);
         gc_root(&vm.heap, value_cell(&ak.head));
@@ -13072,12 +13133,22 @@ private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
             Value bv;
             bool hb = js_get_prop(value_as_object(b), katom, &bv);
             bool ha = js_get_prop(value_as_object(a), katom, &av);
-            if !ha || !hb || !deep_equal(vm, av, bv, depth + 1) { eq = false; }
+            if !ha || !hb || !deep_equal_seen(vm, av, bv, depth + 1, seen) { eq = false; }
         }
         gc_root_reset(&vm.heap, rm);
-        return eq;
+        result = eq;
     }
-    return false;
+    if value_is_cell(a) && value_is_cell(b) {
+        seen.len = seen.len - 2;
+    }
+    return result;
+}
+
+private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
+    Vec<u64> seen = vec_new<u64>(8);
+    bool r = deep_equal_seen(vm, a, b, depth, &seen);
+    vec_free(&seen);
+    return r;
 }
 
 private Value nat_util_deep_equal(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {

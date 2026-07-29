@@ -198,7 +198,17 @@ str node_assert_source() {
 "
         "  if (!threw) throw new AssertionError({ message: message || 'Missing expected exception.', operator: 'throws' });
 "
-        "  if (!checkError(error, expected)) throw error;
+        "  if (!checkError(error, expected)) {
+"
+        "    // the call threw, but not what the caller said it would: that is a
+"
+        "    // failed assertion, not the original error passing through, and it
+"
+        "    // carries both sides so the report can say what was wanted
+"
+        "    throw new AssertionError({ message: message || 'The error did not match the expectation.', actual: error, expected: expected, operator: 'throws' });
+"
+        "  }
 "
         "}
 "
@@ -238,7 +248,11 @@ str node_assert_source() {
 "
         "  if (!threw) throw new AssertionError({ message: message || 'Missing expected rejection.', operator: 'rejects' });
 "
-        "  if (!checkError(error, expected)) throw error;
+        "  if (!checkError(error, expected)) {
+"
+        "    throw new AssertionError({ message: message || 'The rejection did not match the expectation.', actual: error, expected: expected, operator: 'rejects' });
+"
+        "  }
 "
         "}
 "
