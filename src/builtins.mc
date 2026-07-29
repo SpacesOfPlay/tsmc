@@ -11320,21 +11320,184 @@ else {
     tsmc_unsupported_target__add_a_when_os_arm _unsupported_fs;
 }
 
-private void fs_throw(VM* vm, str op, str path) {
+// An fs error in node's shape. Callers branch on `.code` far more than on the
+// message, and `.path` is how they report which file went wrong, so both are
+// set rather than only the text.
+private void fs_fail(VM* vm, str code, str desc, str op, str path) {
     str_buf m;
     str_buf_init(&m);
-    str_buf_add(&m, "ENOENT: no such file or directory, ");
+    str_buf_add(&m, code);
+    str_buf_add(&m, ": ");
+    str_buf_add(&m, desc);
+    str_buf_add(&m, ", ");
     str_buf_add(&m, op);
-    str_buf_add(&m, " '");
-    str_buf_add(&m, path);
-    str_buf_add(&m, "'");
+    if path.len > 0 {
+        str_buf_add(&m, " '");
+        str_buf_add(&m, path);
+        str_buf_add(&m, "'");
+    }
     Value err = vm_make_error(vm, ERR_ERROR, str_buf_to_str(&m));
     str_buf_free(&m);
     vm_push(vm, err);
-    GcString* cs = gc_new_string(&vm.heap, "ENOENT");
-    js_set_prop(value_as_object(err), atom_intern(&vm.atoms, "code"), value_cell(&cs.head));
+    JsObject* eo = value_as_object(err);
+    js_set_prop(eo, atom_intern(&vm.atoms, "code"), new_str(vm, code));
+    js_set_prop(eo, atom_intern(&vm.atoms, "syscall"), new_str(vm, op));
+    if path.len > 0 {
+        js_set_prop(eo, atom_intern(&vm.atoms, "path"), new_str(vm, path));
+    }
     vm_pop(vm);
     vm_throw(vm, err);
+}
+
+private void fs_throw(VM* vm, str op, str path) {
+    fs_fail(vm, "ENOENT", "no such file or directory", op, path);
+}
+
+private bool fs_path_is_dir(str path) {
+    u8* c = str_to_cstr(path);
+    bool d = fs_is_dir(c);
+    free(c);
+    return d;
+}
+
+// True when the path names something, directory or not.
+private bool fs_path_exists(str path) {
+    return file_stamp(path).ok || fs_path_is_dir(path);
+}
+
+// The directory a path sits in, as a view into it; empty when there is none.
+private str fs_parent_of(str path) {
+    str p;
+    p.data = path.data;
+    p.len = 0;
+    i32 end = path.len;
+    while end > 1 && path_is_sep(*(path.data + end - 1)) { end--; }
+    i32 last = -1;
+    for i32 i = 0; i < end; i++ {
+        if path_is_sep(*(path.data + i)) { last = i; }
+    }
+    if last <= 0 { return p; }
+    p.len = last;
+    return p;
+}
+
+private i32 fs_dir_count(VM* vm, str path) {
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    fs_readdir_into(vm, path, arr);
+    i32 n = arr.elen;
+    vm_pop(vm);
+    return n;
+}
+
+// Removes a file, or a directory and everything under it. Returns false when
+// something could not be removed.
+private bool fs_rm_tree(VM* vm, str path) {
+    if !fs_path_is_dir(path) {
+        u8* c = str_to_cstr(path);
+        bool ok = fs_unlink1(c);
+        free(c);
+        return ok;
+    }
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    fs_readdir_into(vm, path, arr);
+    bool ok = true;
+    for i32 i = 0; i < arr.elen; i++ {
+        Value nv = js_array_get(arr, i);
+        if !value_is_string(nv) { continue; }
+        str_buf child;
+        str_buf_init(&child);
+        str_buf_add(&child, path);
+        str_buf_add_byte(&child, path_sep_ch());
+        str_buf_add(&child, sview(nv));
+        if !fs_rm_tree(vm, str_buf_to_str(&child)) { ok = false; }
+        str_buf_free(&child);
+    }
+    vm_pop(vm);
+    if !ok { return false; }
+    u8* c = str_to_cstr(path);
+    bool r = fs_rmdir1(c);
+    free(c);
+    return r;
+}
+
+private Value nat_fs_copy_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str src = path_arg(vm, args, argc, 0);
+    str dst = path_arg(vm, args, argc, 1);
+    FileData fd = file_read(src);
+    if fd.data == null {
+        fs_fail(vm, "ENOENT", "no such file or directory", "copyfile", src);
+        vm_pop(vm);
+        vm_pop(vm);
+        return value_undefined();
+    }
+    bool ok = file_write(dst, fd);
+    free(fd.data);
+    if !ok { fs_fail(vm, "ENOENT", "no such file or directory", "copyfile", dst); }
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_rm(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    bool recursive = false;
+    bool force = false;
+    Value opts = arg_at(args, argc, 1);
+    if value_is_object(opts) {
+        Value v;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "recursive"), &v) { recursive = js_truthy(v); }
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "force"), &v) { force = js_truthy(v); }
+    }
+    if !fs_path_exists(path) {
+        // `force` is exactly the "it is fine if it was not there" switch
+        if !force { fs_fail(vm, "ENOENT", "no such file or directory", "stat", path); }
+        vm_pop(vm);
+        return value_undefined();
+    }
+    bool isdir = fs_path_is_dir(path);
+    if isdir && !recursive {
+        fs_fail(vm, "ERR_FS_EISDIR", "is a directory", "rm", path);
+        vm_pop(vm);
+        return value_undefined();
+    }
+    if !fs_rm_tree(vm, path) && !force {
+        fs_fail(vm, "ENOTEMPTY", "directory not empty", "rm", path);
+    }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+private Value nat_fs_access(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    bool ok = fs_path_exists(path);
+    if !ok { fs_fail(vm, "ENOENT", "no such file or directory", "access", path); }
+    vm_pop(vm);
+    return value_undefined();
+}
+
+// No symlinks are resolved: the path is normalised and made absolute, which
+// is what callers use it for.
+private Value nat_fs_realpath(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    if !fs_path_exists(path) {
+        fs_fail(vm, "ENOENT", "no such file or directory", "lstat", path);
+        vm_pop(vm);
+        return value_undefined();
+    }
+    str_buf out;
+    str_buf_init(&out);
+    Value[1] a = { arg_at(args, argc, 0) };
+    vm_pop(vm);
+    pf_resolve_into(vm, &out, pf_host(), &a[0], 1);
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    return r;
 }
 
 // Encoding from a string arg or a `{ encoding }` options object; -1 = raw
@@ -11353,6 +11516,14 @@ private i32 fs_enc_arg(VM* vm, Value v) {
 private Value nat_fs_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
+    if fs_path_is_dir(path) {
+        str nopath;
+        nopath.data = null;
+        nopath.len = 0;
+        fs_fail(vm, "EISDIR", "illegal operation on a directory", "read", nopath);
+        vm_pop(vm);
+        return value_undefined();
+    }
     FileData fd = file_read(path);
     if fd.data == null {
         fs_throw(vm, "open", path);
@@ -11393,6 +11564,9 @@ private Value nat_fs_write_file(void* vmp, Value callee, Value thisv, Value* arg
     fd.data = bytes.data;
     fd.len = bytes.len;
     bool ok = file_write(path, fd);
+    // a zero-length write reports failure even where the file was created, so
+    // confirm before turning that into an error
+    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -11415,6 +11589,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     fd.data = bytes.data;
     fd.len = bytes.len;
     bool ok = file_write(path, fd);
+    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -11470,6 +11645,20 @@ private Value nat_fs_mkdir(void* vmp, Value callee, Value thisv, Value* args, i3
         Value rv;
         if vm_get_prop_value(vm, opts, bi_atom(vm, "recursive"), &rv) { recursive = js_truthy(rv); }
     }
+    if !recursive {
+        // a plain mkdir says which of the two things went wrong
+        if fs_path_exists(path) {
+            fs_fail(vm, "EEXIST", "file already exists", "mkdir", path);
+            vm_pop(vm);
+            return value_undefined();
+        }
+        str parent = fs_parent_of(path);
+        if parent.len > 0 && !fs_path_exists(parent) {
+            fs_throw(vm, "mkdir", path);
+            vm_pop(vm);
+            return value_undefined();
+        }
+    }
     if recursive {
         // create each ancestor in turn; ignore already-exists failures
         for i32 i = 1; i <= path.len; i++ {
@@ -11493,29 +11682,6 @@ private Value nat_fs_mkdir(void* vmp, Value callee, Value thisv, Value* args, i3
     return value_undefined();
 }
 
-private Value nat_fs_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
-    str path = path_arg(vm, args, argc, 0);
-    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
-    vm_push(vm, value_cell(&arr.head));
-    fs_readdir_into(vm, path, arr);
-    Value r = value_cell(&arr.head);
-    vm_pop(vm);   // arr
-    vm_pop(vm);   // path
-    return r;
-}
-
-private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
-    str path = path_arg(vm, args, argc, 0);
-    u8* c = str_to_cstr(path);
-    bool ok = fs_rmdir1(c);
-    free(c);
-    if !ok { fs_throw(vm, "rmdir", path); }
-    vm_pop(vm);
-    return value_undefined();
-}
-
 private Value nat_fs_stat_isfile(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     Value d;
     if vm_get_prop_value(as_vm(vmp), thisv, bi_atom(as_vm(vmp), "isDirectory_"), &d) {
@@ -11529,6 +11695,71 @@ private Value nat_fs_stat_isdir(void* vmp, Value callee, Value thisv, Value* arg
         return value_bool(js_truthy(d));
     }
     return value_bool(false);
+}
+
+private Value nat_fs_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    if !fs_path_is_dir(path) {
+        if fs_path_exists(path) {
+            fs_fail(vm, "ENOTDIR", "not a directory", "scandir", path);
+        } else {
+            fs_fail(vm, "ENOENT", "no such file or directory", "scandir", path);
+        }
+        vm_pop(vm);
+        return value_undefined();
+    }
+    bool with_types = false;
+    Value opts = arg_at(args, argc, 1);
+    if value_is_object(opts) {
+        Value v;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "withFileTypes"), &v) { with_types = js_truthy(v); }
+    }
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    fs_readdir_into(vm, path, arr);
+    if with_types {
+        // each name becomes a Dirent: the caller asked which entries are
+        // directories, which otherwise costs a stat per name
+        for i32 i = 0; i < arr.elen; i++ {
+            Value nv = js_array_get(arr, i);
+            if !value_is_string(nv) { continue; }
+            str_buf child;
+            str_buf_init(&child);
+            str_buf_add(&child, path);
+            str_buf_add_byte(&child, path_sep_ch());
+            str_buf_add(&child, sview(nv));
+            bool isdir = fs_path_is_dir(str_buf_to_str(&child));
+            str_buf_free(&child);
+            JsObject* de = js_new_object(&vm.heap, vm.object_proto);
+            vm_push(vm, value_cell(&de.head));
+            def_value_enum(vm, de, "name", nv);
+            def_value_enum(vm, de, "parentPath", new_str(vm, path));
+            js_set_prop(de, bi_atom(vm, "isDirectory_"), value_bool(isdir));
+            def_method(vm, de, "isFile", &nat_fs_stat_isfile);
+            def_method(vm, de, "isDirectory", &nat_fs_stat_isdir);
+            js_array_set(arr, i, value_cell(&de.head));
+            vm_pop(vm);
+        }
+    }
+    Value r = value_cell(&arr.head);
+    vm_pop(vm);   // arr
+    vm_pop(vm);   // path
+    return r;
+}
+
+private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str path = path_arg(vm, args, argc, 0);
+    u8* c = str_to_cstr(path);
+    bool ok = fs_rmdir1(c);
+    free(c);
+    if !ok {
+        if !fs_path_exists(path) { fs_throw(vm, "rmdir", path); }
+        else { fs_fail(vm, "ENOTEMPTY", "directory not empty", "rmdir", path); }
+    }
+    vm_pop(vm);
+    return value_undefined();
 }
 
 private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -11548,6 +11779,13 @@ private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32
     vm_push(vm, value_cell(&o.head));
     def_value_enum(vm, o, "size", value_number(cast(f64, st.size)));
     def_value_enum(vm, o, "mtimeMs", value_number(fs_mtime_ms(st.mtime)));
+    // node exposes both spellings, and code that formats a timestamp reaches
+    // for the Date one
+    JsObject* mt = js_new_object(&vm.heap, vm_date_proto(vm));
+    js_set_prop(mt, bi_atom(vm, "%t"), value_number(fs_mtime_ms(st.mtime)));
+    // node exposes both spellings; code that formats a timestamp wants the
+    // Date one
+    def_value_enum(vm, o, "mtime", value_cell(&mt.head));
     props_set_desc(&o.props, bi_atom(vm, "isDirectory_"), value_bool(isdir), 0);  // hidden flag
     def_method(vm, o, "isFile", &nat_fs_stat_isfile);
     def_method(vm, o, "isDirectory", &nat_fs_stat_isdir);
@@ -11663,6 +11901,10 @@ private Value get_prop_or_undef(VM* vm, JsObject* o, str name) {
 // The fs.promises object (also the `fs/promises` module's default).
 private JsObject* build_fs_promises(VM* vm) {
     JsObject* pr = js_new_object(&vm.heap, vm.object_proto);
+    // rooted while the methods are installed: each one allocates, and an
+    // object held only in a local is not reachable from anywhere the collector
+    // looks
+    vm_push(vm, value_cell(&pr.head));
     def_method(vm, pr, "readFile", &nat_fsp_read_file);
     def_method(vm, pr, "writeFile", &nat_fsp_write_file);
     def_method(vm, pr, "appendFile", &nat_fsp_append_file);
@@ -11672,6 +11914,7 @@ private JsObject* build_fs_promises(VM* vm) {
     def_method(vm, pr, "unlink", &nat_fsp_unlink);
     def_method(vm, pr, "rename", &nat_fsp_rename);
     def_method(vm, pr, "stat", &nat_fsp_stat);
+    vm_pop(vm);
     return pr;
 }
 
@@ -11709,6 +11952,12 @@ private JsObject* build_fs_module(VM* vm) {
     def_node_export(vm, mod, ns, "unlinkSync", &nat_fs_unlink);
     def_node_export(vm, mod, ns, "renameSync", &nat_fs_rename);
     def_node_export(vm, mod, ns, "statSync", &nat_fs_stat);
+    // nothing here follows symlinks, so lstat and stat see the same thing
+    def_node_export(vm, mod, ns, "lstatSync", &nat_fs_stat);
+    def_node_export(vm, mod, ns, "copyFileSync", &nat_fs_copy_file);
+    def_node_export(vm, mod, ns, "rmSync", &nat_fs_rm);
+    def_node_export(vm, mod, ns, "accessSync", &nat_fs_access);
+    def_node_export(vm, mod, ns, "realpathSync", &nat_fs_realpath);
     // callback (async) API
     def_node_export(vm, mod, ns, "readFile", &nat_fscb_read_file);
     def_node_export(vm, mod, ns, "writeFile", &nat_fscb_write_file);
@@ -11719,6 +11968,16 @@ private JsObject* build_fs_module(VM* vm) {
     def_node_export(vm, mod, ns, "unlink", &nat_fscb_unlink);
     def_node_export(vm, mod, ns, "rename", &nat_fscb_rename);
     def_node_export(vm, mod, ns, "stat", &nat_fscb_stat);
+    // fs.constants: the access-mode bits callers pass to accessSync
+    JsObject* consts = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&consts.head));
+    def_value_enum(vm, consts, "F_OK", value_number(0.0));
+    def_value_enum(vm, consts, "R_OK", value_number(4.0));
+    def_value_enum(vm, consts, "W_OK", value_number(2.0));
+    def_value_enum(vm, consts, "X_OK", value_number(1.0));
+    def_node_value(vm, mod, ns, "constants", value_cell(&consts.head));
+    vm_pop(vm);
+
     // fs.promises
     JsObject* pr = build_fs_promises(vm);
     def_node_value(vm, mod, ns, "promises", value_cell(&pr.head));

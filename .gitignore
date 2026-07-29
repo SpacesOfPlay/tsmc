@@ -5,3 +5,6 @@ vendor/
 *.obj
 *.tmp
 node_modules/
+
+# scratch directory used by test/diff/fs_semantics.js
+test/diff/.fs-sweep/
