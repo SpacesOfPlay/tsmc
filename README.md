@@ -1,38 +1,57 @@
 # ts-minc
 
-A TypeScript interpreter written in [minc](https://minc.dev).
+A TypeScript runtime written in [minc](https://minc.dev).
 
 `tsmc script.ts` runs TypeScript the way Bun and Deno do: type
 annotations are parsed and erased, nothing is type-checked, and the TS
 constructs with runtime semantics (`enum`, `namespace`, constructor
-parameter properties) are lowered and executed. It is a bytecode VM with
-a precise mark-sweep GC, written in minc. `.js` files run as well, and
-`node_modules` resolve through the CommonJS and ESM algorithms.
+parameter properties) are lowered and executed. It is a bytecode
+interpreter with a precise mark-sweep GC, written in minc. `.js` files
+run as well, and `require` walks `node_modules`, so many pure-JavaScript
+npm packages run unmodified.
 
 ## What runs
 
-Supported ECMAScript includes classes, generators, async/await,
-top-level await, modules (CommonJS and ESM, including dynamic
-`import()`), Proxy/Reflect, BigInt, typed arrays,
-`Map`/`Set`/`WeakMap`/`WeakSet`, and regular expressions including
-Unicode property escapes.
+The language: classes, generators, async/await, top-level await,
+modules (CommonJS and ESM, including dynamic `import()`), Proxy and
+Reflect, BigInt, typed arrays, `Map`/`Set`/`WeakMap`/`WeakSet`,
+`arguments`, and regular expressions with Unicode property escapes.
 
-A subset of the Node.js standard library is implemented: `fs` (with
-`fs/promises`), `path`, `os`, `events`, `stream`, `util`, `buffer`,
-`zlib`, `assert`, `process`, `timers`, and `tty`; `crypto` provides
-MD5/SHA-1/SHA-256/SHA-384/SHA-512 hashes, HMAC, and the `random*`
-functions. Networking covers `net`, `http`,
-and `https` clients and servers, the `fetch` and `URL` globals, and a
-TLS 1.3 stack: the client validates the server certificate against a
-bundled root store, and the server presents an ECDSA-P256 or RSA
-certificate.
+A subset of the Node standard library: `fs` (with `fs/promises`),
+`path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
+`process`, `timers` (with `timers/promises`), and `tty`. `crypto` has
+MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
+`timingSafeEqual`, and the `random*` functions. The globals include
+`fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,
+`structuredClone` and `console`.
 
-Not supported: `eval` / `new Function` (no runtime code generation),
-native addons, `Intl`, and several core modules (`child_process`,
-`worker_threads`, `dns`, and others). `doc/npm-compatibility.md` lists
-npm packages that have been run against the interpreter.
+Networking is `net`, `http`, `https` and `tls` — clients and servers, on
+a non-blocking event loop. The TLS 1.3 stack is the project's own. The
+client validates the server certificate against a bundled root store.
+The server presents an ECDSA-P256 or RSA certificate and sends the
+issuer chain with it.
 
-See `doc/META_PLAN.md` for the design decisions and architecture.
+Not supported: `eval` and `new Function`, since there is no runtime code
+generation. No native addons, no `Intl`, and no `child_process`,
+`worker_threads` or `dns`. `Buffer` is backed by an array rather than a
+`Uint8Array`, so it fails an `instanceof` check and copies where node
+shares memory (`doc/PLAN_M42_buffer_uint8array.md`). An ESM `import`
+takes a relative path only — a bare specifier needs `require`. Async
+generators run under `for await`, but the object they return is not a
+real async iterator: `Symbol.asyncIterator` is missing, `.next()` hands
+back no promise, and `yield*` inside one inserts stray `undefined`s.
+There is no `fs.createReadStream`, so a file is read whole.
+
+`doc/npm-compatibility.md` lists the npm packages that have been run
+against the interpreter. `doc/META_PLAN.md` holds the design decisions
+and architecture.
+
+## An example
+
+`examples/serve` is an HTTPS content server written in TypeScript and
+run directly: Markdown through `markdown-it`, front matter through
+`js-yaml`, SHA-256 entity tags, conditional requests, gzip, a directory
+index, and TLS terminated by tsmc itself.
 
 ## Build
 
@@ -55,6 +74,16 @@ library in `lib/` next to the binary.
 ./build.ps1 t262       # ECMAScript conformance (test262) — see below
 ./build.ps1 clean      # remove build/
 ```
+
+## Tests
+
+27 unit tests in minc exercise the interpreter from the inside. 29
+scripts are checked against golden output. 135 differential scripts run
+under both tsmc and a reference node, and the two outputs are compared
+byte for byte — that suite is the guard against quiet divergence, and
+most of it was written by sweeping one area at a time against node. All
+164 scripts then run again under `--gc-stress`, which collects on every
+allocation.
 
 ## Conformance (test262)
 
@@ -89,13 +118,14 @@ current snapshot and will change as the interpreter does.
 ## Layout
 
 ```
-src/     interpreter source (modern minc)
-doc/     design documents and milestone plans
-test/    unit tests (minc), golden run tests, and differential (.js) tests
-tools/   test262 conformance runner
-minc/    local minc deploy: compiler + lib/ + docs (gitignored)
-build/   build artifacts (gitignored)
-vendor/  fetched test262 checkout (gitignored)
+src/       interpreter source (modern minc)
+doc/       design documents and milestone plans
+test/      unit tests (minc), golden run tests, and differential (.js) tests
+examples/  a TypeScript HTTPS server, on real npm packages
+tools/     test262 conformance runner
+minc/      local minc deploy: compiler + lib/ + docs (gitignored)
+build/     build artifacts (gitignored)
+vendor/    fetched test262 checkout (gitignored)
 ```
 
 ## License

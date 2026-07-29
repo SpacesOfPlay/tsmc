@@ -1,8 +1,10 @@
 # npm package compatibility
 
-tsmc runs `.js`/`.ts` files Bun-style and resolves `node_modules` with the
-CommonJS + ESM algorithms (`package.json` `main`/`exports`, the
+tsmc runs `.js`/`.ts` files Bun-style and `require` resolves `node_modules`
+with the CommonJS algorithm (`package.json` `main`/`exports`, the
 `node_modules` walk), so many pure-JavaScript npm packages run unmodified.
+An ESM `import` takes a relative path only, so a package is reachable through
+`require` alone.
 This page is an **empirical** list: every entry below was actually executed
 under tsmc and its output compared byte-for-byte against Node. It is a
 snapshot, not a guarantee — see [Reproducing](#reproducing) to re-run it.
