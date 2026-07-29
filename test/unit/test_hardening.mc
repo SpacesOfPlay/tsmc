@@ -24,6 +24,7 @@ i32 run(str src) {
     VM m;
     vm_init(&m);
     builtins_install(&m);
+    m.quiet_errors = true;
     vm_set_global(&m, "probe", vm_make_native(&m, &probe_native, "probe"));
     i32 st = vm_run_source(&m, src, "harden");
     vm_destroy(&m);

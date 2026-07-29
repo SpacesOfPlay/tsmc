@@ -129,6 +129,7 @@ struct VM {
     Value pending;
     bool has_pending;
     bool unwind_return;   // the pending value is a return completion, not a throw
+    bool quiet_errors;    // suppress diagnostic/uncaught printing (embedders running expected-failure sources)
     u32 atom_length;
     u32 atom_prototype;
     u32 atom_name;
@@ -2452,6 +2453,7 @@ void vm_init(VM* vm) {
     vm.pending = value_undefined();
     vm.has_pending = false;
     vm.unwind_return = false;
+    vm.quiet_errors = false;
     vm.atom_length = atom_intern(&vm.atoms, "length");
     vm.atom_prototype = atom_intern(&vm.atoms, "prototype");
     vm.atom_name = atom_intern(&vm.atoms, "name");
@@ -2592,6 +2594,7 @@ private i32 rd_u16(u8* code, i32 at) {
 }
 
 private void print_uncaught(VM* vm, Value e) {
+    if vm.quiet_errors { return; }
     if value_is_object(e) {
         // prefer the full stack (Name: message + frames)
         Value sv;
@@ -5232,8 +5235,10 @@ i32 vm_report_unhandled(VM* vm) {
         js_set_prop(p, vm.atom_phandled, value_bool(true));
         Value* rv = props_get(&p.props, vm.atom_pvalue);
         Value reason = rv != null ? *rv : value_undefined();
-        eprint("Unhandled promise rejection. ");
-        print_uncaught(vm, reason);
+        if !vm.quiet_errors {
+            eprint("Unhandled promise rejection. ");
+            print_uncaught(vm, reason);
+        }
         found = 1;
     }
     vm.rejections.len = 0;
@@ -5549,7 +5554,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         }
     }
     if d.n_errors > 0 {
-        diags_print(&d, src_name, src);
+        if !vm.quiet_errors { diags_print(&d, src_name, src); }
         status = 2;
     }
     lower_destroy(&lw);

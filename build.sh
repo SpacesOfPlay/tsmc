@@ -105,8 +105,15 @@ run_tests() {
     # Golden run tests: run test/run/<name>.ts, diff stdout against <name>.expected.
     step "run tests"
     n_run=0
+    n_run_skip=0
     for f in "$PROJECT_DIR"/test/run/*.ts; do
         [ -e "$f" ] || continue
+        # Networking tests need net_os, which is only ported on Windows
+        # so far (build.ps1 covers them there). Remove once POSIX net lands.
+        case "$(basename "$f")" in
+            tls_plaintext_reply.ts)
+                n_run_skip=$((n_run_skip + 1)); continue ;;
+        esac
         n_run=$((n_run + 1))
         name="$(basename "$f" .ts)"
         exp="${f%.ts}.expected"
@@ -124,6 +131,7 @@ run_tests() {
         pass "$name"; n_pass=$((n_pass + 1))
     done
     [ "$n_run" -eq 0 ] && echo "  (none yet)"
+    [ "$n_run_skip" -gt 0 ] && echo "  ($n_run_skip net script(s) skipped)"
 
     # GC stress: re-run every golden and differential script with
     # collect-on-every-allocation, catching use-after-free / missing roots.
@@ -137,7 +145,7 @@ run_tests() {
         # Networking scripts need net_os, which is only ported on Windows
         # so far (build.ps1 covers them there). Remove once POSIX net lands.
         case "$(basename "$f")" in
-            fetch.js|http.js|net.js|tls_error.js|webapi.js|https_server.js|https_server_rsa.js)
+            fetch.js|http.js|net.js|tls_error.js|webapi.js|https_server.js|https_server_rsa.js|http_semantics.js|tls_plaintext_port.js|tls_server_error.js|tls_plaintext_reply.ts)
                 n_stress_skip=$((n_stress_skip + 1)); continue ;;
         esac
         n_stress=$((n_stress + 1))

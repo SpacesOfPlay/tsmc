@@ -23,6 +23,7 @@ i32 run_snippet(str src) {
     VM m;
     vm_init(&m);
     builtins_install(&m);
+    m.quiet_errors = true;
     vm_set_global(&m, "probe", vm_make_native(&m, &probe_native, "probe"));
     i32 st = vm_run_source(&m, src, "snippet");
     vm_destroy(&m);
@@ -110,6 +111,7 @@ i32 main() {
         VM m;
         vm_init(&m);
         builtins_install(&m);
+        m.quiet_errors = true;
         m.heap.stress = true;
         vm_set_global(&m, "probe", vm_make_native(&m, &probe_native, "probe"));
         i32 st = vm_run_source(&m,

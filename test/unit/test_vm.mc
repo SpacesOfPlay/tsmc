@@ -24,6 +24,7 @@ i32 run_snippet(str src, bool stress) {
     g_probe_n = 0;
     VM m;
     vm_init(&m);
+    m.quiet_errors = true;   // error-path snippets are expected to fail
     m.heap.stress = stress;
     vm_set_global(&m, "probe", vm_make_native(&m, &probe_native, "probe"));
     i32 st = vm_run_source(&m, src, "snippet");
