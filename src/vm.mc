@@ -15,7 +15,7 @@ import object;
 import ustr;
 import bigint;
 import os_time;
-import net_os;
+import net;
 import bytecode;
 import ast;
 import bump;
@@ -5095,7 +5095,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
         }
     }
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
-    i32 r = net_os_poll(pf, npoll, to);
+    i32 r = net_poll(pf, npoll, to);
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;

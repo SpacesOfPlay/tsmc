@@ -20,7 +20,7 @@ import math;
 import file;
 import deflate;
 import inflate;
-import net_os;
+import net;
 import os_time;
 import tls_native;
 import tls_chain;
@@ -9875,7 +9875,8 @@ private void typedarray_install(VM* vm) {
 
 // --- net (TCP sockets) ------------------------------------------------------
 //
-// Thin native primitives over net_os; all protocol logic (events, write
+// Thin native primitives over the net library's non-blocking layer; all
+// protocol logic (events, write
 // queue, backpressure) lives in the JS `net` module (src/node_net.mc).
 // The reactor calls net_reactor_dispatch for each ready handle, which
 // simply hands off to the JS owner's __onReady(revents).
@@ -9903,7 +9904,7 @@ private u32 net_host_to_ip(VM* vm, Value hostv, bool for_bind) {
     i32 n = h.len < 255 ? h.len : 255;
     for i32 i = 0; i < n; i++ { cbuf[i] = *(h.data + i); }
     cbuf[n] = 0;
-    return net_os_resolve4(&cbuf[0]);
+    return net_resolve4(&cbuf[0]);
 }
 
 private Value nat_net_connect(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -9911,7 +9912,7 @@ private Value nat_net_connect(void* vmp, Value callee, Value thisv, Value* args,
     u32 ip = net_host_to_ip(vm, arg_at(args, argc, 0), false);
     if ip == 0 { return value_int(-1); }
     i32 port = to_int_arg(arg_at(args, argc, 1));
-    i64 fd = net_os_connect_start(ip, cast(u16, port));
+    i64 fd = net_connect_start(ip, cast(u16, port));
     if fd == -1 { return value_int(-1); }
     i32 id = vm_handle_add(vm, fd, 0, value_undefined());
     vm_handle_set_interest(vm, id, NET_POLLOUT);
@@ -9922,7 +9923,7 @@ private Value nat_net_listen(void* vmp, Value callee, Value thisv, Value* args, 
     VM* vm = as_vm(vmp);
     i32 port = to_int_arg(arg_at(args, argc, 0));
     u32 bind_ip = net_host_to_ip(vm, arg_at(args, argc, 1), true);
-    i64 fd = net_os_listen4(bind_ip, cast(u16, port));
+    i64 fd = net_nb_listen4(bind_ip, cast(u16, port));
     if fd == -1 { return value_int(-1); }
     i32 id = vm_handle_add(vm, fd, 0, value_undefined());
     vm_handle_set_interest(vm, id, NET_POLLIN);
@@ -9933,7 +9934,7 @@ private Value nat_net_accept(void* vmp, Value callee, Value thisv, Value* args, 
     VM* vm = as_vm(vmp);
     i64 lfd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
     if lfd < 0 { return value_int(-1); }
-    i64 afd = net_os_accept(lfd);
+    i64 afd = net_try_accept(lfd);
     if afd < 0 { return value_int(-1); }
     i32 nid = vm_handle_add(vm, afd, 0, value_undefined());
     vm_handle_set_interest(vm, nid, NET_POLLIN);
@@ -9945,7 +9946,7 @@ private Value nat_net_recv(void* vmp, Value callee, Value thisv, Value* args, i3
     i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
     if fd < 0 { return value_int(-1); }
     u8[16384] buf;
-    i32 n = net_os_recv(fd, &buf[0], 16384);
+    i32 n = net_try_recv(fd, &buf[0], 16384);
     if n > 0 { return buf_from_bytes(vm, &buf[0], n); }
     if n == 0 { return value_int(0); }            // clean EOF
     if n == NET_WOULDBLOCK { return value_null(); }
@@ -9970,7 +9971,7 @@ private Value nat_net_send(void* vmp, Value callee, Value thisv, Value* args, i3
         i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, off + i))) : buf_byte(o, off + i);
         tmp[i] = cast(u8, b & 0xFF);
     }
-    return value_int(net_os_send(fd, &tmp[0], chunk));
+    return value_int(net_try_send(fd, &tmp[0], chunk));
 }
 
 private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -9985,7 +9986,7 @@ private Value nat_net_close(void* vmp, Value callee, Value thisv, Value* args, i
     VM* vm = as_vm(vmp);
     i32 id = to_int_arg(arg_at(args, argc, 0));
     i64 fd = vm_handle_fd(vm, id);
-    if fd >= 0 { net_os_close(fd); }
+    if fd >= 0 { net_fd_close(fd); }
     vm_handle_close(vm, id);
     vm_handle_unref(vm, id);
     return value_undefined();
@@ -9995,7 +9996,7 @@ private Value nat_net_connect_result(void* vmp, Value callee, Value thisv, Value
     VM* vm = as_vm(vmp);
     i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
     if fd < 0 { return value_int(NET_ERR); }
-    return value_int(net_os_connect_result(fd));
+    return value_int(net_connect_result(fd));
 }
 
 private Value nat_net_set_owner(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10008,7 +10009,7 @@ private Value nat_net_port(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
     if fd < 0 { return value_int(0); }
-    return value_int(cast(i32, net_os_port(fd)));
+    return value_int(cast(i32, net_fd_port(fd)));
 }
 
 private Value nat_net_ref(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10049,7 +10050,7 @@ private Value nat_tls_connect(void* vmp, Value callee, Value thisv, Value* args,
     u32 ip = net_host_to_ip(vm, arg_at(args, argc, 0), false);
     if ip == 0 { return value_int(-1); }
     i32 port = to_int_arg(arg_at(args, argc, 1));
-    i64 fd = net_os_connect_start(ip, cast(u16, port));
+    i64 fd = net_connect_start(ip, cast(u16, port));
     if fd == -1 { return value_int(-1); }
     Value sniv = arg_at(args, argc, 2);
     u8[256] sni;
@@ -10062,7 +10063,7 @@ private Value nat_tls_connect(void* vmp, Value callee, Value thisv, Value* args,
     }
     bool insecure = js_truthy(arg_at(args, argc, 3));
     TlsSession* s = tls_session_new(has_sni ? &sni[0] : null, insecure);
-    if s == null { net_os_close(fd); return value_int(-1); }
+    if s == null { net_fd_close(fd); return value_int(-1); }
     i32 id = vm_handle_add(vm, fd, 0, value_undefined());
     vm_handle_set_interest(vm, id, cast(i16, NET_POLLIN | NET_POLLOUT));
     vm_handle_set_ext(vm, id, cast(void*, s));
@@ -10122,7 +10123,7 @@ private Value nat_tls_close(void* vmp, Value callee, Value thisv, Value* args, i
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
     if s != null { tls_session_free(s); vm_handle_set_ext(vm, id, null); }
     i64 fd = vm_handle_fd(vm, id);
-    if fd >= 0 { net_os_close(fd); }
+    if fd >= 0 { net_fd_close(fd); }
     vm_handle_close(vm, id);
     vm_handle_unref(vm, id);
     return value_undefined();
@@ -10260,7 +10261,7 @@ private Value nat_tls_server_ctx_free(void* vmp, Value callee, Value thisv, Valu
 }
 
 private void net_install(VM* vm) {
-    ignore net_os_init();
+    ignore net_init();
     vm_set_reactor_hook(vm, &net_reactor_dispatch);
     ignore def_global_fn(vm, "__tls_connect", &nat_tls_connect);
     ignore def_global_fn(vm, "__tls_server_ctx", &nat_tls_server_ctx);

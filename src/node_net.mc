@@ -9,9 +9,9 @@ str node_net_source() {
     return "'use strict';
 const EventEmitter = require('events');
 
-const POLLIN = 0x0100;
-const POLLOUT = 0x0010;
-const POLLBAD = 0x0003;   // POLLERR | POLLHUP
+const POLLIN = 0x0001;
+const POLLOUT = 0x0004;
+const POLLBAD = 0x0018;   // POLLERR | POLLHUP
 
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');

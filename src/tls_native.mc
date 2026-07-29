@@ -11,7 +11,7 @@
 // (rejectUnauthorized:false) skips chain+hostname but still verifies the
 // handshake signature. See doc/PLAN_M34_tls.md and doc/PLAN_M35_ca_trust.md.
 
-import net_os;
+import net;
 import os_time;
 
 // tls_pump result bits.
@@ -21,7 +21,7 @@ const i32 TLS_EOF = 4;
 const i32 TLS_ERR = 8;
 const i32 TLS_WANT_WRITE = 16;
 
-// The sandbox has no sockets (net_os stubs every operation there), so a
+// The sandbox has no sockets (the net library has no wasm arm), so a
 // session could never handshake; stubbing the API here keeps the vendored
 // picotls tree and its libc shims out of the wasm module entirely.
 // __tls_connect sees the null session and reports -1 to the JS layer.
@@ -390,7 +390,7 @@ bool tls_wants_write(TlsSession* s) {
 private bool tls_flush(TlsSession* s, i64 fd) {
     while s.send_off < cast(i64, s.sendbuf.off) {
         i32 remain = cast(i32, cast(i64, s.sendbuf.off) - s.send_off);
-        i32 n = net_os_send(fd, s.sendbuf.base + s.send_off, remain);
+        i32 n = net_try_send(fd, s.sendbuf.base + s.send_off, remain);
         if n == NET_WOULDBLOCK { return true; }
         if n < 0 { return false; }
         s.send_off += cast(i64, n);
@@ -410,7 +410,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     // client to speak first, so tls_feed alone drives its handshake.
     if !s.is_server {
         if !s.checked_connect {
-            if net_os_connect_result(fd) != 0 { s.failed = true; return TLS_ERR; }
+            if net_connect_result(fd) != 0 { s.failed = true; return TLS_ERR; }
             s.checked_connect = true;
         }
         if !s.started {
@@ -425,7 +425,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     while more {
         more = false;
         u8[8192] tmp;
-        i32 n = net_os_recv(fd, &tmp[0], 8192);
+        i32 n = net_try_recv(fd, &tmp[0], 8192);
         if n == 0 {
             s.eof = true;
             flags = flags | TLS_EOF;
