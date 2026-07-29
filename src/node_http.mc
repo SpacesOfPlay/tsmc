@@ -20,10 +20,15 @@ const STATUS = {
   304: 'Not Modified', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
   400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
   404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
-  413: 'Payload Too Large', 418: 'I am a teapot', 429: 'Too Many Requests',
+  413: 'Payload Too Large', 429: 'Too Many Requests',
   500: 'Internal Server Error', 501: 'Not Implemented',
   502: 'Bad Gateway', 503: 'Service Unavailable',
 };
+
+// Set apart from the table above: the reason phrase carries an apostrophe,
+// and this source is embedded in a minc string literal that takes neither a
+// double quote nor a backslash escape.
+STATUS[418] = 'I' + String.fromCharCode(39) + 'm a Teapot';
 
 function statusText(code) { return STATUS[code] || 'Unknown'; }
 
@@ -60,7 +65,13 @@ function parseHeaders(text) {
     if (idx < 0) continue;
     const k = line.slice(0, idx).trim().toLowerCase();
     const v = line.slice(idx + 1).trim();
-    if (headers[k] !== undefined) headers[k] = headers[k] + ', ' + v;
+    // Set-Cookie is the one header that must not be folded: each cookie is a
+    // separate value, and joining them with a comma makes them unparseable,
+    // since a cookie may carry a comma of its own in an Expires date.
+    if (k === 'set-cookie') {
+      if (headers[k] === undefined) headers[k] = [v];
+      else headers[k].push(v);
+    } else if (headers[k] !== undefined) headers[k] = headers[k] + ', ' + v;
     else headers[k] = v;
   }
   return headers;
@@ -97,9 +108,11 @@ class IncomingMessage extends EventEmitter {
 }
 
 class ServerResponse extends EventEmitter {
-  constructor(socket) {
+  constructor(socket, method) {
     super();
     this.socket = socket;
+    // the request method decides whether a body may be sent at all
+    this._method = method || 'GET';
     this.statusCode = 200;
     this.statusMessage = '';
     this.headersSent = false;
@@ -109,7 +122,14 @@ class ServerResponse extends EventEmitter {
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
   getHeader(k) { return this._headers[k.toLowerCase()]; }
+  hasHeader(k) { return this._headers[k.toLowerCase()] !== undefined; }
   removeHeader(k) { delete this._headers[k.toLowerCase()]; }
+  getHeaderNames() { return Object.keys(this._headers); }
+  getHeaders() {
+    const copy = {};
+    for (const k in this._headers) copy[k] = this._headers[k];
+    return copy;
+  }
   writeHead(status, reason, headers) {
     this.statusCode = status;
     if (typeof reason === 'string') this.statusMessage = reason;
@@ -126,12 +146,27 @@ class ServerResponse extends EventEmitter {
     if (this._headers['content-length'] === undefined) this._headers['content-length'] = body.length;
     if (this._headers['connection'] === undefined) this._headers['connection'] = 'close';
     let head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + CRLF;
-    for (const k in this._headers) head += canon(k) + ': ' + this._headers[k] + CRLF;
+    // An array value means one header line per element, not one line holding a
+    // comma-joined list: that is how Set-Cookie sends several cookies, and
+    // folding them produces a single cookie no client can take apart.
+    for (const k in this._headers) {
+      const v = this._headers[k];
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) head += canon(k) + ': ' + v[i] + CRLF;
+      } else {
+        head += canon(k) + ': ' + v + CRLF;
+      }
+    }
     head += CRLF;
     this.headersSent = true;
     this.finished = true;
     this.socket.write(Buffer.from(head, 'utf8'));
-    if (body.length) this.socket.write(body);
+    // A response to HEAD, and a 204 or 304, carry no body -- the headers
+    // still describe what a GET would return. Sending one anyway leaves the
+    // client reading it as the start of the next response.
+    const bodyAllowed = this._method !== 'HEAD'
+      && this.statusCode !== 204 && this.statusCode !== 304;
+    if (body.length && bodyAllowed) this.socket.write(body);
     this.socket.end();
     this.emit('finish');
     return this;
@@ -167,7 +202,7 @@ function serveConnection(server, socket) {
       const cl = msg.headers['content-length'];
       remaining = cl !== undefined ? parseInt(cl, 10) : 0;
       state = 'body';
-      const res = new ServerResponse(socket);
+      const res = new ServerResponse(socket, msg.method);
       server.emit('request', msg, res);
     }
     if (state === 'body') {
@@ -192,7 +227,9 @@ class Server extends EventEmitter {
     const make = connFactory || ((onConn) => net.createServer(onConn));
     this._net = make((sock) => serveConnection(this, sock));
     this._net.on('error', (e) => this.emit('error', e));
-    this._net.on('listening', () => this.emit('listening'));
+    this.listening = false;
+    this._net.on('listening', () => { this.listening = true; this.emit('listening'); });
+    this._net.on('close', () => { this.listening = false; });
     // Node's https.Server is a tls.Server, so a handshake failure surfaces on
     // the server the caller holds. Here the TLS server is wrapped, so forward
     // it; a plain net server never emits this.
