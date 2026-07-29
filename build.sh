@@ -131,8 +131,15 @@ run_tests() {
     step "gc stress"
     n_stress=0
     n_stress_fail=0
+    n_stress_skip=0
     for f in "$PROJECT_DIR"/test/run/*.ts "$PROJECT_DIR"/test/diff/*.js "$PROJECT_DIR"/test/diff/*.mjs; do
         [ -e "$f" ] || continue
+        # Networking scripts need net_os, which is only ported on Windows
+        # so far (build.ps1 covers them there). Remove once POSIX net lands.
+        case "$(basename "$f")" in
+            fetch.js|http.js|net.js|tls_error.js)
+                n_stress_skip=$((n_stress_skip + 1)); continue ;;
+        esac
         n_stress=$((n_stress + 1))
         if ! "$OUT_EXE" --gc-stress "$f" > /dev/null 2>&1; then
             fail "$(basename "$f") (--gc-stress nonzero exit)"; n_stress_fail=$((n_stress_fail + 1))
@@ -141,7 +148,7 @@ run_tests() {
     if [ "$n_stress" -eq 0 ]; then
         echo "  (none)"
     elif [ "$n_stress_fail" -eq 0 ]; then
-        pass "$n_stress scripts clean under --gc-stress"; n_pass=$((n_pass + 1))
+        pass "$n_stress scripts clean under --gc-stress ($n_stress_skip net script(s) skipped)"; n_pass=$((n_pass + 1))
     else
         n_fail=$((n_fail + n_stress_fail))
     fi

@@ -21,6 +21,7 @@ import file;
 import deflate;
 import inflate;
 import net_os;
+import os_time;
 import tls_native;
 import tls_chain;
 import "tls/picotls.mc";   // cifra SHA-384/512 for the crypto module's digests
@@ -6896,10 +6897,11 @@ private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
 
 // --- process ----------------------------------------------------------------
 //
-// A Node-like `process` global. OS facilities (pid, cwd, environment,
-// monotonic clock) are reached through platform externs behind `when`.
+// A Node-like `process` global. OS facilities (pid, cwd, environment)
+// are reached through platform externs behind `when`; the monotonic
+// clock is the reactor's (os_time.mc).
 
-struct ProcTimespec { i64 tv_sec; i64 tv_nsec; }
+private u64 os_mono_ns() { return vm_clock_ns(); }
 
 // Enumerable data property (the normal writable/enumerable/configurable
 // shape), as opposed to def_value's frozen constants.
@@ -6935,8 +6937,6 @@ when os(windows) {
     private extern "kernel32.dll" u32 GetCurrentDirectoryA(u32 len, u8* buf);
     private extern "kernel32.dll" u8* GetEnvironmentStringsA();
     private extern "kernel32.dll" i32 FreeEnvironmentStringsA(u8* p);
-    private extern "kernel32.dll" i32 QueryPerformanceCounter(i64* p);
-    private extern "kernel32.dll" i32 QueryPerformanceFrequency(i64* p);
     private extern "msvcrt.dll" i32 _isatty(i32 fd);
 
     private bool os_isatty(i32 fd) { return _isatty(fd) != 0; }
@@ -6949,20 +6949,6 @@ when os(windows) {
         s.data = &buf[0];
         s.len = cast(i32, n);
         return new_str(vm, s);
-    }
-
-    private u64 os_mono_ns() {
-        i64 freq = 0;
-        i64 ctr = 0;
-        ignore QueryPerformanceFrequency(&freq);
-        ignore QueryPerformanceCounter(&ctr);
-        if freq == 0 { return 0; }
-        u64 uc = cast(u64, ctr);
-        u64 uf = cast(u64, freq);
-        // split to avoid overflow: ns = secs*1e9 + rem*1e9/freq
-        u64 secs = uc / uf;
-        u64 rem = uc % uf;
-        return secs * 1000000000 + rem * 1000000000 / uf;
     }
 
     private void os_env_install(VM* vm, JsObject* env) {
@@ -6989,13 +6975,11 @@ when os(windows) {
     }
 }
 else when os(wasm) {
-    // Sandbox: no process identity, no cwd, no environment. The
-    // monotonic counter is the host clock import (qpf is 1e9 there).
+    // Sandbox: no process identity, no cwd, no environment.
     private str os_platform_name() { return "wasm"; }
     private bool os_isatty(i32 fd) { return false; }
     private i32 os_pid() { return 0; }
     private Value os_cwd_str(VM* vm) { return new_str(vm, "/"); }
-    private u64 os_mono_ns() { return cast(u64, qpc()); }
     private void os_env_install(VM* vm, JsObject* env) { }
 }
 else when os(macos) || os(ios) || os(linux) || os(android) {
@@ -7003,31 +6987,25 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         private str os_platform_name() { return "darwin"; }
         private extern "libSystem.B.dylib" i32 getpid();
         private extern "libSystem.B.dylib" u8* getcwd(u8* buf, u64 size);
-        private extern "libSystem.B.dylib" i32 clock_gettime(i32 clk, ProcTimespec* ts);
         private extern "libSystem.B.dylib" u8*** _NSGetEnviron();
         private extern "libSystem.B.dylib" i32 isatty(i32 fd);
         private u8** os_environ() { return *_NSGetEnviron(); }
-        private i32 os_mono_clock() { return 6; }  // CLOCK_MONOTONIC (darwin)
     }
     else when os(android) {
         private str os_platform_name() { return "android"; }
         private extern "libc.so" i32 getpid();
         private extern "libc.so" u8* getcwd(u8* buf, u64 size);
-        private extern "libc.so" i32 clock_gettime(i32 clk, ProcTimespec* ts);
         private extern "libc.so" u8** environ;
         private extern "libc.so" i32 isatty(i32 fd);
         private u8** os_environ() { return environ; }
-        private i32 os_mono_clock() { return 1; }  // CLOCK_MONOTONIC (linux)
     }
     else {
         private str os_platform_name() { return "linux"; }
         private extern "libc.so.6" i32 getpid();
         private extern "libc.so.6" u8* getcwd(u8* buf, u64 size);
-        private extern "libc.so.6" i32 clock_gettime(i32 clk, ProcTimespec* ts);
         private extern "libc.so.6" u8** environ;
         private extern "libc.so.6" i32 isatty(i32 fd);
         private u8** os_environ() { return environ; }
-        private i32 os_mono_clock() { return 1; }  // CLOCK_MONOTONIC (linux)
     }
 
     private bool os_isatty(i32 fd) { return isatty(fd) != 0; }
@@ -7038,14 +7016,6 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         u8* r = getcwd(&buf[0], 4096);
         if r == null { return new_str(vm, ""); }
         return new_str(vm, str_from_cstr(&buf[0]));
-    }
-
-    private u64 os_mono_ns() {
-        ProcTimespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 0;
-        ignore clock_gettime(os_mono_clock(), &ts);
-        return cast(u64, ts.tv_sec) * 1000000000 + cast(u64, ts.tv_nsec);
     }
 
     private void os_env_install(VM* vm, JsObject* env) {
@@ -9817,25 +9787,10 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     return value_undefined();
 }
 
-// See fs_exists1's wasm arm: the file_exists builtin is unusable there.
-when os(wasm) {
-    private bool fs_exists1(str path) {
-        u8* c = str_to_cstr(path);
-        i64 fd = open(c, 0);
-        free(c);
-        if fd == cast(i64, 0) - 1 { return false; }
-        close(fd);
-        return true;
-    }
-}
-else {
-    private bool fs_exists1(str path) { return file_exists(path); }
-}
-
 private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    bool ok = fs_exists1(path);
+    bool ok = file_exists(path);
     vm_pop(vm);
     return value_bool(ok);
 }

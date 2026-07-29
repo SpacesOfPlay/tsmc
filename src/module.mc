@@ -198,28 +198,11 @@ private str path_join(str dir, str spec) {
     return r;
 }
 
-when os(wasm) {
-    // The file_exists builtin lowers to the Win32 implementation on the
-    // wasm target (minc doc/BUG_wasm_file_exists_emits_kernel32_imports.md),
-    // which no host can satisfy. Probing with the open/close imports
-    // keeps the module's import set to the host surface. Drop this arm
-    // once the builtin lowers correctly.
-    private bool file_there(str path) {
-        u8* c = str_to_cstr(path);
-        i64 fd = open(c, 0);
-        free(c);
-        if fd == cast(i64, 0) - 1 { return false; }
-        close(fd);
-        return true;
-    }
-}
-else {
-    private bool file_there(str path) {
-        u8* c = str_to_cstr(path);
-        bool ok = file_exists(c);
-        free(c);
-        return ok;
-    }
+private bool file_there(str path) {
+    u8* c = str_to_cstr(path);
+    bool ok = file_exists(c);
+    free(c);
+    return ok;
 }
 
 // joined + suffix if that file exists (heap str), else {null, 0}.

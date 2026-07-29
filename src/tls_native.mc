@@ -11,11 +11,6 @@
 // (rejectUnauthorized:false) skips chain+hostname but still verifies the
 // handshake signature. See doc/PLAN_M34_tls.md and doc/PLAN_M35_ca_trust.md.
 
-import "tls/picotls.mc";
-import "tls_x509.mc";
-import "tls_verify.mc";
-import "tls_p384.mc";
-import "tls_chain.mc";
 import net_os;
 import os_time;
 
@@ -25,6 +20,34 @@ const i32 TLS_HAS_DATA = 2;
 const i32 TLS_EOF = 4;
 const i32 TLS_ERR = 8;
 const i32 TLS_WANT_WRITE = 16;
+
+// The sandbox has no sockets (net_os stubs every operation there), so a
+// session could never handshake; stubbing the API here keeps the vendored
+// picotls tree and its libc shims out of the wasm module entirely.
+// __tls_connect sees the null session and reports -1 to the JS layer.
+when os(wasm) {
+    struct TlsSession { bool established; bool failed; }
+    void tls_set_ecdsa_pin(u8* spki32) { }
+    TlsSession* tls_session_new(u8* sni, bool insecure) { return null; }
+    void tls_session_free(TlsSession* s) { }
+    bool tls_wants_write(TlsSession* s) { return false; }
+    i32 tls_pump(TlsSession* s, i64 fd) { return TLS_ERR; }
+    bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) { return false; }
+    i32 tls_read(TlsSession* s, u8* out, i32 max) { return 0 - 1; }
+    bool tls_established(TlsSession* s) { return false; }
+    bool tls_failed(TlsSession* s) { return true; }
+    i32 tls_chain_error(TlsSession* s) { return 0; }
+    i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) { return 0 - 1; }
+    void tls_server_ctx_free(i32 id) { }
+    TlsSession* tls_server_session_new(i32 ctx_id) { return null; }
+}
+else {
+// --- native implementation (everything below) --------------------------------
+import "tls/picotls.mc";
+import "tls_x509.mc";
+import "tls_verify.mc";
+import "tls_p384.mc";
+import "tls_chain.mc";
 
 // --- shared client contexts (built once; must outlive every session) ---
 
@@ -691,3 +714,4 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     s.eof = false;
     return s;
 }
+}   // end !wasm native implementation

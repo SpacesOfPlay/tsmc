@@ -65,9 +65,14 @@ void test_hook(VM* vm, i32 idx, i16 revents) {
 }
 
 i32 main() {
+    // net_os is only ported on Windows so far; elsewhere listen/connect
+    // report failure and the reactor would wait forever for events.
+    if !net_os_init() {
+        print("  SKIP  net_os not ported on this platform\n");
+        return 0;
+    }
     VM m;
     vm_init(&m);
-    check(net_os_init(), "WSAStartup");
     vm_set_reactor_hook(&m, &test_hook);
 
     i64 lfd = net_os_listen4(NET_LOOPBACK_BE, cast(u16, 0));
