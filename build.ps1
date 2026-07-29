@@ -6,7 +6,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("build", "test", "bench", "diff", "t262", "clean", "help")]
+    [ValidateSet("build", "plugins", "test", "bench", "diff", "t262", "clean", "help")]
     [string]$Command = "help",
 
     [Parameter(ValueFromRemainingArguments=$true)]
@@ -53,6 +53,23 @@ function Build-Tsmc {
     $rc = Invoke-Minc @((Join-Path $ProjectDir "src\main.mc"), "-o", $OutExe)
     if ($rc -ne 0) { Fail "compile failed"; exit 1 }
     Pass $OutExe
+}
+
+# A separate binary: plugins bind the embeddable compiler at load time, so
+# this one needs the library beside it to start at all. The default build
+# stays a single file with nothing to find.
+function Build-Plugins {
+    Step "build tsmc with plugin support"
+    Assert-Toolchain
+    New-Item -ItemType Directory -Force $BuildDir | Out-Null
+    $out = Join-Path $BuildDir "tsmc-plugins.exe"
+    $rc = Invoke-Minc @((Join-Path $ProjectDir "src\main.mc"), "-DTSMC_PLUGINS", "-o", $out)
+    if ($rc -ne 0) { Fail "compile failed"; exit 1 }
+    foreach ($lib in @("libminc.dll", "libminc.so", "libminc.dylib")) {
+        $src = Join-Path $MincDir $lib
+        if (Test-Path $src) { Copy-Item $src $BuildDir -Force }
+    }
+    Pass $out
 }
 
 function Run-Tests {
@@ -167,6 +184,7 @@ function Run-Diff {
 
 switch ($Command) {
     "build" { Build-Tsmc }
+    "plugins" { Build-Plugins }
     "test"  { Run-Tests }
     "bench" { Run-Bench }
     "diff"  { Run-Diff }
@@ -193,8 +211,9 @@ switch ($Command) {
         Pass "removed build/"
     }
     "help" {
-        Write-Host "usage: ./build.ps1 <build|test|bench|diff|t262|clean>"
+        Write-Host "usage: ./build.ps1 <build|plugins|test|bench|diff|t262|clean>"
         Write-Host "  build   compile build/tsmc.exe"
+        Write-Host "  plugins compile build/tsmc-plugins.exe (loads minc plugins)"
         Write-Host "  test    build, then run unit + cli + golden run tests"
         Write-Host "  bench   build, then time bench/*.ts"
         Write-Host "  diff    build, then diff test/diff/*.js vs node"

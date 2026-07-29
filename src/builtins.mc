@@ -24,6 +24,8 @@ import net;
 import os_time;
 import tls_native;
 import tls_chain;
+import tsmc_plugin_abi;
+import plugin;
 import "tls/picotls.mc";   // cifra SHA-384/512 for the crypto module's digests
 
 // Platform math not covered by the math module: hyperbolic functions
@@ -11317,6 +11319,134 @@ private JsObject* new_node_module(VM* vm, JsObject** out_mod) {
     props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&mod.head), PROP_DEFAULT);
     *out_mod = mod;
     return ns;
+}
+
+// --- plugins: natives written in minc, compiled and loaded at require() ---
+//
+// A plugin is built as its own program and shares no symbols with the
+// interpreter, so it reaches everything through the TsmcApi table below.
+// That table is a file-level global on purpose: a plugin keeps the pointer
+// it is handed, so a stack copy would dangle as soon as registration
+// returned.
+//
+// Every thunk that can allocate roots the Values it was passed first. A
+// Value in a thunk's parameter is as invisible to the collector as one in a
+// plugin local, and interning a property name allocates.
+
+// What export_fn writes to while a plugin registers.
+private struct PluginReg {
+    VM* vm;
+    JsObject* mod;
+    JsObject* ns;
+}
+
+private void plug_export(void* regp, str name, TsmcNative f) {
+    PluginReg* reg = cast(PluginReg*, regp);
+    VM* vm = reg.vm;
+    JsNative* n = js_new_native(&vm.heap, cast(NativeFn, f), name);
+    Value v = value_cell(&n.head);
+    vm_push(vm, v);
+    u32 key = bi_atom(vm, name);
+    props_set_desc(&reg.mod.props, key, v, PROP_DEFAULT);
+    props_set_desc(&reg.ns.props, key, v, PROP_DEFAULT);
+    vm_pop(vm);
+}
+
+private Value plug_new_string(void* vmp, str s) { return new_str(as_vm(vmp), s); }
+
+private Value plug_new_number(f64 x) { return value_number(x); }
+
+private Value plug_new_undefined() { return value_undefined(); }
+
+private Value plug_new_object(void* vmp) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    return value_cell(&o.head);
+}
+
+private Value plug_arg(Value* args, i32 argc, i32 i) { return arg_at(args, argc, i); }
+
+private f64 plug_to_number(void* vmp, Value v) { return vm_to_number(as_vm(vmp), v); }
+
+private void plug_set_prop(void* vmp, Value obj, str name, Value v) {
+    if !value_is_object(obj) { return; }
+    VM* vm = as_vm(vmp);
+    vm_push(vm, v);
+    u32 key = bi_atom(vm, name);
+    props_set_desc(&value_as_object(obj).props, key, v, PROP_DEFAULT);
+    vm_pop(vm);
+}
+
+private void plug_push_root(void* vmp, Value v) { vm_push(as_vm(vmp), v); }
+private void plug_pop_root(void* vmp) { vm_pop(as_vm(vmp)); }
+
+private void plug_throw_type(void* vmp, str msg) {
+    vm_throw_error(as_vm(vmp), ERR_TYPE, msg);
+}
+
+private TsmcApi g_plugin_api;
+private bool g_plugin_api_filled = false;
+
+private TsmcApi* plugin_api() {
+    if !g_plugin_api_filled {
+        g_plugin_api.abi_version = TSMC_PLUGIN_ABI;
+        g_plugin_api.export_fn = &plug_export;
+        g_plugin_api.new_string = &plug_new_string;
+        g_plugin_api.new_number = &plug_new_number;
+        g_plugin_api.new_undefined = &plug_new_undefined;
+        g_plugin_api.new_object = &plug_new_object;
+        g_plugin_api.arg = &plug_arg;
+        g_plugin_api.to_number = &plug_to_number;
+        g_plugin_api.set_prop = &plug_set_prop;
+        g_plugin_api.push_root = &plug_push_root;
+        g_plugin_api.pop_root = &plug_pop_root;
+        g_plugin_api.throw_type_error = &plug_throw_type;
+        g_plugin_api_filled = true;
+    }
+    return &g_plugin_api;
+}
+
+// Compiles `path`, refuses it unless its ABI word matches, then lets it hang
+// exports on a fresh namespace. Returns the module object, or throws.
+//
+// The image is never released. A registered native's code pointer travels
+// into the GC heap inside a JsNative, and from there into anything the
+// script does with the function, so there is no cheap way to know that the
+// last reference is gone -- unloading would leave those cells pointing at
+// unmapped pages. Load-only sidesteps that; reloading needs an indirection
+// the natives can be re-pointed through.
+Value builtins_load_plugin(VM* vm, str path) {
+    if !plugin_host_ready() {
+        vm_throw_error(vm, ERR_TYPE, plugin_host_error());
+        return value_undefined();
+    }
+    void* image = plugin_compile(path);
+    if image == null {
+        vm_throw_error(vm, ERR_TYPE, plugin_host_error());
+        return value_undefined();
+    }
+    void* pabi = plugin_symbol(image, "tsmc_plugin_abi_version");
+    void* preg = plugin_symbol(image, "tsmc_plugin_register");
+    if pabi == null || preg == null {
+        plugin_release(image);
+        vm_throw_error(vm, ERR_TYPE, "not a tsmc plugin: tsmc_plugin_abi_version or tsmc_plugin_register is missing");
+        return value_undefined();
+    }
+    TsmcPluginAbiFn plugin_abi = cast(TsmcPluginAbiFn, pabi);
+    if plugin_abi() != TSMC_PLUGIN_ABI {
+        plugin_release(image);
+        vm_throw_error(vm, ERR_TYPE, "plugin was built against a different tsmc plugin ABI");
+        return value_undefined();
+    }
+    JsObject* mod = null;
+    JsObject* ns = new_node_module(vm, &mod);
+    PluginReg reg;
+    reg.vm = vm;
+    reg.mod = mod;
+    reg.ns = ns;
+    TsmcPluginRegFn plugin_register = cast(TsmcPluginRegFn, preg);
+    plugin_register(plugin_api(), &reg);
+    return value_cell(&mod.head);
 }
 
 // --- fs: OS layer (dir/type ops; read/write/stat use the file lib) ---

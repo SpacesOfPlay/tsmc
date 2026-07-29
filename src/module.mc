@@ -1121,6 +1121,15 @@ private JsObject* js_builtin_namespace(VM* vm, Value exports) {
 
 // Synchronously loads and evaluates the CJS module named by `spec` from a
 // module at `importer_path`; returns its `module.exports`.
+// A ".mc" tail. Spelled out here because the path_is_* helpers come later in
+// the file, and this is needed before them.
+private bool path_is_mc_ext(str p) {
+    if p.len < 3 { return false; }
+    return *(p.data + p.len - 3) == '.'
+        && *(p.data + p.len - 2) == 'm'
+        && *(p.data + p.len - 1) == 'c';
+}
+
 Value module_require(VM* vm, str importer_path, str spec) {
     // 1. built-in module (fs / path / os / ..., incl. node: prefix)
     str bname = builtin_name(spec);
@@ -1154,6 +1163,28 @@ Value module_require(VM* vm, str importer_path, str spec) {
         Value ex;
         if value_is_object(cached) && vm_get_prop_value(vm, cached, exports_atom, &ex) { return ex; }
         return value_undefined();
+    }
+
+    // 3b. a .mc file: a plugin. The interpreter does not read it — the
+    //     compiler does. Cached like any other module, so a second require
+    //     returns the same exports rather than compiling twice.
+    if path_is_mc_ext(resolved) {
+        i32 pm = gc_root_mark(&vm.heap);
+        Value ex = builtins_load_plugin(vm, resolved);
+        Value ret = value_undefined();
+        if !vm.has_pending {
+            gc_root(&vm.heap, ex);
+            JsObject* pmod = js_new_object(&vm.heap, vm.object_proto);
+            Value pmv = value_cell(&pmod.head);
+            gc_root(&vm.heap, pmv);
+            js_set_prop(pmod, exports_atom, ex);
+            js_set_prop(cache, key, pmv);
+            ret = ex;
+        }
+        gc_root_reset(&vm.heap, pm);
+        free(resolved.data);
+        free(canon.data);
+        return ret;
     }
 
     // 4. read source
