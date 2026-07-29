@@ -10057,6 +10057,9 @@ private Value nat_tls_error_text(void* vmp, Value callee, Value thisv, Value* ar
     if s == null { return value_null(); }
     i32 code = tls_error_code(s);
     if code == 0 { return value_null(); }
+    if code == TLS_ERR_NOT_TLS {
+        return new_str(vm, "peer is not speaking TLS (a plain HTTP request on an HTTPS port?)");
+    }
     if code >= 512 { return new_str(vm, format("internal error {}", code)); }
     str who = "alert sent: ";
     if code >= 256 { who = "peer alert: "; }

@@ -280,6 +280,7 @@ struct TlsSession {
     bool checked_connect;     // confirmed the non-blocking TCP connect
     bool started;
     bool is_server;           // accepted connection: no connect, no ClientHello
+    bool saw_input;           // some inbound bytes have reached the handshake
     bool established;
     bool failed;
     bool eof;
@@ -326,8 +327,28 @@ private void tls_shift(TlsSession* s, i32 n) {
 }
 
 // Feed accumulated ciphertext through the handshake / receive path.
+// A TLS record begins with a content type in 20..23. Anything else is a peer
+// that is not speaking TLS -- most often a browser sent to http:// on an
+// https:// port. Answering that with a TLS alert is worse than useless: the
+// browser renders the alert bytes as the page. Close instead, as node does.
+private bool tls_looks_like_tls(TlsSession* s) {
+    if s.cipher_in_len < 1 { return true; }
+    u8 c = s.cipher_in[0];
+    return c >= cast(u8, 20) && c <= cast(u8, 23);
+}
+
 private i32 tls_feed(TlsSession* s) {
     i32 flags = 0;
+    if s.is_server && !s.saw_input && s.cipher_in_len > 0 {
+        s.saw_input = true;
+        if !tls_looks_like_tls(s) {
+            s.failed = true;
+            s.tls_err = TLS_ERR_NOT_TLS;
+            // deliberately without stepping picotls, so no alert is generated
+            // and nothing is sent back
+            return TLS_ERR;
+        }
+    }
     while s.cipher_in_len > 0 && !s.failed {
         u64 consumed = cast(u64, s.cipher_in_len);
         void* input = cast(void*, &s.cipher_in[0]);
@@ -456,6 +477,11 @@ i32 tls_chain_error(TlsSession* s) { return s.chain_err; }
 // plus a class: 0 when we raised it, 256 when the peer sent it. Anything at
 // 512 or above is an internal failure rather than an alert.
 i32 tls_error_code(TlsSession* s) { return s.tls_err; }
+
+// Reported instead of a picotls result when the peer was not speaking TLS at
+// all. Above the alert range and below picotls's own error class, so it can be
+// mistaken for neither.
+const i32 TLS_ERR_NOT_TLS = 400;
 
 // Short name for an alert, for the message on a failed handshake.
 str tls_alert_str(i32 alert) {
