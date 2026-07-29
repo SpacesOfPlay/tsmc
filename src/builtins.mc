@@ -14005,7 +14005,7 @@ private Value nat_zlib_deflate_raw(void* vmp, Value callee, Value thisv, Value* 
     i32 inlen = 0;
     u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
     i32 outlen = 0;
-    u8* out = zlib_deflate_raw(in, inlen, &outlen);
+    u8* out = zlib_compress_raw(in, inlen, zlib_level_arg(vm, arg_at(args, argc, 1)), &outlen);
     free(in);
     if out == null { vm_throw_error(vm, ERR_ERROR, "deflate failed"); return value_undefined(); }
     Value r = buf_from_bytes(vm, out, outlen);
@@ -14026,12 +14026,55 @@ private Value nat_zlib_inflate_raw(void* vmp, Value callee, Value thisv, Value* 
     return r;
 }
 
+// The compression level from a `{ level }` option, or -1 for the default.
+private i32 zlib_level_arg(VM* vm, Value opts) {
+    if !value_is_object(opts) { return 0 - 1; }
+    Value lv;
+    if !vm_get_prop_value(vm, opts, bi_atom(vm, "level"), &lv) { return 0 - 1; }
+    if !value_is_number(lv) { return 0 - 1; }
+    return to_int_arg(lv);
+}
+
+// Level 0 means do not compress: the data goes into stored deflate blocks,
+// which cost four bytes of framing each and nothing else. Callers ask for it
+// when the input is already compressed and the CPU would be wasted.
+private u8* zlib_store_raw(u8* src, i32 n, i32* outlen) {
+    i32 blocks = n / 65535 + 1;
+    u8* dst = alloc<u8>(n + blocks * 5 + 5);
+    i32 at = 0;
+    i32 pos = 0;
+    while true {
+        i32 chunk = n - pos;
+        if chunk > 65535 { chunk = 65535; }
+        bool last = pos + chunk >= n;
+        *(dst + at) = last ? cast(u8, 1) : cast(u8, 0);   // BFINAL, BTYPE=00
+        at++;
+        *(dst + at) = cast(u8, chunk & 255);
+        *(dst + at + 1) = cast(u8, (chunk >> 8) & 255);
+        *(dst + at + 2) = cast(u8, (~chunk) & 255);
+        *(dst + at + 3) = cast(u8, ((~chunk) >> 8) & 255);
+        at += 4;
+        if chunk > 0 { memcpy(dst + at, src + pos, cast(i64, chunk)); }
+        at += chunk;
+        pos += chunk;
+        if last { break; }
+    }
+    *outlen = at;
+    return dst;
+}
+
+// Raw deflate honouring the level: 0 stores, anything else compresses.
+private u8* zlib_compress_raw(u8* src, i32 n, i32 level, i32* outlen) {
+    if level == 0 { return zlib_store_raw(src, n, outlen); }
+    return zlib_deflate_raw(src, n, outlen);
+}
+
 private Value nat_zlib_deflate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 inlen = 0;
     u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
     i32 rawlen = 0;
-    u8* raw = zlib_deflate_raw(in, inlen, &rawlen);
+    u8* raw = zlib_compress_raw(in, inlen, zlib_level_arg(vm, arg_at(args, argc, 1)), &rawlen);
     if raw == null { free(in); vm_throw_error(vm, ERR_ERROR, "deflate failed"); return value_undefined(); }
     u32 adler = zlib_adler32(in, inlen);
     free(in);
@@ -14071,7 +14114,7 @@ private Value nat_zlib_gzip(void* vmp, Value callee, Value thisv, Value* args, i
     i32 inlen = 0;
     u8* in = zlib_input(vm, arg_at(args, argc, 0), &inlen);
     i32 rawlen = 0;
-    u8* raw = zlib_deflate_raw(in, inlen, &rawlen);
+    u8* raw = zlib_compress_raw(in, inlen, zlib_level_arg(vm, arg_at(args, argc, 1)), &rawlen);
     if raw == null { free(in); vm_throw_error(vm, ERR_ERROR, "gzip failed"); return value_undefined(); }
     u32 crc = zlib_crc32(in, inlen);
     u32 isize = cast(u32, inlen);
@@ -14131,6 +14174,63 @@ private Value nat_zlib_gunzip(void* vmp, Value callee, Value thisv, Value* args,
     return r;
 }
 
+// unzipSync takes either wrapper. A gzip stream starts 1f 8b; a zlib one has
+// deflate in the low nibble of its first byte and a two-byte header that is a
+// multiple of 31. Anything else is neither.
+private Value nat_zlib_unzip(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 n = 0;
+    u8* src = zlib_input(vm, arg_at(args, argc, 0), &n);
+    bool is_gzip = n >= 2 && *(src) == 0x1F && *(src + 1) == 0x8B;
+    bool is_zlib = n >= 2 && (*(src) & 0x0F) == 8
+        && ((cast(i32, *(src)) << 8) + cast(i32, *(src + 1))) % 31 == 0;
+    free(src);
+    if is_gzip { return nat_zlib_gunzip(vmp, callee, thisv, args, argc); }
+    if is_zlib { return nat_zlib_inflate(vmp, callee, thisv, args, argc); }
+    vm_throw_error(vm, ERR_ERROR, "incorrect header check");
+    return value_undefined();
+}
+
+// The callback spellings: run the synchronous core, then deliver its result
+// or its error to cb(err, value) on a later turn, as node does. Which core to
+// run rides in env0, so one wrapper serves all four.
+private Value nat_zlib_async(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 which = value_as_int(value_as_native(callee).env0);
+    Value cb = arg_at(args, argc, argc - 1);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "callback is not a function");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value r = value_undefined();
+    if which == 0 { r = nat_zlib_gzip(vmp, callee, thisv, args, argc); }
+    else if which == 1 { r = nat_zlib_gunzip(vmp, callee, thisv, args, argc); }
+    else if which == 2 { r = nat_zlib_deflate(vmp, callee, thisv, args, argc); }
+    else if which == 3 { r = nat_zlib_inflate(vmp, callee, thisv, args, argc); }
+    else { r = nat_zlib_unzip(vmp, callee, thisv, args, argc); }
+    gc_root(&vm.heap, r);
+    Value err = value_null();
+    if vm.has_pending {
+        err = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        gc_root(&vm.heap, err);
+        r = value_undefined();
+    }
+    fs_schedule_cb(vm, cb, err, r);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private void def_zlib_async(VM* vm, JsObject* mod, JsObject* ns, str name, i32 which) {
+    JsNative* n = js_new_native(&vm.heap, &nat_zlib_async, name);
+    n.env0 = value_int(which);
+    Value v = value_cell(&n.head);
+    props_set_desc(&mod.props, bi_atom(vm, name), v, PROP_DEFAULT);
+    props_set_desc(&ns.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
 private JsObject* build_zlib_module(VM* vm) {
     JsObject* mod;
     JsObject* ns = new_node_module(vm, &mod);
@@ -14140,7 +14240,24 @@ private JsObject* build_zlib_module(VM* vm) {
     def_node_export(vm, mod, ns, "inflateSync", &nat_zlib_inflate);
     def_node_export(vm, mod, ns, "gzipSync", &nat_zlib_gzip);
     def_node_export(vm, mod, ns, "gunzipSync", &nat_zlib_gunzip);
-    def_node_export(vm, mod, ns, "unzipSync", &nat_zlib_gunzip);
+    def_node_export(vm, mod, ns, "unzipSync", &nat_zlib_unzip);
+    def_zlib_async(vm, mod, ns, "gzip", 0);
+    def_zlib_async(vm, mod, ns, "gunzip", 1);
+    def_zlib_async(vm, mod, ns, "deflate", 2);
+    def_zlib_async(vm, mod, ns, "inflate", 3);
+    def_zlib_async(vm, mod, ns, "unzip", 4);
+
+    // zlib.constants: the level names callers pass as { level: ... }
+    JsObject* consts = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&consts.head));
+    def_value_enum(vm, consts, "Z_NO_COMPRESSION", value_number(0.0));
+    def_value_enum(vm, consts, "Z_BEST_SPEED", value_number(1.0));
+    def_value_enum(vm, consts, "Z_BEST_COMPRESSION", value_number(9.0));
+    def_value_enum(vm, consts, "Z_DEFAULT_COMPRESSION", value_number(-1.0));
+    def_value_enum(vm, consts, "Z_NO_FLUSH", value_number(0.0));
+    def_value_enum(vm, consts, "Z_FINISH", value_number(4.0));
+    def_node_value(vm, mod, ns, "constants", value_cell(&consts.head));
+    vm_pop(vm);
     return ns;
 }
 
