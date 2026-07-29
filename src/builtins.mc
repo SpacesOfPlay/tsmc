@@ -13239,6 +13239,7 @@ private void sha1_hash(u8* data, i32 len, u8* out) {
 private i32 crypto_algo_id(str a) {
     if ci_eq(a, "md5") { return 16; }
     if ci_eq(a, "sha1") || ci_eq(a, "sha-1") { return 20; }
+    if ci_eq(a, "sha224") || ci_eq(a, "sha-224") { return 28; }
     if ci_eq(a, "sha256") || ci_eq(a, "sha-256") { return 32; }
     if ci_eq(a, "sha384") || ci_eq(a, "sha-384") { return 48; }
     if ci_eq(a, "sha512") || ci_eq(a, "sha-512") { return 64; }
@@ -13252,6 +13253,13 @@ private i32 crypto_algo_block_len(i32 dlen) { return dlen <= 32 ? 64 : 128; }
 private void crypto_algo_hash(i32 dlen, u8* data, i32 len, u8* out) {
     if dlen == 16 { md5_hash(data, len, out); }
     else if dlen == 20 { sha1_hash(data, len, out); }
+    else if dlen == 28 {
+        // SHA-224 is SHA-256 with a different start state, truncated
+        cf_sha256_context st;
+        cf_sha224_init(&st);
+        cf_sha224_update(&st, cast(void*, data), cast(u64, len));
+        cf_sha224_digest_final(&st, out);
+    }
     else if dlen == 32 { sha256_hash(data, len, out); }
     else if dlen == 48 {
         cf_sha512_context st;
@@ -13367,6 +13375,141 @@ private Value crypto_finalize_digest(VM* vm, u8* bytes, i32 dlen, Value encv) {
     return b;
 }
 
+// A hash or HMAC is single-use: once digest() has run the accumulated state
+// is spent, and quietly answering a second call would hand back a digest of
+// something the caller did not ask about.
+private bool crypto_spent(VM* vm, Value thisv) {
+    if !value_is_object(thisv) { return false; }
+    Value d;
+    if !js_get_prop(value_as_object(thisv), bi_atom(vm, "%done"), &d) { return false; }
+    return js_truthy(d);
+}
+
+private void crypto_mark_spent(VM* vm, Value thisv) {
+    if !value_is_object(thisv) { return; }
+    js_set_prop(value_as_object(thisv), bi_atom(vm, "%done"), value_bool(true));
+}
+
+// Constant-time comparison: the loop always runs the full length, so how long
+// it takes says nothing about where the first difference is.
+private Value nat_crypto_timing_safe_equal(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value av = arg_at(args, argc, 0);
+    Value bv = arg_at(args, argc, 1);
+    if !value_is_array(av) || !value_is_array(bv) {
+        vm_throw_error(vm, ERR_TYPE, "timingSafeEqual expects two buffers");
+        return value_undefined();
+    }
+    JsObject* a = value_as_object(av);
+    JsObject* b = value_as_object(bv);
+    if a.elen != b.elen {
+        vm_throw_error(vm, ERR_RANGE, "Input buffers must have the same byte length");
+        return value_undefined();
+    }
+    i32 diff = 0;
+    for i32 i = 0; i < a.elen; i++ {
+        diff = diff | (buf_byte(a, i) ^ buf_byte(b, i));
+    }
+    return value_bool(diff == 0);
+}
+
+// randomInt(max) or randomInt(min, max): uniform over [min, max).
+private Value nat_crypto_random_int(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i64 lo = 0;
+    i64 hi = 0;
+    if argc >= 2 && value_is_number(arg_at(args, argc, 1)) {
+        lo = cast(i64, js_to_number(arg_at(args, argc, 0)));
+        hi = cast(i64, js_to_number(arg_at(args, argc, 1)));
+    } else {
+        hi = cast(i64, js_to_number(arg_at(args, argc, 0)));
+    }
+    if hi <= lo {
+        vm_throw_error(vm, ERR_RANGE, "The value of \"max\" is out of range");
+        return value_undefined();
+    }
+    u64 span = cast(u64, hi - lo);
+    // rejection sampling, so every value in the range is equally likely
+    u64 limit = 0xFFFFFFFFFFFFFFFF - (0xFFFFFFFFFFFFFFFF % span) - 1;
+    u64 r = 0;
+    while true {
+        u8[8] raw;
+        ignore os_random(&raw[0], 8);
+        r = 0;
+        for i32 i = 0; i < 8; i++ { r = (r << 8) | cast(u64, raw[i]); }
+        if r <= limit { break; }
+    }
+    return value_number(cast(f64, lo + cast(i64, r % span)));
+}
+
+// PBKDF2-HMAC: the derived key is the concatenation of blocks, each of which
+// is `iterations` HMAC rounds XORed together.
+private Value nat_crypto_pbkdf2_sync(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 iters = to_int_arg(arg_at(args, argc, 2));
+    i32 keylen = to_int_arg(arg_at(args, argc, 3));
+    i32 dlen = 20;
+    Value dv = arg_at(args, argc, 4);
+    if value_is_string(dv) { dlen = crypto_algo_id(sview(dv)); }
+    if dlen < 0 {
+        vm_throw_error(vm, ERR_TYPE, "Unknown digest");
+        return value_undefined();
+    }
+    if iters < 1 || keylen < 0 {
+        vm_throw_error(vm, ERR_RANGE, "Invalid iterations or key length");
+        return value_undefined();
+    }
+    str_buf pw;
+    str_buf_init(&pw);
+    fs_data_bytes(vm, &pw, arg_at(args, argc, 0), ENC_UTF8);
+    str_buf salt;
+    str_buf_init(&salt);
+    fs_data_bytes(vm, &salt, arg_at(args, argc, 1), ENC_UTF8);
+
+    str_buf outbuf;
+    str_buf_init(&outbuf);
+    i32 blocks = (keylen + dlen - 1) / dlen;
+    for i32 b = 1; b <= blocks; b++ {
+        // U1 = HMAC(pw, salt || INT32BE(b))
+        str_buf msg;
+        str_buf_init(&msg);
+        str_buf_add_bytes(&msg, salt.data, salt.len);
+        str_buf_add_byte(&msg, cast(u8, (b >> 24) & 255));
+        str_buf_add_byte(&msg, cast(u8, (b >> 16) & 255));
+        str_buf_add_byte(&msg, cast(u8, (b >> 8) & 255));
+        str_buf_add_byte(&msg, cast(u8, b & 255));
+        u8[64] u;
+        u8[64] acc;
+        hmac_compute(dlen, pw.data, pw.len, msg.data, msg.len, &u[0]);
+        str_buf_free(&msg);
+        for i32 i = 0; i < dlen; i++ { acc[i] = u[i]; }
+        for i32 it = 1; it < iters; it++ {
+            u8[64] nxt;
+            hmac_compute(dlen, pw.data, pw.len, &u[0], dlen, &nxt[0]);
+            for i32 i = 0; i < dlen; i++ { u[i] = nxt[i]; acc[i] = acc[i] ^ nxt[i]; }
+        }
+        for i32 i = 0; i < dlen; i++ { str_buf_add_byte(&outbuf, acc[i]); }
+    }
+    Value r = buf_from_bytes(vm, outbuf.data, keylen);
+    str_buf_free(&outbuf);
+    str_buf_free(&salt);
+    str_buf_free(&pw);
+    return r;
+}
+
+private Value nat_crypto_get_hashes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&a.head));
+    str[6] names = { "md5", "sha1", "sha224", "sha256", "sha384", "sha512" };
+    for i32 i = 0; i < 6; i++ {
+        js_array_set(a, i, new_str(vm, names[i]));
+    }
+    Value r = value_cell(&a.head);
+    vm_pop(vm);
+    return r;
+}
+
 private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
@@ -13394,6 +13537,10 @@ private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value
 private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     if !value_is_object(thisv) { return thisv; }
+    if crypto_spent(vm, thisv) {
+        vm_throw_error(vm, ERR_ERROR, "Digest already called");
+        return value_undefined();
+    }
     Value bufv;
     if !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv) || !value_is_array(bufv) {
         return thisv;
@@ -13419,6 +13566,11 @@ private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_hash_digest(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if crypto_spent(vm, thisv) {
+        vm_throw_error(vm, ERR_ERROR, "Digest already called");
+        return value_undefined();
+    }
+    crypto_mark_spent(vm, thisv);
     Value bufv;
     if !value_is_object(thisv)
         || !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv)
@@ -13448,7 +13600,9 @@ private Value nat_crypto_create_hmac(void* vmp, Value callee, Value thisv, Value
     i32 id = crypto_algo_id(sview(algv));
     if id < 0 {
         vm_pop(vm);
-        vm_throw_error(vm, ERR_ERROR, "Digest method not supported");
+        // node reports an unknown HMAC algorithm as a TypeError, unlike the
+        // plain-hash spelling
+        vm_throw_error(vm, ERR_TYPE, "Unknown message authentication code");
         return value_undefined();
     }
     Value keybuf = crypto_to_byte_buffer(vm, arg_at(args, argc, 1));
@@ -13469,6 +13623,8 @@ private Value nat_crypto_create_hmac(void* vmp, Value callee, Value thisv, Value
 
 private Value nat_hmac_digest(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    // Unlike Hash, an Hmac tolerates a second digest() call; the key material
+    // is still there, so node answers rather than refusing.
     if !value_is_object(thisv) { return value_undefined(); }
     JsObject* self = value_as_object(thisv);
     Value bufv;
@@ -13585,6 +13741,10 @@ private JsObject* build_crypto_module(VM* vm) {
     def_node_export(vm, mod, ns, "randomBytes", &nat_crypto_random_bytes);
     def_node_export(vm, mod, ns, "randomFillSync", &nat_crypto_random_fill_sync);
     def_node_export(vm, mod, ns, "randomUUID", &nat_crypto_random_uuid);
+    def_node_export(vm, mod, ns, "randomInt", &nat_crypto_random_int);
+    def_node_export(vm, mod, ns, "timingSafeEqual", &nat_crypto_timing_safe_equal);
+    def_node_export(vm, mod, ns, "pbkdf2Sync", &nat_crypto_pbkdf2_sync);
+    def_node_export(vm, mod, ns, "getHashes", &nat_crypto_get_hashes);
     return ns;
 }
 
