@@ -7752,6 +7752,27 @@ void builtins_set_entry(VM* vm, str filename, str dirname) {
     vm_set_global(vm, "__dirname", new_str(vm, dirname));
     vm_hide_global(vm, "__filename");
     vm_hide_global(vm, "__dirname");
+
+    // The entry runs as a script here, where node runs it as a module, so it
+    // would otherwise have no `module` or `exports` at all -- and
+    // `require.main === module`, the standard way a file asks whether it is
+    // the one that was run, throws a ReferenceError. They are hidden from the
+    // global object for the same reason __dirname is: module scope.
+    JsObject* m = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&m.head));
+    JsObject* ex = js_new_object(&vm.heap, vm.object_proto);
+    js_set_prop(m, bi_atom(vm, "exports"), value_cell(&ex.head));
+    js_set_prop(m, bi_atom(vm, "id"), new_str(vm, "."));
+    js_set_prop(m, bi_atom(vm, "filename"), new_str(vm, filename));
+    js_set_prop(m, bi_atom(vm, "loaded"), value_bool(false));
+    JsObject* kids = js_new_array(&vm.heap, vm.array_proto);
+    js_set_prop(m, bi_atom(vm, "children"), value_cell(&kids.head));
+    vm_set_main_module(vm, m);
+    vm_set_global(vm, "module", value_cell(&m.head));
+    vm_set_global(vm, "exports", value_cell(&ex.head));
+    vm_hide_global(vm, "module");
+    vm_hide_global(vm, "exports");
+    vm_pop(vm);
 }
 
 // Constants (e.g. Math.PI): non-writable, non-enumerable, non-configurable.

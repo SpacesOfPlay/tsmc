@@ -116,6 +116,9 @@ struct VM {
     Handler* handlers;
     i32 hp;
     IntMap<Value> globals;
+    // The entry file's module object, for require.main. Node's entry is a
+    // module like any other; here it is a script, so this stands in for it.
+    JsObject* main_module;
     // Bindings stored in the globals table that the global object must not
     // report. In node these are module-scoped, so a bare `__dirname` resolves
     // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
@@ -363,6 +366,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.url_proto != null { gc_mark_cell(h, &vm.url_proto.head); }
     if vm.usp_proto != null { gc_mark_cell(h, &vm.usp_proto.head); }
     if vm.require_cache != null { gc_mark_cell(h, &vm.require_cache.head); }
+    if vm.main_module != null { gc_mark_cell(h, &vm.main_module.head); }
     for i32 i = vm.job_head; i < vm.jobs.len; i++ {
         VmJob* j = vm.jobs.data + i;
         gc_mark_value(h, j.a);
@@ -1846,6 +1850,8 @@ bool prop_copyable(VM* vm, Prop* pr) {
 
 // --- globals ------------------------------------------------------------------------
 
+void vm_set_main_module(VM* vm, JsObject* m) { vm.main_module = m; }
+
 // A binding the global object does not expose. See hidden_globals.
 void vm_hide_global(VM* vm, str name) {
     if vm.n_hidden_globals >= 4 { return; }
@@ -2441,6 +2447,7 @@ void vm_init(VM* vm) {
     vm.hp = 0;
     intmap_init<Value>(&vm.globals);
     vm.n_hidden_globals = 0;
+    vm.main_module = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;

@@ -920,6 +920,32 @@ private str resolve_require(VM* vm, str importer_path, str spec) {
     return load_node_modules(vm, start, pkg, subpath);
 }
 
+// require.resolve(spec): where the specifier lands, without loading it.
+private Value nat_require_resolve(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    Value spv = argc > 0 ? *(args) : value_undefined();
+    if !value_is_string(spv) {
+        vm_throw_error(vm, ERR_TYPE, "require path must be a string");
+        return value_undefined();
+    }
+    vm_push(vm, spv);
+    str importer;
+    importer.data = null;
+    importer.len = 0;
+    if value_is_string(value_as_native(callee).env0) {
+        importer = js_str_view(value_as_native(callee).env0);
+    }
+    str resolved = resolve_require(vm, importer, js_str_view(spv));
+    vm_pop(vm);
+    if resolved.data == null {
+        require_throw_missing(vm, js_str_view(spv));
+        return value_undefined();
+    }
+    Value r = new_js_str(vm, resolved);
+    free(resolved.data);
+    return r;
+}
+
 // A `require` bound to the requiring module's path (env0), so nested
 // requires resolve relative to their own module's directory.
 private Value make_require_fn(VM* vm, str module_path) {
@@ -927,6 +953,24 @@ private Value make_require_fn(VM* vm, str module_path) {
     vm_push(vm, pv);
     JsNative* n = js_new_native(&vm.heap, &nat_require, "require");
     n.env0 = pv;
+    // rooted before anything else is allocated: the properties below each
+    // allocate, and an object held only in a local is not reachable from
+    // anywhere the collector looks
+    vm_push(vm, value_cell(&n.head));
+    // require.cache is the table the loader itself consults, so deleting an
+    // entry really does force a reload; require.resolve reports where a
+    // specifier lands without running it
+    props_set_desc(&n.props, atom_intern(&vm.atoms, "cache"),
+        value_cell(&require_cache(vm).head), PROP_DEFAULT);
+    JsNative* rs = js_new_native(&vm.heap, &nat_require_resolve, "resolve");
+    rs.env0 = pv;
+    props_set_desc(&n.props, atom_intern(&vm.atoms, "resolve"),
+        value_cell(&rs.head), PROP_DEFAULT);
+    if vm.main_module != null {
+        props_set_desc(&n.props, atom_intern(&vm.atoms, "main"),
+            value_cell(&vm.main_module.head), PROP_DEFAULT);
+    }
+    vm_pop(vm);
     vm_pop(vm);
     return value_cell(&n.head);
 }
@@ -1159,6 +1203,10 @@ Value module_require(VM* vm, str importer_path, str spec) {
     JsObject* exports = js_new_object(&vm.heap, vm.object_proto);
     js_set_prop(module, exports_atom, value_cell(&exports.head));
     js_set_prop(module, atom_intern(&vm.atoms, "id"), new_js_str(vm, canon));
+    js_set_prop(module, atom_intern(&vm.atoms, "filename"), new_js_str(vm, canon));
+    // false while the body runs, so a module can tell it is mid-load, and set
+    // once it returns
+    js_set_prop(module, atom_intern(&vm.atoms, "loaded"), value_bool(false));
     js_set_prop(cache, key, value_cell(&module.head));
 
     str fdir = dir_of(resolved);
@@ -1225,6 +1273,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     // 7. result = final module.exports (unless the body threw)
     Value result = value_undefined();
     if !vm.has_pending {
+        js_set_prop(module, atom_intern(&vm.atoms, "loaded"), value_bool(true));
         Value ex;
         // read through the property path so a module that redefined
         // module.exports as a getter (Object.defineProperty(module,
