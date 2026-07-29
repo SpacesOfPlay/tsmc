@@ -71,8 +71,10 @@ struct VmTimer {
     i32 id;
     bool alive;
     f64 due;      // absolute deadline, milliseconds on the monotonic clock
+    f64 period;   // > 0 for setInterval: rearmed this far ahead after firing
     i64 seq;
     Value cb;
+    Value args;   // extra arguments to hand the callback, or undefined
 }
 
 // An I/O handle keeps the reactor alive while open (Node's ref/unref) and
@@ -114,6 +116,12 @@ struct VM {
     Handler* handlers;
     i32 hp;
     IntMap<Value> globals;
+    // Bindings stored in the globals table that the global object must not
+    // report. In node these are module-scoped, so a bare `__dirname` resolves
+    // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
+    // table, so the distinction is made here instead.
+    u32[4] hidden_globals;
+    i32 n_hidden_globals;
     Vec<TmplPtr> troots;   // owned root templates; consts are GC roots
     Value pending;
     bool has_pending;
@@ -366,6 +374,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 i = 0; i < vm.timers.len; i++ {
         gc_mark_value(h, (vm.timers.data + i).cb);
+        gc_mark_value(h, (vm.timers.data + i).args);
     }
     for i32 i = 0; i < vm.handles.len; i++ {
         IoHandle* hd = vm.handles.data + i;
@@ -1243,6 +1252,19 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
         if (o.obj_flags & OBJF_PROXY) != 0 {
             return proxy_get(vm, cast(JsProxy*, o), a, objv, out);
         }
+        if (o.obj_flags & OBJF_GLOBAL) != 0 {
+            // read the binding itself, so a global declared after this object
+            // was built is still visible through it
+            Value* g = vm_global_hidden(vm, a) ? null : intmap_get<Value>(&vm.globals, a);
+            if g != null {
+                // an accessor is handed back as-is; vm_get_prop_value resolves
+                // it, which is also what makes a lazy global work here
+                *out = *g;
+                return true;
+            }
+            // not a binding: fall through for Object.prototype and anything
+            // defined directly on the object
+        }
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             if a == vm.atom_length {
                 *out = value_int(o.elen);
@@ -1453,6 +1475,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
         JsObject* o = value_as_object(objv);
         if (o.obj_flags & OBJF_PROXY) != 0 {
             return proxy_set(vm, cast(JsProxy*, o), a, v, objv);
+        }
+        if (o.obj_flags & OBJF_GLOBAL) != 0 {
+            // writing a property of the global object creates or updates the
+            // binding a bare name resolves to
+            intmap_set<Value>(&vm.globals, a, v);
+            return true;
         }
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             if a == vm.atom_length {
@@ -1817,6 +1845,45 @@ bool prop_copyable(VM* vm, Prop* pr) {
 }
 
 // --- globals ------------------------------------------------------------------------
+
+// A binding the global object does not expose. See hidden_globals.
+void vm_hide_global(VM* vm, str name) {
+    if vm.n_hidden_globals >= 4 { return; }
+    vm.hidden_globals[vm.n_hidden_globals] = atom_intern(&vm.atoms, name);
+    vm.n_hidden_globals++;
+}
+
+bool vm_global_hidden(VM* vm, u32 a) {
+    for i32 i = 0; i < vm.n_hidden_globals; i++ {
+        if vm.hidden_globals[i] == a { return true; }
+    }
+    return false;
+}
+
+// Whether a global binding of this atom exists. The global object needs to
+// answer for its bindings, which do not live in its property table.
+bool vm_global_exists(VM* vm, u32 a) {
+    if vm_global_hidden(vm, a) { return false; }
+    return intmap_get<Value>(&vm.globals, a) != null;
+}
+
+// Every global binding name, for enumerating the global object.
+JsObject* vm_global_names(VM* vm) {
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vpush(vm, value_cell(&arr.head));
+    i32 n = 0;
+    for i32 i = 0; i < vm.globals.cap; i++ {
+        IntSlot<Value>* sl = vm.globals.slots + i;
+        if sl.state != SLOT_USED { continue; }
+        if (sl.key & 0x80000000) != 0 { continue; }   // symbol-keyed
+        if vm_global_hidden(vm, sl.key) { continue; }
+        GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, sl.key));
+        js_array_set(arr, n, value_cell(&g.head));
+        n++;
+    }
+    vm.sp--;
+    return arr;
+}
 
 void vm_set_global(VM* vm, str name, Value v) {
     u32 a = atom_intern(&vm.atoms, name);
@@ -2235,6 +2302,7 @@ void vm_init(VM* vm) {
     vm.handlers = alloc<Handler>(VM_HANDLERS_MAX);
     vm.hp = 0;
     intmap_init<Value>(&vm.globals);
+    vm.n_hidden_globals = 0;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;
@@ -3060,6 +3128,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             r = idx < ta_prop_int(vm, o, vm.atom_ta_len);
                         } else if idx >= 0 {
                             r = js_array_has(o, idx);
+                        } else if (o.obj_flags & OBJF_GLOBAL) != 0 {
+                            r = vm_global_exists(vm, a) || js_has_prop(o, a);
                         } else {
                             r = js_has_prop(o, a);
                         }
@@ -4042,6 +4112,12 @@ private bool delete_key(VM* vm, Value objv, u32 a) {
         ignore proxy_delete(vm, cast(JsProxy*, o), a);
         return !vm.has_pending;
     }
+    if (o.obj_flags & OBJF_GLOBAL) != 0 {
+        // removing the binding, not a copy of it: the bare name stops
+        // resolving too
+        intmap_remove<Value>(&vm.globals, a);
+        return true;
+    }
     Prop* pe = props_entry(&o.props, a);
     if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
         vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
@@ -4809,15 +4885,23 @@ Value vm_build_arguments(VM* vm, Value* argstart, i32 argc) {
 private f64 vm_now_ms(VM* vm) { return cast(f64, vm_clock_ns()) / 1000000.0; }
 
 i32 vm_add_timer(VM* vm, Value cbfn, f64 delay) {
+    return vm_add_timer_full(vm, cbfn, delay, 0.0, value_undefined());
+}
+
+// `period` > 0 makes the timer repeat at that interval; `extra` is an array of
+// further arguments for the callback, or undefined.
+i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     VmTimer tm;
     tm.id = vm.next_timer_id;
     vm.next_timer_id++;
     tm.alive = true;
     // absolute deadline: negative/NaN delays clamp to "due now"
     tm.due = vm_now_ms(vm) + (delay > 0.0 ? delay : 0.0);
+    tm.period = period;
     tm.seq = vm.timer_seq;
     vm.timer_seq++;
     tm.cb = cbfn;
+    tm.args = extra;
     vec_push(&vm.timers, tm);
     return tm.id;
 }
@@ -4957,11 +5041,21 @@ i32 vm_run_event_loop(VM* vm) {
         }
         VmTimer* bt2 = vm.timers.data + best;
         Value cbfn = bt2.cb;
-        bt2.alive = false;
+        Value extra = bt2.args;
+        // a repeating timer is rearmed before it runs, so clearing it from
+        // inside its own callback still takes effect
+        if bt2.period > 0.0 { bt2.due = now + bt2.period; }
+        else { bt2.alive = false; }
         vpush(vm, cbfn);
+        vpush(vm, extra);
         Value dummy = value_undefined();
-        ignore vm_call_value(vm, cbfn, value_undefined(), &dummy, 0);
-        vm.sp--;
+        if value_is_array(extra) {
+            JsObject* ea = value_as_object(extra);
+            ignore vm_call_value(vm, cbfn, value_undefined(), ea.elems, ea.elen);
+        } else {
+            ignore vm_call_value(vm, cbfn, value_undefined(), &dummy, 0);
+        }
+        vm.sp -= 2;
         if vm.has_pending {
             Value e = vm.pending;
             vm.has_pending = false;

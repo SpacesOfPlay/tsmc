@@ -40,6 +40,9 @@ const i32 OBJF_PROXY_REVOKED = 16;   // a revoked Proxy: every operation throws
 // elements live outside the property table and carry no attributes.
 const i32 OBJF_SEALED = 32;
 const i32 OBJF_FROZEN = 64;
+// The one global object. Its properties ARE the global bindings rather than a
+// copy of them, so `globalThis.x = 1` and a bare `x = 1` reach the same place.
+const i32 OBJF_GLOBAL = 128;
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.

@@ -918,6 +918,10 @@ private bool own_prop_exists(VM* vm, Value ov, Value kv) {
 
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
+        if (o.obj_flags & OBJF_GLOBAL) != 0 {
+            // a global binding is an own property of the global object
+            if vm_global_exists(vm, a) { return true; }
+        }
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             if a == vm.atom_length { return true; }
             i32 idx = ta_atom_index(vm, a);
@@ -6073,15 +6077,59 @@ private Value nat_promise_any(void* vmp, Value callee, Value thisv, Value* args,
 
 // --- timers ------------------------------------------------------------------------------
 
-private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
+// Arguments after the delay are handed to the callback when it runs, so they
+// are collected into an array the timer owns.
+private Value timer_extra_args(VM* vm, Value* args, i32 argc) {
+    if argc <= 2 { return value_undefined(); }
+    JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+    for i32 i = 2; i < argc; i++ { js_array_set(a, i - 2, *(args + i)); }
+    return value_cell(&a.head);
+}
+
+private Value timer_add(VM* vm, Value* args, i32 argc, bool repeating) {
     Value cbfn = arg_at(args, argc, 0);
     if !value_is_callable(cbfn) { return value_int(0); }
     f64 delay = argc > 1 ? js_to_number(*(args + 1)) : 0.0;
     // a delay below 1ms is clamped up, so a 0ms and a 1ms timer share a
     // deadline and fire in registration order
     if delay != delay || delay < 1.0 { delay = 1.0; }
-    return value_int(vm_add_timer(vm, cbfn, delay));
+    i32 rm = gc_root_mark(&vm.heap);
+    Value extra = timer_extra_args(vm, args, argc);
+    gc_root(&vm.heap, extra);
+    i32 id = vm_add_timer_full(vm, cbfn, delay, repeating ? delay : 0.0, extra);
+    gc_root_reset(&vm.heap, rm);
+    return value_int(id);
+}
+
+private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return timer_add(as_vm(vmp), args, argc, false);
+}
+
+// setInterval keeps firing until cleared. It is emphatically not setTimeout:
+// a poller or heartbeat written against it would otherwise run once and stop,
+// with nothing to show that it had.
+private Value nat_set_interval(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return timer_add(as_vm(vmp), args, argc, true);
+}
+
+// setImmediate: due as soon as the loop next looks, so it runs after the
+// current turn and any microtasks, but ahead of a timer with a real delay.
+private Value nat_set_immediate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cbfn = arg_at(args, argc, 0);
+    if !value_is_callable(cbfn) { return value_int(0); }
+    i32 rm = gc_root_mark(&vm.heap);
+    // the argument list starts one earlier than a timer's, so it is rebuilt
+    JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+    Value extra = value_undefined();
+    if argc > 1 {
+        for i32 i = 1; i < argc; i++ { js_array_set(a, i - 1, *(args + i)); }
+        extra = value_cell(&a.head);
+    }
+    gc_root(&vm.heap, extra);
+    i32 id = vm_add_timer_full(vm, cbfn, 0.0, 0.0, extra);
+    gc_root_reset(&vm.heap, rm);
+    return value_int(id);
 }
 
 private Value nat_clear_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -7696,12 +7744,14 @@ private void def_static(VM* vm, JsNative* ctor, str name, NativeFn f) {
 
 // Installs the entry file's __filename / __dirname as global bindings.
 // These are entry-scoped, not per-module: imported modules see the entry
-// file's paths (documented in doc/PLAN_M16_node_globals.md). Set after
-// builtins_install, so they are not part of the globalThis snapshot,
-// matching Node (where they are module-local, not globalThis properties).
+// file's paths (documented in doc/PLAN_M16_node_globals.md). They are hidden
+// from the global object, because in Node they are module-scoped: a bare
+// __dirname resolves, while globalThis.__dirname is undefined.
 void builtins_set_entry(VM* vm, str filename, str dirname) {
     vm_set_global(vm, "__filename", new_str(vm, filename));
     vm_set_global(vm, "__dirname", new_str(vm, dirname));
+    vm_hide_global(vm, "__filename");
+    vm_hide_global(vm, "__dirname");
 }
 
 // Constants (e.g. Math.PI): non-writable, non-enumerable, non-configurable.
@@ -7907,6 +7957,28 @@ private Value nat_process_stderr_write(void* vmp, Value callee, Value thisv, Val
     return value_bool(true);
 }
 
+// Seconds since this process started, as node reports it.
+private Value nat_process_uptime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_number(cast(f64, vm_clock_ns()) / 1000000000.0);
+}
+
+// Heap figures from the collector. rss and external have no counterpart here,
+// so they report the heap total rather than inventing a number.
+private Value nat_process_memory(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&o.head));
+    f64 used = cast(f64, vm.heap.bytes_live);
+    def_value_enum(vm, o, "rss", value_number(used));
+    def_value_enum(vm, o, "heapTotal", value_number(used));
+    def_value_enum(vm, o, "heapUsed", value_number(used));
+    def_value_enum(vm, o, "external", value_number(0.0));
+    def_value_enum(vm, o, "arrayBuffers", value_number(0.0));
+    Value r = value_cell(&o.head);
+    vm_pop(vm);
+    return r;
+}
+
 private Value nat_process_cwd(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return os_cwd_str(as_vm(vmp));
 }
@@ -8028,6 +8100,8 @@ private void process_install(VM* vm) {
     if os_isatty(2) { def_value_enum(vm, errobj, "isTTY", value_bool(true)); }
 
     def_method(vm, proc, "cwd", &nat_process_cwd);
+    def_method(vm, proc, "uptime", &nat_process_uptime);
+    def_method(vm, proc, "memoryUsage", &nat_process_memory);
     def_method(vm, proc, "exit", &nat_process_exit);
     def_method(vm, proc, "nextTick", &nat_process_next_tick);
 
@@ -16271,8 +16345,10 @@ void builtins_install(VM* vm) {
     // timers and microtasks
     ignore def_global_fn(vm, "setTimeout", &nat_set_timeout);
     ignore def_global_fn(vm, "clearTimeout", &nat_clear_timeout);
-    ignore def_global_fn(vm, "setInterval", &nat_set_timeout);
+    ignore def_global_fn(vm, "setInterval", &nat_set_interval);
     ignore def_global_fn(vm, "clearInterval", &nat_clear_timeout);
+    ignore def_global_fn(vm, "setImmediate", &nat_set_immediate);
+    ignore def_global_fn(vm, "clearImmediate", &nat_clear_timeout);
     ignore def_global_fn(vm, "queueMicrotask", &nat_queue_microtask);
 
     // console.warn / console.info
@@ -16281,6 +16357,12 @@ void builtins_install(VM* vm) {
         JsObject* con = value_as_object(*cv);
         def_method(vm, con, "warn", &nat_console_warn);
         def_method(vm, con, "info", &nat_console_info);
+        // console.debug is console.log, as in node -- not a no-op, which is
+        // what its absence amounted to
+        Value logv;
+        if js_get_prop(con, bi_atom(vm, "log"), &logv) {
+            props_set_desc(&con.props, bi_atom(vm, "debug"), logv, METHOD_ATTRS);
+        }
     }
 
     // proto.constructor back-links
@@ -16310,21 +16392,17 @@ void builtins_install(VM* vm) {
     url_install(vm);
     process_install(vm);
 
-    // globalThis: an object mirroring the global bindings. Snapshotting
-    // the built-ins (rather than routing every property access to the
-    // globals table) keeps the hot property path untouched; this matches
-    // module scoping, where top-level declarations are not global props.
+    // globalThis. Its property operations are routed to the globals table
+    // itself (OBJF_GLOBAL) rather than copying it: a snapshot would drift the
+    // moment either side changed, so `globalThis.x = 1` would not define `x`
+    // and a bare `x = 1` would not appear on globalThis. Only this object pays
+    // for the indirection -- reading a bare name still goes straight to the
+    // table. Module-local top-level declarations are unaffected, since they
+    // are lexical bindings and never enter the table at all.
     JsObject* gt = js_new_object(&vm.heap, vm.object_proto);
-    for i32 i = 0; i < vm.globals.cap; i++ {
-        IntSlot<Value>* sl = vm.globals.slots + i;
-        if sl.state == SLOT_USED {
-            props_set_desc(&gt.props, sl.key, sl.val, METHOD_ATTRS);
-        }
-    }
+    gt.obj_flags = gt.obj_flags | OBJF_GLOBAL;
     Value gtv = value_cell(&gt.head);
-    props_set_desc(&gt.props, bi_atom(vm, "globalThis"), gtv, METHOD_ATTRS);
     vm_set_global(vm, "globalThis", gtv);
     // Node exposes the same global object as `global` too (=== globalThis).
-    props_set_desc(&gt.props, bi_atom(vm, "global"), gtv, METHOD_ATTRS);
     vm_set_global(vm, "global", gtv);
 }
