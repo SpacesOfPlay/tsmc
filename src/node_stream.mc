@@ -66,9 +66,13 @@ str node_stream_source() {
 "
         "    this._rs = { buffer: [], flowing: false, ended: false, endEmitted: false, reading: false, scheduled: false, destroyed: false };
 "
+        "    this._rs.objectMode = !!opts.objectMode;
+"
         "    if (typeof opts.read === 'function') this._read = opts.read;
 "
         "    this.readable = true;
+"
+        "    this.destroyed = false;
 "
         "  }
 "
@@ -78,7 +82,21 @@ str node_stream_source() {
 "
         "    const s = this._rs;
 "
-        "    if (chunk === null) { s.ended = true; } else { s.buffer.push(chunk); }
+        "    // outside object mode a stream carries bytes: a pushed string is
+"
+        "    // converted once here, so every consumer sees a Buffer rather than
+"
+        "    // whichever of the two the producer happened to supply
+"
+        "    if (chunk === null) { s.ended = true; }
+"
+        "    else {
+"
+        "      if (!s.objectMode && typeof chunk === 'string') chunk = Buffer.from(chunk, 'utf8');
+"
+        "      s.buffer.push(chunk);
+"
+        "    }
 "
         "    s.reading = false;
 "
@@ -122,7 +140,61 @@ str node_stream_source() {
 "
         "  }
 "
-        "  destroy(err) { const s = this._rs; if (s.destroyed) return this; s.destroyed = true; if (err) this.emit('error', err); this.emit('close'); return this; }
+        "  destroy(err) { const s = this._rs; if (s.destroyed) return this; s.destroyed = true; this.destroyed = true; this.readable = false; if (err) this.emit('error', err); this.emit('close'); return this; }
+"
+        "  [Symbol.asyncIterator]() {
+"
+        "    // for await over a stream: each next() waits for the next chunk,
+"
+        "    // and end or error settles the iteration
+"
+        "    const self = this;
+"
+        "    const queue = [];
+"
+        "    let waiting = null;
+"
+        "    let done = false;
+"
+        "    let failed = null;
+"
+        "    const settle = function () {
+"
+        "      if (!waiting) return;
+"
+        "      if (queue.length) { const w = waiting; waiting = null; w.res({ value: queue.shift(), done: false }); }
+"
+        "      else if (failed) { const w = waiting; waiting = null; w.rej(failed); }
+"
+        "      else if (done) { const w = waiting; waiting = null; w.res({ value: undefined, done: true }); }
+"
+        "    };
+"
+        "    self.on('data', function (c) { queue.push(c); settle(); });
+"
+        "    self.on('end', function () { done = true; settle(); });
+"
+        "    self.on('error', function (e) { failed = e; settle(); });
+"
+        "    return {
+"
+        "      next() {
+"
+        "        if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+"
+        "        if (failed) return Promise.reject(failed);
+"
+        "        if (done) return Promise.resolve({ value: undefined, done: true });
+"
+        "        return new Promise(function (res, rej) { waiting = { res: res, rej: rej }; });
+"
+        "      },
+"
+        "      [Symbol.asyncIterator]() { return this; },
+"
+        "    };
+"
+        "  }
 "
         "  static from(iterable, opts) {
 "
@@ -244,7 +316,7 @@ str node_stream_source() {
 "
         "  }
 "
-        "  destroy(err) { const s = this._ws; if (s.destroyed) return this; s.destroyed = true; if (err) this.emit('error', err); this.emit('close'); return this; }
+        "  destroy(err) { const s = this._ws; if (s.destroyed) return this; s.destroyed = true; this.destroyed = true; if (err) this.emit('error', err); this.emit('close'); return this; }
 "
         "}
 "
@@ -392,7 +464,29 @@ str node_stream_source() {
 "
         "  const last = args[args.length - 1];
 "
-        "  if (cb) finished(last, cb);
+        "  // Every stage is watched, not just the last one. Reporting failures
+"
+        "  // from anywhere in the chain through one callback is the whole
+"
+        "  // reason to reach for pipeline instead of chaining pipe calls.
+"
+        "  if (cb) {
+"
+        "    let called = false;
+"
+        "    const once = function (err) { if (called) return; called = true; cb(err); };
+"
+        "    for (let i = 0; i < args.length; i++) {
+"
+        "      const s = args[i];
+"
+        "      if (s && typeof s.on === 'function') s.on('error', function (e) { once(e); });
+"
+        "    }
+"
+        "    finished(last, once);
+"
+        "  }
 "
         "  return last;
 "
