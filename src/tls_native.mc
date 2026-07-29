@@ -630,10 +630,17 @@ struct TlsServerCtx {
     ptls_context_t ctx;
     ecdsa_sign_cert_ctx_t ec_sign;
     rsa_sign_cert_ctx_t rsa_sign;
-    ptls_iovec_t[1] certs;
-    u8* cert_der;             // owned copy
+    // leaf first, then each issuer above it. A client holds only root
+    // certificates, so it can build a path to one only if the intermediates
+    // travel with the leaf.
+    ptls_iovec_t[TLS_CHAIN_MAX] certs;
+    u8* cert_der;             // owned copy of the whole chain, concatenated
     u64 cert_len;
+    i32 n_certs;
 }
+
+// Enough for a leaf plus the intermediates any public CA issues under.
+const i32 TLS_CHAIN_MAX = 4;
 
 private const i32 TLS_SERVER_CTX_MAX = 64;
 private TlsServerCtx*[64] g_server_ctxs;
@@ -648,7 +655,10 @@ private void tls_server_ctxs_init() {
 // Build a server context from an X.509 cert DER and a private key DER,
 // auto-detecting the key type: an ECDSA-P256 scalar, otherwise RSA. Returns a
 // registry id, or -1 (bad/unsupported key, or registry full).
-i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
+// `cert_blob` holds n_certs DER certificates back to back, `cert_lens` their
+// lengths, leaf first.
+i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
+                       u8* key_der, u64 key_len) {
     tls_ctx_init();
     tls_server_ctxs_init();
     mc_ecdsa_p256_sign_init();
@@ -669,11 +679,23 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     }
     if slot < 0 { return 0 - 1; }
 
+    if n_certs < 1 || n_certs > TLS_CHAIN_MAX { return 0 - 1; }
+    i32 total = 0;
+    for i32 i = 0; i < n_certs; i++ {
+        if cert_lens[i] <= 0 { return 0 - 1; }
+        total += cert_lens[i];
+    }
+
     TlsServerCtx* sc = alloc<TlsServerCtx>(1);
-    sc.cert_der = alloc<u8>(cert_len > cast(u64, 0) ? cast(i32, cert_len) : 1);
-    for u64 i = 0; i < cert_len; i++ { sc.cert_der[i] = cert_der[i]; }
-    sc.cert_len = cert_len;
-    sc.certs[0] = ptls_iovec_init(sc.cert_der, cert_len);
+    sc.cert_der = alloc<u8>(total);
+    for i32 i = 0; i < total; i++ { sc.cert_der[i] = cert_blob[i]; }
+    sc.cert_len = cast(u64, total);
+    sc.n_certs = n_certs;
+    i32 off = 0;
+    for i32 i = 0; i < n_certs; i++ {
+        sc.certs[i] = ptls_iovec_init(sc.cert_der + off, cast(u64, cert_lens[i]));
+        off += cert_lens[i];
+    }
 
     sc.ctx = ptls_context_t{};
     sc.ctx.random_bytes = mc_csprng_bytes;
@@ -681,7 +703,7 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
     sc.ctx.key_exchanges = &g_keyex[0];
     sc.ctx.cipher_suites = &g_cslist[0];
     sc.ctx.certificates.list = &sc.certs[0];
-    sc.ctx.certificates.count = cast(u64, 1);
+    sc.ctx.certificates.count = cast(u64, n_certs);
 
     if is_ec {
         sc.ec_sign = ecdsa_sign_cert_ctx_t{
@@ -716,6 +738,24 @@ i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) {
 
     g_server_ctxs[slot] = sc;
     return slot;
+}
+
+// How many certificates a context presents. A leaf issued by an intermediate
+// is unverifiable on its own, so whether the chain survived into the context
+// is worth being able to ask.
+i32 tls_server_ctx_cert_count(i32 id) {
+    if id < 0 || id >= TLS_SERVER_CTX_MAX { return 0; }
+    TlsServerCtx* sc = g_server_ctxs[id];
+    if sc == null { return 0; }
+    return cast(i32, sc.ctx.certificates.count);
+}
+
+// Length of the `i`th certificate a context presents, or 0.
+i32 tls_server_ctx_cert_len(i32 id, i32 i) {
+    if id < 0 || id >= TLS_SERVER_CTX_MAX { return 0; }
+    TlsServerCtx* sc = g_server_ctxs[id];
+    if sc == null || i < 0 || i >= sc.n_certs { return 0; }
+    return cast(i32, sc.certs[i].len);
 }
 
 void tls_server_ctx_free(i32 id) {

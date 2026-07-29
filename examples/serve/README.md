@@ -63,8 +63,32 @@ the certificate is reissued. A CA is trusted once.
 signs will be trusted by everything using that store, so keep `local/ca.key.pem`
 to yourself and remove the CA when you are done with it.
 
-A publicly-trusted certificate is not an option here: those chain through an
-intermediate, and the server sends a single certificate with no chain.
+## A certificate from a public CA
+
+`--cert` accepts a chain, so a `fullchain.pem` from Let's Encrypt (or any
+public CA) works as-is — the leaf and its intermediates are all presented,
+which is what lets a client build a path to a root it already trusts.
+
+```
+certbot certonly --standalone -d example.com --key-type ecdsa
+tsmc serve.cts --host 0.0.0.0 --port 443 \
+  --cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  --key  /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+Get the certificate with whatever ACME client you like — certbot, lego,
+acme.sh — and point the two flags at what it writes. Worth knowing before
+running this anywhere real:
+
+- **Renewal restarts the server.** The certificate is read once at startup, so
+  a renewal (every 60 days, for a 90-day certificate) needs a restart to take
+  effect. Run it under something that will do that.
+- **One certificate per listener.** There is no SNI-based selection, so one
+  process serves one certificate.
+- **No ALPN.** A browser offering `h2,http/1.1` gets no ALPN extension back
+  and falls back to HTTP/1.1, which is what this server speaks anyway.
+- **TLS 1.3 only**, X25519, AES-128-GCM. Current browsers are fine; old
+  clients and some health-check tooling will not connect at all.
 
 ## What it exercises
 

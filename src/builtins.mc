@@ -10086,17 +10086,45 @@ private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
     return len;
 }
 
-// __tls_server_ctx(certDer, keyDer): build a shared server context from an
-// X.509 cert and its EC private key (both DER buffers). Returns a registry id
-// or -1 (bad/unsupported key).
+// __tls_server_ctx(certs, keyDer): build a shared server context from a
+// certificate chain (an array of DER buffers, leaf first) and its private key.
+// A single buffer is accepted too, for a certificate that needs no chain.
+// Returns a registry id, or -1 for a bad/unsupported key or chain.
 private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    u8[8192] cert;
-    i32 clen = tls_js_bytes(vm, arg_at(args, argc, 0), &cert[0], 8192);
+    u8[16384] blob;
+    i32[TLS_CHAIN_MAX] lens;
+    i32 n = 0;
+    i32 used = 0;
+    Value cv = arg_at(args, argc, 0);
+    // a Buffer is itself an array, so a chain is recognised by its elements
+    // being arrays in turn rather than bytes
+    bool is_chain = false;
+    if value_is_array(cv) {
+        JsObject* a = value_as_object(cv);
+        if a.elen > 0 && value_is_array(js_array_get(a, 0)) { is_chain = true; }
+    }
+    if is_chain {
+        JsObject* a = value_as_object(cv);
+        if a.elen > TLS_CHAIN_MAX { return value_int(-1); }
+        for i32 i = 0; i < a.elen; i++ {
+            i32 got = tls_js_bytes(vm, js_array_get(a, i), &blob[used], 16384 - used);
+            if got <= 0 { return value_int(-1); }
+            lens[n] = got;
+            used += got;
+            n++;
+        }
+    } else {
+        i32 got = tls_js_bytes(vm, cv, &blob[0], 16384);
+        if got <= 0 { return value_int(-1); }
+        lens[0] = got;
+        used = got;
+        n = 1;
+    }
     u8[2048] key;
     i32 klen = tls_js_bytes(vm, arg_at(args, argc, 1), &key[0], 2048);
-    if clen < 0 || klen < 0 { return value_int(-1); }
-    i32 id = tls_server_ctx_new(&cert[0], cast(u64, clen), &key[0], cast(u64, klen));
+    if klen < 0 { return value_int(-1); }
+    i32 id = tls_server_ctx_new(&blob[0], &lens[0], n, &key[0], cast(u64, klen));
     return value_int(id);
 }
 

@@ -114,6 +114,31 @@ function pemToDer(pem) {
   return Buffer.from(b64, 'base64');
 }
 
+// Every certificate in a PEM file, leaf first, as DER. A `cert` option
+// routinely holds a whole chain -- a CA fullchain file is exactly that -- and
+// all of it has to be sent: a client carries root certificates only, so it can
+// build a path to one just when the intermediates arrive with the leaf.
+function pemToChain(pem) {
+  if (Buffer.isBuffer(pem)) return [pem];
+  if (Array.isArray(pem)) return pem.map(pemToDer);
+  const text = String(pem);
+  const out = [];
+  let at = 0;
+  for (;;) {
+    const begin = text.indexOf('-----BEGIN CERTIFICATE-----', at);
+    if (begin < 0) break;
+    const bodyAt = begin + '-----BEGIN CERTIFICATE-----'.length;
+    const end = text.indexOf('-----END CERTIFICATE-----', bodyAt);
+    if (end < 0) break;
+    const b64 = text.slice(bodyAt, end).replace(/[^A-Za-z0-9+/=]/g, '');
+    if (b64.length > 0) out.push(Buffer.from(b64, 'base64'));
+    at = end + 1;
+  }
+  // not a certificate PEM at all: hand back whatever single block is there
+  // and let the context builder reject it
+  return out.length > 0 ? out : [pemToDer(pem)];
+}
+
 // A TLS 1.3 server presenting an ECDSA-P256 certificate. Shaped like
 // net.createServer: `onSecure` (and the 'secureConnection' event) receive a
 // TLSSocket once its handshake completes. listen/address/close proxy to an
@@ -122,7 +147,7 @@ function createServer(opts, onSecure) {
   if (typeof opts === 'function') { onSecure = opts; opts = {}; }
   opts = opts || {};
   const server = new EventEmitter();
-  const ctxId = __tls_server_ctx(pemToDer(opts.cert), pemToDer(opts.key));
+  const ctxId = __tls_server_ctx(pemToChain(opts.cert), pemToDer(opts.key));
   if (ctxId < 0) {
     server.listen = function () {
       queueMicrotask(() => server.emit('error', new Error('tls.createServer: invalid certificate or key (ECDSA-P256 required)')));
