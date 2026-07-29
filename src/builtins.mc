@@ -12705,6 +12705,7 @@ private Value nat_proxy_revocable(void* vmp, Value callee, Value thisv, Value* a
     gc_root(&vm.heap, pv);
     JsNative* revoke = js_new_native(&vm.heap, &nat_proxy_revoke, "revoke");
     revoke.env0 = pv;
+    gc_root(&vm.heap, value_cell(&revoke.head));
     JsObject* result = js_new_object(&vm.heap, vm.object_proto);
     gc_root(&vm.heap, value_cell(&result.head));
     js_set_prop(result, bi_atom(vm, "proxy"), pv);
