@@ -8,3 +8,6 @@ node_modules/
 
 # scratch directory used by test/diff/fs_semantics.js
 test/diff/.fs-sweep/
+
+# generated local CA + server certificate for examples/serve (private keys)
+examples/serve/local/

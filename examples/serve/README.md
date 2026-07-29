@@ -24,6 +24,48 @@ validates it fully:
 curl --cacert serve.cert.pem https://localhost:8443/
 ```
 
+## A certificate browsers do not warn about
+
+The warning is a trust decision, not a defect, so the fix is to make the
+issuer trusted. `make-local-cert.sh` / `make-local-cert.ps1` creates a local
+certificate authority and a server certificate signed by it, in `local/`
+(gitignored — it holds private keys):
+
+```
+./make-local-cert.sh                    # or: .\make-local-cert.ps1
+../../build/tsmc serve.cts --cert local/server.cert.pem --key local/server.key.pem
+```
+
+Then trust `local/ca.cert.pem` **once**. On Windows, for Chrome, Edge and
+anything else using the system store:
+
+```
+certutil -user -addstore Root local\ca.cert.pem      # remove: -delstore
+```
+
+Firefox keeps its own trust store, so it needs the certificate imported under
+Settings → Privacy & Security → Certificates → View Certificates →
+Authorities → Import, ticking "Trust this CA to identify websites".
+
+[mkcert](https://github.com/FiloSottile/mkcert) does all of that in one step
+and handles Firefox's store for you, if you would rather not do it by hand:
+
+```
+mkcert -install && mkcert localhost 127.0.0.1 ::1
+```
+
+A CA rather than a self-signed certificate because a browser can only be told
+to trust an *issuer*: a self-signed certificate is its own issuer, so trusting
+it means trusting that exact file, and the trust has to be redone every time
+the certificate is reissued. A CA is trusted once.
+
+**This is a trust-store change on your machine.** Any certificate that CA
+signs will be trusted by everything using that store, so keep `local/ca.key.pem`
+to yourself and remove the CA when you are done with it.
+
+A publicly-trusted certificate is not an option here: those chain through an
+intermediate, and the server sends a single certificate with no chain.
+
 ## What it exercises
 
 Three things at once, which is the point of the example:
