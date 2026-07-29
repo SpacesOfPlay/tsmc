@@ -10066,6 +10066,16 @@ private Value nat_tls_error_text(void* vmp, Value callee, Value thisv, Value* ar
     return new_str(vm, str_concat(who, tls_alert_str(code % 256)));
 }
 
+// The node-style error code for a failed handshake, or null. Only the cases an
+// application would branch on are named; everything else is a message.
+private Value nat_tls_error_name(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
+    if s == null { return value_null(); }
+    if tls_error_code(s) == TLS_ERR_NOT_TLS { return new_str(vm, "ERR_SSL_HTTP_REQUEST"); }
+    return value_null();
+}
+
 // True while outbound ciphertext is still queued: an ending socket must wait
 // for it to drain before closing so the response is not truncated.
 private Value nat_tls_wants_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10166,6 +10176,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_established", &nat_tls_established);
     ignore def_global_fn(vm, "__tls_verify_error", &nat_tls_verify_error);
     ignore def_global_fn(vm, "__tls_error_text", &nat_tls_error_text);
+    ignore def_global_fn(vm, "__tls_error_name", &nat_tls_error_name);
     ignore def_global_fn(vm, "__tls_wants_write", &nat_tls_wants_write);
     ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);

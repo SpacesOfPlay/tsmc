@@ -162,6 +162,28 @@ function handle(opts: ServeOptions, req: any, res: any): void {
   log(req, out.status, enc.bytes.length, out.outcome);
 }
 
+/**
+ * What to send someone who spoke plain HTTP to the TLS port — typing
+ * http://host:8443 instead of https://. There is no session to encrypt with,
+ * so this goes out in the clear; without it the browser gets nothing and shows
+ * a blank error, which does not hint at the one-character fix.
+ */
+function plaintextRedirect(opts: ServeOptions): string {
+  const url = 'https://' + opts.host + ':' + opts.port + '/';
+  const body =
+    '<!doctype html><meta charset="utf-8"><title>Use HTTPS</title>' +
+    '<h1>This port speaks HTTPS</h1>' +
+    '<p>You asked for it over plain HTTP. Try <a href="' + url + '">' + url + '</a>.</p>\n';
+  return [
+    'HTTP/1.1 400 Bad Request',
+    'Content-Type: text/html; charset=utf-8',
+    'Content-Length: ' + Buffer.byteLength(body, 'utf8'),
+    'Connection: close',
+    '',
+    body,
+  ].join('\r\n');
+}
+
 function main(): void {
   const opts = parseArgs(process.argv.slice(2));
   if (!fs.existsSync(opts.root)) {
@@ -172,7 +194,11 @@ function main(): void {
   const listener = (req: any, res: any) => handle(opts, req, res);
   const server = opts.tls
     ? https.createServer(
-        { cert: fs.readFileSync(opts.certFile, 'utf8'), key: fs.readFileSync(opts.keyFile, 'utf8') },
+        {
+          cert: fs.readFileSync(opts.certFile, 'utf8'),
+          key: fs.readFileSync(opts.keyFile, 'utf8'),
+          plaintextResponse: plaintextRedirect(opts),
+        },
         listener,
       )
     : http.createServer(listener);

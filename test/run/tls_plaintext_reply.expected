@@ -1,0 +1,4 @@
+reply status: HTTP/1.1 400 Bad Request
+reply body: https
+error code: ERR_SSL_HTTP_REQUEST
+then over TLS: 200 secure

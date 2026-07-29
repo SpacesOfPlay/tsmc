@@ -35,7 +35,7 @@ class TLSSocket extends EventEmitter {
       if (why) this._fail('certificate verify failed: ' + why);
       else {
         const what = __tls_error_text(this._id);
-        this._fail(what ? 'TLS error: ' + what : 'TLS error');
+        this._fail(what ? 'TLS error: ' + what : 'TLS error', __tls_error_name(this._id));
       }
       return;
     }
@@ -97,7 +97,24 @@ class TLSSocket extends EventEmitter {
     this.emit('close');
   }
   destroy() { this._finish(); return this; }
-  _fail(msg) { const e = new Error(msg); this.emit('error', e); this._finish(); }
+  _fail(msg, code) {
+    const e = new Error(msg);
+    if (code) e.code = code;
+    this.emit('error', e);
+    this._finish();
+  }
+  // Bytes straight onto the socket, with no TLS session in the way. Only
+  // meaningful when the peer turned out not to be speaking TLS: there is
+  // nothing to encrypt with, and a cleartext reply is the one useful answer.
+  _writeCleartext(data) {
+    const buf = asBuffer(data, 'utf8');
+    let off = 0;
+    while (off < buf.length) {
+      const n = __net_send(this._id, buf, off);
+      if (n <= 0) break;
+      off += n;
+    }
+  }
   ref() { __net_ref(this._id, true); return this; }
   unref() { __net_ref(this._id, false); return this; }
   setNoDelay() { return this; }
@@ -170,7 +187,15 @@ function createServer(opts, onSecure) {
     // 'error' with no listener throws, and nothing has had the chance to
     // attach one yet, so the failure is reported as 'tlsClientError' — an
     // ordinary event, safely ignorable — the way Node reports it.
-    tsock.on('error', (e) => server.emit('tlsClientError', e, tsock));
+    tsock.on('error', (e) => {
+      // A peer that never spoke TLS is still waiting for an ordinary reply, so
+      // an application may hand one over to be sent in the clear -- the only
+      // point at which anything readable can reach it.
+      if (e.code === 'ERR_SSL_HTTP_REQUEST' && opts.plaintextResponse) {
+        tsock._writeCleartext(opts.plaintextResponse);
+      }
+      server.emit('tlsClientError', e, tsock);
+    });
   });
   raw.on('error', (e) => server.emit('error', e));
   raw.on('listening', () => server.emit('listening'));

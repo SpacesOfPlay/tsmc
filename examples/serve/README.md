@@ -13,6 +13,13 @@ npm install
 
 Options: `--root DIR --port N --host H --http --cert FILE --key FILE`.
 
+Reaching the TLS port over plain `http://` answers with a readable 400 and a
+link to the right URL, rather than the blank error a browser gets when a TLS
+server just hangs up on it. That reply necessarily goes out in the clear —
+there is no session to encrypt it with — and the server supplies it through
+the `plaintextResponse` option, which is a tsmc extension. Without it the
+connection simply closes, which is what node does.
+
 The certificate is self-signed, so a browser shows a warning on first visit —
 click through it ("Advanced" → "Accept the Risk and Continue" in Firefox). Until
 you do, the browser aborts the handshake and the server logs a line like
