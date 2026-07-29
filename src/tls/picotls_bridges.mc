@@ -603,6 +603,11 @@ when os(linux) {
         i64 getrandom(u8* buf, u64 buflen, u32 flags);
     }
 }
+when os(macos) || os(ios) {
+    extern "libSystem.B.dylib" {
+        void arc4random_buf(void* buf, u64 n);
+    }
+}
 
 void mc_csprng_bytes(void* buf, u64 len) {
     u8* p = cast(u8*, buf);
@@ -622,5 +627,8 @@ void mc_csprng_bytes(void* buf, u64 len) {
             p = p + cast(u64, n);
             remaining = remaining - cast(u64, n);
         }
+    }
+    when os(macos) || os(ios) {
+        arc4random_buf(cast(void*, p), remaining);
     }
 }

@@ -137,7 +137,7 @@ run_tests() {
         # Networking scripts need net_os, which is only ported on Windows
         # so far (build.ps1 covers them there). Remove once POSIX net lands.
         case "$(basename "$f")" in
-            fetch.js|http.js|net.js|tls_error.js)
+            fetch.js|http.js|net.js|tls_error.js|webapi.js|https_server.js|https_server_rsa.js)
                 n_stress_skip=$((n_stress_skip + 1)); continue ;;
         esac
         n_stress=$((n_stress + 1))
