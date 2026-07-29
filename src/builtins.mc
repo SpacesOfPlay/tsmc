@@ -6635,15 +6635,14 @@ private f64 date_parse_legacy(str s) {
             }
             i32 ndig = i - start;
             if i < end && *(s.data + i) == ':' {
-                // a clock time; parse through a cursor, then commit to i
+                // a clock time
                 hour = v;
-                i32 p = i + 1;
-                if !ds_digits(s, &p, 2, &mi) { return nan; }
-                if p < end && *(s.data + p) == ':' {
-                    p++;
-                    if !ds_digits(s, &p, 2, &sec) { return nan; }
+                i++;
+                if !ds_digits(s, &i, 2, &mi) { return nan; }
+                if i < end && *(s.data + i) == ':' {
+                    i++;
+                    if !ds_digits(s, &i, 2, &sec) { return nan; }
                 }
-                i = p;
                 have_time = true;
             } else if ndig >= 3 {
                 year = cast(i64, v);
@@ -6671,13 +6670,12 @@ private f64 date_parse_legacy(str s) {
             continue;
         }
         if c == '+' {
-            i32 p = i + 1;
+            i++;
             i32 oh = 0;
             i32 om = 0;
-            if !ds_digits(s, &p, 2, &oh) { return nan; }
-            if p < end && *(s.data + p) == ':' { p++; }
-            if !ds_digits(s, &p, 2, &om) { return nan; }
-            i = p;
+            if !ds_digits(s, &i, 2, &oh) { return nan; }
+            if i < end && *(s.data + i) == ':' { i++; }
+            if !ds_digits(s, &i, 2, &om) { return nan; }
             off_min = oh * 60 + om;
             continue;
         }
