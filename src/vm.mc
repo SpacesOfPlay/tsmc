@@ -2003,10 +2003,21 @@ private bool inspect_ident_key(str k) {
 }
 
 private void inspect_quoted(str_buf* sb, str s) {
-    str_buf_add(sb, "'");
+    // Single quotes, unless the text carries one of its own and no double
+    // quote -- then double quotes read better than an escape. Node chooses the
+    // delimiter the same way.
+    bool has_single = false;
+    bool has_double = false;
     for i32 i = 0; i < s.len; i++ {
         u8 c = *(s.data + i);
-        if c == '\'' { str_buf_add(sb, "\\'"); }
+        if c == '\'' { has_single = true; }
+        if c == '"' { has_double = true; }
+    }
+    u8 q = has_single && !has_double ? cast(u8, '"') : cast(u8, '\'');
+    str_buf_add_byte(sb, q);
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c == q { str_buf_add(sb, "\\"); str_buf_add_byte(sb, c); }
         else if c == '\\' { str_buf_add(sb, "\\\\"); }
         else if c == '\n' { str_buf_add(sb, "\\n"); }
         else {
@@ -2016,7 +2027,7 @@ private void inspect_quoted(str_buf* sb, str s) {
             str_buf_add(sb, one);
         }
     }
-    str_buf_add(sb, "'");
+    str_buf_add_byte(sb, q);
 }
 
 // Node-like single-line inspect. `nested` quotes strings; the seen set
@@ -2044,6 +2055,107 @@ private str inspect_ctor_name(VM* vm, JsObject* o) {
         p = p.proto;
     }
     return none;
+}
+
+// Whether `p` is anywhere on o's prototype chain.
+private bool inspect_proto_has(JsObject* o, JsObject* p) {
+    if p == null { return false; }
+    JsObject* cur = o.proto;
+    while cur != null {
+        if cur == p { return true; }
+        cur = cur.proto;
+    }
+    return false;
+}
+
+// Renders an object whose meaning is not in its enumerable properties: an
+// error, a date, a regular expression, a Buffer, a boxed primitive. Returns
+// false for anything ordinary. `ov` is `o` as a Value, for property reads.
+private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
+    // an error prints as its stack, which already begins "Name: message"
+    if vm.error_protos[ERR_ERROR] != null && inspect_proto_has(o, vm.error_protos[ERR_ERROR]) {
+        Value sv;
+        if vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "stack"), &sv)
+           && value_is_string(sv) {
+            str_buf_add(sb, gc_string_view(value_as_string(sv)));
+            return true;
+        }
+        Value mv;
+        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "message"), &mv);
+        Value nv;
+        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "name"), &nv);
+        if value_is_string(nv) { str_buf_add(sb, gc_string_view(value_as_string(nv))); }
+        else { str_buf_add(sb, "Error"); }
+        if value_is_string(mv) && value_as_string(mv).len > 0 {
+            str_buf_add(sb, ": ");
+            str_buf_add(sb, gc_string_view(value_as_string(mv)));
+        }
+        return true;
+    }
+    if vm.date_proto != null && inspect_proto_has(o, vm.date_proto) {
+        Value s;
+        if vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "toISOString"), &s)
+           && value_is_callable(s) {
+            Value dummy = value_undefined();
+            Value r = vm_call_value(vm, s, ov, &dummy, 0);
+            if vm.has_pending {
+                // an invalid date has no ISO form; node says so rather than
+                // propagating the RangeError out of a debug print
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                str_buf_add(sb, "Invalid Date");
+                return true;
+            }
+            if value_is_string(r) { str_buf_add(sb, gc_string_view(value_as_string(r))); return true; }
+        }
+        str_buf_add(sb, "Invalid Date");
+        return true;
+    }
+    if vm.regexp_proto != null && inspect_proto_has(o, vm.regexp_proto) {
+        Value src;
+        Value fl;
+        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "source"), &src);
+        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "flags"), &fl);
+        str_buf_add(sb, "/");
+        if value_is_string(src) { str_buf_add(sb, gc_string_view(value_as_string(src))); }
+        str_buf_add(sb, "/");
+        if value_is_string(fl) { str_buf_add(sb, gc_string_view(value_as_string(fl))); }
+        return true;
+    }
+    if vm.buffer_proto != null && o.proto == vm.buffer_proto {
+        // node shows the bytes in hex, which is what makes a Buffer readable
+        str hexd = "0123456789abcdef";
+        str_buf_add(sb, "<Buffer");
+        i32 shown = o.elen < 50 ? o.elen : 50;
+        for i32 i = 0; i < shown; i++ {
+            Value e = js_array_get(o, i);
+            i32 by = value_is_number(e) ? (cast(i32, js_to_number(e)) & 255) : 0;
+            str_buf_add(sb, " ");
+            str_buf_add_byte(sb, *(hexd.data + (by >> 4)));
+            str_buf_add_byte(sb, *(hexd.data + (by & 15)));
+        }
+        if o.elen > shown {
+            string more = format(" ... {} more bytes", o.elen - shown);
+            str_buf_add(sb, more);
+            free(more);
+        }
+        str_buf_add(sb, ">");
+        return true;
+    }
+    // a boxed primitive shows the value it wraps
+    Value* pv = props_get(&o.props, atom_intern(&vm.atoms, "%prim"));
+    if pv != null {
+        str_buf_add(sb, "[");
+        if value_is_string(*pv) { str_buf_add(sb, "String: "); }
+        else if value_is_bool(*pv) { str_buf_add(sb, "Boolean: "); }
+        else { str_buf_add(sb, "Number: "); }
+        Vec<u64> inner = vec_new<u64>(2);
+        inspect_into(vm, sb, *pv, 0, true, &inner);
+        vec_free(&inner);
+        str_buf_add(sb, "]");
+        return true;
+    }
+    return false;
 }
 
 private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, Vec<u64>* seen) {
@@ -2116,6 +2228,12 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
             str_buf_add(sb, " ]");
             return;
         }
+        // Types whose whole value lives in internal slots print as that value.
+        // Falling through to the generic path shows the constructor name and
+        // an empty brace pair -- `Error {}` for a thrown error, which is worse
+        // than useless, since the message and stack are exactly what is wanted.
+        if inspect_special(vm, sb, o, v) { return; }
+
         bool is_arr = (o.obj_flags & OBJF_ARRAY) != 0;
         if depth < 0 {
             str_buf_add(sb, is_arr ? "[Array]" : "[Object]");
@@ -2221,19 +2339,39 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
 
 // Display form for console: primitives as ToString (with -0 shown),
 // objects/arrays via a Node-like inspect.
+// A string in the quoting inspect uses for a nested one, for callers that
+// want the quoted form at the top level too (util.inspect does; console does
+// not).
+Value vm_quoted_string(VM* vm, str s) {
+    str_buf sb;
+    str_buf_init(&sb);
+    inspect_quoted(&sb, s);
+    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return value_cell(&g.head);
+}
+
+// Nesting below this is elided as [Object] / [Array]. Node's default, and the
+// reason printing a deep or recursive structure stays readable.
+const i32 INSPECT_DEPTH = 2;
+
+Value vm_inspect_depth(VM* vm, Value v, i32 depth) {
+    str_buf sb;
+    str_buf_init(&sb);
+    Vec<u64> seen = vec_new<u64>(8);
+    inspect_into(vm, &sb, v, depth, false, &seen);
+    vec_free(&seen);
+    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return value_cell(&g.head);
+}
+
 Value js_console_string(VM* vm, Value v) {
     if value_is_object(v) || value_is_array(v) || value_is_map(v)
         || value_is_function(v) || value_is_native(v) || value_is_bigint(v)
         || value_is_symbol(v)
         || (value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0) {
-        str_buf sb;
-        str_buf_init(&sb);
-        Vec<u64> seen = vec_new<u64>(8);
-        inspect_into(vm, &sb, v, 4, false, &seen);
-        vec_free(&seen);
-        GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
-        str_buf_free(&sb);
-        return value_cell(&g.head);
+        return vm_inspect_depth(vm, v, INSPECT_DEPTH);
     }
     return js_to_string_value(vm, v);
 }

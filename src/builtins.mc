@@ -12837,27 +12837,25 @@ private Value nat_util_callbackify(void* vmp, Value callee, Value thisv, Value* 
 
 // inspect: the console string form; a top-level string is single-quoted
 // (matching Node), unlike console.log.
+// util.inspect quotes a top-level string, unlike console.log, which prints it
+// as-is. Both use the same quoting so the delimiter choice cannot drift.
 private Value util_inspect_value(VM* vm, Value v) {
-    if value_is_string(v) {
-        str s = sview(v);
-        str_buf sb;
-        str_buf_init(&sb);
-        str_buf_add_byte(&sb, cast(u8, 39));   // '
-        for i32 i = 0; i < s.len; i++ {
-            u8 c = *(s.data + i);
-            if c == 39 || c == 92 { str_buf_add_byte(&sb, cast(u8, 92)); }   // escape ' and backslash
-            str_buf_add_byte(&sb, c);
-        }
-        str_buf_add_byte(&sb, cast(u8, 39));
-        Value r = new_str(vm, str_buf_to_str(&sb));
-        str_buf_free(&sb);
-        return r;
-    }
+    if value_is_string(v) { return vm_quoted_string(vm, sview(v)); }
     return js_console_string(vm, v);
 }
 
 private Value nat_util_inspect(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return util_inspect_value(as_vm(vmp), arg_at(args, argc, 0));
+    VM* vm = as_vm(vmp);
+    Value v = arg_at(args, argc, 0);
+    Value opts = arg_at(args, argc, 1);
+    if value_is_object(opts) {
+        Value d;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "depth"), &d) && value_is_number(d) {
+            if value_is_string(v) { return vm_quoted_string(vm, sview(v)); }
+            return vm_inspect_depth(vm, v, to_int_arg(d));
+        }
+    }
+    return util_inspect_value(vm, v);
 }
 
 // Appends the number-to-string of `x` (a JS number Value) to sb.
@@ -13008,6 +13006,25 @@ private bool deep_equal(VM* vm, Value a, Value b, i32 depth) {
         bool hb = js_get_prop(value_as_object(b), tatom, &tb);
         if ha && hb { return js_to_number(ta) == js_to_number(tb); }
     }
+    // Maps and Sets compare by contents, not identity: their entries live in
+    // their own storage, so the property walk below would call any two of them
+    // equal
+    JsMap* ma = map_storage(vm, a);
+    JsMap* mb = map_storage(vm, b);
+    if (ma != null) != (mb != null) { return false; }
+    if ma != null {
+        if ma.is_set != mb.is_set { return false; }
+        if ma.count != mb.count { return false; }
+        for i32 i = 0; i < ma.len; i++ {
+            if !ma.live[i] { continue; }
+            i32 j = map_find(mb, ma.keys[i]);
+            if j < 0 { return false; }
+            if !ma.is_set && !deep_equal(vm, ma.vals[i], mb.vals[j], depth + 1) {
+                return false;
+            }
+        }
+        return true;
+    }
     bool aarr = value_is_array(a);
     bool barr = value_is_array(b);
     if aarr != barr { return false; }
@@ -13055,6 +13072,12 @@ private Value nat_types_is_date(void* vmp, Value callee, Value thisv, Value* arg
 private Value nat_types_is_regexp(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return value_bool(proto_chain_has(arg_at(args, argc, 0), as_vm(vmp).regexp_proto));
 }
+private Value nat_types_is_typedarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(vm_is_typed_array(arg_at(args, argc, 0)));
+}
+private Value nat_types_is_arraybuffer(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(is_arraybuffer(as_vm(vmp), arg_at(args, argc, 0)));
+}
 private Value nat_types_is_map(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     JsMap* mp = map_storage(as_vm(vmp), arg_at(args, argc, 0));
     return value_bool(mp != null && !mp.is_set);
@@ -13094,6 +13117,15 @@ private JsObject* build_util_module(VM* vm) {
     def_node_export(vm, mod, ns, "callbackify", &nat_util_callbackify);
     def_node_export(vm, mod, ns, "format", &nat_util_format);
     def_node_export(vm, mod, ns, "inspect", &nat_util_inspect);
+    // util.inspect.custom: the registered symbol a type uses to say how it
+    // should print. Libraries test for it, so its absence is visible even
+    // where nothing here consults it yet.
+    Value insp;
+    if js_get_prop(mod, bi_atom(vm, "inspect"), &insp) && value_is_native(insp) {
+        Value[1] ka = { new_str(vm, "nodejs.util.inspect.custom") };
+        Value sym = nat_symbol_for(cast(void*, vm), value_undefined(), value_undefined(), &ka[0], 1);
+        props_set_desc(&value_as_native(insp).props, bi_atom(vm, "custom"), sym, 0);
+    }
     def_node_export(vm, mod, ns, "inherits", &nat_util_inherits);
     def_node_export(vm, mod, ns, "deprecate", &nat_util_deprecate);
     def_node_export(vm, mod, ns, "isDeepStrictEqual", &nat_util_deep_equal);
@@ -13109,10 +13141,12 @@ private JsObject* build_util_module(VM* vm) {
     def_method(vm, types, "isSet", &nat_types_is_set);
     def_method(vm, types, "isPromise", &nat_types_is_promise);
     def_method(vm, types, "isNativeError", &nat_types_is_native_error);
+    def_method(vm, types, "isTypedArray", &nat_types_is_typedarray);
+    def_method(vm, types, "isArrayBuffer", &nat_types_is_arraybuffer);
     def_method(vm, types, "isAsyncFunction", &nat_types_is_async_fn);
     def_method(vm, types, "isGeneratorFunction", &nat_types_is_gen_fn);
-    def_method(vm, types, "isTypedArray", &nat_types_false);
-    def_method(vm, types, "isArrayBuffer", &nat_types_false);
+    // isProxy stays a stub: a Proxy is transparent here, and answering true
+    // would claim a distinction nothing else can observe
     def_method(vm, types, "isProxy", &nat_types_false);
     return ns;
 }
