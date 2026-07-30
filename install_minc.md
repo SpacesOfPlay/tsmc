@@ -13,15 +13,6 @@ powershell -c "irm minc.dev/install.ps1 | iex"
 curl -fsSL https://minc.dev/install | bash
 ```
 
-Or run the scripts checked into this repo — they fetch the same
-installer, and pin the compiler version this repo was tested with
-when one is set:
-
-```
-./install_minc.sh                                          # macOS / Linux
-powershell -ExecutionPolicy Bypass -File install_minc.ps1  # Windows
-```
-
 The installer puts the toolchain in `~/.minc` (override with
 `MINC_INSTALL`), adds it to your PATH, and offers to install the
 VS Code extension if VS Code is present.
