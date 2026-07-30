@@ -161,4 +161,4 @@ vendor/    fetched test262 checkout (gitignored)
 
 ## License
 
-MIT, once published. Not yet released.
+MIT, See LICENSE.md
