@@ -1,8 +1,9 @@
 # build.ps1 — build and test tsmc on Windows.
 #
-# Requires the minc compiler. MINC: minc install dir (the folder
-# holding minc.exe and its lib/); defaults to the local deploy at
-# .\minc (gitignored — refresh by copying in a new deploy).
+# Requires the minc compiler: its install dir on PATH, or MINC naming
+# that dir (the folder holding minc.exe and its lib/). A deploy at
+# .\minc is preferred over PATH when present, which is how this repo is
+# developed; nothing needs it to be there.
 
 param(
     [Parameter(Position=0)]
@@ -17,21 +18,46 @@ $ProjectDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $BuildDir = Join-Path $ProjectDir "build"
 $OutExe = Join-Path $BuildDir "tsmc.exe"
 
-$MincDir = if ($env:MINC) { $env:MINC } else { Join-Path $ProjectDir "minc" }
+# Set by Assert-Toolchain.
+$MincDir = $null
 
 function Step($msg) { Write-Host ":: $msg" -ForegroundColor Cyan }
 function Pass($msg) { Write-Host "  PASS  $msg" -ForegroundColor Green }
 function Fail($msg) { Write-Host "  FAIL  $msg" -ForegroundColor Red }
 
+# MINC first, then a local deploy, then the minc on PATH. An install is
+# one folder with the binary at its root and lib\ beside it, so the dir
+# is where the binary resolves.
+function Find-MincDir {
+    if ($env:MINC) { return $env:MINC }
+    $local = Join-Path $ProjectDir "minc"
+    if (Test-Path (Join-Path $local "minc.exe")) { return $local }
+    $onPath = Get-Command minc -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($onPath) { return (Split-Path $onPath.Source -Parent) }
+    return $null
+}
+
 function Assert-Toolchain {
-    if (-not (Test-Path (Join-Path $MincDir "minc.exe"))) {
-        Fail "minc.exe not found in $MincDir"
-        Write-Host "  copy a minc deploy into minc\, or set MINC (see README.md)"
+    $dir = Find-MincDir
+    if (-not $dir) {
+        Fail "minc not found"
+        Write-Host "  put the minc install dir on PATH, or set MINC to it (see README.md)"
         exit 1
     }
-    $script:MincDir = (Resolve-Path $MincDir).Path
-    if (-not (Test-Path (Join-Path $MincDir "lib\str.mc"))) {
-        Fail "no lib\ in $MincDir — bare imports (import str;) cannot resolve"
+    if (-not (Test-Path $dir)) {
+        Fail "no such minc install dir: $dir"
+        Write-Host "  MINC names the folder holding minc.exe and lib\"
+        exit 1
+    }
+    $script:MincDir = (Resolve-Path $dir).Path
+    if (-not (Test-Path (Join-Path $script:MincDir "minc.exe"))) {
+        Fail "no minc.exe in $script:MincDir"
+        Write-Host "  MINC names the folder holding minc.exe and lib\"
+        exit 1
+    }
+    if (-not (Test-Path (Join-Path $script:MincDir "lib\str.mc"))) {
+        Fail "no lib\ in $script:MincDir — bare imports (import str;) cannot resolve"
         Write-Host "  a minc install has lib\ beside the binary"
         exit 1
     }

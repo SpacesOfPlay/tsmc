@@ -80,11 +80,11 @@ the rooting rule a plugin has to follow.
 
 ## Build
 
-Requires the minc compiler. The project uses a local copy of a minc
-deploy at `minc/` (gitignored) — the folder holding the compiler
-binary, its `lib/`, and `LANGUAGE.md`. To update the compiler, copy a
-new deploy over it. The `MINC` environment variable overrides the
-install dir.
+Requires the minc compiler, installed and on PATH — an install is one
+folder holding the compiler binary and its `lib/`. `MINC` names that
+folder instead, for a compiler that is not on PATH. A deploy copied into
+`minc/` (gitignored) is used ahead of PATH when present, which is how
+this repo is developed; nothing needs it to be there.
 
 The build scripts prepend the install dir to their own PATH and invoke
 `minc` from the project folder; the compiler finds its standard

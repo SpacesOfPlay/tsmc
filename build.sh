@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # build.sh — build and test tsmc on Linux/macOS.
 #
-# Requires the minc compiler. MINC: minc install dir (the folder
-# holding the minc binary and its lib/); defaults to the local deploy
-# at ./minc (gitignored — refresh by copying in a new deploy).
+# Requires the minc compiler: its install dir on PATH, or MINC naming
+# that dir (the folder holding the minc binary and its lib/). A deploy
+# at ./minc is preferred over PATH when present, which is how this repo
+# is developed; nothing needs it to be there.
 
 set -u
 
@@ -11,7 +12,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 OUT_EXE="$BUILD_DIR/tsmc"
 
-MINC_DIR="${MINC:-$PROJECT_DIR/minc}"
+MINC_DIR=""   # set by assert_toolchain
 
 # Millisecond clock. GNU date has %N (nanoseconds); BSD date on macOS
 # passes the unknown %N through literally, so fall back to Perl there.
@@ -25,10 +26,35 @@ step() { printf '\033[36m:: %s\033[0m\n' "$1"; }
 pass() { printf '\033[32m  PASS  %s\033[0m\n' "$1"; }
 fail() { printf '\033[31m  FAIL  %s\033[0m\n' "$1"; }
 
+# MINC first, then a local deploy, then the minc on PATH. An install is
+# one folder with the binary at its root and lib/ beside it, so the dir
+# is where the binary resolves.
+find_minc_dir() {
+    if [ -n "${MINC:-}" ]; then echo "$MINC"; return; fi
+    if [ -x "$PROJECT_DIR/minc/minc" ] || [ -x "$PROJECT_DIR/minc/minc.exe" ]; then
+        echo "$PROJECT_DIR/minc"
+        return
+    fi
+    on_path="$(command -v minc 2>/dev/null || true)"
+    if [ -n "$on_path" ]; then dirname "$on_path"; return; fi
+    echo ""
+}
+
 assert_toolchain() {
+    MINC_DIR="$(find_minc_dir)"
+    if [ -z "$MINC_DIR" ]; then
+        fail "minc not found"
+        echo "  put the minc install dir on PATH, or set MINC to it (see README.md)"
+        exit 1
+    fi
+    if [ ! -d "$MINC_DIR" ]; then
+        fail "no such minc install dir: $MINC_DIR"
+        echo "  MINC names the folder holding the minc binary and lib/"
+        exit 1
+    fi
     if [ ! -x "$MINC_DIR/minc" ] && [ ! -x "$MINC_DIR/minc.exe" ]; then
-        fail "minc not found in $MINC_DIR"
-        echo "  copy a minc deploy into minc/, or set MINC (see README.md)"
+        fail "no minc binary in $MINC_DIR"
+        echo "  MINC names the folder holding the minc binary and lib/"
         exit 1
     fi
     MINC_DIR="$(cd "$MINC_DIR" && pwd)"

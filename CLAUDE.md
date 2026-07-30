@@ -17,10 +17,13 @@ TypeScript interpreter written in modern minc. CLI binary: `tsmc`.
 ./build.ps1 test       # build + full test suite
 ```
 
-The compiler is a local minc deploy at `minc/` (gitignored; refresh by
-copying in a new deploy). `MINC` env var overrides the install dir.
-The scripts prepend it to PATH and run `minc` from the project folder.
-No symlinks anywhere. The language reference is `minc/LANGUAGE.md`.
+The compiler is found in this order: `MINC` (the install dir), a local
+deploy at `minc/` (gitignored; refresh by copying in a new deploy), then
+the `minc` on PATH. The deploy is a dev convenience — the repo builds
+from an ordinary install. The scripts prepend the install dir to PATH
+and run `minc` from the project folder. No symlinks anywhere. The
+language reference is `minc/LANGUAGE.md` when the deploy is present,
+otherwise the copy in the install dir.
 
 ## Rules of the road
 
