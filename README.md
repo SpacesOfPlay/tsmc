@@ -111,8 +111,8 @@ failed — the honest metric is the pass rate over the tests that ran.
 Failing test paths are written to `build/test262-fails.txt`. Pin a
 different revision with the `T262_COMMIT` environment variable.
 
-On the default `test/language` run, 10,697 of the 16,235 tests that ran
-pass (about 65%); 7,478 more are skipped as unsupported. This is a
+On the default `test/language` run, 12,679 of the 16,235 tests that ran
+pass (about 78%); 7,478 more are skipped as unsupported. This is a
 current snapshot and will change as the interpreter does.
 
 ## Layout
