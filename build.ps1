@@ -91,11 +91,16 @@ function Build-Plugins {
     $out = Join-Path $BuildDir "tsmc-plugins.exe"
     $rc = Invoke-Minc @((Join-Path $ProjectDir "src\main.mc"), "-DTSMC_PLUGINS", "-o", $out)
     if ($rc -ne 0) { Fail "compile failed"; exit 1 }
+    $copied = @()
     foreach ($lib in @("libminc.dll", "libminc.so", "libminc.dylib")) {
         $src = Join-Path $MincDir $lib
-        if (Test-Path $src) { Copy-Item $src $BuildDir -Force }
+        if (Test-Path $src) { Copy-Item $src $BuildDir -Force; $copied += $lib }
     }
-    Pass $out
+    if ($copied.Count -eq 0) {
+        Fail "no libminc in $MincDir — a plugin build cannot start without it"
+        exit 1
+    }
+    Pass "$out (+$($copied -join ' '))"
 }
 
 function Run-Tests {

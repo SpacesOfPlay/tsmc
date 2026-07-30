@@ -4,7 +4,8 @@ A plugin is minc source that tsmc compiles and loads when a script requires
 it. `require('./demo.mc')` returns a module whose functions are native code.
 
 ```
-./build.ps1 plugins                                   # -> build/tsmc-plugins.exe
+./build.ps1 plugins        # Windows      -> build/tsmc-plugins.exe
+./build.sh plugins         # Linux/macOS  -> build/tsmc-plugins
 ./build/tsmc-plugins.exe examples/plugin/demo.js
 ```
 

@@ -70,30 +70,35 @@ through a table of services handed to it at registration — values,
 arguments, properties, throwing, and the GC root stack. A version word
 is checked before any of its exports are called.
 
-Plugins need their own binary, `./build.ps1 plugins`, because the
-compiler library binds at load time; the default build stays a single
-file and reports that it has no plugin support when a `.mc` file is
-required. A loaded plugin is never released, since a native's code
+Plugins need their own binary — the `plugins` build target — because the
+compiler library binds at load time, so that binary needs the library
+beside it and the target copies it there. The default build stays a
+single file and reports that it has no plugin support when a `.mc` file
+is required. A loaded plugin is never released, since a native's code
 pointer travels into the GC heap and unloading would leave those cells
 pointing at unmapped pages. `examples/plugin` has a worked example and
 the rooting rule a plugin has to follow.
 
+## Install minc
+
+```
+# Windows
+powershell -c "irm minc.dev/install.ps1 | iex"
+
+# macOS / Linux
+curl -fsSL https://minc.dev/install | bash
+```
+
 ## Build
 
-Requires the minc compiler, installed and on PATH — an install is one
-folder holding the compiler binary and its `lib/`. `MINC` names that
-folder instead, for a compiler that is not on PATH. A deploy copied into
-`minc/` (gitignored) is used ahead of PATH when present, which is how
-this repo is developed; nothing needs it to be there.
-
-The build scripts prepend the install dir to their own PATH and invoke
-`minc` from the project folder; the compiler finds its standard
-library in `lib/` next to the binary.
+Requires the minc compiler, see above. The `MINC` environment variable 
+overrides the install dir.
 
 ```
 ./build.ps1 build      # Windows      -> build/tsmc.exe
 ./build.sh build       # Linux/macOS  -> build/tsmc
-./build.ps1 plugins    # -> build/tsmc-plugins.exe, with plugin support
+./build.ps1 plugins    # Windows      -> build/tsmc-plugins.exe
+./build.sh plugins     # Linux/macOS  -> build/tsmc-plugins
 ./build.ps1 test       # build + run the full test suite (incl. GC stress)
 ./build.ps1 diff       # differential test vs a reference node
 ./build.ps1 bench      # time bench/*.ts

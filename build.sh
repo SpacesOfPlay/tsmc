@@ -84,6 +84,33 @@ build_tsmc() {
     pass "$OUT_EXE"
 }
 
+# A separate binary: plugins bind the embeddable compiler at load time, so
+# this one needs the library beside it to start at all. The default build
+# stays a single file with nothing to find. The loader looks next to the
+# executable, so the copy below is what makes a plugin build runnable.
+build_plugins() {
+    step "build tsmc with plugin support"
+    assert_toolchain
+    mkdir -p "$BUILD_DIR"
+    out="$BUILD_DIR/tsmc-plugins"
+    if ! invoke_minc "$PROJECT_DIR/src/main.mc" -DTSMC_PLUGINS -o "$out"; then
+        fail "compile failed"
+        exit 1
+    fi
+    copied=""
+    for lib in libminc.so libminc.dylib libminc.dll; do
+        if [ -f "$MINC_DIR/$lib" ]; then
+            cp -f "$MINC_DIR/$lib" "$BUILD_DIR/$lib"
+            copied="$copied $lib"
+        fi
+    done
+    if [ -z "$copied" ]; then
+        fail "no libminc in $MINC_DIR — a plugin build cannot start without it"
+        exit 1
+    fi
+    pass "$out (+${copied# })"
+}
+
 run_tests() {
     build_tsmc
     n_fail=0
@@ -218,6 +245,7 @@ run_diff() {
 
 case "${1:-help}" in
     build) build_tsmc ;;
+    plugins) build_plugins ;;
     test)  run_tests ;;
     bench) run_bench ;;
     diff)  run_diff ;;
@@ -228,8 +256,9 @@ case "${1:-help}" in
         pass "removed build/"
         ;;
     *)
-        echo "usage: ./build.sh <build|test|bench|diff|t262|clean>"
+        echo "usage: ./build.sh <build|plugins|test|bench|diff|t262|clean>"
         echo "  build   compile build/tsmc"
+        echo "  plugins compile build/tsmc-plugins (loads minc plugins)"
         echo "  test    build, then run unit + cli + golden run tests"
         echo "  bench   build, then time bench/*.ts"
         echo "  diff    build, then diff test/diff/*.js vs node"
