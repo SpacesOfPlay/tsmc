@@ -50,25 +50,25 @@ when defined(TSMC_PLUGINS) && os(linux) {
 }
 
 when defined(TSMC_PLUGINS) {
-    private void* g_plugin_ctx = null;
-    private bool g_plugin_tried = false;
-    private str g_plugin_error = "";
+    private void* g_ctx = null;
+    private bool g_tried = false;
+    private str g_error = "";
 
     bool plugin_support_built() { return true; }
 
     // Creates the compiler context on first use. A failure is remembered, so
     // a second require does not retry a compiler that is not going to work.
     bool plugin_host_ready() {
-        if g_plugin_ctx != null { return true; }
-        if g_plugin_tried { return false; }
-        g_plugin_tried = true;
+        if g_ctx != null { return true; }
+        if g_tried { return false; }
+        g_tried = true;
         if minc_abi_version() != TSMC_MINC_ABI {
-            g_plugin_error = "the installed minc library has a different ABI than this build expects";
+            g_error = "the installed minc library has a different ABI than this build expects";
             return false;
         }
-        g_plugin_ctx = minc_create();
-        if g_plugin_ctx == null {
-            g_plugin_error = "could not create a compiler context";
+        g_ctx = minc_create();
+        if g_ctx == null {
+            g_error = "could not create a compiler context";
             return false;
         }
         return true;
@@ -78,9 +78,9 @@ when defined(TSMC_PLUGINS) {
     // diagnostics left in plugin_host_error().
     void* plugin_compile(str path) {
         u8* c = str_to_cstr(path);
-        void* mod = minc_compile_file(g_plugin_ctx, c);
+        void* mod = minc_compile_file(g_ctx, c);
         free(c);
-        if mod == null { g_plugin_error = str_from_cstr(minc_errors(g_plugin_ctx)); }
+        if mod == null { g_error = str_from_cstr(minc_errors(g_ctx)); }
         return mod;
     }
 
@@ -93,7 +93,7 @@ when defined(TSMC_PLUGINS) {
 
     void plugin_release(void* mod) { minc_module_free(mod); }
 
-    str plugin_host_error() { return g_plugin_error; }
+    str plugin_host_error() { return g_error; }
 }
 else {
     bool plugin_support_built() { return false; }
