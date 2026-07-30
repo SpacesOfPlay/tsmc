@@ -32,7 +32,8 @@ The server presents an ECDSA-P256 or RSA certificate and sends the
 issuer chain with it.
 
 Not supported: `eval` and `new Function`, since there is no runtime code
-generation. No native addons, no `Intl`, and no `child_process`,
+generation. Node's native addons do not load; native code is written in
+minc instead, described below. No `Intl`, and no `child_process`,
 `worker_threads` or `dns`. `Buffer` is backed by an array rather than a
 `Uint8Array`, so it fails an `instanceof` check and copies where node
 shares memory (`doc/PLAN_M42_buffer_uint8array.md`). An ESM `import`
@@ -46,12 +47,36 @@ There is no `fs.createReadStream`, so a file is read whole.
 against the interpreter. `doc/META_PLAN.md` holds the design decisions
 and architecture.
 
-## An example
+## An example server
 
 `examples/serve` is an HTTPS content server written in TypeScript and
 run directly: Markdown through `markdown-it`, front matter through
 `js-yaml`, SHA-256 entity tags, conditional requests, gzip, a directory
 index, and TLS terminated by tsmc itself.
+
+## Native modules
+
+A `.mc` file can be required like any other module:
+
+```
+const demo = require('./demo.mc');
+```
+
+tsmc compiles it with the embeddable minc compiler, loads it in process,
+and its exported functions run as native code. The contract is
+`src/tsmc_plugin_abi.mc`, imported by both sides: a plugin is built as
+its own program and shares no symbols with the interpreter, so it works
+through a table of services handed to it at registration — values,
+arguments, properties, throwing, and the GC root stack. A version word
+is checked before any of its exports are called.
+
+Plugins need their own binary, `./build.ps1 plugins`, because the
+compiler library binds at load time; the default build stays a single
+file and reports that it has no plugin support when a `.mc` file is
+required. A loaded plugin is never released, since a native's code
+pointer travels into the GC heap and unloading would leave those cells
+pointing at unmapped pages. `examples/plugin` has a worked example and
+the rooting rule a plugin has to follow.
 
 ## Build
 
@@ -68,6 +93,7 @@ library in `lib/` next to the binary.
 ```
 ./build.ps1 build      # Windows      -> build/tsmc.exe
 ./build.sh build       # Linux/macOS  -> build/tsmc
+./build.ps1 plugins    # -> build/tsmc-plugins.exe, with plugin support
 ./build.ps1 test       # build + run the full test suite (incl. GC stress)
 ./build.ps1 diff       # differential test vs a reference node
 ./build.ps1 bench      # time bench/*.ts
@@ -121,7 +147,7 @@ current snapshot and will change as the interpreter does.
 src/       interpreter source (modern minc)
 doc/       design documents and milestone plans
 test/      unit tests (minc), golden run tests, and differential (.js) tests
-examples/  a TypeScript HTTPS server, on real npm packages
+examples/  a TypeScript HTTPS server, and a native module in minc
 tools/     test262 conformance runner
 minc/      local minc deploy: compiler + lib/ + docs (gitignored)
 build/     build artifacts (gitignored)
