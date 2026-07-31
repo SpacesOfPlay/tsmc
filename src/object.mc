@@ -349,6 +349,10 @@ struct JsGenerator {
     bool is_async;
     bool awaiting;       // the last suspend was an await
     bool draining;       // a request is in flight
+    // A return completion can suspend: `finally { yield x }` parks the body
+    // mid-unwind. The flag belongs to the generator, not the VM, or the
+    // completion comes back as a throw of the bare value.
+    bool unwind_return;
     Value queue;         // pending requests: promise, input, kind
     i32 qhead;           // first unserved request, in values not requests
 }
@@ -552,6 +556,7 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
     g.is_async = false;
     g.awaiting = false;
     g.draining = false;
+    g.unwind_return = false;
     g.queue = value_undefined();
     g.qhead = 0;
     return g;

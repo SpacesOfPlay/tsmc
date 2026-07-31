@@ -92,3 +92,22 @@ Still open: closing a delegate does not await its `return()`. `OP_ITER_CLOSE`
 calls the method and drops the promise, so when a throw unwinds out of a
 `yield*` over an async generator, the delegate's `finally` runs late rather
 than before the throw continues. Nothing in the suite sees it.
+
+A second sweep, 33 more checks, found three more. Two were already fixed:
+
+- A return completion could suspend. `finally { yield x }` parks the body
+  mid-unwind, and `vm.unwind_return` lives on the VM, so the fact was lost
+  at the suspend and the completion came back later as a throw of the bare
+  value. `it.return('r')` on such a generator threw the string `'r'`. The
+  flag is saved on the generator now. Sync generators had this too.
+- `return p` reported the promise rather than what it resolves to.
+
+Two are left, and both belong elsewhere because sync generators share them:
+
+- `yield*` does not forward `throw()` into the delegate. The spec calls the
+  delegate's `throw` method; tsmc closes the delegate and rethrows, so an
+  inner `catch` never runs.
+- `Object.getPrototypeOf` on a generator returns null. Generators are their
+  own cell kind rather than objects, so there is no prototype chain to walk,
+  and the `%IteratorPrototype%` / `%AsyncIteratorPrototype%` layer does not
+  exist either.

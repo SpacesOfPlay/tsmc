@@ -3,6 +3,11 @@
 // Checks run one at a time and each is raced against a timer, so a
 // regression that never settles shows up as TIMEOUT instead of wedging the
 // suite.
+//
+// Two gaps are left out because sync generators share them, so they belong
+// to yield* and to the generator object rather than to anything async:
+// yield* does not forward throw() into the delegate, and getPrototypeOf on
+// a generator returns null instead of walking to its prototype.
 
 const out = [];
 
@@ -272,6 +277,218 @@ async function main() {
     async function* g() { log.push('a'); yield 1; log.push('b'); yield 2; log.push('c'); }
     for await (const v of g()) log.push('got' + v);
     return log.join(',');
+  });
+
+  // --- the request queue ---------------------------------------------------
+  await T('three-concurrent-nexts', async () => {
+    async function* g() { yield 1; yield 2; yield 3; }
+    const it = g();
+    const r = await Promise.all([it.next(), it.next(), it.next()]);
+    return r.map((x) => x.value + ':' + x.done);
+  });
+  await T('concurrent-past-the-end', async () => {
+    async function* g() { yield 1; }
+    const it = g();
+    const r = await Promise.all([it.next(), it.next(), it.next()]);
+    return r.map((x) => show(x.value) + ':' + x.done);
+  });
+  await T('concurrent-with-awaits', async () => {
+    async function* g() { await tick(); yield 1; await tick(); yield 2; }
+    const it = g();
+    const r = await Promise.all([it.next(), it.next(), it.next()]);
+    return r.map((x) => show(x.value) + ':' + x.done);
+  });
+  await T('next-then-return-queued', async () => {
+    const log = [];
+    async function* g() {
+      try { await tick(); yield 1; await tick(); yield 2; } finally { log.push('fin'); }
+    }
+    const it = g();
+    const [a, b] = await Promise.all([it.next(), it.return('stop')]);
+    return [show(a.value), a.done, show(b.value), b.done, log.join(',')].join('/');
+  });
+  await T('next-then-throw-queued', async () => {
+    async function* g() { await tick(); yield 1; yield 2; }
+    const it = g();
+    const rs = await Promise.allSettled([it.next(), it.throw(new RangeError('q'))]);
+    return rs.map((r) => r.status + ':' + (r.value ? show(r.value.value) : r.reason.constructor.name));
+  });
+  await T('return-then-next', async () => {
+    async function* g() { yield 1; yield 2; }
+    const it = g();
+    await it.next();
+    const r = await it.return('x');
+    const n = await it.next();
+    return [show(r.value), r.done, show(n.value), n.done].join('/');
+  });
+
+  // --- cleanup while suspended --------------------------------------------
+  await T('return-before-start', async () => {
+    const log = [];
+    async function* g() { try { yield 1; } finally { log.push('fin'); } }
+    const it = g();
+    const r = await it.return('early');
+    return [show(r.value), r.done, log.length].join('/');
+  });
+  await T('throw-before-start', async () => {
+    async function* g() { yield 1; }
+    const it = g();
+    try { await it.throw(new TypeError('t')); return 'no-throw'; }
+    catch (e) { return e.constructor.name; }
+  });
+  await T('finally-yields-on-return', async () => {
+    async function* g() {
+      try { yield 1; } finally { yield 'from-finally'; }
+    }
+    const it = g();
+    await it.next();
+    const r = await it.return('r');
+    const after = await it.next();
+    return [show(r.value), r.done, show(after.value), after.done].join('/');
+  });
+  await T('finally-awaits-on-return', async () => {
+    const log = [];
+    async function* g() {
+      try { yield 1; } finally { await tick(); log.push('after-await'); }
+    }
+    const it = g();
+    await it.next();
+    const r = await it.return('r');
+    return [show(r.value), r.done, log.join(',')].join('/');
+  });
+  await T('return-value-awaited', async () => {
+    async function* g() { yield 1; return Promise.resolve('late'); }
+    const it = g();
+    await it.next();
+    const r = await it.next();
+    return [show(r.value), r.done].join('/');
+  });
+
+  // --- delegation ----------------------------------------------------------
+  await T('delegate-sent-value', async () => {
+    async function* inner() { const got = yield 'a'; yield 'got:' + got; }
+    async function* outer() { yield* inner(); }
+    const it = outer();
+    await it.next();
+    const r = await it.next('sent');
+    return r.value;
+  });
+  await T('delegate-body-throws', async () => {
+    async function* inner() { yield 1; throw new RangeError('inner'); }
+    async function* outer() { try { yield* inner(); } catch (e) { yield 'caught:' + e.constructor.name; } }
+    return await collect(outer());
+  });
+  await T('delegate-custom-async-iterable', async () => {
+    const obj = {
+      [Symbol.asyncIterator]() {
+        let i = 0;
+        return { next: () => Promise.resolve({ value: i, done: i++ >= 2 }) };
+      },
+    };
+    async function* g() { yield* obj; }
+    return await collect(g());
+  });
+  await T('delegate-with-awaits-inside', async () => {
+    async function* inner() { await tick(); yield 1; await tick(); yield 2; }
+    async function* outer() { await tick(); yield 0; yield* inner(); await tick(); yield 3; }
+    return await collect(outer());
+  });
+  await T('nested-delegation', async () => {
+    async function* a() { yield 1; }
+    async function* b() { yield* a(); yield 2; }
+    async function* c() { yield* b(); yield 3; }
+    return await collect(c());
+  });
+  await T('delegate-return-forwarded', async () => {
+    const log = [];
+    async function* inner() { try { yield 1; yield 2; } finally { log.push('inner-fin'); } }
+    async function* outer() { yield* inner(); }
+    const it = outer();
+    await it.next();
+    await it.return('done');
+    await tick();
+    return log.join(',');
+  });
+
+  // --- ordering ------------------------------------------------------------
+  await T('yield-vs-promise-order', async () => {
+    const log = [];
+    async function* g() { yield 1; yield 2; }
+    const p = (async () => { for await (const v of g()) log.push('g' + v); })();
+    Promise.resolve().then(() => log.push('micro'));
+    await p;
+    return log.join(',');
+  });
+  await T('body-runs-lazily', async () => {
+    const log = [];
+    async function* g() { log.push('started'); yield 1; }
+    const it = g();
+    log.push('created');
+    await it.next();
+    return log.join(',');
+  });
+  await T('await-does-not-yield-turn-early', async () => {
+    const log = [];
+    async function* g() { log.push('a'); await null; log.push('b'); yield 1; }
+    const it = g();
+    const p = it.next();
+    log.push('called');
+    await p;
+    return log.join(',');
+  });
+
+  // --- shapes --------------------------------------------------------------
+  await T('fn-toStringTag', () => {
+    async function* g() { yield 1; }
+    return Object.prototype.toString.call(g);
+  });
+  await T('next-is-not-own', () => {
+    async function* g() { yield 1; }
+    const it = g();
+    return Object.prototype.hasOwnProperty.call(it, 'next');
+  });
+  await T('methods-are-functions', () => {
+    async function* g() { yield 1; }
+    const it = g();
+    return [typeof it.next, typeof it.return, typeof it.throw].join('/');
+  });
+  await T('for-of-rejects', () => {
+    async function* g() { yield 1; }
+    try { for (const v of g()) { void v; } return 'no-throw'; }
+    catch (e) { return e.constructor.name; }
+  });
+  await T('plain-async-still-works', async () => {
+    async function f() { const a = await 1; const b = await Promise.resolve(2); return a + b; }
+    return await f();
+  });
+  await T('sync-generator-unchanged', () => {
+    function* g() { const got = yield 1; yield got; }
+    const it = g();
+    const a = it.next();
+    const b = it.next('s');
+    return [a.value, a.done, b.value, b.done].join('/');
+  });
+  await T('sync-delegation-unchanged', () => {
+    function* inner() { yield 1; return 'r'; }
+    function* outer() { const r = yield* inner(); yield r; }
+    return [...outer()];
+  });
+  await T('for-await-in-plain-async', async () => {
+    async function f() {
+      const seen = [];
+      for await (const v of [Promise.resolve(1), 2]) seen.push(v);
+      return seen;
+    }
+    return await f();
+  });
+  await T('await-in-for-await-body', async () => {
+    const seen = [];
+    for await (const v of [1, 2]) { await tick(); seen.push(v); }
+    return seen;
+  });
+  await T('generator-in-class-unchanged', () => {
+    class C { *g() { yield 'sync'; } }
+    return [...new C().g()];
   });
 
   console.log(out.join('\n'));

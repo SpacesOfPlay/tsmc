@@ -3976,6 +3976,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         vm.hp -= nh;
                     }
                     g.state = GEN_SUSPENDED;
+                    g.unwind_return = vm.unwind_return;
                     Value out = vpop(vm);
                     vm.sp = fr.base - 2;
                     vpush(vm, out);
@@ -4600,7 +4601,7 @@ Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, boo
     // Closing a delegate runs nested inside the outer generator's own return
     // completion, so this flag has to be saved rather than simply cleared.
     bool saved_unwind_return = vm.unwind_return;
-    vm.unwind_return = false;
+    vm.unwind_return = g.unwind_return;
     defer { vm.unwind_return = saved_unwind_return; }
     if g.state == GEN_RUNNING {
         vm_throw_error(vm, ERR_TYPE, "generator is already running");
@@ -4646,6 +4647,7 @@ Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, boo
         vpush(vm, input);
     }
     if is_throw {
+        vm.unwind_return = false;
         vm_throw(vm, input);
     } else if is_return {
         vm_throw_return(vm, input);
@@ -5056,6 +5058,24 @@ private Value nat_agen_throw_in(void* vmp, Value callee, Value thisv, Value* arg
     return value_undefined();
 }
 
+// The body finished and its value was a promise. What that promise resolves
+// to is what `done: true` carries.
+private Value nat_agen_done_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    agen_settle(vm, value_as_generator(me.env0), argc > 0 ? *(args) : value_undefined(), false, true);
+    vm_agen_pump(vm, me.env0);
+    return value_undefined();
+}
+
+private Value nat_agen_done_rej(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    agen_settle(vm, value_as_generator(me.env0), argc > 0 ? *(args) : value_undefined(), true, false);
+    vm_agen_pump(vm, me.env0);
+    return value_undefined();
+}
+
 private Value nat_agen_yield_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = cast(VM*, vmp);
     JsNative* me = value_as_native(callee);
@@ -5084,7 +5104,23 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
         return;
     }
     if g.state == GEN_DONE {
-        agen_settle(vm, g, res, false, true);
+        // `return p` reports what p resolves to, so an object goes through a
+        // promise. A primitive cannot be thenable and settles as it is.
+        if !value_is_object(res) {
+            agen_settle(vm, g, res, false, true);
+            gc_root_reset(&vm.heap, rm);
+            return;
+        }
+        Value dt = vm_promise_new(vm);
+        gc_root(&vm.heap, dt);
+        vm_promise_settle(vm, dt, res, false);
+        JsNative* df = js_new_native(&vm.heap, &nat_agen_done_ful, "step");
+        df.env0 = genv;
+        gc_root(&vm.heap, value_cell(&df.head));
+        JsNative* dr = js_new_native(&vm.heap, &nat_agen_done_rej, "step");
+        dr.env0 = genv;
+        gc_root(&vm.heap, value_cell(&dr.head));
+        ignore vm_promise_then(vm, dt, value_cell(&df.head), value_cell(&dr.head));
         gc_root_reset(&vm.heap, rm);
         return;
     }
