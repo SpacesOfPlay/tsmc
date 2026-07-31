@@ -3,13 +3,6 @@
 // Checks run one at a time and each is raced against a timer, so a
 // regression that never settles shows up as TIMEOUT instead of wedging the
 // suite.
-//
-// Not covered, because tsmc drives an async generator with the synchronous
-// generator machinery: the object's shape (next() returns a plain result,
-// Symbol.asyncIterator missing, Symbol.iterator present, the Generator tag)
-// and any body that awaits. An await compiles to the same opcode as a
-// yield, so the awaited value escapes to the consumer. See
-// doc/PLAN_M43_async_generators.md. Every generator below only yields.
 
 const out = [];
 
@@ -41,6 +34,8 @@ async function T(label, fn) {
   out.push(label + ' = ' + show(v));
 }
 
+const tick = () => new Promise((r) => setTimeout(r, 1));
+
 async function collect(it) {
   const seen = [];
   for await (const v of it) seen.push(v);
@@ -48,6 +43,68 @@ async function collect(it) {
 }
 
 async function main() {
+  // --- shape of the object -------------------------------------------------
+  await T('next-returns-promise', () => {
+    async function* g() { yield 1; }
+    return g().next() instanceof Promise;
+  });
+  await T('has-asyncIterator', () => {
+    async function* g() { yield 1; }
+    return typeof g()[Symbol.asyncIterator];
+  });
+  await T('asyncIterator-returns-self', () => {
+    async function* g() { yield 1; }
+    const it = g();
+    return it[Symbol.asyncIterator]() === it;
+  });
+  await T('no-sync-iterator', () => {
+    async function* g() { yield 1; }
+    return typeof g()[Symbol.iterator];
+  });
+  await T('toStringTag', () => {
+    async function* g() { yield 1; }
+    return Object.prototype.toString.call(g());
+  });
+
+  // --- awaiting inside the body --------------------------------------------
+  await T('await-then-yield', async () => {
+    async function* g() { await tick(); yield 1; await tick(); yield 2; }
+    return await collect(g());
+  });
+  await T('await-value-used', async () => {
+    async function* g() { const v = await Promise.resolve(7); yield v * 2; }
+    return await collect(g());
+  });
+  await T('await-between-every-yield', async () => {
+    async function* g() {
+      for (let i = 0; i < 3; i++) { await tick(); yield i; }
+    }
+    return await collect(g());
+  });
+  await T('await-rejection-caught-inside', async () => {
+    async function* g() {
+      try { await Promise.reject(new RangeError('r')); yield 'no'; }
+      catch (e) { yield 'caught:' + e.constructor.name; }
+    }
+    return await collect(g());
+  });
+  await T('reject-awaited', async () => {
+    async function* g() { await Promise.reject(new RangeError('r')); yield 1; }
+    try { await collect(g()); return 'no-throw'; }
+    catch (e) { return e.constructor.name + ':' + e.message; }
+  });
+  await T('return-while-awaiting-runs-finally', async () => {
+    const log = [];
+    async function* g() {
+      try { await tick(); yield 1; await tick(); yield 2; }
+      finally { log.push('cleanup'); }
+    }
+    const it = g();
+    await it.next();
+    await it.return('done');
+    return log;
+  });
+
   // --- production ----------------------------------------------------------
   await T('yields', async () => {
     async function* g() { yield 1; yield 2; yield 3; }

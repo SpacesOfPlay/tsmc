@@ -344,6 +344,13 @@ struct JsGenerator {
     i32 saved_len;
     i32* handler_data;   // open try handlers: (sp_rel, ip) pairs
     i32 n_handlers;
+    // An async generator suspends for two reasons and has to tell them
+    // apart: a yield hands its value to the consumer, an await does not.
+    bool is_async;
+    bool awaiting;       // the last suspend was an await
+    bool draining;       // a request is in flight
+    Value queue;         // pending requests: promise, input, kind
+    i32 qhead;           // first unserved request, in values not requests
 }
 
 // --- GC hooks ---------------------------------------------------------
@@ -406,6 +413,7 @@ void js_trace(GcHeap* h, GcCell* c) {
         if g.fun != null { gc_mark_cell(h, &g.fun.head); }
         gc_mark_value(h, g.this_val);
         gc_mark_value(h, g.arguments_obj);
+        gc_mark_value(h, g.queue);
         for i32 i = 0; i < g.saved_len; i++ {
             gc_mark_value(h, *(g.saved + i));
         }
@@ -541,6 +549,11 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
     g.this_val = this_val;
     g.arguments_obj = value_undefined();
     g.state = GEN_START;
+    g.is_async = false;
+    g.awaiting = false;
+    g.draining = false;
+    g.queue = value_undefined();
+    g.qhead = 0;
     return g;
 }
 

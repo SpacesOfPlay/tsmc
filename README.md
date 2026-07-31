@@ -12,10 +12,11 @@ npm packages run unmodified.
 
 ## What runs
 
-The language: classes, generators, async/await, top-level await,
-modules (CommonJS and ESM, including dynamic `import()`), Proxy and
-Reflect, BigInt, typed arrays, `Map`/`Set`/`WeakMap`/`WeakSet`,
-`arguments`, and regular expressions with Unicode property escapes.
+The language: classes, generators, async/await, async generators and
+`for await`, top-level await, modules (CommonJS and ESM, including
+dynamic `import()`), Proxy and Reflect, BigInt, typed arrays,
+`Map`/`Set`/`WeakMap`/`WeakSet`, `arguments`, and regular expressions
+with Unicode property escapes.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
@@ -37,13 +38,8 @@ minc instead, described below. No `Intl`, and no `child_process`,
 `worker_threads` or `dns`. `Buffer` is backed by an array rather than a
 `Uint8Array`, so it fails an `instanceof` check and copies where node
 shares memory (`doc/PLAN_M42_buffer_uint8array.md`). An ESM `import`
-takes a relative path only — a bare specifier needs `require`. Async
-generators run under `for await`, but the object they return is not a
-real async iterator: `Symbol.asyncIterator` is missing and `.next()`
-hands back no promise. An `await` inside one compiles to a `yield`, so
-its value escapes into the sequence
-(`doc/PLAN_M43_async_generators.md`). There is no
-`fs.createReadStream`, so a file is read whole.
+takes a relative path only — a bare specifier needs `require`. There is
+no `fs.createReadStream`, so a file is read whole.
 
 `doc/npm-compatibility.md` lists the npm packages that have been run
 against the interpreter. `doc/META_PLAN.md` holds the design decisions

@@ -144,6 +144,7 @@ struct VM {
     JsObject*[8] error_protos;   // indexed by ERR_* (size = ERR_KIND_COUNT)
     u64 rng;
     JsObject* generator_proto;
+    JsObject* async_generator_proto;
     JsObject* promise_proto;
     JsObject* regexp_proto;
     JsObject* map_proto;
@@ -332,6 +333,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         if vm.error_protos[i] != null { gc_mark_cell(h, &vm.error_protos[i].head); }
     }
     if vm.generator_proto != null { gc_mark_cell(h, &vm.generator_proto.head); }
+    if vm.async_generator_proto != null { gc_mark_cell(h, &vm.async_generator_proto.head); }
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
@@ -1379,7 +1381,8 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
         return true;
     }
     if value_is_generator(objv) {
-        if vm.generator_proto != null { ignore js_get_prop(vm.generator_proto, a, out); }
+        JsObject* gp = value_as_generator(objv).is_async ? vm.async_generator_proto : vm.generator_proto;
+        if gp != null { ignore js_get_prop(gp, a, out); }
         return true;
     }
     if value_is_map(objv) {
@@ -2469,6 +2472,7 @@ void vm_init(VM* vm) {
     }
     vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
     vm.generator_proto = null;
+    vm.async_generator_proto = null;
     vm.promise_proto = null;
     vm.regexp_proto = null;
     vm.map_proto = null;
@@ -3214,7 +3218,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else if value_is_map(v) {
                         start = value_as_map(v).proto;
                     } else if value_is_generator(v) {
-                        start = vm.generator_proto;
+                        start = value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto;
                     } else if value_is_bigint(v) {
                         start = vm.bigint_proto;
                     } else if value_is_function(v) || value_is_native(v) {
@@ -3376,6 +3380,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
+                            if ft.is_async { value_as_generator(gv).is_async = true; }
                             vpush(vm, gv);
                         } else if ft.is_async {
                             Value rp = make_async_from_call(vm, f, argc);
@@ -3936,11 +3941,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
             }
-            case OP_YIELD: {
+            case OP_YIELD, OP_AWAIT: {
                 JsGenerator* g = fr.gen;
                 if g == null {
                     vm_throw_error(vm, ERR_TYPE, "yield outside a generator");
                 } else {
+                    g.awaiting = op == OP_AWAIT;
                     i32 depth = vm.sp - fr.base - 1;
                     if g.saved != null { free(g.saved); }
                     g.saved = alloc<Value>(depth > 0 ? depth : 1);
@@ -4942,6 +4948,175 @@ private Value make_async_from_call(VM* vm, JsFunction* f, i32 argc) {
     vm_async_step(vm, genv, rp, value_undefined(), false);
     vm.sp -= 2;
     return rp;
+}
+
+// --- async generators -------------------------------------------------------
+//
+// An async generator suspends for two reasons and has to tell them apart. An
+// await resumes here and the consumer never sees it; a yield settles the
+// consumer's promise. That is the one branch this driver adds to
+// vm_async_step. The queue is the other half: next() can be called again
+// before the last one settles, and a body must not be resumed while it is
+// already running.
+
+const i32 AG_NEXT = 0;
+const i32 AG_THROW = 1;
+const i32 AG_RETURN = 2;
+
+private Value agen_result(VM* vm, Value val, bool done) {
+    vpush(vm, val);
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vpush(vm, value_cell(&r.head));
+    js_set_prop(r, atom_intern(&vm.atoms, "value"), val);
+    js_set_prop(r, atom_intern(&vm.atoms, "done"), value_bool(done));
+    Value out = value_cell(&r.head);
+    vm.sp -= 2;
+    return out;
+}
+
+// Three values per request: the promise to settle, the resume input, the kind.
+private i32 agen_pending(JsGenerator* g) {
+    if !value_is_object(g.queue) { return 0; }
+    return value_as_object(g.queue).elen - g.qhead;
+}
+
+private Value agen_head(JsGenerator* g, i32 k) {
+    return js_array_get(value_as_object(g.queue), g.qhead + k);
+}
+
+private void agen_push(VM* vm, JsGenerator* g, Value p, Value input, i32 kind) {
+    if !value_is_object(g.queue) {
+        JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+        g.queue = value_cell(&a.head);
+    }
+    JsObject* q = value_as_object(g.queue);
+    i32 n = q.elen;
+    js_array_set(q, n, p);
+    js_array_set(q, n + 1, input);
+    js_array_set(q, n + 2, value_int(kind));
+}
+
+// Settles the head request and drops it. The queue is emptied once it drains
+// so a long-lived generator does not grow one.
+private void agen_settle(VM* vm, JsGenerator* g, Value v, bool reject, bool done) {
+    if agen_pending(g) <= 0 {
+        g.draining = false;
+        return;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, v);
+    Value p = agen_head(g, 0);
+    gc_root(&vm.heap, p);
+    JsObject* q = value_as_object(g.queue);
+    g.qhead += 3;
+    if g.qhead >= q.elen {
+        g.qhead = 0;
+        js_array_set_length(q, 0);
+    }
+    g.draining = false;
+    if reject { vm_promise_settle(vm, p, v, true); }
+    else { vm_promise_settle(vm, p, agen_result(vm, v, done), false); }
+    gc_root_reset(&vm.heap, rm);
+}
+
+// Starts the next request when the body is idle.
+private void vm_agen_pump(VM* vm, Value genv) {
+    JsGenerator* g = value_as_generator(genv);
+    while !g.draining && agen_pending(g) > 0 {
+        Value input = agen_head(g, 1);
+        i32 kind = value_as_int(agen_head(g, 2));
+        if g.state == GEN_DONE {
+            // Nothing left to resume: throw() rejects, return() and next()
+            // report the end.
+            if kind == AG_THROW { agen_settle(vm, g, input, true, false); }
+            else if kind == AG_RETURN { agen_settle(vm, g, input, false, true); }
+            else { agen_settle(vm, g, value_undefined(), false, true); }
+        } else {
+            g.draining = true;
+            vm_agen_step(vm, genv, input, kind == AG_THROW, kind == AG_RETURN);
+        }
+    }
+}
+
+private Value nat_agen_await_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_agen_step(vm, me.env0, argc > 0 ? *(args) : value_undefined(), false, false);
+    vm_agen_pump(vm, me.env0);
+    return value_undefined();
+}
+
+// A rejected await, and a rejected yielded value, both resume the body with a
+// throw at the point it suspended, so the generator's own catch can see it.
+private Value nat_agen_throw_in(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    vm_agen_step(vm, me.env0, argc > 0 ? *(args) : value_undefined(), true, false);
+    vm_agen_pump(vm, me.env0);
+    return value_undefined();
+}
+
+private Value nat_agen_yield_ful(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    JsNative* me = value_as_native(callee);
+    JsGenerator* g = value_as_generator(me.env0);
+    agen_settle(vm, g, argc > 0 ? *(args) : value_undefined(), false, false);
+    vm_agen_pump(vm, me.env0);
+    return value_undefined();
+}
+
+// Runs the body until it suspends or finishes, then decides what the head
+// request sees.
+private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool is_return) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, genv);
+    gc_root(&vm.heap, input);
+    JsGenerator* g = value_as_generator(genv);
+    Value res = vm_gen_resume_mode(vm, g, input, is_throw, is_return);
+    gc_root(&vm.heap, res);
+    if vm.has_pending {
+        Value e = vm.pending;
+        vm.has_pending = false;
+        vm.pending = value_undefined();
+        gc_root(&vm.heap, e);
+        agen_settle(vm, g, e, true, false);
+        gc_root_reset(&vm.heap, rm);
+        return;
+    }
+    if g.state == GEN_DONE {
+        agen_settle(vm, g, res, false, true);
+        gc_root_reset(&vm.heap, rm);
+        return;
+    }
+    // Suspended. Both reasons wait on the value first: an await by
+    // definition, a yield because `yield p` hands the consumer what p
+    // resolves to. Settling a fresh promise with it runs the assimilation
+    // path, so a thenable is followed.
+    Value target = vm_promise_new(vm);
+    gc_root(&vm.heap, target);
+    vm_promise_settle(vm, target, res, false);
+    JsNative* onf = js_new_native(&vm.heap, g.awaiting ? &nat_agen_await_ful : &nat_agen_yield_ful, "step");
+    onf.env0 = genv;
+    gc_root(&vm.heap, value_cell(&onf.head));
+    JsNative* onr = js_new_native(&vm.heap, &nat_agen_throw_in, "step");
+    onr.env0 = genv;
+    gc_root(&vm.heap, value_cell(&onr.head));
+    ignore vm_promise_then(vm, target, value_cell(&onf.head), value_cell(&onr.head));
+    gc_root_reset(&vm.heap, rm);
+}
+
+// next/throw/return on an async generator: queue the request, return its
+// promise, and start the body if it is idle.
+Value vm_agen_request(VM* vm, Value genv, Value input, i32 kind) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, genv);
+    gc_root(&vm.heap, input);
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    agen_push(vm, value_as_generator(genv), p, input, kind);
+    vm_agen_pump(vm, genv);
+    gc_root_reset(&vm.heap, rm);
+    return p;
 }
 
 // --- I/O handles -------------------------------------------------------------------

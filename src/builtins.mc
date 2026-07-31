@@ -5589,6 +5589,32 @@ private Value nat_gen_symiter(void* vmp, Value callee, Value thisv, Value* args,
     return thisv;
 }
 
+// The async generator methods queue a request and hand back its promise.
+// A rejected promise is how a misuse is reported, since these never throw.
+private Value agen_call(void* vmp, Value thisv, Value* args, i32 argc, i32 kind) {
+    VM* vm = as_vm(vmp);
+    Value input = arg_at(args, argc, 0);
+    if !value_is_generator(thisv) || !value_as_generator(thisv).is_async {
+        Value p = vm_promise_new(vm);
+        vm_push(vm, p);
+        vm_promise_settle(vm, p, vm_make_error(vm, ERR_TYPE, "not an async generator"), true);
+        return vm_pop_ret(vm, p);
+    }
+    return vm_agen_request(vm, thisv, input, kind);
+}
+
+private Value nat_agen_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return agen_call(vmp, thisv, args, argc, AG_NEXT);
+}
+
+private Value nat_agen_return(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return agen_call(vmp, thisv, args, argc, AG_RETURN);
+}
+
+private Value nat_agen_throw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return agen_call(vmp, thisv, args, argc, AG_THROW);
+}
+
 // --- Promise -----------------------------------------------------------------------------
 
 private Value nat_resolve_fn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -16751,6 +16777,17 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.generator_proto, "throw", &nat_gen_throw);
     JsNative* gen_it = js_new_native(&vm.heap, &nat_gen_symiter, "[Symbol.iterator]");
     js_set_prop(vm.generator_proto, iter_id, value_cell(&gen_it.head));
+
+    // AsyncGenerator.prototype. Its methods hand back promises, and it
+    // carries Symbol.asyncIterator instead of Symbol.iterator, so a plain
+    // for-of over one is a TypeError rather than a silent sync walk.
+    vm.async_generator_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_tag(vm, vm.async_generator_proto, "AsyncGenerator");
+    def_method(vm, vm.async_generator_proto, "next", &nat_agen_next);
+    def_method(vm, vm.async_generator_proto, "return", &nat_agen_return);
+    def_method(vm, vm.async_generator_proto, "throw", &nat_agen_throw);
+    JsNative* agen_it = js_new_native(&vm.heap, &nat_gen_symiter, "[Symbol.asyncIterator]");
+    js_set_prop(vm.async_generator_proto, vm_sym_async_iterator_id(vm), value_cell(&agen_it.head));
 
     // Promise
     vm.promise_proto = js_new_object(&vm.heap, vm.object_proto);

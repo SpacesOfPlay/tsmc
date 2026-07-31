@@ -1746,8 +1746,13 @@ private void compile_expr(Compiler* co, Node* n) {
             // yield*: iterate the operand, yielding each value; the expression
             // result is the inner iterator's return value. Whatever resumes
             // this generator is sent on into the delegate's next().
+            // In an async generator the delegate is walked with the async
+            // protocol: its next() hands back a promise, so each step is
+            // awaited. A sync iterable still works, since OP_GET_AITER falls
+            // back to Symbol.iterator and awaiting a plain result is a no-op.
+            bool adelegate = co.cur.is_async;
             compile_expr(co, n.a);
-            ch_op(ch, OP_GET_ITER);
+            ch_op(ch, adelegate ? OP_GET_AITER : OP_GET_ITER);
             i32 t_it = alloc_slot(co.cur);
             ch_op_u16(ch, OP_SETLOCAL, t_it);
             ch_op(ch, OP_POP);
@@ -1766,15 +1771,30 @@ private void compile_expr(Compiler* co, Node* n) {
             // delegate before carrying on
             i32 jclose = ch_jump(ch, OP_TRY_PUSH);
             i32 lstart = ch_pos(ch);
-            ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETLOCAL, t_sent);
-            ch_op(ch, OP_ITER_SEND);       // [value, done]
-            i32 jdone = ch_jump(ch, OP_JUMPT);
+            i32 jdone = 0;
+            if adelegate {
+                ch_op_u16(ch, OP_GETLOCAL, t_it);
+                ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
+                ch_op_u16(ch, OP_GETLOCAL, t_sent);
+                ch_op_u16(ch, OP_CALL, 1);
+                ch_op(ch, OP_AWAIT);
+                ch_op(ch, OP_ITER_CHECK);  // [res]
+                ch_op(ch, OP_DUP);
+                ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+                jdone = ch_jump(ch, OP_JUMPT);
+                ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            } else {
+                ch_op_u16(ch, OP_GETLOCAL, t_it);
+                ch_op_u16(ch, OP_GETLOCAL, t_sent);
+                ch_op(ch, OP_ITER_SEND);       // [value, done]
+                jdone = ch_jump(ch, OP_JUMPT);
+            }
             ch_op(ch, OP_YIELD);           // yield value; keep the resume input
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_JUMP, lstart);
             ch_patch(ch, jdone);           // [value] — the final iterator value
+            if adelegate { ch_op_u16(ch, OP_GETPROP, name_const(co, "value")); }
             ch_op(ch, OP_TRY_POP);
             i32 jend = ch_jump(ch, OP_JUMP);
             ch_patch(ch, jclose);
@@ -1800,7 +1820,7 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         compile_expr(co, n.a);
-        ch_op(ch, OP_YIELD);
+        ch_op(ch, OP_AWAIT);
         return;
     }
     cerror(co, n, "expression not supported yet");
@@ -2547,7 +2567,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
     ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
     ch_op_u16(ch, OP_CALL, 0);
-    ch_op(ch, OP_YIELD);
+    ch_op(ch, OP_AWAIT);
     ch_op(ch, OP_ITER_CHECK);
     // if result.done: break (leaving result on the stack for the pop)
     ch_op(ch, OP_DUP);
@@ -2558,7 +2578,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     i32 jend = ch_jump(ch, OP_JUMPT);
     // value = await result.value
     ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
-    ch_op(ch, OP_YIELD);
+    ch_op(ch, OP_AWAIT);
 
     for i32 i = bind_start; i < bind_end; i++ {
         CBind b = vec_get(&fs.binds, i);

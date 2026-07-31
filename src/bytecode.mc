@@ -97,6 +97,8 @@ enum Op {
     OP_KEYS,         // [v] -> array of own enumerable key strings
 
     OP_YIELD,        // suspend the generator frame; top is the value
+    OP_AWAIT,        // suspends like OP_YIELD, but marks the reason as await
+                     // so an async generator can tell one from the other
     OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
     OP_GET_AITER,    // [v] -> iterator via Symbol.asyncIterator, else Symbol.iterator
     OP_ITER_SEND,    // [iter, sent] -> [value, done] via iter.next(sent)

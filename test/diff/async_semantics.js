@@ -7,9 +7,9 @@
 // that never settles then shows up as a "TIMEOUT" mismatch instead of wedging
 // the whole suite.
 //
+// Async generators live in async_iteration.js.
+//
 // Deliberately not covered, because tsmc does not implement them yet:
-//   - Async generators, covered in async_iteration.js. Everything below
-//     sticks to ones that only yield.
 //   - A function's constructor is Function for every kind, so
 //     `f.constructor.name === 'AsyncFunction'` does not hold. Functions share
 //     one prototype object rather than one per kind. The Symbol.toStringTag
