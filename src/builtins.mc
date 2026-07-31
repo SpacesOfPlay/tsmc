@@ -6114,9 +6114,56 @@ private Value timer_extra_args(VM* vm, Value* args, i32 argc) {
     return value_cell(&a.head);
 }
 
+// The handle setTimeout and setInterval hand back. Node returns an object,
+// and server code calls unref() on it, so a bare id throws there. valueOf
+// keeps clearTimeout(id) working on either shape.
+private i32 timeout_id(VM* vm, Value thisv) {
+    if !value_is_object(thisv) { return 0; }
+    Value* p = props_get(&value_as_object(thisv).props, bi_atom(vm, "%tid"));
+    return p == null ? 0 : value_as_int(*p);
+}
+
+private Value nat_timeout_unref(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    ignore vm_timer_set_ref(vm, timeout_id(vm, thisv), false);
+    return thisv;
+}
+
+private Value nat_timeout_ref(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    ignore vm_timer_set_ref(vm, timeout_id(vm, thisv), true);
+    return thisv;
+}
+
+private Value nat_timeout_hasref(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return value_bool(vm_timer_has_ref(vm, timeout_id(vm, thisv)));
+}
+
+private Value nat_timeout_refresh(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    vm_timer_refresh(vm, timeout_id(vm, thisv));
+    return thisv;
+}
+
+private Value nat_timeout_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return value_int(timeout_id(vm, thisv));
+}
+
+private Value timeout_new(VM* vm, i32 id) {
+    JsObject* o = js_new_object(&vm.heap, vm.timeout_proto);
+    vm_push(vm, value_cell(&o.head));
+    props_set_desc(&o.props, bi_atom(vm, "%tid"), value_int(id), 0);
+    return vm_pop_ret(vm, value_cell(&o.head));
+}
+
 private Value timer_add(VM* vm, Value* args, i32 argc, bool repeating) {
     Value cbfn = arg_at(args, argc, 0);
-    if !value_is_callable(cbfn) { return value_int(0); }
+    if !value_is_callable(cbfn) {
+        vm_throw_error(vm, ERR_TYPE, "callback must be a function");
+        return value_undefined();
+    }
     f64 delay = argc > 1 ? js_to_number(*(args + 1)) : 0.0;
     // a delay below 1ms is clamped up, so a 0ms and a 1ms timer share a
     // deadline and fire in registration order
@@ -6126,7 +6173,7 @@ private Value timer_add(VM* vm, Value* args, i32 argc, bool repeating) {
     gc_root(&vm.heap, extra);
     i32 id = vm_add_timer_full(vm, cbfn, delay, repeating ? delay : 0.0, extra);
     gc_root_reset(&vm.heap, rm);
-    return value_int(id);
+    return timeout_new(vm, id);
 }
 
 private Value nat_set_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -6145,7 +6192,10 @@ private Value nat_set_interval(void* vmp, Value callee, Value thisv, Value* args
 private Value nat_set_immediate(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value cbfn = arg_at(args, argc, 0);
-    if !value_is_callable(cbfn) { return value_int(0); }
+    if !value_is_callable(cbfn) {
+        vm_throw_error(vm, ERR_TYPE, "callback must be a function");
+        return value_undefined();
+    }
     i32 rm = gc_root_mark(&vm.heap);
     // the argument list starts one earlier than a timer's, so it is rebuilt
     JsObject* a = js_new_array(&vm.heap, vm.array_proto);
@@ -6157,18 +6207,26 @@ private Value nat_set_immediate(void* vmp, Value callee, Value thisv, Value* arg
     gc_root(&vm.heap, extra);
     i32 id = vm_add_timer_full(vm, cbfn, 0.0, 0.0, extra);
     gc_root_reset(&vm.heap, rm);
-    return value_int(id);
+    return timeout_new(vm, id);
 }
 
+// Takes either the Timeout object or a bare id. ToNumber cannot reach the
+// object's valueOf from here, so the id is read straight off it.
 private Value nat_clear_timeout(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    vm_clear_timer(vm, to_int_arg(arg_at(args, argc, 0)));
+    Value a0 = arg_at(args, argc, 0);
+    i32 id = value_is_object(a0) ? timeout_id(vm, a0) : to_int_arg(a0);
+    vm_clear_timer(vm, id);
     return value_undefined();
 }
 
 private Value nat_queue_microtask(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value cbfn = arg_at(args, argc, 0);
+    if !value_is_callable(cbfn) {
+        vm_throw_error(vm, ERR_TYPE, "callback must be a function");
+        return value_undefined();
+    }
     if value_is_callable(cbfn) {
         // schedule via an already-resolved promise reaction
         i32 rm = gc_root_mark(&vm.heap);
@@ -16926,6 +16984,12 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.regexp_proto, "toString", &nat_regexp_tostring);
 
     // timers and microtasks
+    vm.timeout_proto = js_new_object(&vm.heap, vm.object_proto);
+    def_method(vm, vm.timeout_proto, "unref", &nat_timeout_unref);
+    def_method(vm, vm.timeout_proto, "ref", &nat_timeout_ref);
+    def_method(vm, vm.timeout_proto, "hasRef", &nat_timeout_hasref);
+    def_method(vm, vm.timeout_proto, "refresh", &nat_timeout_refresh);
+    def_method(vm, vm.timeout_proto, "valueOf", &nat_timeout_valueof);
     ignore def_global_fn(vm, "setTimeout", &nat_set_timeout);
     ignore def_global_fn(vm, "clearTimeout", &nat_clear_timeout);
     ignore def_global_fn(vm, "setInterval", &nat_set_interval);

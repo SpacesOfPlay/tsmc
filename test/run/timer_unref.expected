@@ -1,0 +1,5 @@
+hasRef: true
+hasRef after unref: false
+typeof handle: object
+clear accepts the object
+re-reffed then unreffed: false

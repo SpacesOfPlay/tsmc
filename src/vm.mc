@@ -70,7 +70,9 @@ struct VmJob {
 struct VmTimer {
     i32 id;
     bool alive;
+    bool reffed;  // an unreffed timer fires, but does not hold the loop open
     f64 due;      // absolute deadline, milliseconds on the monotonic clock
+    f64 delay;    // what refresh() re-arms from
     f64 period;   // > 0 for setInterval: rearmed this far ahead after firing
     i64 seq;
     Value cb;
@@ -158,6 +160,7 @@ struct VM {
     JsObject* buffer_proto;
     JsObject* textenc_proto;
     JsObject* textdec_proto;
+    JsObject* timeout_proto;
     JsObject* ta_proto;        // %TypedArray%.prototype (shared methods)
     JsObject* arraybuffer_proto;
     JsObject* dataview_proto;
@@ -353,6 +356,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
     if vm.textdec_proto != null { gc_mark_cell(h, &vm.textdec_proto.head); }
+    if vm.timeout_proto != null { gc_mark_cell(h, &vm.timeout_proto.head); }
     if vm.node_fs_ns != null { gc_mark_cell(h, &vm.node_fs_ns.head); }
     if vm.node_fsp_ns != null { gc_mark_cell(h, &vm.node_fsp_ns.head); }
     if vm.node_path_ns != null { gc_mark_cell(h, &vm.node_path_ns.head); }
@@ -2490,6 +2494,7 @@ void vm_init(VM* vm) {
     for i32 i = 0; i < 9; i++ { vm.ta_protos[i] = null; }
     vm.textenc_proto = null;
     vm.textdec_proto = null;
+    vm.timeout_proto = null;
     vm.node_fs_ns = null;
     vm.node_fsp_ns = null;
     vm.node_path_ns = null;
@@ -5254,8 +5259,10 @@ i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     tm.id = vm.next_timer_id;
     vm.next_timer_id++;
     tm.alive = true;
+    tm.reffed = true;
     // absolute deadline: negative/NaN delays clamp to "due now"
-    tm.due = vm_now_ms(vm) + (delay > 0.0 ? delay : 0.0);
+    tm.delay = delay > 0.0 ? delay : 0.0;
+    tm.due = vm_now_ms(vm) + tm.delay;
     tm.period = period;
     tm.seq = vm.timer_seq;
     vm.timer_seq++;
@@ -5263,6 +5270,39 @@ i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     tm.args = extra;
     vec_push(&vm.timers, tm);
     return tm.id;
+}
+
+// Node's ref/unref/refresh, reached through the Timeout object.
+bool vm_timer_set_ref(VM* vm, i32 id, bool on) {
+    for i32 i = 0; i < vm.timers.len; i++ {
+        VmTimer* tm = vm.timers.data + i;
+        if tm.id == id && tm.alive { tm.reffed = on; return true; }
+    }
+    return false;
+}
+
+bool vm_timer_has_ref(VM* vm, i32 id) {
+    for i32 i = 0; i < vm.timers.len; i++ {
+        VmTimer* tm = vm.timers.data + i;
+        if tm.id == id { return tm.alive && tm.reffed; }
+    }
+    return false;
+}
+
+void vm_timer_refresh(VM* vm, i32 id) {
+    for i32 i = 0; i < vm.timers.len; i++ {
+        VmTimer* tm = vm.timers.data + i;
+        if tm.id == id && tm.alive { tm.due = vm_now_ms(vm) + tm.delay; }
+    }
+}
+
+// True while some live timer still holds the loop open.
+bool vm_timers_reffed(VM* vm) {
+    for i32 i = 0; i < vm.timers.len; i++ {
+        VmTimer* tm = vm.timers.data + i;
+        if tm.alive && tm.reffed { return true; }
+    }
+    return false;
 }
 
 void vm_clear_timer(VM* vm, i32 id) {
@@ -5375,12 +5415,15 @@ i32 vm_run_event_loop(VM* vm) {
             VmTimer* bt = vm.timers.data + best;
             if tm.due < bt.due || (tm.due == bt.due && tm.seq < bt.seq) { best = i; }
         }
+        // An unreffed timer fires if the loop runs, but does not keep it
+        // running on its own. Checked before firing, or an unreffed interval
+        // would hold the process open forever.
+        if !vm_timers_reffed(vm) && !vm_handles_alive(vm) { break; }
         f64 now = vm_now_ms(vm);
         bool timer_due = best >= 0 && (vm.timers.data + best).due <= now;
         if !timer_due {
             // nothing to fire yet — poll the sockets, bounded by the next
             // timer deadline (or block until I/O when only handles remain)
-            if best < 0 && !vm_handles_alive(vm) { break; }
             i64 timeout;
             if best < 0 {
                 timeout = -1;
