@@ -15,8 +15,13 @@
 #
 # A test is skipped (not failed) when it needs a feature the interpreter
 # does not implement (see SKIP_FEATURES) or a harness mode we do not run
-# (modules, async, raw multi-realm). The honest metric is the pass rate
-# over the tests that actually ran.
+# (modules, raw multi-realm). The honest metric is the pass rate over the
+# tests that actually ran.
+#
+# `flags: [async]` tests report through print(): doneprintHandle.js turns
+# $DONE into one of two markers on stdout, and a test passes only if the
+# completion marker shows up. Silence is a failure, which is what catches a
+# promise that never settles.
 
 set -u
 
@@ -86,6 +91,11 @@ step "running $SUBPATH  (tsmc, pinned test262 ${T262_COMMIT:0:12})"
 
 HBASE="$VENDOR/harness"
 BASE_HARNESS="$(cat "$HBASE/sta.js" "$HBASE/assert.js")"
+# tsmc has no print(), which is what doneprintHandle.js reports through.
+ASYNC_HARNESS="function print(s) { console.log(s); }
+$(cat "$HBASE/doneprintHandle.js")"
+# A test that never settles would otherwise wedge the run.
+if command -v timeout >/dev/null 2>&1; then T262_RUN="timeout 10"; else T262_RUN=""; fi
 TMP="$(mktemp --suffix=.js)"
 FAILS="$PROJECT_DIR/build/test262-fails.txt"
 : > "$FAILS"
@@ -96,11 +106,19 @@ pass=0; failc=0; skip=0
 # Extracts field VALUE from a test's YAML frontmatter block.
 frontmatter() { sed -n '/\/\*---/,/---\*\//p' "$1"; }
 
-run_variant() {   # <body-with-harness> <negative-phase> <negative-type>
-    local src="$1" nphase="$2" ntype="$3"
+run_variant() {   # <body-with-harness> <negative-phase> <negative-type> <async>
+    local src="$1" nphase="$2" ntype="$3" isasync="${4:-0}"
     printf '%s' "$src" > "$TMP"
     local out rc
-    out="$("$TSMC" "$TMP" 2>&1)"; rc=$?
+    out="$($T262_RUN "$TSMC" "$TMP" 2>&1)"; rc=$?
+    if [ -z "$nphase" ] && [ "$isasync" = "1" ]; then
+        # the markers decide, not the exit code
+        case "$out" in
+            *Test262:AsyncTestFailure*)  return 1 ;;
+            *Test262:AsyncTestComplete*) [ "$rc" -eq 0 ] && return 0; return 1 ;;
+        esac
+        return 1
+    fi
     if [ -z "$nphase" ]; then
         # positive: harness throws Test262Error on failure -> nonzero exit
         [ "$rc" -eq 0 ] && return 0
@@ -128,9 +146,11 @@ run_one() {
 
     # skip: modes we do not run
     case ",$flags," in
-        *,module,*|*,async,*|*,CanBlockIsFalse,*|*,CanBlockIsTrue,*)
+        *,module,*|*,CanBlockIsFalse,*|*,CanBlockIsTrue,*)
             skip=$((skip + 1)); return ;;
     esac
+    local isasync=0
+    case ",$flags," in *,async,*) isasync=1 ;; esac
     # skip: unsupported feature families
     for ft in $feats; do
         for s in $SKIP_FEATURES; do
@@ -156,6 +176,8 @@ run_one() {
     for inc in $incs; do
         [ -f "$HBASE/$inc" ] && inc_src="$inc_src$(cat "$HBASE/$inc")"$'\n'
     done
+    # doneprintHandle.js is implied by the flag, not listed in includes
+    [ "$isasync" = "1" ] && inc_src="$inc_src$ASYNC_HARNESS"
     local body; body="$(cat "$f")"
 
     # which strict variants to run
@@ -168,13 +190,13 @@ run_one() {
 
     local ok=1
     if [ "$raw" = "1" ]; then
-        run_variant "$body" "$nphase" "$ntype" || ok=0
+        run_variant "$body" "$nphase" "$ntype" "$isasync" || ok=0
     else
         if [ "$do_sloppy" = "1" ]; then
-            run_variant "$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" || ok=0
+            run_variant "$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" "$isasync" || ok=0
         fi
         if [ "$ok" = "1" ] && [ "$do_strict" = "1" ]; then
-            run_variant '"use strict";'$'\n'"$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" || ok=0
+            run_variant '"use strict";'$'\n'"$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" "$isasync" || ok=0
         fi
     fi
 
