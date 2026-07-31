@@ -4974,30 +4974,55 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
 
 // --- console additions ----------------------------------------------------------------------
 
-private Value console_write(VM* vm, Value* args, i32 argc, bool to_err) {
-    for i32 i = 0; i < argc; i++ {
-        if i > 0 {
-            if to_err { eprint(" "); } else { print(" "); }
-        }
-        i32 rm = gc_root_mark(&vm.heap);
-        Value s = js_console_string(vm, *(args + i));
-        gc_root(&vm.heap, s);
-        str view = sview(s);
-        // lone surrogates can't go to a UTF-8 sink; show U+FFFD
-        if wtf8_has_surrogate(view) {
-            str_buf sb;
-            str_buf_init(&sb);
-            wtf8_sanitize_into(&sb, view);
-            str clean = str_buf_to_str(&sb);
-            if to_err { eprint("{}", clean); } else { print("{}", clean); }
-            str_buf_free(&sb);
-        } else {
-            if to_err { eprint("{}", view); } else { print("{}", view); }
-        }
-        gc_root_reset(&vm.heap, rm);
+// console.group indents everything printed until groupEnd.
+private i32 g_console_group_depth = 0;
+
+// Writes one formatted line, indented for any open group.
+private void console_emit(VM* vm, Value s, bool to_err) {
+    str view = sview(s);
+    str_buf sb;
+    str_buf_init(&sb);
+    // lone surrogates can't go to a UTF-8 sink; show U+FFFD
+    if wtf8_has_surrogate(view) {
+        wtf8_sanitize_into(&sb, view);
+        view = str_buf_to_str(&sb);
     }
-    if to_err { eprint("\n"); } else { print("\n"); }
+    if g_console_group_depth > 0 {
+        str_buf out;
+        str_buf_init(&out);
+        for i32 g = 0; g < g_console_group_depth; g++ { str_buf_add(&out, "  "); }
+        // a multi-line value moves in on every line, as node does
+        for i32 i = 0; i < view.len; i++ {
+            u8 c = *(view.data + i);
+            str_buf_add_byte(&out, c);
+            if c == 10 {
+                for i32 g = 0; g < g_console_group_depth; g++ { str_buf_add(&out, "  "); }
+            }
+        }
+        str done = str_buf_to_str(&out);
+        if to_err { eprint("{}\n", done); } else { print("{}\n", done); }
+        str_buf_free(&out);
+        str_buf_free(&sb);
+        return;
+    }
+    if to_err { eprint("{}\n", view); } else { print("{}\n", view); }
+    str_buf_free(&sb);
+}
+
+// console.log formats like util.format: a leading string with %s / %d / %j
+// consumes the arguments after it. Without this a package logging
+// "%s: %d" printed the specifiers.
+private Value console_write(VM* vm, Value* args, i32 argc, bool to_err) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value s = nat_util_format(cast(void*, vm), value_undefined(), value_undefined(), args, argc);
+    gc_root(&vm.heap, s);
+    console_emit(vm, s, to_err);
+    gc_root_reset(&vm.heap, rm);
     return value_undefined();
+}
+
+private Value nat_console_log(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return console_write(as_vm(vmp), args, argc, false);
 }
 
 private Value nat_console_warn(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5006,6 +5031,183 @@ private Value nat_console_warn(void* vmp, Value callee, Value thisv, Value* args
 
 private Value nat_console_info(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return console_write(as_vm(vmp), args, argc, false);
+}
+
+// console.dir shows one value the way the inspector does, and ignores the
+// format specifiers.
+private Value nat_console_dir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value s = util_inspect_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, s);
+    console_emit(vm, s, false);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_console_assert(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if argc > 0 && js_truthy(*(args)) { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    str_buf out;
+    str_buf_init(&out);
+    str_buf_add(&out, "Assertion failed");
+    if argc > 1 {
+        Value rest = nat_util_format(vmp, callee, thisv, args + 1, argc - 1);
+        gc_root(&vm.heap, rest);
+        str_buf_add(&out, ": ");
+        str_buf_add(&out, sview(rest));
+    }
+    Value line = new_str(vm, str_buf_to_str(&out));
+    gc_root(&vm.heap, line);
+    str_buf_free(&out);
+    console_emit(vm, line, true);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// Label bookkeeping for count() and time() hangs off the console object, so
+// it needs no root of its own.
+private JsObject* console_store(VM* vm, str slot) {
+    Value* cv = intmap_get<Value>(&vm.globals, bi_atom(vm, "console"));
+    if cv == null || !value_is_object(*cv) { return null; }
+    JsObject* con = value_as_object(*cv);
+    Value* have = props_get(&con.props, bi_atom(vm, slot));
+    if have != null && value_is_object(*have) { return value_as_object(*have); }
+    JsObject* m = js_new_object(&vm.heap, null);
+    props_set_desc(&con.props, bi_atom(vm, slot), value_cell(&m.head), 0);
+    return m;
+}
+
+private str console_label(VM* vm, Value* args, i32 argc, Value* keep) {
+    if argc == 0 || value_is_undefined(*(args)) { return "default"; }
+    *keep = js_to_string_value(vm, *(args));
+    return sview(*keep);
+}
+
+private Value nat_console_count(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value keep = value_undefined();
+    str label = console_label(vm, args, argc, &keep);
+    gc_root(&vm.heap, keep);
+    JsObject* m = console_store(vm, "%counts");
+    if m == null {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    u32 key = bi_atom(vm, label);
+    Value* cur = props_get(&m.props, key);
+    i32 n = cur == null ? 1 : value_as_int(*cur) + 1;
+    props_set_desc(&m.props, key, value_int(n), 0);
+    str_buf out;
+    str_buf_init(&out);
+    str_buf_add(&out, label);
+    str_buf_add(&out, ": ");
+    util_append_num(vm, &out, cast(f64, n));
+    Value line = new_str(vm, str_buf_to_str(&out));
+    gc_root(&vm.heap, line);
+    str_buf_free(&out);
+    console_emit(vm, line, false);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_console_count_reset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value keep = value_undefined();
+    str label = console_label(vm, args, argc, &keep);
+    gc_root(&vm.heap, keep);
+    JsObject* m = console_store(vm, "%counts");
+    if m != null { ignore props_remove(&m.props, bi_atom(vm, label)); }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_console_group(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if argc > 0 { ignore console_write(vm, args, argc, false); }
+    g_console_group_depth++;
+    return value_undefined();
+}
+
+private Value nat_console_group_end(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    if g_console_group_depth > 0 { g_console_group_depth--; }
+    return value_undefined();
+}
+
+private Value nat_console_time(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value keep = value_undefined();
+    str label = console_label(vm, args, argc, &keep);
+    gc_root(&vm.heap, keep);
+    JsObject* m = console_store(vm, "%times");
+    if m != null { props_set_desc(&m.props, bi_atom(vm, label), value_number(vm_now_millis(vm)), 0); }
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// The duration is real time, so nothing can pin its digits.
+private Value console_time_report(VM* vm, Value* args, i32 argc, bool finish) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value keep = value_undefined();
+    str label = console_label(vm, args, argc, &keep);
+    gc_root(&vm.heap, keep);
+    JsObject* m = console_store(vm, "%times");
+    if m == null {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    u32 key = bi_atom(vm, label);
+    Value* start = props_get(&m.props, key);
+    if start == null {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    f64 ms = vm_now_millis(vm) - js_to_number(*start);
+    if finish { ignore props_remove(&m.props, key); }
+    str_buf out;
+    str_buf_init(&out);
+    str_buf_add(&out, label);
+    str_buf_add(&out, ": ");
+    util_append_num(vm, &out, ms);
+    str_buf_add(&out, "ms");
+    Value line = new_str(vm, str_buf_to_str(&out));
+    gc_root(&vm.heap, line);
+    str_buf_free(&out);
+    console_emit(vm, line, false);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_console_time_end(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return console_time_report(as_vm(vmp), args, argc, true);
+}
+
+private Value nat_console_time_log(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return console_time_report(as_vm(vmp), args, argc, false);
+}
+
+private Value nat_console_trace(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    str_buf out;
+    str_buf_init(&out);
+    str_buf_add(&out, "Trace");
+    if argc > 0 {
+        Value rest = nat_util_format(vmp, callee, thisv, args, argc);
+        gc_root(&vm.heap, rest);
+        str_buf_add(&out, ": ");
+        str_buf_add(&out, sview(rest));
+    }
+    Value line = new_str(vm, str_buf_to_str(&out));
+    gc_root(&vm.heap, line);
+    str_buf_free(&out);
+    console_emit(vm, line, true);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
 }
 
 // --- Errors ------------------------------------------------------------------------------------
@@ -13305,9 +13507,11 @@ private Value nat_util_format(void* vmp, Value callee, Value thisv, Value* args,
                         } else if spec == 'd' || spec == 'f' {
                             util_append_num(vm, &out, js_to_number(a));
                         } else if spec == 'i' {
-                            f64 n = js_to_number(a);
+                            // parseInt, not Number: '12px' is 12 and '' is NaN
+                            Value iv = nat_parseint(vmp, callee, thisv, args + next - 1, 1);
+                            f64 n = js_to_number(iv);
                             if n != n { str_buf_add(&out, "NaN"); }
-                            else { util_append_num(vm, &out, cast(f64, cast(i64, n))); }
+                            else { util_append_num(vm, &out, n); }
                         } else if spec == 'j' {
                             Value jr = nat_json_stringify(vmp, callee, thisv, args + next - 1, 1);
                             if vm.has_pending { vm.has_pending = false; vm.pending = value_undefined(); str_buf_add(&out, "[Circular]"); }
@@ -13332,8 +13536,9 @@ private Value nat_util_format(void* vmp, Value callee, Value thisv, Value* args,
         next = 0;
     }
     // remaining args (space-joined, console.log-style)
+    bool had_fmt = next > 0;
     for i32 k = next; k < argc; k++ {
-        if out.len > 0 || k > next { str_buf_add_byte(&out, cast(u8, ' ')); }
+        if had_fmt || out.len > 0 || k > next { str_buf_add_byte(&out, cast(u8, ' ')); }
         i32 rm = gc_root_mark(&vm.heap);
         Value s = js_console_string(vm, *(args + k));
         gc_root(&vm.heap, s);
@@ -17002,8 +17207,21 @@ void builtins_install(VM* vm) {
     Value* cv = intmap_get<Value>(&vm.globals, bi_atom(vm, "console"));
     if cv != null && value_is_object(*cv) {
         JsObject* con = value_as_object(*cv);
+        def_method(vm, con, "log", &nat_console_log);
+        def_method(vm, con, "error", &nat_console_warn);
         def_method(vm, con, "warn", &nat_console_warn);
         def_method(vm, con, "info", &nat_console_info);
+        def_method(vm, con, "dir", &nat_console_dir);
+        def_method(vm, con, "assert", &nat_console_assert);
+        def_method(vm, con, "count", &nat_console_count);
+        def_method(vm, con, "countReset", &nat_console_count_reset);
+        def_method(vm, con, "group", &nat_console_group);
+        def_method(vm, con, "groupCollapsed", &nat_console_group);
+        def_method(vm, con, "groupEnd", &nat_console_group_end);
+        def_method(vm, con, "time", &nat_console_time);
+        def_method(vm, con, "timeEnd", &nat_console_time_end);
+        def_method(vm, con, "timeLog", &nat_console_time_log);
+        def_method(vm, con, "trace", &nat_console_trace);
         // console.debug is console.log, as in node -- not a no-op, which is
         // what its absence amounted to
         Value logv;
