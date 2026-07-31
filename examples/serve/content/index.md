@@ -20,6 +20,7 @@ packages resolved out of `node_modules`.
 - an HTTPS server whose TLS is terminated by tsmc itself
 - `fs`, `path`, `crypto` (SHA-256 entity tags), `zlib` (gzip)
 
-Try: `/notes/`, `/notes/regex.md`, and `/style.css`.
+Try: [`/notes/`](/notes/), [`/notes/regex.md`](/notes/regex.md), and
+[`/style.css`](/style.css).
 
 Bare URLs get linkified too: https://minc.dev
