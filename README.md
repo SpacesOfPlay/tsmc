@@ -39,9 +39,11 @@ minc instead, described below. No `Intl`, and no `child_process`,
 shares memory (`doc/PLAN_M42_buffer_uint8array.md`). An ESM `import`
 takes a relative path only — a bare specifier needs `require`. Async
 generators run under `for await`, but the object they return is not a
-real async iterator: `Symbol.asyncIterator` is missing, `.next()` hands
-back no promise, and `yield*` inside one inserts stray `undefined`s.
-There is no `fs.createReadStream`, so a file is read whole.
+real async iterator: `Symbol.asyncIterator` is missing and `.next()`
+hands back no promise. An `await` inside one compiles to a `yield`, so
+its value escapes into the sequence
+(`doc/PLAN_M43_async_generators.md`). There is no
+`fs.createReadStream`, so a file is read whole.
 
 `doc/npm-compatibility.md` lists the npm packages that have been run
 against the interpreter. `doc/META_PLAN.md` holds the design decisions

@@ -8,12 +8,8 @@
 // the whole suite.
 //
 // Deliberately not covered, because tsmc does not implement them yet:
-//   - Async generators are driven by the synchronous generator machinery, so
-//     `await` inside one behaves as a `yield` and corrupts the values it
-//     produces; next() returns a plain result rather than a promise, and the
-//     object carries Symbol.iterator and the Generator tag instead of their
-//     async spellings. Everything below sticks to async generators that only
-//     yield.
+//   - Async generators, covered in async_iteration.js. Everything below
+//     sticks to ones that only yield.
 //   - A function's constructor is Function for every kind, so
 //     `f.constructor.name === 'AsyncFunction'` does not hold. Functions share
 //     one prototype object rather than one per kind. The Symbol.toStringTag

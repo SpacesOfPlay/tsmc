@@ -8364,34 +8364,45 @@ private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
             i32 c = buf_byte(b, i);
             i32 need = 0;
             i32 cp = 0;
+            // Range for the second byte. It is what rules out the overlong
+            // forms and the surrogates, so no check is needed after decoding.
+            i32 lo = 0x80;
+            i32 hi = 0xBF;
             if c < 0x80 { need = 0; cp = c; }
-            else if (c & 0xE0) == 0xC0 { need = 1; cp = c & 0x1F; }
-            else if (c & 0xF0) == 0xE0 { need = 2; cp = c & 0x0F; }
-            else if (c & 0xF8) == 0xF0 { need = 3; cp = c & 0x07; }
-            else { need = -1; }
-            bool ok = need >= 0 && i + need < end;
+            else if c >= 0xC2 && c <= 0xDF { need = 1; cp = c & 0x1F; }
+            else if c >= 0xE0 && c <= 0xEF {
+                need = 2;
+                cp = c & 0x0F;
+                if c == 0xE0 { lo = 0xA0; }
+                if c == 0xED { hi = 0x9F; }
+            } else if c >= 0xF0 && c <= 0xF4 {
+                need = 3;
+                cp = c & 0x07;
+                if c == 0xF0 { lo = 0x90; }
+                if c == 0xF4 { hi = 0x8F; }
+            } else { need = -1; }
+            i32 taken = 0;
+            bool ok = need >= 0;
             if ok {
                 for i32 k = 1; k <= need; k++ {
+                    if i + k >= end { ok = false; break; }
                     i32 cc = buf_byte(b, i + k);
-                    if (cc & 0xC0) != 0x80 { ok = false; break; }
+                    if cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF) { ok = false; break; }
                     cp = (cp << 6) | (cc & 0x3F);
+                    taken++;
                 }
             }
-            // overlong forms, surrogates and out-of-range values are as
-            // malformed as a bad continuation byte
-            if ok && need == 1 && cp < 0x80 { ok = false; }
-            if ok && need == 2 && cp < 0x800 { ok = false; }
-            if ok && need == 3 && cp < 0x10000 { ok = false; }
-            if ok && (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { ok = false; }
             u8[4] tmp;
             if ok {
                 i32 n = bi_utf8_encode(&tmp[0], cast(u32, cp));
                 str_buf_add_bytes(&sb, &tmp[0], n);
                 i += need + 1;
             } else {
+                // One replacement per maximal subpart, so a truncated tail is
+                // a single error rather than one per leftover byte.
                 i32 n = bi_utf8_encode(&tmp[0], cast(u32, 0xFFFD));
                 str_buf_add_bytes(&sb, &tmp[0], n);
-                i++;
+                i += 1 + taken;
             }
         }
     } else if enc == ENC_LATIN1 || enc == ENC_ASCII {
@@ -10591,9 +10602,63 @@ private void buffer_install(VM* vm) {
 
 // --- TextEncoder / TextDecoder ----------------------------------------------
 //
-// The WHATWG encoding APIs over UTF-8 (plus latin1 decode). TextEncoder
-// yields a Buffer (byte array) since there is no Uint8Array; TextDecoder
-// reads any byte array-like.
+// The WHATWG encoding APIs over UTF-8, plus latin1 decode. TextEncoder
+// yields a Buffer, not a Uint8Array. See doc/PLAN_M42_buffer_uint8array.md.
+
+// Bytes of a Buffer, typed array or ArrayBuffer. False for anything else.
+private bool codec_bytes(VM* vm, Value v, str_buf* out) {
+    if !value_is_object(v) { return false; }
+    JsObject* o = value_as_object(v);
+    if is_arraybuffer(vm, v) {
+        GcBytes* gb = value_as_bytes(*(o.elems));
+        str_buf_add_bytes(out, gb_data(gb), gb.len);
+        return true;
+    }
+    if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+        JsObject* ab = ta_buffer(vm, o);
+        if ab == null { return false; }
+        GcBytes* gb = value_as_bytes(*(ab.elems));
+        i32 off = ta_off(vm, o);
+        i32 n = ta_len(vm, o) * ta_elem_size(ta_kind(vm, o));
+        if off < 0 || n < 0 || off + n > gb.len { return false; }
+        str_buf_add_bytes(out, gb_data(gb) + off, n);
+        return true;
+    }
+    if value_is_array(v) {
+        for i32 i = 0; i < o.elen; i++ { str_buf_add_byte(out, cast(u8, buf_byte(o, i))); }
+        return true;
+    }
+    return false;
+}
+
+// Well-formed UTF-8, by the decoder's rules: no overlong form, no
+// surrogate, nothing past U+10FFFF. `fatal` rejects what this refuses.
+private bool utf8_is_valid(u8* p, i32 n) {
+    i32 i = 0;
+    while i < n {
+        i32 c = cast(i32, *(p + i));
+        i32 need = 0;
+        i32 cp = 0;
+        if c < 0x80 { i++; continue; }
+        else if (c & 0xE0) == 0xC0 { need = 1; cp = c & 0x1F; }
+        else if (c & 0xF0) == 0xE0 { need = 2; cp = c & 0x0F; }
+        else if (c & 0xF8) == 0xF0 { need = 3; cp = c & 0x07; }
+        else { return false; }
+        if i + need >= n { return false; }
+        for i32 k = 1; k <= need; k++ {
+            i32 cc = cast(i32, *(p + i + k));
+            if (cc & 0xC0) != 0x80 { return false; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if need == 1 && cp < 0x80 { return false; }
+        if need == 2 && cp < 0x800 { return false; }
+        if need == 3 && cp < 0x10000 { return false; }
+        if cp > 0x10FFFF { return false; }
+        if cp >= 0xD800 && cp <= 0xDFFF { return false; }
+        i = i + need + 1;
+    }
+    return true;
+}
 
 private Value nat_textencoder_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -10601,48 +10666,152 @@ private Value nat_textencoder_ctor(void* vmp, Value callee, Value thisv, Value* 
     return value_cell(&inst.head);
 }
 
+// A lone surrogate has no UTF-8 form, so it encodes as U+FFFD.
 private Value nat_textencoder_encode(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value a = arg_at(args, argc, 0);
     Value s = value_is_undefined(a) ? new_str(vm, "") : js_to_string_value(vm, a);
     vm_push(vm, s);
-    str v = sview(s);
-    Value r = buf_from_bytes(vm, v.data, v.len);
+    str_buf sb;
+    str_buf_init(&sb);
+    wtf8_sanitize_into(&sb, sview(s));
+    Value r = buf_from_bytes(vm, sb.data, sb.len);
+    str_buf_free(&sb);
     vm_pop(vm);
     return r;
 }
 
+// Fills dst with as many whole code points as fit. `read` counts UTF-16
+// units taken from the source, `written` the bytes stored.
+private Value nat_textencoder_encodeinto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value a = arg_at(args, argc, 0);
+    Value dv = arg_at(args, argc, 1);
+    if !vm_is_typed_array(dv) {
+        vm_throw_error(vm, ERR_TYPE, "encodeInto expects a Uint8Array destination");
+        return value_undefined();
+    }
+    JsObject* dst = value_as_object(dv);
+    Value s = value_is_undefined(a) ? new_str(vm, "") : js_to_string_value(vm, a);
+    vm_push(vm, s);
+    str_buf sb;
+    str_buf_init(&sb);
+    wtf8_sanitize_into(&sb, sview(s));
+    i32 cap = ta_len(vm, dst) * ta_elem_size(ta_kind(vm, dst));
+    i32 read = 0;
+    i32 written = 0;
+    i32 i = 0;
+    while i < sb.len {
+        i32 c = cast(i32, *(sb.data + i));
+        i32 seq = 1;
+        if (c & 0xE0) == 0xC0 { seq = 2; }
+        else if (c & 0xF0) == 0xE0 { seq = 3; }
+        else if (c & 0xF8) == 0xF0 { seq = 4; }
+        if written + seq > cap { break; }
+        for i32 k = 0; k < seq; k++ {
+            vm_ta_set(vm, dst, written + k, value_int(cast(i32, *(sb.data + i + k))));
+        }
+        written = written + seq;
+        read = read + (seq == 4 ? 2 : 1);
+        i = i + seq;
+    }
+    str_buf_free(&sb);
+    JsObject* res = js_new_object(&vm.heap, vm.object_proto);
+    vm_push(vm, value_cell(&res.head));
+    def_value(vm, res, "read", value_int(read));
+    def_value(vm, res, "written", value_int(written));
+    vm.sp -= 2;
+    return value_cell(&res.head);
+}
+
+// The label set tsmc decodes. An unknown one is a RangeError, so a caller
+// hears about it instead of silently getting UTF-8.
+private str codec_label(str l) {
+    if ci_eq(l, "utf-8") || ci_eq(l, "utf8") || ci_eq(l, "unicode-1-1-utf-8") { return "utf-8"; }
+    if ci_eq(l, "latin1") || ci_eq(l, "iso-8859-1") || ci_eq(l, "windows-1252")
+        || ci_eq(l, "binary") || ci_eq(l, "l1") || ci_eq(l, "iso8859-1") {
+        return "windows-1252";
+    }
+    str none;
+    none.data = null;
+    none.len = 0;
+    return none;
+}
+
 private Value nat_textdecoder_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    JsObject* inst = js_new_object(&vm.heap, vm.textdec_proto);
-    vm_push(vm, value_cell(&inst.head));
     str canon = "utf-8";
     Value label = arg_at(args, argc, 0);
-    if value_is_string(label) {
-        str l = sview(label);
-        if ci_eq(l, "latin1") || ci_eq(l, "iso-8859-1") || ci_eq(l, "windows-1252") || ci_eq(l, "binary") {
-            canon = "windows-1252";
+    if !value_is_undefined(label) {
+        Value ls = js_to_string_value(vm, label);
+        vm_push(vm, ls);
+        canon = codec_label(sview(ls));
+        vm_pop(vm);
+        if canon.data == null {
+            vm_throw_error(vm, ERR_RANGE, "unsupported encoding label");
+            return value_undefined();
         }
-        // any other label (including unknown ones) is treated as utf-8
     }
+    bool fatal = false;
+    bool ignore_bom = false;
+    Value opts = arg_at(args, argc, 1);
+    if value_is_object(opts) {
+        Value f;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "fatal"), &f) { fatal = js_truthy(f); }
+        Value b;
+        if vm_get_prop_value(vm, opts, bi_atom(vm, "ignoreBOM"), &b) { ignore_bom = js_truthy(b); }
+    }
+    JsObject* inst = js_new_object(&vm.heap, vm.textdec_proto);
+    vm_push(vm, value_cell(&inst.head));
     def_value(vm, inst, "encoding", new_str(vm, canon));
-    def_value(vm, inst, "fatal", value_bool(false));
-    def_value(vm, inst, "ignoreBOM", value_bool(false));
+    def_value(vm, inst, "fatal", value_bool(fatal));
+    def_value(vm, inst, "ignoreBOM", value_bool(ignore_bom));
     vm_pop(vm);
     return value_cell(&inst.head);
+}
+
+private bool decoder_flag(VM* vm, Value thisv, str name) {
+    Value v;
+    if !vm_get_prop_value(vm, thisv, bi_atom(vm, name), &v) { return false; }
+    return js_truthy(v);
 }
 
 private Value nat_textdecoder_decode(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value inp = arg_at(args, argc, 0);
-    if !value_is_array(inp) { return new_str(vm, ""); }
-    JsObject* a = value_as_object(inp);
+    if value_is_undefined(inp) { return new_str(vm, ""); }
+    str_buf sb;
+    str_buf_init(&sb);
+    if !codec_bytes(vm, inp, &sb) {
+        str_buf_free(&sb);
+        vm_throw_error(vm, ERR_TYPE, "decode expects a buffer, typed array or ArrayBuffer");
+        return value_undefined();
+    }
     i32 enc = ENC_UTF8;
     Value encv;
     if vm_get_prop_value(vm, thisv, bi_atom(vm, "encoding"), &encv) && value_is_string(encv) {
         if !ci_eq(sview(encv), "utf-8") { enc = ENC_LATIN1; }
     }
-    return bytes_to_str(vm, a, enc, 0, a.elen);
+    i32 start = 0;
+    if enc == ENC_UTF8 {
+        if decoder_flag(vm, thisv, "fatal") && !utf8_is_valid(sb.data, sb.len) {
+            str_buf_free(&sb);
+            vm_throw_error(vm, ERR_TYPE, "invalid byte sequence");
+            return value_undefined();
+        }
+        // The BOM is a marker, not text, unless the caller asked to keep it.
+        if !decoder_flag(vm, thisv, "ignoreBOM") && sb.len >= 3
+            && *(sb.data) == 0xEF && *(sb.data + 1) == 0xBB && *(sb.data + 2) == 0xBF {
+            start = 3;
+        }
+    }
+    Value tmp = buf_from_bytes(vm, sb.data, sb.len);
+    str_buf_free(&sb);
+    vm_push(vm, tmp);
+    JsObject* b = value_as_object(tmp);
+    Value r = bytes_to_str(vm, b, enc, start, b.elen);
+    vm_pop(vm);
+    return r;
 }
 
 private void textcodec_install(VM* vm) {
@@ -10651,13 +10820,16 @@ private void textcodec_install(VM* vm) {
     props_set_desc(&ec.props, vm.atom_prototype, value_cell(&vm.textenc_proto.head), 0);
     link_ctor(vm, vm.textenc_proto, ec);
     def_method(vm, vm.textenc_proto, "encode", &nat_textencoder_encode);
+    def_method(vm, vm.textenc_proto, "encodeInto", &nat_textencoder_encodeinto);
     def_value(vm, vm.textenc_proto, "encoding", new_str(vm, "utf-8"));
+    def_tag(vm, vm.textenc_proto, "TextEncoder");
 
     vm.textdec_proto = js_new_object(&vm.heap, vm.object_proto);
     JsNative* dc = def_global_fn(vm, "TextDecoder", &nat_textdecoder_ctor);
     props_set_desc(&dc.props, vm.atom_prototype, value_cell(&vm.textdec_proto.head), 0);
     link_ctor(vm, vm.textdec_proto, dc);
     def_method(vm, vm.textdec_proto, "decode", &nat_textdecoder_decode);
+    def_tag(vm, vm.textdec_proto, "TextDecoder");
 }
 
 // --- node built-in modules: path / fs ---------------------------------------
