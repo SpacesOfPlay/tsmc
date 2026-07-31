@@ -5055,7 +5055,9 @@ private Value nat_console_assert(void* vmp, Value callee, Value thisv, Value* ar
     if argc > 1 {
         Value rest = nat_util_format(vmp, callee, thisv, args + 1, argc - 1);
         gc_root(&vm.heap, rest);
-        str_buf_add(&out, ": ");
+        // A message reads as one sentence and takes the colon. Anything else
+        // is just another value to show, so it only gets a space.
+        str_buf_add(&out, value_is_string(*(args + 1)) ? ": " : " ");
         str_buf_add(&out, sview(rest));
     }
     Value line = new_str(vm, str_buf_to_str(&out));
@@ -12791,6 +12793,29 @@ when os(windows) {
     private u8* os_shell() { return null; }
     private i32 os_uid() { return 0 - 1; }
     private i32 os_gid() { return 0 - 1; }
+
+    private extern "kernel32.dll" u64 GetTickCount64();
+    struct _MemStatus {
+        u32 length; u32 memload;
+        u64 total_phys; u64 avail_phys;
+        u64 total_page; u64 avail_page;
+        u64 total_virt; u64 avail_virt; u64 avail_ext;
+    }
+    private extern "kernel32.dll" i32 GlobalMemoryStatusEx(_MemStatus* m);
+    private f64 os_uptime_s() { return cast(f64, GetTickCount64()) / 1000.0; }
+    private f64 os_mem(bool want_free) {
+        _MemStatus m;
+        m.length = cast(u32, sizeof(_MemStatus));
+        if GlobalMemoryStatusEx(&m) == 0 { return 0.0; }
+        return want_free ? cast(f64, m.avail_phys) : cast(f64, m.total_phys);
+    }
+    // Windows has no load average. Node reports zeros there.
+    private void os_loadavg_into(f64* out) {
+        *(out) = 0.0;
+        *(out + 1) = 0.0;
+        *(out + 2) = 0.0;
+    }
+    private str os_devnull_str() { return "\\\\.\\nul"; }
 }
 else when os(wasm) {
     // Sandbox: no environment, no host identity. os.* reports the
@@ -12798,6 +12823,14 @@ else when os(wasm) {
     private str os_type_str() { return "Wasm"; }
     private str os_eol_str() { return "\n"; }
     private i32 os_ncpu() { return 1; }
+    private f64 os_uptime_s() { return 0.0; }
+    private f64 os_mem(bool want_free) { return 0.0; }
+    private void os_loadavg_into(f64* out) {
+        *(out) = 0.0;
+        *(out + 1) = 0.0;
+        *(out + 2) = 0.0;
+    }
+    private str os_devnull_str() { return "/dev/null"; }
     private bool os_hostname_into(u8* buf, i32 cap) { return false; }
     private u8* os_home() { return null; }
     private u8* os_tmp() { return null; }
@@ -12813,8 +12846,12 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         private extern "libSystem.B.dylib" i64 sysconf(i32 name);
         private extern "libSystem.B.dylib" i32 getuid();
         private extern "libSystem.B.dylib" i32 getgid();
+        private extern "libSystem.B.dylib" i32 getloadavg(f64* a, i32 n);
         private str os_type_str() { return "Darwin"; }
         private i32 os_ncpu_name() { return 58; }   // _SC_NPROCESSORS_ONLN (Darwin)
+        private i32 os_physpages_name() { return 200; }   // _SC_PHYS_PAGES (Darwin)
+        private i32 os_avpages_name() { return 0 - 1; }   // Darwin has no _SC_AVPHYS_PAGES
+        private i32 os_pagesize_name() { return 29; }     // _SC_PAGESIZE (Darwin)
     }
     else when os(android) {
         private extern "libc.so" u8* getenv(u8* name);
@@ -12822,8 +12859,12 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         private extern "libc.so" i64 sysconf(i32 name);
         private extern "libc.so" i32 getuid();
         private extern "libc.so" i32 getgid();
+        private extern "libc.so" i32 getloadavg(f64* a, i32 n);
         private str os_type_str() { return "Linux"; }
         private i32 os_ncpu_name() { return 84; }   // _SC_NPROCESSORS_ONLN (Linux)
+        private i32 os_physpages_name() { return 85; }   // _SC_PHYS_PAGES (Linux)
+        private i32 os_avpages_name() { return 86; }     // _SC_AVPHYS_PAGES (Linux)
+        private i32 os_pagesize_name() { return 30; }    // _SC_PAGESIZE (Linux)
     }
     else {
         private extern "libc.so.6" u8* getenv(u8* name);
@@ -12831,11 +12872,32 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         private extern "libc.so.6" i64 sysconf(i32 name);
         private extern "libc.so.6" i32 getuid();
         private extern "libc.so.6" i32 getgid();
+        private extern "libc.so.6" i32 getloadavg(f64* a, i32 n);
         private str os_type_str() { return "Linux"; }
         private i32 os_ncpu_name() { return 84; }   // _SC_NPROCESSORS_ONLN (Linux)
+        private i32 os_physpages_name() { return 85; }   // _SC_PHYS_PAGES (Linux)
+        private i32 os_avpages_name() { return 86; }     // _SC_AVPHYS_PAGES (Linux)
+        private i32 os_pagesize_name() { return 30; }    // _SC_PAGESIZE (Linux)
     }
     private str os_eol_str() { return "\n"; }
     private i32 os_ncpu() { i64 n = sysconf(os_ncpu_name()); if n < 1 { return 1; } return cast(i32, n); }
+    // CLOCK_MONOTONIC runs from boot here, so the monotonic clock is uptime.
+    private f64 os_uptime_s() { return cast(f64, vm_clock_ns()) / 1000000000.0; }
+    private f64 os_mem(bool want_free) {
+        i32 name = want_free ? os_avpages_name() : os_physpages_name();
+        if name < 0 { return 0.0; }
+        i64 pages = sysconf(name);
+        i64 psize = sysconf(os_pagesize_name());
+        if pages < 0 || psize < 0 { return 0.0; }
+        return cast(f64, pages) * cast(f64, psize);
+    }
+    private void os_loadavg_into(f64* out) {
+        *(out) = 0.0;
+        *(out + 1) = 0.0;
+        *(out + 2) = 0.0;
+        ignore getloadavg(out, 3);
+    }
+    private str os_devnull_str() { return "/dev/null"; }
     private bool os_hostname_into(u8* buf, i32 cap) { return gethostname(buf, cast(u64, cap)) == 0; }
     private u8* os_home() { return getenv("HOME"); }
     private u8* os_tmp() { return getenv("TMPDIR"); }
@@ -12887,6 +12949,32 @@ private Value nat_os_hostname(void* vmp, Value callee, Value thisv, Value* args,
     if os_hostname_into(&buf[0], 256) { return new_str(vm, str_from_cstr(&buf[0])); }
     return new_str(vm, "");
 }
+private Value nat_os_uptime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_number(os_uptime_s());
+}
+
+private Value nat_os_totalmem(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_number(os_mem(false));
+}
+
+private Value nat_os_freemem(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_number(os_mem(true));
+}
+
+private Value nat_os_loadavg(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64[3] la;
+    os_loadavg_into(&la[0]);
+    JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&arr.head));
+    for i32 i = 0; i < 3; i++ { js_array_set(arr, i, value_number(la[i])); }
+    return vm_pop_ret(vm, value_cell(&arr.head));
+}
+
+private Value nat_os_parallelism(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(os_ncpu());
+}
+
 private Value nat_os_cpus(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 n = os_ncpu();
@@ -12936,7 +13024,13 @@ private JsObject* build_os_module(VM* vm) {
     def_node_export(vm, mod, ns, "hostname", &nat_os_hostname);
     def_node_export(vm, mod, ns, "cpus", &nat_os_cpus);
     def_node_export(vm, mod, ns, "userInfo", &nat_os_userinfo);
+    def_node_export(vm, mod, ns, "uptime", &nat_os_uptime);
+    def_node_export(vm, mod, ns, "totalmem", &nat_os_totalmem);
+    def_node_export(vm, mod, ns, "freemem", &nat_os_freemem);
+    def_node_export(vm, mod, ns, "loadavg", &nat_os_loadavg);
+    def_node_export(vm, mod, ns, "availableParallelism", &nat_os_parallelism);
     def_node_value(vm, mod, ns, "EOL", new_str(vm, os_eol_str()));
+    def_node_value(vm, mod, ns, "devNull", new_str(vm, os_devnull_str()));
     return ns;
 }
 

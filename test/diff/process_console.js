@@ -3,6 +3,10 @@
 //
 // Left out, still divergent: process.env does not coerce a value to a
 // string on assignment, and console.table is missing.
+//
+// Everything here writes to stdout. console.assert writes to stderr, and
+// the harness merges the two streams, so their relative order depends on
+// flushing rather than on the program. It lives in console_assert.js.
 
 const rows = [];
 function show(v) {
@@ -111,7 +115,4 @@ console.count();
 console.count('x');
 console.countReset();
 console.count();
-console.assert(true, 'not shown');
-console.assert(false, 'shown %s', 'here');
-console.assert(false);
 console.dir({ a: { b: { c: 1 } } });
