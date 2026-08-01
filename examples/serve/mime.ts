@@ -28,13 +28,11 @@ const TYPES: Record<string, string> = {
 /** Types worth compressing: text, plus the structured formats that are text. */
 const COMPRESSIBLE = /^(text\/|application\/(json|xml|wasm)|image\/svg)/;
 
-function contentTypeFor(ext: string): string {
+export function contentTypeFor(ext: string): string {
   const t = TYPES[ext.toLowerCase()];
   return t === undefined ? 'application/octet-stream' : t;
 }
 
-function isCompressible(contentType: string): boolean {
+export function isCompressible(contentType: string): boolean {
   return COMPRESSIBLE.test(contentType);
 }
-
-module.exports = { contentTypeFor, isCompressible };

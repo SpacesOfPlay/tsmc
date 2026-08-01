@@ -5,10 +5,10 @@
 // forms of either. The decision is made on the resolved absolute path rather
 // than on the text of the URL, so an encoding trick has nothing to work with.
 
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
-interface Resolved {
+export interface Resolved {
   kind: 'file' | 'dir' | 'missing' | 'rejected';
   /** Absolute path on disk; empty when the request was rejected. */
   path: string;
@@ -16,7 +16,7 @@ interface Resolved {
   urlPath: string;
 }
 
-function decodePath(rawUrl: string): string | null {
+export function decodePath(rawUrl: string): string | null {
   const q = rawUrl.indexOf('?');
   const withoutQuery = q < 0 ? rawUrl : rawUrl.slice(0, q);
   try {
@@ -26,7 +26,7 @@ function decodePath(rawUrl: string): string | null {
   }
 }
 
-function resolve(root: string, rawUrl: string): Resolved {
+export function resolve(root: string, rawUrl: string): Resolved {
   const decoded = decodePath(rawUrl);
   if (decoded === null || decoded.indexOf('\0') >= 0) {
     return { kind: 'rejected', path: '', urlPath: rawUrl };
@@ -50,7 +50,7 @@ function resolve(root: string, rawUrl: string): Resolved {
 }
 
 /** A directory serves its index.md or index.html when one is present. */
-function indexOf(dir: string): string | null {
+export function indexOf(dir: string): string | null {
   const names = ['index.md', 'index.html'];
   for (const name of names) {
     const candidate = path.join(dir, name);
@@ -58,5 +58,3 @@ function indexOf(dir: string): string | null {
   }
   return null;
 }
-
-module.exports = { resolve, indexOf, decodePath };

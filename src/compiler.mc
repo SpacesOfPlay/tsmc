@@ -281,6 +281,26 @@ private i32 import_meta_url_const(Compiler* co) {
     return idx;
 }
 
+// import.meta.filename and .dirname: the module's own path, and the
+// directory holding it. An ESM file has no __dirname, so these are how it
+// finds a file beside itself.
+private i32 import_meta_path_const(Compiler* co, bool dir_only) {
+    str p = co.src_name;
+    i32 end = p.len;
+    if dir_only {
+        i32 sep = -1;
+        for i32 i = 0; i < p.len; i++ {
+            u8 c = *(p.data + i);
+            if c == '/' || c == cast(u8, '\\') { sep = i; }
+        }
+        end = sep < 0 ? 0 : sep;   // no trailing separator, as node has none
+    }
+    str v;
+    v.data = p.data;
+    v.len = end;
+    return str_const(co, v);
+}
+
 // Numeric property keys stringify the JS way: 1, not 1.0.
 // The property-name text of a numeric key, copied into the arena so it can
 // outlive this call as a function's inferred name.
@@ -1341,11 +1361,20 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_IDENT { emit_load_ident(co, n); return; }
     if k == N_IMPORT_META {
-        // import.meta: an object exposing `url` (a file:// URL of this module).
+        // import.meta: `url` as a file:// URL, plus the filename and dirname
+        // node exposes, which is what an ESM file uses to reach a sibling.
         ch_op(ch, OP_NEWOBJ);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_url_const(co));
         ch_op_u16(ch, OP_SETPROP, name_const(co, "url"));
+        ch_op(ch, OP_POP);
+        ch_op(ch, OP_DUP);
+        ch_op_u16(ch, OP_CONST, import_meta_path_const(co, false));
+        ch_op_u16(ch, OP_SETPROP, name_const(co, "filename"));
+        ch_op(ch, OP_POP);
+        ch_op(ch, OP_DUP);
+        ch_op_u16(ch, OP_CONST, import_meta_path_const(co, true));
+        ch_op_u16(ch, OP_SETPROP, name_const(co, "dirname"));
         ch_op(ch, OP_POP);
         return;
     }

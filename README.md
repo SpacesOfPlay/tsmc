@@ -106,12 +106,12 @@ overrides the install dir.
 
 ## Tests
 
-27 unit tests in minc exercise the interpreter from the inside. 30
-scripts are checked against golden output. 143 differential scripts run
+27 unit tests in minc exercise the interpreter from the inside. 31
+scripts are checked against golden output. 145 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-173 scripts then run again under `--gc-stress`, which collects on every
+175 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)

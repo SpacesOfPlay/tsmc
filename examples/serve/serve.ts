@@ -1,20 +1,20 @@
 // An HTTPS content server, in TypeScript, on tsmc.
 //
-//   tsmc serve.cts [--root DIR] [--port N] [--host H] [--http]
+//   tsmc serve.ts [--root DIR] [--port N] [--host H] [--http]
 //
 // Markdown renders to HTML; anything else is served as-is. Responses carry a
 // SHA-256 entity tag and answer conditional requests with 304, and text is
 // gzipped when the client asks for it.
 
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
-const https = require('https');
-const { Outcome } = require('./types.cts');
-const router = require('./router.cts');
-const render = require('./render.cts');
-const mime = require('./mime.cts');
-const respond = require('./respond.cts');
+import fs from 'fs';
+import path from 'path';
+import http from 'http';
+import https from 'https';
+import { Outcome } from './types.ts';
+import * as router from './router.ts';
+import * as render from './render.ts';
+import * as mime from './mime.ts';
+import * as respond from './respond.ts';
 
 interface ServeOptions {
   root: string;
@@ -33,7 +33,7 @@ interface Prepared {
 }
 
 function parseArgs(argv: string[]): ServeOptions {
-  const here = __dirname;
+  const here = import.meta.dirname;
   const opts: ServeOptions = {
     root: path.join(here, 'content'),
     port: 8443,

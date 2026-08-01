@@ -7,8 +7,8 @@ tags, conditional requests, gzip, and a directory index.
 ```
 cd examples/serve
 npm install
-../../build/tsmc serve.cts              # https://127.0.0.1:8443
-../../build/tsmc serve.cts --http       # plain HTTP, no certificate needed
+../../build/tsmc serve.ts              # https://127.0.0.1:8443
+../../build/tsmc serve.ts --http       # plain HTTP, no certificate needed
 ```
 
 Options: `--root DIR --port N --host H --http --cert FILE --key FILE`.
@@ -40,7 +40,7 @@ certificate authority and a server certificate signed by it, in `local/`
 
 ```
 ./make-local-cert.sh                    # or: .\make-local-cert.ps1
-../../build/tsmc serve.cts --cert local/server.cert.pem --key local/server.key.pem
+../../build/tsmc serve.ts --cert local/server.cert.pem --key local/server.key.pem
 ```
 
 Then trust `local/ca.cert.pem` **once**. On Windows, for Chrome, Edge and
@@ -78,7 +78,7 @@ which is what lets a client build a path to a root it already trusts.
 
 ```
 certbot certonly --standalone -d example.com --key-type ecdsa
-tsmc serve.cts --host 0.0.0.0 --port 443 \
+tsmc serve.ts --host 0.0.0.0 --port 443 \
   --cert /etc/letsencrypt/live/example.com/fullchain.pem \
   --key  /etc/letsencrypt/live/example.com/privkey.pem
 ```
@@ -105,7 +105,8 @@ Three things at once, which is the point of the example:
   annotations, interfaces and the `Outcome` enum are handled by tsmc itself.
 - **Real npm packages.** `markdown-it` renders the Markdown (with `linkify`
   turning bare URLs into links) and `js-yaml` parses the front-matter. Both
-  resolve out of `node_modules` unmodified.
+  are CommonJS, imported from ES modules with `import`, and resolve out of
+  `node_modules` unmodified.
 - **TLS 1.3 terminated by tsmc.** The HTTPS listener runs on the vendored
   picotls stack — the handshake, the certificate signature and the record layer
   are all tsmc's own.
@@ -120,7 +121,7 @@ normalised transcript — status, the headers the server controls, body length
 and hash. Bodies are hashed rather than printed so the output is stable.
 
 ```
-../../build/tsmc serve.cts --http --port 8099 &
+../../build/tsmc serve.ts --http --port 8099 &
 node check.cjs 8099            # or: ../../build/tsmc check.cjs 8099
 ```
 
@@ -132,28 +133,16 @@ negotiation, Markdown, nested Markdown, a directory index, a static asset,
 `HEAD`, a rejected method, a miss, and four path-traversal attempts including
 percent-encoded forms.
 
-## Why the files are `.cts`
-
-`.ts` is treated as an ES module, and tsmc's ESM resolver does not search
-`node_modules` for bare specifiers yet — so a `.ts` file cannot `import` an npm
-package today. `.cts` is Node's spelling for CommonJS TypeScript and gets both
-the type syntax and `require`, so that is what the example uses.
-
-The same constraint means no `import` syntax at all in these files, including
-`import type` and `export`: any of them marks the file as ESM. Interfaces are
-therefore declared in the file that uses them, and modules end with
-`module.exports`.
-
 ## Shape of the thing
 
 | file | role |
 |------|------|
-| `serve.cts` | argument parsing, request handling, the listener |
-| `router.cts` | URL → path, and the traversal guard |
-| `render.cts` | Markdown + front-matter → HTML, directory index |
-| `respond.cts` | entity tags, conditional requests, compression |
-| `mime.cts` | extension → content type |
-| `types.cts` | the `Outcome` enum |
+| `serve.ts` | argument parsing, request handling, the listener |
+| `router.ts` | URL → path, and the traversal guard |
+| `render.ts` | Markdown + front-matter → HTML, directory index |
+| `respond.ts` | entity tags, conditional requests, compression |
+| `mime.ts` | extension → content type |
+| `types.ts` | the `Outcome` enum |
 | `check.cjs` | transcript driver |
 | `content/` | demo corpus |
 

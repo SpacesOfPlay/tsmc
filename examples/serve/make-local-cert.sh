@@ -79,4 +79,4 @@ echo
 openssl x509 -in local/server.cert.pem -noout -subject -issuer -ext subjectAltName
 echo
 echo "trust local/ca.cert.pem once (see README.md), then:"
-echo "  ../../build/tsmc serve.cts --cert local/server.cert.pem --key local/server.key.pem"
+echo "  ../../build/tsmc serve.ts --cert local/server.cert.pem --key local/server.key.pem"

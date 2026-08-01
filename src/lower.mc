@@ -460,6 +460,18 @@ private void lower_export(Lower* lw, Node* n) {
             }
             n.a = vec_get(&lw.scratch, at);
             vec_set(&lw.scratch, at, n);
+            // An export copies the binding where it stands, and the var is
+            // still empty there: the IIFE fills it on the next statement. A
+            // second export after that is what carries the value out.
+            i32 smark = lw.scratch.len;
+            Node* spec = mk(lw, N_EXPORT_SPEC);
+            spec.name = d.name;
+            spec.span = d.span;
+            vec_push(&lw.scratch, spec);
+            Node* again = mk(lw, N_EXPORT);
+            again.span = d.span;
+            again.kids = kids_from_scratch(lw, smark);
+            vec_push(&lw.scratch, again);
             return;
         }
         lower_slot(lw, &n.a);

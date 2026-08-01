@@ -1,6 +1,6 @@
 # M44 — ESM: node_modules and CJS interop
 
-Status: tiers 1 and 2 landed. Tier 3 open.
+Status: complete.
 
 ## Why
 
@@ -145,6 +145,27 @@ the ESM branch, `require` the CommonJS one, from the same package.
   header. That becomes true of neither tier once this lands, and the
   package table wants a re-run.
 
+## Tier 3 as built
+
+`examples/serve` is `.ts` throughout, with `import` and `export`. The
+transcript `check.cjs` prints is byte-identical to the `.cts` version, over
+plain HTTP and over TLS, which is the regression test that matters here.
+
+Two things came out of the conversion.
+
+`import.meta.dirname` and `.filename` did not exist. An ESM file has no
+`__dirname` in node, and the example needs its own directory to find
+`content/`. tsmc had `__dirname` in ESM, which node does not, so writing
+the example against it would have taught a spelling that only works here.
+Both are compile-time constants now, like `import.meta.url` beside them.
+
+`export enum` and `export namespace` exported the name with the value
+undefined. The lowering emits `var E` and then an IIFE that fills it, and
+an export copies the binding where it stands, which is before the IIFE
+runs. `import { Outcome }` therefore gave undefined, and the server threw
+on its first request. A second export after the IIFE carries the value.
+`test/run/export_enum.ts` covers both forms.
+
 ## Acceptance
 
 A diff test, `test/diff/esm_interop.mjs`, matching node on:
@@ -172,5 +193,7 @@ transcript it does now, which is the real regression test for the example.
   module that imports a CJS file that requires it back has no good answer
   in any runtime, and the loader's dedup key needs to be the same for both
   paths or the cycle turns into two copies.
-- `examples/serve` runs on `node` today. Whatever lands has to keep that
-  true, since it is what makes the example honest.
+- `examples/serve` does not run on plain `node`, which the earlier note
+  here got wrong: node 22 needs `--experimental-strip-types` for a `.cts`
+  or `.ts` file, and refuses the first `interface` without it. Only
+  `check.cjs` is portable, being plain JavaScript.

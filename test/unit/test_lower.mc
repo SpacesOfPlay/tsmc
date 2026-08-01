@@ -101,7 +101,7 @@ i32 main() {
         "(program (var (declarator (ident F))) (expr-stmt (call (function (block (expr-stmt (assign = (index (ident F) (assign = (index (ident F) (string A)) (number 1.0))) (string A))) (expr-stmt (assign = (index (ident F) (assign = (index (ident F) (string B)) (number 4.0))) (string B))) (expr-stmt (assign = (index (ident F) (assign = (index (ident F) (string C)) (number 5.0))) (string C)))) (param (ident F))) (bin || (ident F) (assign = (ident F) (object))))))",
         "enum constant folding");
     check_lower("export enum E { A }",
-        "(program (export (var (declarator (ident E)))) (expr-stmt (call (function (block (expr-stmt (assign = (index (ident E) (assign = (index (ident E) (string A)) (number 0.0))) (string A)))) (param (ident E))) (bin || (ident E) (assign = (ident E) (object))))))",
+        "(program (export (var (declarator (ident E)))) (expr-stmt (call (function (block (expr-stmt (assign = (index (ident E) (assign = (index (ident E) (string A)) (number 0.0))) (string A)))) (param (ident E))) (bin || (ident E) (assign = (ident E) (object))))) (export (export-spec E)))",
         "export enum");
     check_lower_error("enum X { A = f(), B }", "auto increment after computed");
 

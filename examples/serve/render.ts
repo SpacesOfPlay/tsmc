@@ -3,10 +3,10 @@
 // markdown-it and js-yaml are the two npm dependencies this example exists to
 // exercise: ordinary CommonJS packages resolved out of node_modules.
 
-const fs = require('fs');
-const path = require('path');
-const MarkdownIt = require('markdown-it');
-const yaml = require('js-yaml');
+import fs from 'fs';
+import path from 'path';
+import MarkdownIt from 'markdown-it';
+import yaml from 'js-yaml';
 
 interface FrontMatter {
   title?: string;
@@ -17,7 +17,7 @@ const md = new MarkdownIt({ html: false, linkify: true, typographer: false });
 
 const FRONT = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
-function splitFrontMatter(src: string): { front: FrontMatter; body: string } {
+export function splitFrontMatter(src: string): { front: FrontMatter; body: string } {
   const m = FRONT.exec(src);
   if (!m) return { front: {}, body: src };
   let front: FrontMatter = {};
@@ -62,13 +62,13 @@ function page(title: string, main: string): string {
   ].join('\n');
 }
 
-function renderMarkdown(src: string, fallbackTitle: string): string {
+export function renderMarkdown(src: string, fallbackTitle: string): string {
   const split = splitFrontMatter(src);
   const t = split.front.title;
   return page(typeof t === 'string' ? t : fallbackTitle, md.render(split.body));
 }
 
-function renderIndex(dir: string, urlPath: string): string {
+export function renderIndex(dir: string, urlPath: string): string {
   const entries = fs.readdirSync(dir).sort();
   const items = entries.map((name: string) => {
     const isDir = fs.statSync(path.join(dir, name)).isDirectory();
@@ -79,5 +79,3 @@ function renderIndex(dir: string, urlPath: string): string {
   const body = '<h1>' + escapeHtml(urlPath) + '</h1>\n<ul>\n' + items.join('\n') + '\n</ul>';
   return page('Index of ' + urlPath, body);
 }
-
-module.exports = { renderMarkdown, renderIndex, splitFrontMatter };
