@@ -6779,6 +6779,284 @@ private Value nat_set_is_disjoint(void* vmp, Value callee, Value thisv, Value* a
     return set_relate(vmp, thisv, args, argc, 2);
 }
 
+// --- base64 globals, buffer validators, crc32, util helpers ----------------
+
+// The web codecs report a DOMException named InvalidCharacterError. tsmc has
+// no DOMException, so this is an Error wearing the name callers check.
+private void throw_named(VM* vm, str name, str msg) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value e = vm_make_error(vm, ERR_TYPE, msg);
+    gc_root(&vm.heap, e);
+    if value_is_object(e) {
+        props_set_desc(&value_as_object(e).props, bi_atom(vm, "name"), new_str(vm, name), PROP_DEFAULT);
+    }
+    vm_throw(vm, e);
+    gc_root_reset(&vm.heap, rm);
+}
+
+// btoa takes a string of code units that each fit in a byte. Anything above
+// that has no single-byte form, which is the error rather than a silent
+// truncation.
+private Value nat_btoa(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str src = sview(sv);
+    str_buf raw;
+    str_buf_init(&raw);
+    i32 i = 0;
+    while i < src.len {
+        i32 c = cast(i32, *(src.data + i));
+        i32 cp = c;
+        i32 adv = 1;
+        if c >= 0xF0 { cp = 0x10000; adv = 4; }
+        else if c >= 0xE0 { cp = 0x1000; adv = 3; }
+        else if c >= 0xC0 {
+            cp = ((c & 0x1F) << 6) | (i + 1 < src.len ? (cast(i32, *(src.data + i + 1)) & 0x3F) : 0);
+            adv = 2;
+        }
+        if cp > 0xFF {
+            str_buf_free(&raw);
+            gc_root_reset(&vm.heap, rm);
+            throw_named(vm, "InvalidCharacterError", "string contains a character outside latin1");
+            return value_undefined();
+        }
+        str_buf_add_byte(&raw, cast(u8, cp));
+        i += adv;
+    }
+    Value tmp = buf_from_bytes(vm, raw.data, raw.len);
+    gc_root(&vm.heap, tmp);
+    str_buf_free(&raw);
+    str_buf out;
+    str_buf_init(&out);
+    JsObject* b = value_as_object(tmp);
+    b64_encode(&out, b, 0, b.elen, false);
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private bool b64_is_valid(str s) {
+    i32 seen = 0;
+    i32 pad = 0;
+    for i32 i = 0; i < s.len; i++ {
+        u8 c = *(s.data + i);
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { continue; }
+        if c == '=' { pad++; continue; }
+        if pad > 0 { return false; }
+        if b64_val(c) < 0 { return false; }
+        seen++;
+    }
+    if pad > 2 { return false; }
+    return seen % 4 != 1;
+}
+
+private Value nat_atob(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str src = sview(sv);
+    if !b64_is_valid(src) {
+        gc_root_reset(&vm.heap, rm);
+        throw_named(vm, "InvalidCharacterError", "string is not valid base64");
+        return value_undefined();
+    }
+    str_buf raw;
+    str_buf_init(&raw);
+    b64_decode(&raw, src);
+    Value tmp = buf_from_bytes(vm, raw.data, raw.len);
+    gc_root(&vm.heap, tmp);
+    str_buf_free(&raw);
+    // one code unit per byte, which is latin1
+    JsObject* b = value_as_object(tmp);
+    Value r = bytes_to_str(vm, b, ENC_LATIN1, 0, b.elen);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_buffer_isutf8(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
+    if !codec_bytes(vm, arg_at(args, argc, 0), &sb) {
+        str_buf_free(&sb);
+        vm_throw_error(vm, ERR_TYPE, "expected a buffer, typed array or ArrayBuffer");
+        return value_undefined();
+    }
+    bool ok = utf8_is_valid(sb.data, sb.len);
+    str_buf_free(&sb);
+    return value_bool(ok);
+}
+
+private Value nat_buffer_isascii(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
+    if !codec_bytes(vm, arg_at(args, argc, 0), &sb) {
+        str_buf_free(&sb);
+        vm_throw_error(vm, ERR_TYPE, "expected a buffer, typed array or ArrayBuffer");
+        return value_undefined();
+    }
+    bool ok = true;
+    for i32 i = 0; i < sb.len; i++ {
+        if *(sb.data + i) >= 0x80 { ok = false; }
+    }
+    str_buf_free(&sb);
+    return value_bool(ok);
+}
+
+// CRC-32, reflected, polynomial 0xEDB88320. The check value for "123456789"
+// is 3421780262, which is what pins the byte order.
+private Value nat_zlib_crc32(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    str_buf sb;
+    str_buf_init(&sb);
+    Value a0 = arg_at(args, argc, 0);
+    if !codec_bytes(vm, a0, &sb) {
+        Value sv = js_to_string_value(vm, a0);
+        gc_root(&vm.heap, sv);
+        str v = sview(sv);
+        str_buf_add_bytes(&sb, v.data, v.len);
+    }
+    u32 crc = 0xFFFFFFFF;
+    for i32 i = 0; i < sb.len; i++ {
+        crc = crc ^ cast(u32, *(sb.data + i));
+        for i32 k = 0; k < 8; k++ {
+            u32 mask = 0 - (crc & 1);
+            crc = (crc >> 1) ^ (0xEDB88320 & mask);
+        }
+    }
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return value_number(cast(f64, crc ^ 0xFFFFFFFF));
+}
+
+// Drops the escape sequences a terminal would act on, keeping the text.
+private Value nat_util_strip_vt(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str src = sview(sv);
+    str_buf out;
+    str_buf_init(&out);
+    i32 i = 0;
+    while i < src.len {
+        u8 c = *(src.data + i);
+        if c == 0x1B && i + 1 < src.len {
+            u8 n = *(src.data + i + 1);
+            if n == '[' {
+                i += 2;
+                while i < src.len {
+                    u8 f = *(src.data + i);
+                    i++;
+                    if f >= 0x40 && f <= 0x7E { break; }
+                }
+                continue;
+            }
+            if n == ']' {
+                i += 2;
+                while i < src.len {
+                    if *(src.data + i) == 0x07 { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            i += 2;
+            continue;
+        }
+        str_buf_add_byte(&out, c);
+        i++;
+    }
+    Value r = new_str(vm, str_buf_to_str(&out));
+    str_buf_free(&out);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_util_tousv(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sv);
+    str_buf sb;
+    str_buf_init(&sb);
+    wtf8_sanitize_into(&sb, sview(sv));
+    Value r = new_str(vm, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// The logger debuglog hands back. Silent unless its section was switched on,
+// which is what makes it safe to call on a hot path.
+private Value nat_debuglog_call(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    if !js_truthy(me.env0) { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value msg = nat_util_format(vmp, callee, thisv, args, argc);
+    gc_root(&vm.heap, msg);
+    str_buf out;
+    str_buf_init(&out);
+    str_buf_add(&out, sview(me.env1));
+    str_buf_add(&out, sview(msg));
+    Value line = new_str(vm, str_buf_to_str(&out));
+    gc_root(&vm.heap, line);
+    str_buf_free(&out);
+    console_emit(vm, line, true);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_util_debuglog(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sec = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, sec);
+    bool on = false;
+    Value* pv = intmap_get<Value>(&vm.globals, bi_atom(vm, "process"));
+    Value envv;
+    if pv != null && vm_get_prop_value(vm, *pv, bi_atom(vm, "env"), &envv) {
+        Value dbg;
+        if vm_get_prop_value(vm, envv, bi_atom(vm, "NODE_DEBUG"), &dbg) && value_is_string(dbg) {
+            str want = sview(sec);
+            str have = sview(dbg);
+            on = str_contains(have, want);
+        }
+    }
+    // node tags each line with the section and the pid, so interleaved
+    // output from several sections stays readable.
+    str_buf pre;
+    str_buf_init(&pre);
+    str sname = sview(sec);
+    for i32 i = 0; i < sname.len; i++ {
+        u8 c = *(sname.data + i);
+        if c >= 'a' && c <= 'z' { c = cast(u8, c - 32); }
+        str_buf_add_byte(&pre, c);
+    }
+    str_buf_add(&pre, " ");
+    Value pidv = value_undefined();
+    if pv != null { ignore vm_get_prop_value(vm, *pv, bi_atom(vm, "pid"), &pidv); }
+    util_append_num(vm, &pre, js_to_number(pidv));
+    str_buf_add(&pre, ": ");
+    Value prefix = new_str(vm, str_buf_to_str(&pre));
+    gc_root(&vm.heap, prefix);
+    str_buf_free(&pre);
+    JsNative* logfn = js_new_native(&vm.heap, &nat_debuglog_call, "debuglog");
+    logfn.env0 = value_bool(on);
+    logfn.env1 = prefix;
+    Value fv = value_cell(&logfn.head);
+    gc_root(&vm.heap, fv);
+    props_set_desc(&logfn.props, bi_atom(vm, "enabled"), value_bool(on), PROP_DEFAULT);
+    gc_root_reset(&vm.heap, rm);
+    return fv;
+}
+
 private Value nat_map_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
@@ -14120,6 +14398,10 @@ private JsObject* build_util_module(VM* vm) {
     def_node_export(vm, mod, ns, "promisify", &nat_util_promisify);
     def_node_export(vm, mod, ns, "callbackify", &nat_util_callbackify);
     def_node_export(vm, mod, ns, "format", &nat_util_format);
+    def_node_export(vm, mod, ns, "stripVTControlCharacters", &nat_util_strip_vt);
+    def_node_export(vm, mod, ns, "toUSVString", &nat_util_tousv);
+    def_node_export(vm, mod, ns, "debuglog", &nat_util_debuglog);
+    def_node_export(vm, mod, ns, "debug", &nat_util_debuglog);
     def_node_export(vm, mod, ns, "inspect", &nat_util_inspect);
     // util.inspect.custom: the registered symbol a type uses to say how it
     // should print. Libraries test for it, so its absence is visible even
@@ -15224,6 +15506,7 @@ private JsObject* build_zlib_module(VM* vm) {
     def_node_export(vm, mod, ns, "gzipSync", &nat_zlib_gzip);
     def_node_export(vm, mod, ns, "gunzipSync", &nat_zlib_gunzip);
     def_node_export(vm, mod, ns, "unzipSync", &nat_zlib_unzip);
+    def_node_export(vm, mod, ns, "crc32", &nat_zlib_crc32);
     def_zlib_async(vm, mod, ns, "gzip", 0);
     def_zlib_async(vm, mod, ns, "gunzip", 1);
     def_zlib_async(vm, mod, ns, "deflate", 2);
@@ -15280,6 +15563,11 @@ private JsObject* build_buffer_module(VM* vm) {
     gc_root(&vm.heap, value_cell(&ns.head));
     props_set_desc(&ns.props, bi_atom(vm, "default"), value_cell(&mod.head), PROP_DEFAULT);
     def_global_both(vm, mod, ns, "Buffer");
+    def_node_export(vm, mod, ns, "atob", &nat_atob);
+    def_node_export(vm, mod, ns, "btoa", &nat_btoa);
+    def_node_export(vm, mod, ns, "isUtf8", &nat_buffer_isutf8);
+    def_node_export(vm, mod, ns, "isAscii", &nat_buffer_isascii);
+    def_node_value(vm, mod, ns, "kMaxLength", value_number(2147483647.0));
     vm_pop(vm);
     return ns;
 }
@@ -17529,6 +17817,8 @@ void builtins_install(VM* vm) {
     ignore def_global_fn(vm, "setImmediate", &nat_set_immediate);
     ignore def_global_fn(vm, "clearImmediate", &nat_clear_timeout);
     ignore def_global_fn(vm, "queueMicrotask", &nat_queue_microtask);
+    ignore def_global_fn(vm, "atob", &nat_atob);
+    ignore def_global_fn(vm, "btoa", &nat_btoa);
 
     // console.warn / console.info
     Value* cv = intmap_get<Value>(&vm.globals, bi_atom(vm, "console"));

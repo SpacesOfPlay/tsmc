@@ -26,7 +26,7 @@ A subset of the Node standard library: `fs` (with `fs/promises`),
 MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
 `timingSafeEqual`, and the `random*` functions. The globals include
 `fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,
-`structuredClone` and `console`.
+`structuredClone`, `atob`/`btoa` and `console`.
 
 Networking is `net`, `http`, `https` and `tls` — clients and servers, on
 a non-blocking event loop. The TLS 1.3 stack is the project's own. The
@@ -108,11 +108,11 @@ overrides the install dir.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 31
-scripts are checked against golden output. 147 differential scripts run
+scripts are checked against golden output. 148 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-177 scripts then run again under `--gc-stress`, which collects on every
+178 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)
