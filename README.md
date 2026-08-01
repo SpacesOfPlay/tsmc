@@ -16,8 +16,9 @@ packages run unmodified.
 The language: classes, generators, async/await, async generators and
 `for await`, top-level await, modules (CommonJS and ESM, including
 dynamic `import()`), Proxy and Reflect, BigInt, typed arrays,
-`Map`/`Set`/`WeakMap`/`WeakSet`, `arguments`, and regular expressions
-with Unicode property escapes.
+`Map`/`Set`/`WeakMap`/`WeakSet` with the set operations, `arguments`,
+and regular expressions with
+Unicode property escapes.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
@@ -107,11 +108,11 @@ overrides the install dir.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 31
-scripts are checked against golden output. 146 differential scripts run
+scripts are checked against golden output. 147 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-176 scripts then run again under `--gc-stress`, which collects on every
+177 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)

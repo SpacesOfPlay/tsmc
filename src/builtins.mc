@@ -6583,6 +6583,202 @@ private Value nat_set_add(void* vmp, Value callee, Value thisv, Value* args, i32
     return thisv;
 }
 
+// --- set operations ---------------------------------------------------------
+//
+// The argument is a "set-like": anything with a numeric size, a has() and a
+// keys(). A Set qualifies, and so does a Map, by its keys. An array does
+// not, which is a TypeError rather than a silent walk of its indices.
+
+private struct SetLike {
+    Value obj;
+    Value has;
+    Value keys;
+    f64 size;
+    bool ok;
+}
+
+private SetLike setlike_of(VM* vm, Value v) {
+    SetLike r;
+    r.obj = v;
+    r.has = value_undefined();
+    r.keys = value_undefined();
+    r.size = 0.0;
+    r.ok = false;
+    if !value_is_object(v) && !value_is_map(v) {
+        vm_throw_error(vm, ERR_TYPE, "argument is not set-like");
+        return r;
+    }
+    Value sz;
+    if !vm_get_prop_value(vm, v, bi_atom(vm, "size"), &sz) || vm.has_pending {
+        if !vm.has_pending { vm_throw_error(vm, ERR_TYPE, "argument has no size"); }
+        return r;
+    }
+    f64 n = js_to_number(sz);
+    if n != n {
+        vm_throw_error(vm, ERR_TYPE, "argument has no size");
+        return r;
+    }
+    Value hasf;
+    Value keysf;
+    if !vm_get_prop_value(vm, v, bi_atom(vm, "has"), &hasf) || !value_is_callable(hasf) {
+        vm_throw_error(vm, ERR_TYPE, "argument has no has()");
+        return r;
+    }
+    if !vm_get_prop_value(vm, v, bi_atom(vm, "keys"), &keysf) || !value_is_callable(keysf) {
+        vm_throw_error(vm, ERR_TYPE, "argument has no keys()");
+        return r;
+    }
+    r.has = hasf;
+    r.keys = keysf;
+    r.size = n;
+    r.ok = true;
+    return r;
+}
+
+private bool setlike_has(VM* vm, SetLike* o, Value v) {
+    Value one = v;
+    Value r = vm_call_value(vm, o.has, o.obj, &one, 1);
+    if vm.has_pending { return false; }
+    return js_truthy(r);
+}
+
+// The other side's elements, in its own order. Read through keys() so a Map
+// contributes its keys and a custom set-like is honoured.
+private JsObject* setlike_keys(VM* vm, SetLike* o) {
+    JsObject* out = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&out.head));
+    Value it = vm_call_value(vm, o.keys, o.obj, null, 0);
+    if vm.has_pending { vm.sp--; return out; }
+    vm_push(vm, it);
+    Value nextf;
+    if vm_get_prop_value(vm, it, bi_atom(vm, "next"), &nextf) && value_is_callable(nextf) {
+        i32 guard = 0;
+        while guard < 100000000 {
+            guard++;
+            Value step = vm_call_value(vm, nextf, it, null, 0);
+            if vm.has_pending { break; }
+            vm_push(vm, step);
+            Value done;
+            bool fin = vm_get_prop_value(vm, step, bi_atom(vm, "done"), &done) && js_truthy(done);
+            Value val;
+            bool got = vm_get_prop_value(vm, step, bi_atom(vm, "value"), &val);
+            vm.sp--;
+            if fin { break; }
+            if got { js_array_set(out, out.elen, val); }
+        }
+    }
+    vm.sp--;
+    vm.sp--;
+    return out;
+}
+
+private JsMap* new_set(VM* vm) {
+    return js_new_map(&vm.heap, vm.set_proto, true);
+}
+
+// 0 union, 1 intersection, 2 difference, 3 symmetric difference
+private Value set_combine(void* vmp, Value thisv, Value* args, i32 argc, i32 op) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    SetLike other = setlike_of(vm, arg_at(args, argc, 0));
+    if !other.ok {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    gc_root(&vm.heap, other.obj);
+    JsMap* out = new_set(vm);
+    gc_root(&vm.heap, value_cell(&out.head));
+    // Intersection walks whichever side is smaller, and the result keeps
+    // that side's order, which is what node does.
+    bool other_first = op == 1 && other.size < cast(f64, mp.count);
+    if !other_first {
+        for i32 i = 0; i < mp.len; i++ {
+            if !*(mp.live + i) { continue; }
+            Value k = *(mp.keys + i);
+            bool inb = setlike_has(vm, &other, k);
+            if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+            bool keep = op == 0 || (op == 1 && inb) || (op >= 2 && !inb);
+            if keep { map_put(out, k, value_undefined()); }
+        }
+    }
+    if op != 2 {
+        JsObject* ks = setlike_keys(vm, &other);
+        gc_root(&vm.heap, value_cell(&ks.head));
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+        for i32 i = 0; i < ks.elen; i++ {
+            Value k = js_array_get(ks, i);
+            bool mine = map_find(mp, k) >= 0;
+            bool keep = op == 0 || (op == 1 && other_first && mine) || (op == 3 && !mine);
+            if keep { map_put(out, k, value_undefined()); }
+        }
+    }
+    Value r = value_cell(&out.head);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+private Value nat_set_union(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_combine(vmp, thisv, args, argc, 0);
+}
+private Value nat_set_intersection(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_combine(vmp, thisv, args, argc, 1);
+}
+private Value nat_set_difference(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_combine(vmp, thisv, args, argc, 2);
+}
+private Value nat_set_symdifference(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_combine(vmp, thisv, args, argc, 3);
+}
+
+// 0 subset, 1 superset, 2 disjoint
+private Value set_relate(void* vmp, Value thisv, Value* args, i32 argc, i32 op) {
+    VM* vm = as_vm(vmp);
+    JsMap* mp = this_map(vm, thisv);
+    if mp == null { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    SetLike other = setlike_of(vm, arg_at(args, argc, 0));
+    if !other.ok {
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    gc_root(&vm.heap, other.obj);
+    bool result = true;
+    if op == 1 {
+        // every element of the other side has to be here
+        JsObject* ks = setlike_keys(vm, &other);
+        gc_root(&vm.heap, value_cell(&ks.head));
+        if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+        for i32 i = 0; i < ks.elen; i++ {
+            if map_find(mp, js_array_get(ks, i)) < 0 { result = false; }
+        }
+    } else {
+        if op == 0 && cast(f64, mp.count) > other.size { result = false; }
+        else {
+            for i32 i = 0; i < mp.len; i++ {
+                if !*(mp.live + i) { continue; }
+                bool inb = setlike_has(vm, &other, *(mp.keys + i));
+                if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+                if op == 0 && !inb { result = false; }
+                if op == 2 && inb { result = false; }
+            }
+        }
+    }
+    gc_root_reset(&vm.heap, rm);
+    return value_bool(result);
+}
+
+private Value nat_set_is_subset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_relate(vmp, thisv, args, argc, 0);
+}
+private Value nat_set_is_superset(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_relate(vmp, thisv, args, argc, 1);
+}
+private Value nat_set_is_disjoint(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return set_relate(vmp, thisv, args, argc, 2);
+}
+
 private Value nat_map_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsMap* mp = this_map(vm, thisv);
@@ -7189,10 +7385,13 @@ private Value date_set_field(VM* vm, Value thisv, Value* args, i32 argc, i32 fie
     i32 mi = p.min;
     i32 se = p.sec;
     i32 ms = p.ms;
-    for i32 i = 0; i < argc; i++ {
+    // Every setter has a required first parameter, so calling one with no
+    // argument reads undefined and lands on NaN, invalidating the date.
+    i32 n = argc > 0 ? argc : 1;
+    for i32 i = 0; i < n; i++ {
         i32 slot = field + i;
         if slot > 6 { break; }
-        f64 a = js_to_number(*(args + i));
+        f64 a = js_to_number(arg_at(args, argc, i));
         if a != a {
             return date_store(vm, thisv, 0.0 / 0.0);
         }
@@ -17222,6 +17421,13 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.set_proto, "values", &nat_map_values);
     def_method(vm, vm.set_proto, "entries", &nat_map_entries);
     def_accessor(vm, vm.set_proto, "size", &nat_map_size);
+    def_method(vm, vm.set_proto, "union", &nat_set_union);
+    def_method(vm, vm.set_proto, "intersection", &nat_set_intersection);
+    def_method(vm, vm.set_proto, "difference", &nat_set_difference);
+    def_method(vm, vm.set_proto, "symmetricDifference", &nat_set_symdifference);
+    def_method(vm, vm.set_proto, "isSubsetOf", &nat_set_is_subset);
+    def_method(vm, vm.set_proto, "isSupersetOf", &nat_set_is_superset);
+    def_method(vm, vm.set_proto, "isDisjointFrom", &nat_set_is_disjoint);
     JsNative* set_it = js_new_native(&vm.heap, &nat_map_values, "[Symbol.iterator]");
     js_set_prop(vm.set_proto, iter_id, value_cell(&set_it.head));
 
