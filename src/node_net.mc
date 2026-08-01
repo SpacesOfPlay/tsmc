@@ -26,6 +26,8 @@ class Socket extends EventEmitter {
     this._connecting = false;
     this._reading = false;
     this._ending = false;
+    this._sentFin = false;
+    this._encoding = null;
     this.destroyed = false;
   }
   __onReady(revents) {
@@ -38,7 +40,7 @@ class Socket extends EventEmitter {
         this.emit('connect');
         this._flush();
       } else {
-        this._fail('connect ECONNREFUSED');
+        this._fail('connect ECONNREFUSED', 'ECONNREFUSED');
         return;
       }
     }
@@ -59,7 +61,7 @@ class Socket extends EventEmitter {
       if (r === null) return;
       if (r === 0) { this.emit('end'); this._finish(); return; }
       if (r === -1) { this._fail('read EIO'); return; }
-      this.emit('data', r);
+      this.emit('data', this._encoding ? r.toString(this._encoding) : r);
       if (this.destroyed) return;
     }
   }
@@ -79,11 +81,14 @@ class Socket extends EventEmitter {
     }
     __net_want_write(this._id, false);
     this.emit('drain');
-    if (this._ending) this._finish();
+    if (this._ending) this._shutdownSend();
   }
   write(data, enc, cb) {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }
-    if (!this.destroyed) {
+    // Once end() has sent the FIN the send direction is closed, so there is
+    // nowhere for this to go. Queueing it anyway meant a later flush tried
+    // to send on a half-closed socket and reported the failure as an error.
+    if (!this.destroyed && !this._ending) {
       this._wq.push({ buf: asBuffer(data, enc), off: 0 });
       this._flush();
     }
@@ -93,8 +98,14 @@ class Socket extends EventEmitter {
   end(data, enc) {
     if (data != null) this.write(data, enc);
     this._ending = true;
-    if (this._wq.length === 0) this._finish();
+    if (this._wq.length === 0) this._shutdownSend();
     return this;
+  }
+  _shutdownSend() {
+    if (this.destroyed || this._sentFin) return;
+    this._sentFin = true;
+    __net_shutdown(this._id);
+    this.emit('finish');
   }
   _finish() {
     if (this.destroyed) return;
@@ -103,8 +114,9 @@ class Socket extends EventEmitter {
     this.emit('close');
   }
   destroy() { this._finish(); return this; }
-  _fail(msg) {
+  _fail(msg, code) {
     const e = new Error(msg);
+    if (code) e.code = code;
     this.emit('error', e);
     this._finish();
   }
@@ -112,7 +124,7 @@ class Socket extends EventEmitter {
   unref() { __net_ref(this._id, false); return this; }
   setNoDelay() { return this; }
   setKeepAlive() { return this; }
-  setEncoding() { return this; }
+  setEncoding(enc) { this._encoding = enc || 'utf8'; return this; }
   setTimeout() { return this; }
 }
 
@@ -121,6 +133,7 @@ class Server extends EventEmitter {
     super();
     this._id = -1;
     this._closed = false;
+    this.listening = false;
     if (typeof onConn === 'function') this.on('connection', onConn);
   }
   __onReady(revents) {
@@ -149,6 +162,7 @@ class Server extends EventEmitter {
     }
     __net_set_owner(this._id, this);
     if (typeof cb === 'function') this.on('listening', cb);
+    this.listening = true;
     queueMicrotask(() => this.emit('listening'));
     return this;
   }
@@ -159,6 +173,7 @@ class Server extends EventEmitter {
     if (typeof cb === 'function') this.on('close', cb);
     if (!this._closed) {
       this._closed = true;
+      this.listening = false;
       __net_close(this._id);
       queueMicrotask(() => this.emit('close'));
     }

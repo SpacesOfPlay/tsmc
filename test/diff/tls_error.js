@@ -7,7 +7,13 @@ const net = require('net');
 const tls = require('tls');
 
 const server = net.createServer((sock) => {
+  // Answer the first record and nothing after it. A peer may reply to the
+  // garbage with an alert, and that arrives as another data event: end()
+  // half-closes, so this socket is still readable.
+  let answered = false;
   sock.on('data', () => {
+    if (answered) return;
+    answered = true;
     sock.write('NOT-A-TLS-RECORD garbage garbage garbage');
     sock.end();
   });

@@ -10281,6 +10281,32 @@ private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* ar
     return value_undefined();
 }
 
+// Half-close: stop sending, keep reading. end() needs this, or a peer that
+// replies after our FIN is talking to a socket that is already gone.
+when os(windows) {
+    private extern "ws2_32.dll" i32 shutdown(i64 s, i32 how);
+    private i32 net_shutdown_send(i64 fd) { return shutdown(fd, 1); }   // SD_SEND
+}
+else when os(macos) || os(ios) {
+    private extern "libSystem.B.dylib" i32 shutdown(i32 s, i32 how);
+    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
+}
+else when os(linux) || os(android) {
+    when os(android) { private extern "libc.so" i32 shutdown(i32 s, i32 how); }
+    else { private extern "libc.so.6" i32 shutdown(i32 s, i32 how); }
+    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
+}
+else {
+    private i32 net_shutdown_send(i64 fd) { return 0; }
+}
+
+private Value nat_net_shutdown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
+    if fd >= 0 { ignore net_shutdown_send(fd); }
+    return value_undefined();
+}
+
 private Value nat_net_close(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 id = to_int_arg(arg_at(args, argc, 0));
@@ -10583,6 +10609,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__net_send", &nat_net_send);
     ignore def_global_fn(vm, "__net_want_write", &nat_net_want_write);
     ignore def_global_fn(vm, "__net_close", &nat_net_close);
+    ignore def_global_fn(vm, "__net_shutdown", &nat_net_shutdown);
     ignore def_global_fn(vm, "__net_connect_result", &nat_net_connect_result);
     ignore def_global_fn(vm, "__net_set_owner", &nat_net_set_owner);
     ignore def_global_fn(vm, "__net_port", &nat_net_port);
