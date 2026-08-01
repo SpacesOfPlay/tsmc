@@ -7,8 +7,9 @@ annotations are parsed and erased, nothing is type-checked, and the TS
 constructs with runtime semantics (`enum`, `namespace`, constructor
 parameter properties) are lowered and executed. It is a bytecode
 interpreter with a precise mark-sweep GC, written in minc. `.js` files
-run as well, and both `require` and `import` walk `node_modules`, so many
-pure-JavaScript npm packages run unmodified.
+run as well, and both `require` and `import` walk `node_modules`, taking a
+package's CommonJS or ESM entry to suit, so many pure-JavaScript npm
+packages run unmodified.
 
 ## What runs
 
@@ -37,9 +38,7 @@ generation. Node's native addons do not load; native code is written in
 minc instead, described below. No `Intl`, and no `child_process`,
 `worker_threads` or `dns`. `Buffer` is backed by an array rather than a
 `Uint8Array`, so it fails an `instanceof` check and copies where node
-shares memory (`doc/PLAN_M42_buffer_uint8array.md`). An ESM `import`
-resolves a bare specifier against `node_modules`, but picks a package's
-CommonJS entry: one that ships only ESM will not load. There is no
+shares memory (`doc/PLAN_M42_buffer_uint8array.md`). There is no
 `fs.createReadStream`, so a file is read whole.
 
 `doc/npm-compatibility.md` lists the npm packages that have been run
@@ -108,11 +107,11 @@ overrides the install dir.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 30
-scripts are checked against golden output. 142 differential scripts run
+scripts are checked against golden output. 143 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-172 scripts then run again under `--gc-stress`, which collects on every
+173 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)

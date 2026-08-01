@@ -1,6 +1,6 @@
 # M44 — ESM: node_modules and CJS interop
 
-Status: tier 1 landed. Tiers 2 and 3 open.
+Status: tiers 1 and 2 landed. Tier 3 open.
 
 ## Why
 
@@ -115,6 +115,26 @@ needs three more things, none of which exist yet:
 
 A dual package will keep working after tier 1 by taking its `require`
 branch, so tier 2 is specifically about packages that ship ESM only.
+
+## Tier 2 as built
+
+Measuring first cut this down. Of five ESM-only package shapes, three
+already worked after tier 1, because the source sniff catches `export`
+syntax wherever it appears. Two did not, and those are what tier 2 is:
+
+- A package gating its entry on the `import` condition. `is_active_condition`
+  now takes who is asking: `node` and `default` always match, then `import`
+  for an ESM importer and `require` for a require(). The flag is threaded
+  from the two call sites down through the target resolver.
+- A `"type": "module"` entry whose own syntax gives nothing away. A body
+  with top-level await and no import or export was classified as CommonJS
+  and failed to parse. `pkg_type_is_module` walks up to the nearest
+  package.json and lets it decide, before the sniff.
+
+`test/diff/esm_packages.mjs` covers both against node, with a fixture
+carrying its own node_modules so the walk starts beside it. The dual
+package in it proves the split works in both directions: `import` takes
+the ESM branch, `require` the CommonJS one, from the same package.
 
 ## Tier 3: the payoff
 

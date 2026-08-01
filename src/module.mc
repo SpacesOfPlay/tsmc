@@ -350,11 +350,59 @@ private i32 load_builtin_module(Loader* ld, str name) {
     return idx;
 }
 
-// Is this file an ES module? The extension decides when it can, and the
-// source is sniffed when it cannot, which is what dynamic import does.
-private bool esm_source_file(str path) {
+// Does the nearest package.json above `path` say "type": "module"? That is
+// what makes a .js file ESM when its own syntax gives nothing away, a body
+// with top-level await and no import or export being the realistic case.
+private bool pkg_type_is_module(VM* vm, str path) {
+    // dir_of returns a view into `path`, and the walk below frees what it
+    // holds, so start from a copy.
+    str cur = owned_str(dir_of(path));
+    i32 guard = 0;
+    bool found = false;
+    while guard < 64 {
+        guard++;
+        str pj = path_under(cur, "package.json");
+        if file_there(pj) {
+            FileData fd = file_read(pj);
+            if fd.data != null {
+                str text;
+                text.data = fd.data;
+                text.len = fd.len;
+                bool ok = false;
+                i32 rm = gc_root_mark(&vm.heap);
+                Value j = builtins_json_parse(vm, text, &ok);
+                gc_root(&vm.heap, j);
+                free(fd.data);
+                if ok && value_is_object(j) {
+                    Value tv;
+                    if js_get_prop(value_as_object(j), atom_intern(&vm.atoms, "type"), &tv)
+                        && value_is_string(tv) {
+                        found = str_equal(gc_string_view(value_as_string(tv)), "module");
+                    }
+                }
+                gc_root_reset(&vm.heap, rm);
+            }
+            free(pj.data);
+            free(cur.data);
+            return found;   // the nearest one decides, whatever it says
+        }
+        free(pj.data);
+        str up = parent_of(cur);
+        free(cur.data);
+        if up.data == null { return false; }
+        cur = up;
+    }
+    free(cur.data);
+    return false;
+}
+
+// Is this file an ES module? The extension decides when it can, then the
+// package type, then the source is sniffed, which is what dynamic import
+// does.
+private bool esm_source_file(VM* vm, str path) {
     if path_is_mjs(path) { return true; }
     if path_is_cjs(path) || path_is_json(path) { return false; }
+    if pkg_type_is_module(vm, path) { return true; }
     FileData fd = file_read(path);
     if fd.data == null { return false; }
     str s;
@@ -488,7 +536,7 @@ private i32 load_module(Loader* ld, str path) {
         // An ESM file path first, then require's resolver, which is what
         // reaches node_modules and a package subpath.
         str resolved = resolve_specifier(mod.path, spec);
-        if resolved.data == null { resolved = resolve_require(ld.vm, mod.path, spec); }
+        if resolved.data == null { resolved = resolve_require(ld.vm, mod.path, spec, true); }
         if resolved.data == null {
             eprint("tsmc: cannot resolve '{}' from '{}'\n", spec, mod.path);
             ld.failed = true;
@@ -498,7 +546,7 @@ private i32 load_module(Loader* ld, str path) {
         // A CommonJS target exports through module.exports, which the ESM
         // loader would not see at all: it would parse, export nothing, and
         // hand back an empty namespace.
-        i32 dep = esm_source_file(resolved)
+        i32 dep = esm_source_file(ld.vm, resolved)
             ? load_module(ld, resolved)
             : load_cjs_module(ld, mod.path, spec, resolved);
         vec_push(&mod.dep_idx, dep);
@@ -739,17 +787,20 @@ private str load_as_dir(VM* vm, str dir) {
     return load_index(dir);
 }
 
-// package.json "exports" resolution (conditional + subpath maps). Active
-// conditions for a require() are node / require / default, matched in the
-// object's key order (first match wins).
+// package.json "exports" resolution (conditional + subpath maps). Conditions
+// are matched in the object's key order, first match wins. Which ones are
+// active depends on the importer: an ESM file takes the "import" branch, a
+// require() takes "require". A package that gates its entry on "import" is
+// unreachable otherwise.
 
-private bool is_require_condition(str k) {
-    return str_equal(k, "require") || str_equal(k, "node") || str_equal(k, "default");
+private bool is_active_condition(str k, bool esm) {
+    if str_equal(k, "node") || str_equal(k, "default") { return true; }
+    return esm ? str_equal(k, "import") : str_equal(k, "require");
 }
 
 // Resolves an exports target (string / array fallback / conditions object)
 // to a heap file path under `pkg_dir`, or {null,0}.
-private str resolve_export_target(VM* vm, str pkg_dir, Value target) {
+private str resolve_export_target(VM* vm, str pkg_dir, Value target, bool esm) {
     if value_is_string(target) {
         str t = gc_string_view(value_as_string(target));
         if t.len < 2 || *(t.data) != '.' { return null_str(); }   // must be "./..."
@@ -758,7 +809,7 @@ private str resolve_export_target(VM* vm, str pkg_dir, Value target) {
     if value_is_array(target) {
         JsObject* a = value_as_object(target);
         for i32 i = 0; i < a.elen; i++ {
-            str r = resolve_export_target(vm, pkg_dir, js_array_get(a, i));
+            str r = resolve_export_target(vm, pkg_dir, js_array_get(a, i), esm);
             if r.data != null {
                 if file_there(r) { return r; }
                 free(r.data);
@@ -773,10 +824,10 @@ private str resolve_export_target(VM* vm, str pkg_dir, Value target) {
         for i32 i = 0; i < keys.elen; i++ {
             Value kv = js_array_get(keys, i);
             str k = gc_string_view(value_as_string(kv));
-            if is_require_condition(k) {
+            if is_active_condition(k, esm) {
                 Value v;
                 if js_get_prop(value_as_object(target), atom_intern(&vm.atoms, k), &v) {
-                    str r = resolve_export_target(vm, pkg_dir, v);
+                    str r = resolve_export_target(vm, pkg_dir, v, esm);
                     if r.data != null { result = r; break; }
                 }
             }
@@ -790,7 +841,7 @@ private str resolve_export_target(VM* vm, str pkg_dir, Value target) {
 // PACKAGE_EXPORTS_RESOLVE for a require: choose the target for `subpath`
 // ("" -> ".", "sub" -> "./sub") and resolve it through the conditions.
 // `exports` must be kept rooted by the caller.
-private str resolve_exports(VM* vm, str pkg_dir, Value exports, str subpath) {
+private str resolve_exports(VM* vm, str pkg_dir, Value exports, str subpath, bool esm) {
     Value target = value_undefined();
     bool have = false;
     if value_is_string(exports) || value_is_array(exports) {
@@ -822,13 +873,13 @@ private str resolve_exports(VM* vm, str pkg_dir, Value exports, str subpath) {
         }
     }
     if !have { return null_str(); }
-    return resolve_export_target(vm, pkg_dir, target);
+    return resolve_export_target(vm, pkg_dir, target, esm);
 }
 
 // Resolves `subpath` within a located package directory. package.json
 // "exports", when present, is authoritative (non-listed subpaths are
 // blocked). Otherwise the legacy main/index (bare) or subpath-as-file/dir.
-private str resolve_package(VM* vm, str pkg_dir, str subpath) {
+private str resolve_package(VM* vm, str pkg_dir, str subpath, bool esm) {
     str pj = path_under(pkg_dir, "package.json");
     bool handled = false;
     str result = null_str();
@@ -846,7 +897,7 @@ private str resolve_package(VM* vm, str pkg_dir, str subpath) {
                 Value ev;
                 if js_get_prop(value_as_object(j), atom_intern(&vm.atoms, "exports"), &ev)
                     && !value_is_undefined(ev) {
-                    result = resolve_exports(vm, pkg_dir, ev, subpath);
+                    result = resolve_exports(vm, pkg_dir, ev, subpath, esm);
                     handled = true;
                 }
             }
@@ -907,7 +958,7 @@ private void split_pkg(str spec, str* pkg, str* subpath) {
 
 // LOAD_NODE_MODULES: walk up from `start_dir` trying
 // <d>/node_modules/<pkg>[/<subpath>] at each level. Heap path or null.
-private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath) {
+private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath, bool esm) {
     str cur = owned_str(start_dir);
     str result = null_str();
     i32 guard = 0;
@@ -921,7 +972,7 @@ private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath) {
             // package directory found here: resolve within it — exports
             // (authoritative: non-listed subpaths are blocked), else the
             // legacy main / index / subpath-as-file. Stop walking.
-            f = resolve_package(vm, base, subpath);
+            f = resolve_package(vm, base, subpath, esm);
             stop = true;
         } else {
             // no package directory: try base[/subpath] as a bare file
@@ -965,7 +1016,7 @@ private bool spec_is_dot(str s) {
 
 // Full CJS resolution of `spec` from a module at `importer_path`. Returns a
 // heap file path (caller frees .data) or {null,0} if unresolved.
-private str resolve_require(VM* vm, str importer_path, str spec) {
+private str resolve_require(VM* vm, str importer_path, str spec, bool esm) {
     str idir = dir_of(importer_path);   // includes trailing separator
     if spec_is_absolute(spec) {
         str r = load_as_file(spec);
@@ -988,7 +1039,7 @@ private str resolve_require(VM* vm, str importer_path, str spec) {
     if start.len > 1 && (*(start.data + start.len - 1) == '/' || *(start.data + start.len - 1) == '\\') {
         start.len = start.len - 1;
     }
-    return load_node_modules(vm, start, pkg, subpath);
+    return load_node_modules(vm, start, pkg, subpath, esm);
 }
 
 // require.resolve(spec): where the specifier lands, without loading it.
@@ -1006,7 +1057,7 @@ private Value nat_require_resolve(void* vmp, Value callee, Value thisv, Value* a
     if value_is_string(value_as_native(callee).env0) {
         importer = js_str_view(value_as_native(callee).env0);
     }
-    str resolved = resolve_require(vm, importer, js_str_view(spv));
+    str resolved = resolve_require(vm, importer, js_str_view(spv), false);
     vm_pop(vm);
     if resolved.data == null {
         require_throw_missing(vm, js_str_view(spv));
@@ -1216,7 +1267,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
         if jsrc.data != null { return run_js_builtin(vm, bname, jsrc); }
     }
     // 2. resolve (relative/absolute file, or a node_modules package)
-    str resolved = resolve_require(vm, importer_path, spec);
+    str resolved = resolve_require(vm, importer_path, spec, false);
     if resolved.data == null {
         require_throw_missing(vm, spec);
         return value_undefined();

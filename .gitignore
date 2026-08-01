@@ -11,3 +11,7 @@ test/diff/.fs-sweep/
 
 # generated local CA + server certificate for examples/serve (private keys)
 examples/serve/local/
+
+# a package fixture, needed on disk for the node_modules walk
+!test/diff/esm_pkg/node_modules/
+!test/diff/esm_pkg/node_modules/**
