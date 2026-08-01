@@ -1,6 +1,6 @@
 # M44 — ESM: node_modules and CJS interop
 
-Status: planned.
+Status: tier 1 landed. Tiers 2 and 3 open.
 
 ## Why
 
@@ -72,6 +72,32 @@ loader's shape.
 
 Scope: `src/module.mc` only. No compiler change, since named imports read
 off the namespace object at run time.
+
+## Tier 1 as built
+
+The dependency loop takes `resolve_require` when `resolve_specifier` finds
+nothing, and classifies whatever comes back: an ESM file goes to the ESM
+loader, anything else becomes a synthetic module that `require` owns. The
+require runs in `eval_module`, so a CommonJS dependency's body lands in
+dependency order, which is the option the plan preferred and which matches
+node:
+
+    cjs body ran
+    esm dep body ran
+    importer body ran
+
+Keyed by the target's canonical path, so a file imported statically and
+again through `await import()` is one module. `test/diff/esm_interop.mjs`
+checks that, along with the default export and the namespace shape.
+
+A `.ts` file can now import an npm package:
+
+    import yaml from 'js-yaml';
+    import MarkdownIt from 'markdown-it';
+
+The classification also fixes a relative `.js` import whose target turns
+out to be CommonJS. That used to parse as ESM, export nothing, and yield
+an empty namespace with no error.
 
 ## Tier 2: ESM-only packages
 

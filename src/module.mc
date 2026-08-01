@@ -117,6 +117,12 @@ struct Module {
     JsObject* ns;
     i32 state;
     bool ok;
+    // A CommonJS dependency of an ESM file. require() owns it, so there is
+    // no template to run: `path` is the importer and `cjs_spec` the
+    // specifier, and the require happens when this module is evaluated, in
+    // dependency order, rather than while the graph is being loaded.
+    bool cjs;
+    str cjs_spec;         // owned
 }
 
 type ModulePtr = Module*;
@@ -329,6 +335,8 @@ private i32 load_builtin_module(Loader* ld, str name) {
     mod.path.data = pc;
     mod.path.len = name.len;
     mod.canon = canon;
+    mod.cjs = false;
+    mod.cjs_spec = null_str();
     mod.src_data = null;
     mod.src_len = 0;
     mod.state = MOD_DONE;
@@ -337,6 +345,48 @@ private i32 load_builtin_module(Loader* ld, str name) {
     bump_init(&mod.arena);
     mod.tmpl = null;
     mod.ns = ns;
+    i32 idx = ld.mods.len;
+    vec_push(&ld.mods, mod);
+    return idx;
+}
+
+// Is this file an ES module? The extension decides when it can, and the
+// source is sniffed when it cannot, which is what dynamic import does.
+private bool esm_source_file(str path) {
+    if path_is_mjs(path) { return true; }
+    if path_is_cjs(path) || path_is_json(path) { return false; }
+    FileData fd = file_read(path);
+    if fd.data == null { return false; }
+    str s;
+    s.data = fd.data;
+    s.len = fd.len;
+    bool r = has_module_syntax(s);
+    free(fd.data);
+    return r;
+}
+
+// Registers a CommonJS dependency without running it. Keyed by the target's
+// canonical path, so importing and requiring the same file is one module.
+private i32 load_cjs_module(Loader* ld, str importer, str spec, str resolved) {
+    str canon = canon_path(resolved);
+    i32 existing = find_module(ld, canon);
+    if existing >= 0 {
+        free(canon.data);
+        return existing;
+    }
+    Module* mod = new(Module);
+    mod.path = owned_str(importer);
+    mod.canon = canon;
+    mod.cjs = true;
+    mod.cjs_spec = owned_str(spec);
+    mod.src_data = null;
+    mod.src_len = 0;
+    mod.state = MOD_LOADED;
+    mod.ok = true;
+    vec_init<i32>(&mod.dep_idx, 1);
+    bump_init(&mod.arena);
+    mod.tmpl = null;
+    mod.ns = null;
     i32 idx = ld.mods.len;
     vec_push(&ld.mods, mod);
     return idx;
@@ -363,6 +413,8 @@ private i32 load_module(Loader* ld, str path) {
     mod.path.data = pc;
     mod.path.len = path.len;
     mod.canon = canon;
+    mod.cjs = false;
+    mod.cjs_spec = null_str();
     mod.src_data = fd.data;
     mod.src_len = fd.len;
     mod.state = MOD_NEW;
@@ -433,14 +485,22 @@ private i32 load_module(Loader* ld, str path) {
             vec_push(&mod.dep_idx, dep);
             continue;
         }
+        // An ESM file path first, then require's resolver, which is what
+        // reaches node_modules and a package subpath.
         str resolved = resolve_specifier(mod.path, spec);
+        if resolved.data == null { resolved = resolve_require(ld.vm, mod.path, spec); }
         if resolved.data == null {
             eprint("tsmc: cannot resolve '{}' from '{}'\n", spec, mod.path);
             ld.failed = true;
             vec_push(&mod.dep_idx, -1);
             continue;
         }
-        i32 dep = load_module(ld, resolved);
+        // A CommonJS target exports through module.exports, which the ESM
+        // loader would not see at all: it would parse, export nothing, and
+        // hand back an empty namespace.
+        i32 dep = esm_source_file(resolved)
+            ? load_module(ld, resolved)
+            : load_cjs_module(ld, mod.path, spec, resolved);
         vec_push(&mod.dep_idx, dep);
         free(resolved.data);
     }
@@ -458,6 +518,16 @@ private i32 load_module(Loader* ld, str path) {
 private i32 eval_module(Loader* ld, i32 idx) {
     Module* mod = vec_get(&ld.mods, idx);
     if mod.state == MOD_DONE || mod.state == MOD_EVALUATING { return 0; }
+    if mod.cjs {
+        // Runs here, not at load time, so a CommonJS dependency's side
+        // effects land in dependency order with the ESM bodies around it.
+        mod.state = MOD_EVALUATING;
+        Value ex = module_require(ld.vm, mod.path, mod.cjs_spec);
+        if ld.vm.has_pending { return 1; }
+        mod.ns = js_builtin_namespace(ld.vm, ex);
+        mod.state = MOD_DONE;
+        return 0;
+    }
     mod.state = MOD_EVALUATING;
     for i32 i = 0; i < mod.dep_idx.len; i++ {
         i32 dep = vec_get(&mod.dep_idx, i);
@@ -491,6 +561,7 @@ private i32 eval_module(Loader* ld, i32 idx) {
 private void module_free(Module* mod) {
     free(mod.path.data);
     free(mod.canon.data);
+    if mod.cjs_spec.data != null { free(mod.cjs_spec.data); }
     if mod.src_data != null { free(mod.src_data); }
     vec_free(&mod.dep_idx);
     bump_destroy(&mod.arena);
