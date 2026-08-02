@@ -96,7 +96,10 @@ struct RxParser {
     i32 pos;
     i32 group_count;
     bool failed;
-    bool unicode;           // the /u flag: code-point mode
+    bool unicode;           // the /u or /v flag: code-point mode
+    bool sets;              // the /v flag: set notation, which is not supported
+    i32 max_backref;        // highest -style reference seen
+    bool in_class;          // inside [...], where more escapes are legal
     Vec<RxClass> classes;   // owns range arrays until moved into prog
     Vec<RxGroupName> gnames;
     // \k<name> nodes awaiting resolution: the group may be declared later
@@ -389,7 +392,13 @@ private i32 escape_char(RxParser* p) {
     if c == 'r' { return '\r'; }
     if c == 'f' { return 12; }
     if c == 'v' { return 11; }
-    if c == '0' { return 0; }
+    if c == '0' {
+        // \0 is the null character, but \01 and up are Annex B octal, which
+        // u mode does not have
+        if p.unicode && px_cur(p) >= '0' && px_cur(p) <= '9' { p.failed = true; }
+        return 0;
+    }
+    if p.unicode && c >= '1' && c <= '9' { p.failed = true; return c; }
     if c == 'x' {
         i32 h1 = hexval(px_cur(p));
         i32 h2 = hexval(px_at(p, p.pos + 1));
@@ -443,28 +452,64 @@ private i32 escape_char(RxParser* p) {
         }
         return 'u';
     }
+    // In u mode only the syntax characters and '/' may be escaped for their
+    // own sake; a class adds '-'. Anything else is an error rather than a
+    // quietly accepted literal, which is how node reads it.
+    if p.unicode && !is_syntax_char(c) && c != '/' && !(p.in_class && c == '-') {
+        p.failed = true;
+    }
     return c;   // escaped literal (\. \* \\ etc.)
+}
+
+private bool is_syntax_char(u8 c) {
+    return c == '^' || c == '$' || c == '\\' || c == '.' || c == '*' || c == '+'
+        || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{'
+        || c == '}' || c == '|';
+}
+
+// A class escape stands for a set, so it cannot be an end of a range: node
+// reads [a-\d] in u mode as an error rather than as a-to-'d'.
+private bool is_class_escape(u8 c) {
+    return c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S'
+        || c == 'p' || c == 'P';
+}
+
+// A set escape has just been read inside a class. In u mode it cannot be one
+// end of a range: [\d-a] is an error there, where Annex B reads the dash as a
+// literal.
+private void no_range_after_set(RxParser* p) {
+    if p.unicode && px_cur(p) == '-' && px_at(p, p.pos + 1) != ']' && p.pos + 1 < p.src.len {
+        p.failed = true;
+    }
 }
 
 private RxNode* parse_class(RxParser* p) {
     p.pos++;   // '['
     bool negate = false;
     if px_cur(p) == '^' { negate = true; p.pos++; }
+    // The v flag's set notation (nested classes, -- difference, && union of
+    // the intersection kind, \q{} string literals) is not implemented. It is
+    // refused here rather than read as something else: [\p{ASCII}--[a-z]]
+    // would otherwise quietly match nothing.
+    if p.sets { check_no_set_notation(p); }
+    bool outer_in_class = p.in_class;
+    p.in_class = true;
     Vec<RxRange> rs = vec_new<RxRange>(4);
     while p.pos < p.src.len && px_cur(p) != ']' {
         i32 lo;
         if px_cur(p) == '\\' {
             p.pos++;
             u8 e = px_cur(p);
-            if e == 'd' { p.pos++; add_digit(&rs); continue; }
-            if e == 'w' { p.pos++; add_word(&rs); continue; }
-            if e == 's' { p.pos++; add_space(&rs); continue; }
+            if e == 'd' { p.pos++; add_digit(&rs); no_range_after_set(p); continue; }
+            if e == 'w' { p.pos++; add_word(&rs); no_range_after_set(p); continue; }
+            if e == 's' { p.pos++; add_space(&rs); no_range_after_set(p); continue; }
             if e == 'D' {
                 p.pos++;
                 Vec<RxRange> base = vec_new<RxRange>(2);
                 add_digit(&base);
                 add_negated(&rs, &base);
                 vec_free(&base);
+                no_range_after_set(p);
                 continue;
             }
             if e == 'W' {
@@ -473,6 +518,7 @@ private RxNode* parse_class(RxParser* p) {
                 add_word(&base);
                 add_negated(&rs, &base);
                 vec_free(&base);
+                no_range_after_set(p);
                 continue;
             }
             if e == 'S' {
@@ -481,6 +527,7 @@ private RxNode* parse_class(RxParser* p) {
                 add_space(&base);
                 add_negated(&rs, &base);
                 vec_free(&base);
+                no_range_after_set(p);
                 continue;
             }
             // \p{...} inside a class contributes its ranges as a class member;
@@ -488,9 +535,14 @@ private RxNode* parse_class(RxParser* p) {
             // same as negating the enclosing class.
             if (e == 'p' || e == 'P') && p.unicode && px_at(p, p.pos + 1) == '{' {
                 ignore parse_uniprop(p, &rs, e == 'P');
+                no_range_after_set(p);
                 continue;
             }
+            bool lo_is_set = p.unicode && is_class_escape(px_cur(p));
             lo = escape_char(p);
+            if lo_is_set && px_cur(p) == '-' && px_at(p, p.pos + 1) != ']' {
+                p.failed = true;
+            }
         } else {
             lo = px_read_cp(p);
         }
@@ -500,21 +552,48 @@ private RxNode* parse_class(RxParser* p) {
             i32 hi;
             if px_cur(p) == '\\' {
                 p.pos++;
+                if p.unicode && is_class_escape(px_cur(p)) { p.failed = true; }
                 hi = escape_char(p);
             } else {
                 hi = px_read_cp(p);
             }
+            // a range must run upwards
+            if hi < lo { p.failed = true; }
             class_add(&rs, lo, hi);
         } else {
             class_add(&rs, lo, lo);
         }
     }
+    p.in_class = outer_in_class;
     if px_cur(p) == ']' { p.pos++; } else { p.failed = true; }
     i32 ci = register_class(p, &rs, negate);
     vec_free(&rs);
     RxNode* n = rx_node(RN_CLASS);
     n.cls = ci;
     return n;
+}
+
+// Scans the class about to be parsed for v-mode set notation and refuses it.
+// `p.pos` is just past the opening '['.
+private void check_no_set_notation(RxParser* p) {
+    i32 i = p.pos;
+    i32 depth = 0;
+    while i < p.src.len {
+        u8 c = px_at(p, i);
+        if c == '\\' {
+            if px_at(p, i + 1) == 'q' { p.failed = true; return; }
+            i += 2;
+            continue;
+        }
+        if c == '[' { p.failed = true; return; }
+        if c == ']' {
+            if depth == 0 { return; }
+            depth--;
+        }
+        if c == '-' && px_at(p, i + 1) == '-' { p.failed = true; return; }
+        if c == '&' && px_at(p, i + 1) == '&' { p.failed = true; return; }
+        i++;
+    }
 }
 
 private i32 parse_int(RxParser* p) {
@@ -530,8 +609,47 @@ private i32 parse_int(RxParser* p) {
     return v;
 }
 
+// A group name is an identifier: no leading digit, and none of the punctuation
+// that would make the pattern ambiguous.
+private bool valid_group_name(str nm) {
+    if nm.len == 0 { return false; }
+    u8 c0 = *(nm.data);
+    if c0 >= '0' && c0 <= '9' { return false; }
+    for i32 i = 0; i < nm.len; i++ {
+        u8 c = *(nm.data + i);
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_' || c == '$' || c >= 0x80 { continue; }
+        return false;
+    }
+    return true;
+}
+
 private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
     u8 c = px_cur(p);
+    // A quantifier here has nothing in front of it to repeat.
+    if c == '*' || c == '+' {
+        p.failed = true;
+        p.pos++;
+        return rx_node(RN_CHAR);
+    }
+    // u mode has no Annex B leniency for a bracket or brace standing alone
+    if p.unicode && (c == ']' || c == '}') {
+        p.failed = true;
+        p.pos++;
+        return rx_node(RN_CHAR);
+    }
+    if p.unicode && c == '{' {
+        i32 save = p.pos;
+        p.pos++;
+        i32 lo = parse_int(p);
+        bool ok = lo >= 0;
+        if ok && px_cur(p) == ',' {
+            p.pos++;
+            if px_cur(p) != '}' { ok = parse_int(p) >= 0; }
+        }
+        if !ok || px_cur(p) != '}' { p.failed = true; }
+        p.pos = save;
+    }
     if c == '(' {
         p.pos++;
         i32 kind = RN_GROUP;
@@ -558,6 +676,10 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
                 nm.data = p.src.data + nstart;
                 nm.len = p.pos - nstart;
                 if px_cur(p) == '>' { p.pos++; } else { p.failed = true; }
+                if !valid_group_name(nm) { p.failed = true; }
+                for i32 gi = 0; gi < p.gnames.len; gi++ {
+                    if str_equal(vec_get(&p.gnames, gi).name, nm) { p.failed = true; }
+                }
                 p.group_count++;
                 gidx = p.group_count;
                 RxGroupName gn;
@@ -606,6 +728,7 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         }
         if e >= '1' && e <= '9' {
             i32 g = parse_int(p);
+            if g > p.max_backref { p.max_backref = g; }
             RxNode* n = rx_node(RN_BACKREF);
             n.a = g;
             return n;
@@ -677,9 +800,13 @@ private RxNode* parse_quant(RxParser* p, Vec<RxNodePtr>* stack) {
             }
         }
         if px_cur(p) == '}' { p.pos++; } else { p.pos = save; return atom; }
+        // {2,1} counts down, which is not a range
+        if rmax >= 0 && rmax < rmin { p.failed = true; }
         kind = RN_REPEAT;
     }
     if kind < 0 { return atom; }
+    // a lookbehind has nothing to repeat: node refuses (?<=a)* outright
+    if atom != null && atom.kind == RN_LOOKBEHIND { p.failed = true; }
     bool greedy = true;
     if px_cur(p) == '?' { greedy = false; p.pos++; }
     RxNode* q = rx_node(kind);
@@ -966,6 +1093,8 @@ bool regex_flags_valid(str flags) {
         if (seen & bit) != 0 { return false; }
         seen = seen | bit;
     }
+    // u and v both put the pattern in code-point mode and cannot be combined
+    if (seen & 32) != 0 && (seen & 64) != 0 { return false; }
     return true;
 }
 
@@ -976,8 +1105,13 @@ RegexProg* regex_compile(str pattern, str flags) {
     p.group_count = 0;
     p.failed = false;
     p.unicode = false;
+    p.sets = false;
+    p.in_class = false;
+    p.max_backref = 0;
     for i32 i = 0; i < flags.len; i++ {
+        // v implies u's code-point mode, plus set notation on top
         if *(flags.data + i) == 'u' { p.unicode = true; }
+        if *(flags.data + i) == 'v' { p.unicode = true; p.sets = true; }
     }
     vec_init<RxClass>(&p.classes, 4);
     vec_init<RxGroupName>(&p.gnames, 2);
@@ -987,6 +1121,9 @@ RegexProg* regex_compile(str pattern, str flags) {
     Vec<RxNodePtr> stack = vec_new<RxNodePtr>(8);
     RxNode* root = parse_alt(&p, &stack);
     vec_free(&stack);
+    // A reference to a group that is not there is an error in u mode, where
+    // Annex B's fallback to an octal escape does not exist.
+    if p.unicode && p.max_backref > p.group_count { p.failed = true; }
     // Resolve \k<name> now that every named group has been seen, so a
     // reference may point forward as well as back.
     for i32 i = 0; i < p.kpend.len; i++ {
@@ -1088,7 +1225,7 @@ RegexProg* regex_compile(str pattern, str flags) {
         if f == 's' { prog.dotall = true; }
         if f == 'g' { prog.global = true; }
         if f == 'y' { prog.sticky = true; }
-        if f == 'u' { prog.unicode = true; }
+        if f == 'u' || f == 'v' { prog.unicode = true; }
     }
     return prog;
 }
