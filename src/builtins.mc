@@ -13688,7 +13688,47 @@ private Value fs_promise_of(VM* vm, Value r) {
 }
 
 // Runs a sync fs native over `args` and wraps the outcome in a Promise.
-private Value fs_promise_run(VM* vm, NativeFn sync, Value callee, Value* args, i32 argc) {
+// The error every abort-aware call rejects with: node's own AbortError, which
+// carries a code as well as a name.
+private Value make_abort_error(VM* vm) {
+    i32 rm = gc_root_mark(&vm.heap);
+    Value e = vm_make_error(vm, ERR_ERROR, "The operation was aborted");
+    gc_root(&vm.heap, e);
+    if value_is_object(e) {
+        props_set_desc(&value_as_object(e).props, bi_atom(vm, "name"),
+            new_str(vm, "AbortError"), PROP_DEFAULT);
+        props_set_desc(&value_as_object(e).props, bi_atom(vm, "code"),
+            new_str(vm, "ABORT_ERR"), PROP_DEFAULT);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return e;
+}
+
+// An options object carrying an already-aborted signal, which every fs
+// promise honours by refusing to start.
+private bool opts_aborted(VM* vm, Value* args, i32 argc) {
+    if argc == 0 { return false; }
+    Value last = *(args + argc - 1);
+    if !value_is_object(last) { return false; }
+    Value sig;
+    if !vm_get_prop_value(vm, last, bi_atom(vm, "signal"), &sig) { return false; }
+    if !value_is_object(sig) { return false; }
+    Value ab;
+    if !vm_get_prop_value(vm, sig, bi_atom(vm, "aborted"), &ab) { return false; }
+    return js_truthy(ab);
+}
+
+// `abortable` is the handful of calls that take a signal in their options:
+// the others are not abort-aware, and a missing file still reports itself.
+private Value fs_promise_run(VM* vm, NativeFn sync, Value callee, Value* args, i32 argc, bool abortable) {
+    if abortable && opts_aborted(vm, args, argc) {
+        i32 rm = gc_root_mark(&vm.heap);
+        Value p = vm_promise_new(vm);
+        gc_root(&vm.heap, p);
+        vm_promise_settle(vm, p, make_abort_error(vm), true);
+        gc_root_reset(&vm.heap, rm);
+        return p;
+    }
     Value r = sync(cast(void*, vm), callee, value_undefined(), args, argc);
     return fs_promise_of(vm, r);
 }
@@ -13740,15 +13780,15 @@ private Value fs_cb_run(VM* vm, NativeFn sync, Value callee, Value* args, i32 ar
     return value_undefined();
 }
 
-private Value nat_fsp_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_read_file, callee, args, argc); }
-private Value nat_fsp_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_write_file, callee, args, argc); }
-private Value nat_fsp_append_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_append_file, callee, args, argc); }
-private Value nat_fsp_mkdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_mkdir, callee, args, argc); }
-private Value nat_fsp_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_readdir, callee, args, argc); }
-private Value nat_fsp_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rmdir, callee, args, argc); }
-private Value nat_fsp_unlink(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_unlink, callee, args, argc); }
-private Value nat_fsp_rename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rename, callee, args, argc); }
-private Value nat_fsp_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_stat, callee, args, argc); }
+private Value nat_fsp_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_read_file, callee, args, argc, true); }
+private Value nat_fsp_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_write_file, callee, args, argc, true); }
+private Value nat_fsp_append_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_append_file, callee, args, argc, true); }
+private Value nat_fsp_mkdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_mkdir, callee, args, argc, false); }
+private Value nat_fsp_readdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_readdir, callee, args, argc, false); }
+private Value nat_fsp_rmdir(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rmdir, callee, args, argc, false); }
+private Value nat_fsp_unlink(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_unlink, callee, args, argc, false); }
+private Value nat_fsp_rename(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_rename, callee, args, argc, false); }
+private Value nat_fsp_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_promise_run(as_vm(vmp), &nat_fs_stat, callee, args, argc, false); }
 
 private Value nat_fscb_read_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_read_file, callee, args, argc); }
 private Value nat_fscb_write_file(void* vmp, Value callee, Value thisv, Value* args, i32 argc) { return fs_cb_run(as_vm(vmp), &nat_fs_write_file, callee, args, argc); }

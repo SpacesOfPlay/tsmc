@@ -277,6 +277,15 @@ class ClientRequest extends EventEmitter {
     this._parse();
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
+  // Tears the connection down without waiting for the response. An error is
+  // only emitted when one is given, since a plain destroy is not a failure.
+  destroy(err) {
+    this._destroyed = true;
+    if (this.socket && typeof this.socket.destroy === 'function') this.socket.destroy();
+    if (err) this.emit('error', err);
+    return this;
+  }
+  abort() { return this.destroy(); }
   write(chunk, enc) { this._body.push(toBuf(chunk, enc)); return true; }
   end(chunk, enc) {
     if (chunk != null) this.write(chunk, enc);

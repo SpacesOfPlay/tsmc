@@ -305,7 +305,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "tty") || str_equal(s, "_fetch") || str_equal(s, "_webapi")
         || str_equal(s, "querystring") || str_equal(s, "string_decoder")
         || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
-        || str_equal(s, "_webevents")
+        || str_equal(s, "_webevents") || str_equal(s, "_eventsx")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -326,7 +326,7 @@ private i32 load_builtin_module(Loader* ld, str name) {
     i32 existing = find_module(ld, canon);
     if existing >= 0 { free(canon.data); return existing; }
 
-    JsObject* ns = builtins_node_module(ld.vm, name);
+    JsObject* ns = node_namespace(ld.vm, name);
     if ns == null {
         // JS-source built-in (e.g. stream): run it, wrap exports as a namespace
         str jsrc = builtin_js_source(name);
@@ -1110,13 +1110,62 @@ private Value make_require_fn(VM* vm, str module_path) {
 private str node_timers_promises_source() {
     return
         "'use strict';\n"
-        "exports.setTimeout = function (ms, value, opts) {\n"
-        "  return new Promise(function (res) { setTimeout(function () { res(value); }, ms); });\n"
-        "};\n"
-        "exports.setImmediate = function (value, opts) {\n"
-        "  return new Promise(function (res) { setTimeout(function () { res(value); }, 0); });\n"
-        "};\n"
+        "const DOMException = require('_webevents').DOMException;\n"
+        "function abortError() {\n"
+        "  return new DOMException('The operation was aborted', 'AbortError');\n"
+        "}\n"
+        "// A signal already aborted refuses before the timer is even set; one\n"
+        "// aborted while waiting clears it, so nothing is left holding the loop.\n"
+        "function delay(ms, value, opts) {\n"
+        "  const signal = opts && opts.signal;\n"
+        "  return new Promise(function (res, rej) {\n"
+        "    if (signal && signal.aborted) { rej(abortError()); return; }\n"
+        "    function done() { if (signal) signal.removeEventListener('abort', onAbort); }\n"
+        "    const t = setTimeout(function () { done(); res(value); }, ms);\n"
+        "    if (opts && opts.ref === false && t && typeof t.unref === 'function') t.unref();\n"
+        "    function onAbort() { clearTimeout(t); done(); rej(abortError()); }\n"
+        "    if (signal) signal.addEventListener('abort', onAbort, { once: true });\n"
+        "  });\n"
+        "}\n"
+        "exports.setTimeout = function (ms, value, opts) { return delay(ms, value, opts); };\n"
+        "exports.setImmediate = function (value, opts) { return delay(0, value, opts); };\n"
         ;
+}
+
+// `events.once` and the abort handling around it. The events module itself is
+// built natively; this rides alongside it, reached through a lazy thunk, so
+// the abort machinery only loads for a program that waits on an event.
+private str node_events_extra_source() {
+    return "'use strict';
+const DOMException = require('_webevents').DOMException;
+
+function once(emitter, name, options) {
+  const signal = options && options.signal;
+  return new Promise(function (resolve, reject) {
+    if (signal && signal.aborted) {
+      reject(new DOMException('The operation was aborted', 'AbortError'));
+      return;
+    }
+    function cleanup() {
+      emitter.off(name, onEvent);
+      if (name !== 'error') emitter.off('error', onError);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+    function onEvent(...args) { cleanup(); resolve(args); }
+    function onError(err) { cleanup(); reject(err); }
+    function onAbort() {
+      cleanup();
+      reject(new DOMException('The operation was aborted', 'AbortError'));
+    }
+    emitter.on(name, onEvent);
+    // an error event rejects instead, unless the error IS what is awaited
+    if (name !== 'error') emitter.on('error', onError);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+module.exports = { once: once };
+";
 }
 
 // Minimal `tty`: tsmc has no interactive terminal detection, so isatty is
@@ -1148,6 +1197,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "punycode") { return node_punycode_source(); }
     if str_equal(name, "_webevents") { return node_webevents_source(); }
     if str_equal(name, "perf_hooks") { return node_perf_hooks_source(); }
+    if str_equal(name, "_eventsx") { return node_events_extra_source(); }
     return null_str();
 }
 
@@ -1268,7 +1318,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     // 1. built-in module (fs / path / os / ..., incl. node: prefix)
     str bname = builtin_name(spec);
     if bname.data != null {
-        JsObject* ns = builtins_node_module(vm, bname);
+        JsObject* ns = node_namespace(vm, bname);
         if ns != null {
             Value def;
             if js_get_prop(ns, atom_intern(&vm.atoms, "default"), &def) { return def; }
@@ -1512,6 +1562,41 @@ private Value webapi_class(VM* vm, str which) {
         vm_mirror_global(vm, which, false);
     }
     return cls;
+}
+
+// events.once, loaded on first call the way `fetch` is.
+private Value nat_events_once(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    str none;
+    none.data = null;
+    none.len = 0;
+    Value impl = module_require(vm, none, "_eventsx");
+    if vm.has_pending { return value_undefined(); }
+    if !value_is_object(impl) { return value_undefined(); }
+    Value f;
+    if !vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, "once"), &f) { return value_undefined(); }
+    if !value_is_callable(f) { return value_undefined(); }
+    return vm_call_value(vm, f, value_undefined(), args, argc);
+}
+
+// The natively-built namespaces, with the pieces that are written in JS
+// attached: `events` carries a `once` that returns a promise, which node has
+// on the module and on the EventEmitter class both.
+private JsObject* node_namespace(VM* vm, str name) {
+    JsObject* ns = builtins_node_module(vm, name);
+    if ns == null || !str_equal(name, "events") { return ns; }
+    u32 key = atom_intern(&vm.atoms, "once");
+    if props_get(&ns.props, key) != null { return ns; }
+    JsNative* n = js_new_native(&vm.heap, &nat_events_once, "once");
+    Value nv = value_cell(&n.head);
+    vm_push(vm, nv);
+    props_set_desc(&ns.props, key, nv, PROP_DEFAULT);
+    Value* def = props_get(&ns.props, atom_intern(&vm.atoms, "default"));
+    if def != null && value_is_native(*def) {
+        props_set_desc(&value_as_native(*def).props, key, nv, PROP_DEFAULT);
+    }
+    vm_pop(vm);
+    return ns;
 }
 
 // The `_webevents` classes behind the DOMException / Event / EventTarget /

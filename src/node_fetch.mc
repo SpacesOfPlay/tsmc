@@ -25,7 +25,10 @@ function fetch(resource, options) {
     if (merged.body === undefined && resource._buf && resource._buf.length > 0) merged.body = resource._buf;
     options = merged;
   }
+  const signal = options.signal;
   return new Promise(function (resolve, reject) {
+    // An abort rejects with the signal's own reason, whatever it is
+    if (signal && signal.aborted) { reject(signal.reason); return; }
     let urlStr = typeof resource === 'string' ? resource : (resource && resource.url) || String(resource);
     let u;
     try { u = new URL(urlStr); } catch (e) { reject(new TypeError('Failed to parse URL: ' + urlStr)); return; }
@@ -50,6 +53,7 @@ function fetch(resource, options) {
       const chunks = [];
       res.on('data', function (c) { chunks.push(c); });
       res.on('end', function () {
+        if (signal) signal.removeEventListener('abort', onAbort);
         resolve(new Response(Buffer.concat(chunks), {
           status: res.statusCode,
           statusText: res.statusMessage,
@@ -60,6 +64,11 @@ function fetch(resource, options) {
       res.on('error', reject);
     });
     req.on('error', reject);
+    function onAbort() {
+      req.destroy();
+      reject(signal.reason);
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     if (options.body != null) req.write(options.body);
     req.end();
   });
