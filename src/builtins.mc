@@ -9455,10 +9455,94 @@ private Value nat_process_cwd(void* vmp, Value callee, Value thisv, Value* args,
 }
 
 private Value nat_process_exit(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
     i32 code = 0;
     Value c = arg_at(args, argc, 0);
     if !value_is_undefined(c) { code = to_int_arg(c); }
+    else {
+        // no argument: whatever process.exitCode was left at
+        Value ec;
+        if vm_get_prop_value(vm, thisv, bi_atom(vm, "exitCode"), &ec) && value_is_number(ec) {
+            code = cast(i32, js_to_number(ec));
+        }
+    }
+    // 'exit' still runs, though nothing scheduled from it will
+    ignore vm_process_emit(vm, "exit", value_int(code), value_undefined(), 1);
     exit(code);
+    return value_undefined();
+}
+
+// process.emitWarning(warning[, type[, code]]) or (warning, options).
+private Value nat_process_emit_warning(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 rm = gc_root_mark(&vm.heap);
+    Value w = arg_at(args, argc, 0);
+    Value opt = arg_at(args, argc, 1);
+    str type = "Warning";
+    Value codev = value_undefined();
+    if value_is_string(opt) { type = sview(opt); }
+    else if value_is_object(opt) {
+        Value tv;
+        if vm_get_prop_value(vm, opt, bi_atom(vm, "type"), &tv) && value_is_string(tv) {
+            type = sview(tv);
+        }
+        ignore vm_get_prop_value(vm, opt, bi_atom(vm, "code"), &codev);
+    }
+    if value_is_string(arg_at(args, argc, 2)) { codev = arg_at(args, argc, 2); }
+    Value err = w;
+    if !value_is_object(w) {
+        Value msgv = js_to_string_value(vm, w);
+        gc_root(&vm.heap, msgv);
+        err = vm_make_error(vm, ERR_ERROR, sview(msgv));
+        gc_root(&vm.heap, err);
+        props_set_desc(&value_as_object(err).props, vm_atom(vm, "name"),
+            new_str(vm, type), PROP_WRITABLE | PROP_CONFIGURABLE);
+    }
+    gc_root(&vm.heap, err);
+    if value_is_object(err) && !value_is_undefined(codev) {
+        props_set_desc(&value_as_object(err).props, bi_atom(vm, "code"), codev,
+            PROP_WRITABLE | PROP_CONFIGURABLE);
+    }
+    // node hands a warning out on the next tick rather than inline, so a
+    // listener installed in the same block still hears it
+    JsNative* job = js_new_native(&vm.heap, &nat_warning_deliver, "emitWarning");
+    job.env0 = err;
+    job.env1 = codev;
+    gc_root(&vm.heap, value_cell(&job.head));
+    Value p = vm_promise_new(vm);
+    gc_root(&vm.heap, p);
+    vm_promise_settle(vm, p, value_undefined(), false);
+    ignore vm_promise_then(vm, p, value_cell(&job.head), value_undefined());
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// The warning itself, once that tick comes round.
+private Value nat_warning_deliver(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    JsNative* me = value_as_native(callee);
+    Value err = me.env0;
+    Value codev = me.env1;
+    ignore codev;
+    ignore vm_process_emit(vm, "warning", err, value_undefined(), 1);
+    return value_undefined();
+}
+
+// The default warning listener, installed at startup. node prints through one
+// too, which is why removeAllListeners('warning') silences it there.
+private Value nat_warning_print(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value w = arg_at(args, argc, 0);
+    Value nv;
+    Value mv;
+    Value cv;
+    ignore vm_get_prop_value(vm, w, vm_atom(vm, "name"), &nv);
+    ignore vm_get_prop_value(vm, w, vm_atom(vm, "message"), &mv);
+    ignore vm_get_prop_value(vm, w, bi_atom(vm, "code"), &cv);
+    eprint("(tsmc:{}) ", os_pid());
+    if value_is_string(cv) { eprint("[{}] ", sview(cv)); }
+    eprint("{}: {}\n", value_is_string(nv) ? sview(nv) : "Warning",
+        value_is_string(mv) ? sview(mv) : "");
     return value_undefined();
 }
 
@@ -9574,6 +9658,28 @@ private void process_install(VM* vm) {
     def_method(vm, proc, "uptime", &nat_process_uptime);
     def_method(vm, proc, "memoryUsage", &nat_process_memory);
     def_method(vm, proc, "exit", &nat_process_exit);
+    def_method(vm, proc, "emitWarning", &nat_process_emit_warning);
+    // process is an EventEmitter: 'exit', 'beforeExit', 'uncaughtException',
+    // 'unhandledRejection' and 'warning' are all emitted on it
+    def_method(vm, proc, "on", &nat_ee_on);
+    def_method(vm, proc, "addListener", &nat_ee_on);
+    def_method(vm, proc, "once", &nat_ee_once);
+    def_method(vm, proc, "off", &nat_ee_off);
+    def_method(vm, proc, "removeListener", &nat_ee_off);
+    def_method(vm, proc, "removeAllListeners", &nat_ee_remove_all);
+    def_method(vm, proc, "emit", &nat_ee_emit);
+    def_method(vm, proc, "listeners", &nat_ee_listeners);
+    def_method(vm, proc, "listenerCount", &nat_ee_listener_count);
+    def_method(vm, proc, "eventNames", &nat_ee_event_names);
+    def_method(vm, proc, "prependListener", &nat_ee_prepend);
+    def_method(vm, proc, "prependOnceListener", &nat_ee_prepend_once);
+    def_method(vm, proc, "setMaxListeners", &nat_ee_set_max);
+    def_method(vm, proc, "getMaxListeners", &nat_ee_get_max);
+    JsNative* wprint = js_new_native(&vm.heap, &nat_warning_print, "warningPrinter");
+    vm_push(vm, value_cell(&wprint.head));
+    Value[2] wargs = { new_str(vm, "warning"), value_cell(&wprint.head) };
+    ignore ee_add(vm, value_cell(&proc.head), &wargs[0], 2, value_cell(&wprint.head), false);
+    vm_pop(vm);
     def_method(vm, proc, "nextTick", &nat_process_next_tick);
 
     // hrtime(prev?) -> [s, ns]; hrtime.bigint() -> nanoseconds

@@ -155,6 +155,26 @@ run_tests() {
         fail "missing file"; n_fail=$((n_fail + 1))
     fi
 
+    # What a script leaves with: process.exitCode, exit(), and whether an
+    # uncaught error or rejection was taken by a listener. These cannot live
+    # in test/diff, where every script has to end with 0.
+    exit_fail=0
+    for pair in property:7 explicit:3 exit-no-arg:5 listener:4 caught:0 uncaught:1 rejection-caught:0; do
+        mode="${pair%%:*}"
+        want="${pair##*:}"
+        "$OUT_EXE" "$PROJECT_DIR/test/cli/exitcode.js" "$mode" > /dev/null 2>&1
+        got=$?
+        if [ "$got" != "$want" ]; then
+            fail "exit code '$mode' (want $want, got $got)"
+            exit_fail=$((exit_fail + 1))
+        fi
+    done
+    if [ $exit_fail -eq 0 ]; then
+        pass "exit codes"; n_pass=$((n_pass + 1))
+    else
+        n_fail=$((n_fail + exit_fail))
+    fi
+
     # Golden run tests: run test/run/<name>.ts, diff stdout against <name>.expected.
     step "run tests"
     n_run=0

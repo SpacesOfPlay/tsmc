@@ -1899,6 +1899,25 @@ i32 module_run_entry(VM* vm, str src, str path) {
         rc = vm_run_source(vm, src, resolve_path);
     }
 
+    // The run is over: report the code, let anything listening see it, and
+    // let a listener still change it, which node allows.
+    Value proc = vm_process_object(vm);
+    if rc == 0 && value_is_object(proc) {
+        Value ec;
+        if vm_get_prop_value(vm, proc, atom_intern(&vm.atoms, "exitCode"), &ec)
+            && value_is_number(ec) {
+            rc = cast(i32, js_to_number(ec));
+        }
+    }
+    ignore vm_process_emit(vm, "exit", value_int(rc), value_undefined(), 1);
+    if value_is_object(proc) {
+        Value ec2;
+        if vm_get_prop_value(vm, proc, atom_intern(&vm.atoms, "exitCode"), &ec2)
+            && value_is_number(ec2) {
+            rc = cast(i32, js_to_number(ec2));
+        }
+    }
+
     vm_set_esm_loader(vm, null);
     for i32 i = 0; i < ld.mods.len; i++ {
         module_free(vec_get(&ld.mods, i));

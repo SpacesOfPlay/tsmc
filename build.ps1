@@ -144,6 +144,24 @@ function Run-Tests {
     if ($LASTEXITCODE -eq 2) { Pass "missing file exits 2"; $pass++ }
     else { Fail "missing file (exit $LASTEXITCODE)"; $fail++ }
 
+    # What a script leaves with: process.exitCode, exit(), and whether an
+    # uncaught error or rejection was taken by a listener. These cannot live
+    # in test/diff, where every script has to end with 0.
+    $exitCases = [ordered]@{
+        "property" = 7; "explicit" = 3; "exit-no-arg" = 5; "listener" = 4;
+        "caught" = 0; "uncaught" = 1; "rejection-caught" = 0
+    }
+    $exitFixture = Join-Path $ProjectDir "test\cli\exitcode.js"
+    $exitFail = 0
+    foreach ($mode in $exitCases.Keys) {
+        & $OutExe $exitFixture $mode > $null 2> $null
+        if ($LASTEXITCODE -ne $exitCases[$mode]) {
+            Fail "exit code '$mode' (want $($exitCases[$mode]), got $LASTEXITCODE)"
+            $exitFail++
+        }
+    }
+    if ($exitFail -eq 0) { Pass "exit codes"; $pass++ } else { $fail += $exitFail }
+
     # Golden run tests: run test/run/<name>.ts, diff stdout against <name>.expected.
     Step "run tests"
     $runTests = @(Get-ChildItem (Join-Path $ProjectDir "test\run\*.ts") -ErrorAction SilentlyContinue | Sort-Object Name)

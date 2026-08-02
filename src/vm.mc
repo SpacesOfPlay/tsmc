@@ -117,6 +117,7 @@ struct VM {
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
+    bool before_exit_done;     // 'beforeExit' already asked for more work
     u32 sym_inspect_custom;    // key atom of Symbol.for(nodejs.util.inspect.custom)
     Value util_inspect_fn;     // util.inspect, handed to a custom inspector
     Handler* handlers;
@@ -3002,6 +3003,7 @@ void vm_init(VM* vm) {
     // process.uptime and performance.now count from here
     vm.start_ns = vm_clock_ns();
     vm.stack_limit = 10;
+    vm.before_exit_done = false;
     vm.sym_inspect_custom = 0;
     vm.util_inspect_fn = value_undefined();
     gc_init(&vm.heap);
@@ -3168,6 +3170,43 @@ private i32 rd_u16(u8* code, i32 at) {
     i32 lo = *(code + at);
     i32 hi = *(code + at + 1);
     return lo | (hi << 8);
+}
+
+// The `process` global, or undefined before the builtins are installed.
+Value vm_process_object(VM* vm) {
+    Value* pv = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "process"));
+    return pv != null ? *pv : value_undefined();
+}
+
+// process.emit(name, ...), true when a listener ran. Nothing here is an
+// 'error' event, so an absent listener is simply false rather than a throw.
+bool vm_process_emit(VM* vm, str name, Value a, Value b, i32 nargs) {
+    Value proc = vm_process_object(vm);
+    if !value_is_object(proc) { return false; }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, proc);
+    gc_root(&vm.heap, a);
+    gc_root(&vm.heap, b);
+    Value emit;
+    if !vm_get_prop_value(vm, proc, atom_intern(&vm.atoms, "emit"), &emit)
+        || !value_is_callable(emit) {
+        gc_root_reset(&vm.heap, rm);
+        return false;
+    }
+    GcString* nm = gc_new_string(&vm.heap, name);
+    Value[3] ca = { value_cell(&nm.head), a, b };
+    Value r = vm_call_value(vm, emit, proc, &ca[0], nargs + 1);
+    gc_root_reset(&vm.heap, rm);
+    if vm.has_pending { return false; }
+    return js_truthy(r);
+}
+
+// An error nothing caught. A process listening for it takes over: node keeps
+// running afterwards, so this reports whether the run should carry on.
+bool vm_uncaught(VM* vm, Value e) {
+    if vm_process_emit(vm, "uncaughtException", e, value_undefined(), 1) { return true; }
+    print_uncaught(vm, e);
+    return false;
 }
 
 private void print_uncaught(VM* vm, Value e) {
@@ -5965,12 +6004,15 @@ i32 vm_run_event_loop(VM* vm) {
                 Value e = vm.pending;
                 vm.has_pending = false;
                 vm.pending = value_undefined();
-                print_uncaught(vm, e);
-                return 1;
+                if !vm_uncaught(vm, e) { return 1; }
             }
         }
         vm.jobs.len = 0;
         vm.job_head = 0;
+        // A rejection nobody took is reported at this point, the end of a
+        // turn, rather than at the end of the run: that is when node reports
+        // it, and it is fatal there too unless a listener takes it.
+        if vm.rejections.len > 0 && vm_report_unhandled(vm) != 0 { return 1; }
         // earliest live timer by (deadline, insertion order)
         i32 best = -1;
         for i32 i = 0; i < vm.timers.len; i++ {
@@ -5986,7 +6028,22 @@ i32 vm_run_event_loop(VM* vm) {
         // An unreffed timer fires if the loop runs, but does not keep it
         // running on its own. Checked before firing, or an unreffed interval
         // would hold the process open forever.
-        if !vm_timers_reffed(vm) && !vm_handles_alive(vm) { break; }
+        if !vm_timers_reffed(vm) && !vm_handles_alive(vm) {
+            // Nothing left to do. A beforeExit listener may schedule more, in
+            // which case the loop picks it up and asks again later.
+            if vm.before_exit_done { break; }
+            vm.before_exit_done = true;
+            if !vm_process_emit(vm, "beforeExit", value_int(0), value_undefined(), 1) { break; }
+            if vm.has_pending {
+                Value e = vm.pending;
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                if !vm_uncaught(vm, e) { return 1; }
+            }
+            if !vm_timers_reffed(vm) && !vm_handles_alive(vm) && vm.jobs.len == 0 { break; }
+            vm.before_exit_done = false;
+            continue;
+        }
         f64 now = vm_now_ms(vm);
         bool timer_due = best >= 0 && (vm.timers.data + best).due <= now;
         if !timer_due {
@@ -6004,8 +6061,7 @@ i32 vm_run_event_loop(VM* vm) {
                 Value e = vm.pending;
                 vm.has_pending = false;
                 vm.pending = value_undefined();
-                print_uncaught(vm, e);
-                return 1;
+                if !vm_uncaught(vm, e) { return 1; }
             }
             continue;
         }
@@ -6030,8 +6086,7 @@ i32 vm_run_event_loop(VM* vm) {
             Value e = vm.pending;
             vm.has_pending = false;
             vm.pending = value_undefined();
-            print_uncaught(vm, e);
-            return 1;
+            if !vm_uncaught(vm, e) { return 1; }
         }
     }
     vm.timers.len = 0;
@@ -6057,6 +6112,9 @@ i32 vm_report_unhandled(VM* vm) {
         js_set_prop(p, vm.atom_phandled, value_bool(true));
         Value* rv = props_get(&p.props, vm.atom_pvalue);
         Value reason = rv != null ? *rv : value_undefined();
+        if vm_process_emit(vm, "unhandledRejection", reason, value_cell(&p.head), 2) {
+            continue;
+        }
         if !vm.quiet_errors {
             eprint("Unhandled promise rejection. ");
             print_uncaught(vm, reason);
