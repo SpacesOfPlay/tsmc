@@ -30,6 +30,7 @@ import node_querystring;
 import node_strdec;
 import node_punycode;
 import node_webevents;
+import node_webcrypto;
 import node_tls;
 import node_https;
 
@@ -306,6 +307,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "querystring") || str_equal(s, "string_decoder")
         || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
         || str_equal(s, "_webevents") || str_equal(s, "_eventsx")
+        || str_equal(s, "_webcrypto")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -1198,6 +1200,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "_webevents") { return node_webevents_source(); }
     if str_equal(name, "perf_hooks") { return node_perf_hooks_source(); }
     if str_equal(name, "_eventsx") { return node_events_extra_source(); }
+    if str_equal(name, "_webcrypto") { return node_webcrypto_source(); }
     return null_str();
 }
 
@@ -1582,9 +1585,30 @@ private Value nat_events_once(void* vmp, Value callee, Value thisv, Value* args,
 // The natively-built namespaces, with the pieces that are written in JS
 // attached: `events` carries a `once` that returns a promise, which node has
 // on the module and on the EventEmitter class both.
+private void attach_accessor(VM* vm, JsObject* obj, u32 key, NativeFn getter) {
+    JsNative* g = js_new_native(&vm.heap, getter, "get");
+    vm_push(vm, value_cell(&g.head));
+    JsAccessor* ac = js_new_accessor(&vm.heap);
+    ac.get = value_cell(&g.head);
+    props_set_desc(&obj.props, key, value_cell(&ac.head), PROP_ENUMERABLE | PROP_CONFIGURABLE);
+    vm_pop(vm);
+}
+
 private JsObject* node_namespace(VM* vm, str name) {
     JsObject* ns = builtins_node_module(vm, name);
-    if ns == null || !str_equal(name, "events") { return ns; }
+    if ns == null { return ns; }
+    if str_equal(name, "crypto") {
+        u32 wkey = atom_intern(&vm.atoms, "webcrypto");
+        if props_get(&ns.props, wkey) == null {
+            attach_accessor(vm, ns, wkey, &nat_crypto_webcrypto_get);
+            Value* def = props_get(&ns.props, atom_intern(&vm.atoms, "default"));
+            if def != null && value_is_object(*def) {
+                attach_accessor(vm, value_as_object(*def), wkey, &nat_crypto_webcrypto_get);
+            }
+        }
+        return ns;
+    }
+    if !str_equal(name, "events") { return ns; }
     u32 key = atom_intern(&vm.atoms, "once");
     if props_get(&ns.props, key) != null { return ns; }
     JsNative* n = js_new_native(&vm.heap, &nat_events_once, "once");
@@ -1618,6 +1642,37 @@ private Value webevents_class(VM* vm, str which) {
         vm_mirror_global(vm, which, false);
     }
     return cls;
+}
+
+// The Web Crypto object, built on first mention like the other web globals.
+private Value webcrypto_object(VM* vm) {
+    str none;
+    none.data = null;
+    none.len = 0;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value impl = module_require(vm, none, "_webcrypto");
+    if vm.has_pending || !value_is_object(impl) { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, impl);
+    Value c;
+    bool ok = vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, "crypto"), &c);
+    gc_root_reset(&vm.heap, rm);
+    return ok ? c : value_undefined();
+}
+
+private Value nat_g_crypto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    Value c = webcrypto_object(vm);
+    if value_is_object(c) {
+        vm_set_global(vm, "crypto", c);
+        vm_mirror_global(vm, "crypto", false);
+    }
+    return c;
+}
+
+// require('crypto').webcrypto is that same object. An accessor, so requiring
+// the node module does not drag the web one in with it.
+private Value nat_crypto_webcrypto_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webcrypto_object(cast(VM*, vmp));
 }
 
 private Value nat_g_domexception(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -1849,6 +1904,7 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vm_set_lazy_global(vm, "AbortSignal", &nat_g_abortsignal);
     vm_set_lazy_global(vm, "AbortController", &nat_g_abortcontroller);
     vm_set_lazy_global(vm, "performance", &nat_g_performance);
+    vm_set_lazy_global(vm, "crypto", &nat_g_crypto);
     // publish onto globalThis, whose snapshot predates all four
     vm_mirror_global(vm, "fetch", true);
     vm_mirror_global(vm, "Headers", false);
@@ -1861,6 +1917,7 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vm_mirror_global(vm, "AbortSignal", false);
     vm_mirror_global(vm, "AbortController", false);
     vm_mirror_global(vm, "performance", false);
+    vm_mirror_global(vm, "crypto", false);
 
     // __filename / __dirname for the entry file (absolute, entry-scoped).
     str fname = canon_path(path);

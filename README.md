@@ -28,8 +28,8 @@ MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
 `timingSafeEqual`, and the `random*` functions. The globals include
 `fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,
 `structuredClone`, `atob`/`btoa`, `console`, `performance`,
-`EventTarget`/`Event`, `AbortController`/`AbortSignal` and
-`DOMException`.
+`EventTarget`/`Event`, `AbortController`/`AbortSignal`, `DOMException`,
+and `crypto` with `randomUUID`, `getRandomValues` and `subtle.digest`.
 
 `process` is an event emitter: `exit`, `beforeExit`, `uncaughtException`,
 `unhandledRejection` and `warning` all fire, and `process.exitCode` is
@@ -115,11 +115,11 @@ overrides the install dir.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 31
-scripts are checked against golden output. 155 differential scripts run
+scripts are checked against golden output. 156 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-186 scripts then run again under `--gc-stress`, which collects on every
+187 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)
