@@ -116,6 +116,9 @@ struct VM {
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
+    i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
+    u32 sym_inspect_custom;    // key atom of Symbol.for(nodejs.util.inspect.custom)
+    Value util_inspect_fn;     // util.inspect, handed to a custom inspector
     Handler* handlers;
     i32 hp;
     IntMap<Value> globals;
@@ -312,6 +315,7 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
 private void vm_mark_roots(GcHeap* h, void* ctx) {
     VM* vm = cast(VM*, ctx);
     gc_mark_value(h, vm.pending_new_target);
+    gc_mark_value(h, vm.util_inspect_fn);
     for i32 i = 0; i < vm.sp; i++ {
         gc_mark_value(h, *(vm.stack + i));
     }
@@ -948,6 +952,12 @@ void vm_throw_return(VM* vm, Value v) {
 // user-constructed errors (the native-call site stores the caller's ip);
 // a VM-internal throw's innermost line is best-effort.
 Value vm_error_stack(VM* vm, str name, str msg, bool has_msg) {
+    return vm_error_stack_below(vm, name, msg, has_msg, value_undefined());
+}
+
+// `below` is Error.captureStackTrace's second argument: the frames from that
+// function inwards are left out, so a constructor can hide itself.
+Value vm_error_stack_below(VM* vm, str name, str msg, bool has_msg, Value below) {
     str_buf sb;
     str_buf_init(&sb);
     str_buf_add(&sb, name);
@@ -955,10 +965,23 @@ Value vm_error_stack(VM* vm, str name, str msg, bool has_msg) {
         str_buf_add(&sb, ": ");
         str_buf_add(&sb, msg);
     }
-    for i32 i = vm.fp - 1; i >= 0; i-- {
+    i32 top = vm.fp - 1;
+    if value_is_function(below) {
+        JsFunction* want = value_as_function(below);
+        for i32 i = top; i >= 0; i-- {
+            if (vm.frames + i).fun == want {
+                top = i - 1;
+                break;
+            }
+        }
+    }
+    i32 kept = 0;
+    for i32 i = top; i >= 0; i-- {
+        if kept >= vm.stack_limit { break; }
         Frame* fr = vm.frames + i;
         FnTemplate* t = fr.tmpl;
         if t == null { continue; }
+        kept++;
         i32 off = fr.cur_ip - 1;
         if off < 0 { off = 0; }
         i32 line = 0;
@@ -2319,6 +2342,12 @@ private void inspect_layout(str_buf* sb, str prefix, str head, str base, bool ar
         grouped = inspect_group(eb, off, indent, numeric, has_more, &rows, &roff);
     }
     bool one_line = !grouped;
+    // a base that already spans lines (an error's stack) keeps its entries on
+    // their own lines too
+    for i32 i = 0; i < base.len; i++ {
+        if *(base.data + i) == '
+' { one_line = false; }
+    }
     if one_line {
         i32 total = n + n + indent + head.len + 1 + base.len + 10;
         if total + n > INSPECT_WIDTH { one_line = false; }
@@ -2361,27 +2390,37 @@ private void inspect_layout(str_buf* sb, str prefix, str head, str base, bool ar
 // Renders an object whose meaning is not in its enumerable properties: an
 // error, a date, a regular expression, a Buffer, a boxed primitive. Returns
 // false for anything ordinary. `ov` is `o` as a Value, for property reads.
-private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
-    // an error prints as its stack, which already begins "Name: message"
-    if vm.error_protos[ERR_ERROR] != null && inspect_proto_has(o, vm.error_protos[ERR_ERROR]) {
-        Value sv;
-        if vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "stack"), &sv)
-           && value_is_string(sv) {
-            str_buf_add(sb, gc_string_view(value_as_string(sv)));
-            return true;
+// An error reads as its stack, which already begins "Name: message". A stack
+// with no frames in it is bracketed, the way node marks one that carries no
+// trace: `[Error: boom]`.
+private void inspect_error_base(VM* vm, str_buf* base, JsObject* o, Value ov) {
+    Value sv;
+    if vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "stack"), &sv) && value_is_string(sv) {
+        str txt = gc_string_view(value_as_string(sv));
+        bool multi = false;
+        for i32 i = 0; i < txt.len; i++ {
+            if *(txt.data + i) == '\n' { multi = true; }
         }
-        Value mv;
-        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "message"), &mv);
-        Value nv;
-        ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "name"), &nv);
-        if value_is_string(nv) { str_buf_add(sb, gc_string_view(value_as_string(nv))); }
-        else { str_buf_add(sb, "Error"); }
-        if value_is_string(mv) && value_as_string(mv).len > 0 {
-            str_buf_add(sb, ": ");
-            str_buf_add(sb, gc_string_view(value_as_string(mv)));
-        }
-        return true;
+        if !multi { str_buf_add(base, "["); }
+        str_buf_add(base, txt);
+        if !multi { str_buf_add(base, "]"); }
+        return;
     }
+    Value mv;
+    ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "message"), &mv);
+    Value nv;
+    ignore vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "name"), &nv);
+    str_buf_add(base, "[");
+    if value_is_string(nv) { str_buf_add(base, gc_string_view(value_as_string(nv))); }
+    else { str_buf_add(base, "Error"); }
+    if value_is_string(mv) && value_as_string(mv).len > 0 {
+        str_buf_add(base, ": ");
+        str_buf_add(base, gc_string_view(value_as_string(mv)));
+    }
+    str_buf_add(base, "]");
+}
+
+private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
     if vm.date_proto != null && inspect_proto_has(o, vm.date_proto) {
         Value s;
         if vm_get_prop_value(vm, ov, atom_intern(&vm.atoms, "toISOString"), &s)
@@ -2496,12 +2535,21 @@ private void inspect_fn_base(VM* vm, str_buf* sb, Value v) {
 // Own enumerable properties, string-keyed and symbol-keyed, as "key: value"
 // entries. Shared by objects, functions that carry properties, and the tail
 // of an array.
-private void inspect_props(VM* vm, PropList* props, i32 depth, InspectCtx* cx, i32 indent,
-                           str_buf* eb, Vec<i32>* off) {
+// `hdr` is an error's first line, which already carries its name and message:
+// a property whose text is in there is not printed again.
+private void inspect_props_ex(VM* vm, PropList* props, i32 depth, InspectCtx* cx, i32 indent,
+                              str_buf* eb, Vec<i32>* off, str hdr) {
     vm_props_order(vm, props);
     for i32 i = 0; i < props.len; i++ {
         Prop* pr = props.items + i;
         if !prop_copyable(vm, pr) { continue; }
+        if hdr.len > 0 && value_is_string(pr.val) {
+            str kn2 = atom_name(&vm.atoms, pr.key);
+            if (str_equal(kn2, "name") || str_equal(kn2, "message") || str_equal(kn2, "stack"))
+                && str_contains(hdr, gc_string_view(value_as_string(pr.val))) {
+                continue;
+            }
+        }
         vec_push(off, eb.len);
         if (pr.key & 0x80000000) != 0 {
             string sym = vm_atom_display(vm, pr.key);
@@ -2526,6 +2574,29 @@ private void inspect_props(VM* vm, PropList* props, i32 depth, InspectCtx* cx, i
             inspect_into(vm, eb, pr.val, depth - 1, true, cx, indent + 2);
         }
     }
+}
+
+// A property node shows even though it is not enumerable, labelled in
+// brackets: an error's cause, and an AggregateError's errors.
+private void inspect_hidden_extra(VM* vm, JsObject* o, Value ov, str name, i32 depth,
+                                  InspectCtx* cx, i32 indent, str_buf* eb, Vec<i32>* off) {
+    u32 key = atom_intern(&vm.atoms, name);
+    Prop* pr = props_entry(&o.props, key);
+    if pr == null { return; }
+    if (pr.flags & PROP_ENUMERABLE) != 0 { return; }   // already printed
+    vec_push(off, eb.len);
+    str_buf_add(eb, "[");
+    str_buf_add(eb, name);
+    str_buf_add(eb, "]: ");
+    inspect_into(vm, eb, pr.val, depth - 1, true, cx, indent + 2);
+}
+
+private void inspect_props(VM* vm, PropList* props, i32 depth, InspectCtx* cx, i32 indent,
+                           str_buf* eb, Vec<i32>* off) {
+    str none;
+    none.data = null;
+    none.len = 0;
+    inspect_props_ex(vm, props, depth, cx, indent, eb, off, none);
 }
 
 private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
@@ -2644,6 +2715,30 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
             inspect_into(vm, sb, cast(JsProxy*, o).target, depth, nested, cx, indent);
             return;
         }
+        // An object that says how it wants to be printed is printed that way.
+        // A returned string is used as it is; anything else is inspected.
+        Value custom;
+        if vm.sym_inspect_custom != 0 && depth >= 0
+            && js_get_prop(o, vm.sym_inspect_custom, &custom) && value_is_callable(custom) {
+            ignore vec_pop(&cx.seen);
+            str_buf_free(&base);
+            str_buf_free(&head);
+            str_buf_free(&eb);
+            vec_free(&off);
+            JsObject* opts = js_new_object(&vm.heap, vm.object_proto);
+            vm_push(vm, value_cell(&opts.head));
+            js_set_prop(opts, vm_atom(vm, "depth"), value_int(depth));
+            Value[3] ca = { value_int(depth), value_cell(&opts.head), vm.util_inspect_fn };
+            Value r = vm_call_value(vm, custom, v, &ca[0], 3);
+            vm.sp--;
+            if vm.has_pending { return; }
+            if value_is_string(r) {
+                str_buf_add(sb, gc_string_view(value_as_string(r)));
+            } else {
+                inspect_into(vm, sb, r, depth, nested, cx, indent);
+            }
+            return;
+        }
         if vm.arraybuffer_proto != null && o.proto == vm.arraybuffer_proto && o.elen > 0
             && value_is_bytes(*(o.elems)) {
             // the bytes are the point of it, the way node shows them
@@ -2703,6 +2798,13 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
                     free(more);
                 }
             }
+        } else if vm.error_protos[ERR_ERROR] != null
+            && inspect_proto_has(o, vm.error_protos[ERR_ERROR]) {
+            // the stack, then anything the error carries beyond it
+            inspect_error_base(vm, &base, o, v);
+            inspect_props_ex(vm, &o.props, depth, cx, indent, &eb, &off, str_buf_to_str(&base));
+            inspect_hidden_extra(vm, o, v, "cause", depth, cx, indent, &eb, &off);
+            inspect_hidden_extra(vm, o, v, "errors", depth, cx, indent, &eb, &off);
         } else if inspect_special(vm, sb, o, v) {
             bail = true;
         } else if depth < 0 {
@@ -2899,6 +3001,9 @@ private void vm_install_globals(VM* vm) {
 void vm_init(VM* vm) {
     // process.uptime and performance.now count from here
     vm.start_ns = vm_clock_ns();
+    vm.stack_limit = 10;
+    vm.sym_inspect_custom = 0;
+    vm.util_inspect_fn = value_undefined();
     gc_init(&vm.heap);
     vm.heap.tracer = &js_trace;
     vm.heap.finalizer = &js_finalize;

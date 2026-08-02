@@ -5356,6 +5356,53 @@ private Value error_ctor_impl(VM* vm, Value thisv, Value* args, i32 argc, i32 ki
     return value_cell(&target.head);
 }
 
+// Error.captureStackTrace(target[, constructorOpt]): gives `target` a stack
+// as if it had been thrown where the call is, with the frames from
+// constructorOpt inwards left out. The header reads from the target's own
+// name and message, so a half-built custom error still says what it is.
+private Value nat_error_capture_stack(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value target = arg_at(args, argc, 0);
+    if !value_is_object(target) {
+        vm_throw_error(vm, ERR_TYPE, "Error.captureStackTrace requires an object");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, target);
+    Value namev;
+    str nm = "Error";
+    if vm_get_prop_value(vm, target, vm.atom_name, &namev) && value_is_string(namev) {
+        nm = sview(namev);
+    }
+    Value msgv;
+    str msg = "";
+    bool has_msg = false;
+    if vm_get_prop_value(vm, target, vm.atom_message, &msgv) && value_is_string(msgv) {
+        msg = sview(msgv);
+        has_msg = msg.len > 0;
+    }
+    Value stack = vm_error_stack_below(vm, nm, msg, has_msg, arg_at(args, argc, 1));
+    gc_root(&vm.heap, stack);
+    props_set_desc(&value_as_object(target).props, bi_atom(vm, "stack"), stack,
+        PROP_WRITABLE | PROP_CONFIGURABLE);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+private Value nat_error_limit_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_int(as_vm(vmp).stack_limit);
+}
+
+private Value nat_error_limit_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64 n = js_to_number(arg_at(args, argc, 0));
+    if n != n { n = 0.0; }
+    if n < 0.0 { n = 0.0; }
+    if n > 1000000.0 { n = 1000000.0; }
+    vm.stack_limit = cast(i32, n);
+    return value_undefined();
+}
+
 private Value nat_error_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return error_ctor_impl(as_vm(vmp), thisv, args, argc, ERR_ERROR);
 }
@@ -15087,6 +15134,7 @@ private JsObject* build_util_module(VM* vm) {
         Value[1] ka = { new_str(vm, "nodejs.util.inspect.custom") };
         Value sym = nat_symbol_for(cast(void*, vm), value_undefined(), value_undefined(), &ka[0], 1);
         props_set_desc(&value_as_native(insp).props, bi_atom(vm, "custom"), sym, 0);
+        vm.util_inspect_fn = insp;
     }
     def_node_export(vm, mod, ns, "inherits", &nat_util_inherits);
     def_node_export(vm, mod, ns, "deprecate", &nat_util_deprecate);
@@ -18239,6 +18287,20 @@ void builtins_install(VM* vm) {
     // Errors
     JsNative* err_ctor = def_global_fn(vm, "Error", &nat_error_ctor);
     props_set_desc(&err_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_ERROR].head), 0);
+    def_static(vm, err_ctor, "captureStackTrace", &nat_error_capture_stack);
+    // stackTraceLimit reads and writes the VM's own limit, so building a
+    // stack never has to look a property up
+    JsNative* lim_get = js_new_native(&vm.heap, &nat_error_limit_get, "stackTraceLimit");
+    vm_push(vm, value_cell(&lim_get.head));
+    JsNative* lim_set = js_new_native(&vm.heap, &nat_error_limit_set, "stackTraceLimit");
+    vm_push(vm, value_cell(&lim_set.head));
+    JsAccessor* lim_ac = js_new_accessor(&vm.heap);
+    lim_ac.get = value_cell(&lim_get.head);
+    lim_ac.set = value_cell(&lim_set.head);
+    props_set_desc(&err_ctor.props, bi_atom(vm, "stackTraceLimit"), value_cell(&lim_ac.head),
+        PROP_WRITABLE | PROP_CONFIGURABLE);
+    vm_pop(vm);
+    vm_pop(vm);
     JsNative* te_ctor = def_global_fn(vm, "TypeError", &nat_typeerror_ctor);
     props_set_desc(&te_ctor.props, vm.atom_prototype, value_cell(&vm.error_protos[ERR_TYPE].head), 0);
     JsNative* re_ctor = def_global_fn(vm, "RangeError", &nat_rangeerror_ctor);
@@ -18297,6 +18359,14 @@ void builtins_install(VM* vm) {
 
     // Symbol
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
+    // util.inspect.custom, registered up front: inspect lives in the VM and
+    // needs the key whether or not the util module was ever loaded
+    Value[1] icka = { new_str(vm, "nodejs.util.inspect.custom") };
+    Value ic = nat_symbol_for(cast(void*, vm), value_undefined(), value_undefined(), &icka[0], 1);
+    vm_push(vm, ic);
+    str icname;
+    vm.sym_inspect_custom = reflect_key(vm, ic, &icname);
+    vm_pop(vm);
     props_set(&symbol_ctor.props, bi_atom(vm, "iterator"), vm.sym_iterator);
     props_set(&symbol_ctor.props, bi_atom(vm, "toPrimitive"), vm.sym_to_primitive);
     props_set(&symbol_ctor.props, bi_atom(vm, "asyncIterator"), vm.sym_async_iterator);
