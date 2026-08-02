@@ -9377,8 +9377,13 @@ private Value nat_process_stderr_write(void* vmp, Value callee, Value thisv, Val
 }
 
 // Seconds since this process started, as node reports it.
+// Seconds this process has been running, not seconds the machine has: the
+// monotonic counter starts wherever the platform starts it.
 private Value nat_process_uptime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return value_number(cast(f64, vm_clock_ns()) / 1000000000.0);
+    VM* vm = as_vm(vmp);
+    u64 now = vm_clock_ns();
+    u64 since = now > vm.start_ns ? now - vm.start_ns : 0;
+    return value_number(cast(f64, since) / 1000000000.0);
 }
 
 // Heap figures from the collector. rss and external have no counterpart here,

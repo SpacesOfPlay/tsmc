@@ -23,11 +23,13 @@ Unicode property escapes.
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
 `process`, `timers` (with `timers/promises`), `tty`, `querystring`,
-`string_decoder` and `punycode`. `crypto` has
+`string_decoder`, `punycode` and `perf_hooks`. `crypto` has
 MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
 `timingSafeEqual`, and the `random*` functions. The globals include
 `fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,
-`structuredClone`, `atob`/`btoa` and `console`.
+`structuredClone`, `atob`/`btoa`, `console`, `performance`,
+`EventTarget`/`Event`, `AbortController`/`AbortSignal` and
+`DOMException`.
 
 Networking is `net`, `http`, `https` and `tls` — clients and servers, on
 a non-blocking event loop. The TLS 1.3 stack is the project's own. The

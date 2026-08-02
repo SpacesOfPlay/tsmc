@@ -115,6 +115,7 @@ struct VM {
     Frame* frames;
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
+    u64 start_ns;              // monotonic clock at startup, for process.uptime
     Handler* handlers;
     i32 hp;
     IntMap<Value> globals;
@@ -2896,6 +2897,8 @@ private void vm_install_globals(VM* vm) {
 // --- lifecycle -------------------------------------------------------------------------
 
 void vm_init(VM* vm) {
+    // process.uptime and performance.now count from here
+    vm.start_ns = vm_clock_ns();
     gc_init(&vm.heap);
     vm.heap.tracer = &js_trace;
     vm.heap.finalizer = &js_finalize;

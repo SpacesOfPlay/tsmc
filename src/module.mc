@@ -29,6 +29,7 @@ import node_webapi;
 import node_querystring;
 import node_strdec;
 import node_punycode;
+import node_webevents;
 import node_tls;
 import node_https;
 
@@ -303,7 +304,8 @@ private str builtin_name(str spec) {
         || str_equal(s, "tls") || str_equal(s, "https")
         || str_equal(s, "tty") || str_equal(s, "_fetch") || str_equal(s, "_webapi")
         || str_equal(s, "querystring") || str_equal(s, "string_decoder")
-        || str_equal(s, "punycode")
+        || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
+        || str_equal(s, "_webevents")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -1144,6 +1146,8 @@ private str builtin_js_source(str name) {
     if str_equal(name, "querystring") { return node_querystring_source(); }
     if str_equal(name, "string_decoder") { return node_strdec_source(); }
     if str_equal(name, "punycode") { return node_punycode_source(); }
+    if str_equal(name, "_webevents") { return node_webevents_source(); }
+    if str_equal(name, "perf_hooks") { return node_perf_hooks_source(); }
     return null_str();
 }
 
@@ -1510,6 +1514,49 @@ private Value webapi_class(VM* vm, str which) {
     return cls;
 }
 
+// The `_webevents` classes behind the DOMException / Event / EventTarget /
+// AbortController globals, on the same lazy footing as the fetch types.
+private Value webevents_class(VM* vm, str which) {
+    str none;
+    none.data = null;
+    none.len = 0;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value impl = module_require(vm, none, "_webevents");
+    if vm.has_pending || !value_is_object(impl) { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, impl);
+    Value cls;
+    bool ok = vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, which), &cls);
+    gc_root_reset(&vm.heap, rm);
+    if !ok { return value_undefined(); }
+    if value_is_callable(cls) || value_is_object(cls) {
+        vm_set_global(vm, which, cls);
+        vm_mirror_global(vm, which, false);
+    }
+    return cls;
+}
+
+private Value nat_g_domexception(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "DOMException");
+}
+private Value nat_g_event(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "Event");
+}
+private Value nat_g_customevent(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "CustomEvent");
+}
+private Value nat_g_eventtarget(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "EventTarget");
+}
+private Value nat_g_abortsignal(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "AbortSignal");
+}
+private Value nat_g_abortcontroller(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "AbortController");
+}
+private Value nat_g_performance(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "performance");
+}
+
 private Value nat_g_headers(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return webapi_class(cast(VM*, vmp), "Headers");
 }
@@ -1710,11 +1757,25 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vm_set_lazy_global(vm, "Headers", &nat_g_headers);
     vm_set_lazy_global(vm, "Request", &nat_g_request);
     vm_set_lazy_global(vm, "Response", &nat_g_response);
+    vm_set_lazy_global(vm, "DOMException", &nat_g_domexception);
+    vm_set_lazy_global(vm, "Event", &nat_g_event);
+    vm_set_lazy_global(vm, "CustomEvent", &nat_g_customevent);
+    vm_set_lazy_global(vm, "EventTarget", &nat_g_eventtarget);
+    vm_set_lazy_global(vm, "AbortSignal", &nat_g_abortsignal);
+    vm_set_lazy_global(vm, "AbortController", &nat_g_abortcontroller);
+    vm_set_lazy_global(vm, "performance", &nat_g_performance);
     // publish onto globalThis, whose snapshot predates all four
     vm_mirror_global(vm, "fetch", true);
     vm_mirror_global(vm, "Headers", false);
     vm_mirror_global(vm, "Request", false);
     vm_mirror_global(vm, "Response", false);
+    vm_mirror_global(vm, "DOMException", false);
+    vm_mirror_global(vm, "Event", false);
+    vm_mirror_global(vm, "CustomEvent", false);
+    vm_mirror_global(vm, "EventTarget", false);
+    vm_mirror_global(vm, "AbortSignal", false);
+    vm_mirror_global(vm, "AbortController", false);
+    vm_mirror_global(vm, "performance", false);
 
     // __filename / __dirname for the entry file (absolute, entry-scoped).
     str fname = canon_path(path);
