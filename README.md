@@ -22,7 +22,8 @@ Unicode property escapes.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
-`process`, `timers` (with `timers/promises`), and `tty`. `crypto` has
+`process`, `timers` (with `timers/promises`), `tty`, `querystring`,
+`string_decoder` and `punycode`. `crypto` has
 MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
 `timingSafeEqual`, and the `random*` functions. The globals include
 `fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,

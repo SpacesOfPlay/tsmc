@@ -3254,6 +3254,14 @@ private Value uri_encode(VM* vm, Value thisv, Value* args, i32 argc, bool compon
     str hex = "0123456789ABCDEF";
     for i32 i = 0; i < s.len; i++ {
         u8 c = *(s.data + i);
+        // A surrogate that never found its pair has no UTF-8 form. tsmc keeps
+        // it as ED A0..BF, which is exactly what the encoders must refuse.
+        if c == 0xED && i + 1 < s.len && *(s.data + i + 1) >= 0xA0 {
+            str_buf_free(&sb);
+            gc_root_reset(&vm.heap, rm);
+            vm_throw_error(vm, ERR_URI, "URI malformed");
+            return value_undefined();
+        }
         if uri_unreserved(c) || (!component && uri_reserved(c)) {
             str one;
             one.data = s.data + i;
@@ -3307,13 +3315,55 @@ private Value uri_decode(VM* vm, Value thisv, Value* args, i32 argc, bool compon
                 keep.data = s.data + i;
                 keep.len = 3;
                 str_buf_add(&sb, keep);
-            } else {
+            } else if b < 0x80 {
                 u8[1] bb;
                 bb[0] = b;
                 str one;
                 one.data = &bb[0];
                 one.len = 1;
                 str_buf_add(&sb, one);
+            } else {
+                // A byte above ASCII opens a sequence whose continuation
+                // bytes must be escaped too, and must spell one code point:
+                // no truncated tail, no overlong form, no surrogate, nothing
+                // past U+10FFFF. Anything else is malformed input, not a
+                // replacement character.
+                i32 need = 0;
+                i32 cp = 0;
+                i32 lo_bound = 0;
+                if b >= 0xC2 && b <= 0xDF { need = 1; cp = b & 0x1F; lo_bound = 0x80; }
+                else if b >= 0xE0 && b <= 0xEF { need = 2; cp = b & 0x0F; lo_bound = 0x800; }
+                else if b >= 0xF0 && b <= 0xF4 { need = 3; cp = b & 0x07; lo_bound = 0x10000; }
+                else { need = -1; }
+                i32 at = i + 3;
+                for i32 k = 0; k < need; k++ {
+                    if at + 2 >= s.len || *(s.data + at) != '%' { need = -1; break; }
+                    i32 h2 = hex_val(*(s.data + at + 1));
+                    i32 l2 = hex_val(*(s.data + at + 2));
+                    if h2 < 0 || l2 < 0 { need = -1; break; }
+                    i32 cb = (h2 << 4) | l2;
+                    if cb < 0x80 || cb > 0xBF { need = -1; break; }
+                    cp = (cp << 6) | (cb & 0x3F);
+                    at += 3;
+                }
+                if need < 0 || cp < lo_bound || cp > 0x10FFFF
+                    || (cp >= 0xD800 && cp <= 0xDFFF) {
+                    str_buf_free(&sb);
+                    gc_root_reset(&vm.heap, rm);
+                    vm_throw_error(vm, ERR_URI, "URI malformed");
+                    return value_undefined();
+                }
+                str seq;
+                seq.data = s.data + i;
+                seq.len = at - i;
+                // re-emit the octets the escapes spelled
+                for i32 k = 0; k < seq.len; k += 3 {
+                    i32 hh = hex_val(*(seq.data + k + 1));
+                    i32 ll = hex_val(*(seq.data + k + 2));
+                    str_buf_add_byte(&sb, cast(u8, (hh << 4) | ll));
+                }
+                i = at;
+                continue;
             }
             i += 3;
         } else if c == '%' {
