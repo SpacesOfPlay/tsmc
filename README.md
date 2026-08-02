@@ -16,8 +16,8 @@ packages run unmodified.
 The language: classes, generators, async/await, async generators and
 `for await`, top-level await, modules (CommonJS and ESM, including
 dynamic `import()`), Proxy and Reflect, BigInt, typed arrays,
-`Map`/`Set`/`WeakMap`/`WeakSet` with the set operations, `arguments`,
-and regular expressions with
+`Map`/`Set`/`WeakMap`/`WeakSet` with the set operations, the iterator
+helpers, `arguments`, and regular expressions with
 Unicode property escapes.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),

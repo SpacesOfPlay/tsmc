@@ -147,6 +147,8 @@ struct VM {
     u64 rng;
     JsObject* generator_proto;
     JsObject* async_generator_proto;
+    JsObject* iterator_proto;      // shared by every iterator: the helpers live here
+    JsObject* iter_helper_proto;   // what map/filter/take/drop/flatMap return
     JsObject* promise_proto;
     JsObject* regexp_proto;
     JsObject* map_proto;
@@ -337,6 +339,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     if vm.generator_proto != null { gc_mark_cell(h, &vm.generator_proto.head); }
     if vm.async_generator_proto != null { gc_mark_cell(h, &vm.async_generator_proto.head); }
+    if vm.iterator_proto != null { gc_mark_cell(h, &vm.iterator_proto.head); }
+    if vm.iter_helper_proto != null { gc_mark_cell(h, &vm.iter_helper_proto.head); }
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
@@ -2477,6 +2481,8 @@ void vm_init(VM* vm) {
     vm.rng = cast(u64, vm) ^ 0x9E3779B97F4A7C15;
     vm.generator_proto = null;
     vm.async_generator_proto = null;
+    vm.iterator_proto = null;
+    vm.iter_helper_proto = null;
     vm.promise_proto = null;
     vm.regexp_proto = null;
     vm.map_proto = null;

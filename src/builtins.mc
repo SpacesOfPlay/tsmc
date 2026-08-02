@@ -397,23 +397,63 @@ private Value nat_object_create(void* vmp, Value callee, Value thisv, Value* arg
     return ov;
 }
 
+private Value proto_cell(JsObject* p) {
+    return p != null ? value_cell(&p.head) : value_null();
+}
+
+// What a value inherits from. A primitive reports its wrapper's prototype,
+// which is what boxing it would give; a Set, Map or generator has one too,
+// even though none of them is a plain object.
+private Value proto_of_value(VM* vm, Value v) {
+    if value_is_object(v) { return proto_cell(value_as_object(v).proto); }
+    if value_is_map(v) { return proto_cell(value_as_map(v).proto); }
+    if value_is_generator(v) {
+        return proto_cell(value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto);
+    }
+    if value_is_function(v) {
+        // an explicitly set [[Prototype]] (parent ctor or plain object / null),
+        // else the default Function.prototype
+        Value fp = value_as_function(v).fproto;
+        if value_is_function(fp) || value_is_native(fp) || value_is_object(fp) { return fp; }
+        if value_is_null(fp) { return value_null(); }
+        return proto_cell(vm.function_proto);
+    }
+    if value_is_native(v) { return proto_cell(vm.function_proto); }
+    if value_is_string(v) { return proto_cell(vm.string_proto); }
+    if value_is_symbol(v) { return proto_cell(vm.symbol_proto); }
+    if value_is_bigint(v) { return proto_cell(vm.bigint_proto); }
+    if value_is_bool(v) { return proto_cell(vm.boolean_proto); }
+    if value_is_int(v) || value_is_number(v) { return proto_cell(vm.number_proto); }
+    return value_null();
+}
+
 private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if value_is_object(ov) {
-        JsObject* p = value_as_object(ov).proto;
-        if p != null { return value_cell(&p.head); }
-    } else if value_is_function(ov) {
-        // an explicitly set [[Prototype]] (parent ctor or plain object / null),
-        // else the default Function.prototype
-        Value fp = value_as_function(ov).fproto;
-        if value_is_function(fp) || value_is_native(fp) || value_is_object(fp) { return fp; }
-        if value_is_null(fp) { return value_null(); }
-        if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
-    } else if value_is_native(ov) {
-        if vm.function_proto != null { return value_cell(&vm.function_proto.head); }
+    if bi_nullish(ov) {
+        vm_throw_error(vm, ERR_TYPE, "Object.getPrototypeOf called on null or undefined");
+        return value_undefined();
     }
-    return value_null();
+    return proto_of_value(vm, ov);
+}
+
+// Object.prototype.isPrototypeOf: is the receiver anywhere on the argument's
+// prototype chain? A primitive argument has no chain to walk, so false, and
+// so is the receiver itself, which is not on its own chain.
+private Value nat_is_prototype_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value v = arg_at(args, argc, 0);
+    if !value_is_reference(v) || !value_is_cell(thisv) { return value_bool(false); }
+    GcCell* want = value_as_cell(thisv);
+    Value cur = proto_of_value(vm, v);
+    i32 guard = 0;
+    while guard < 100000 {
+        guard++;
+        if !value_is_cell(cur) { return value_bool(false); }
+        if value_as_cell(cur) == want { return value_bool(true); }
+        cur = proto_of_value(vm, cur);
+    }
+    return value_bool(false);
 }
 
 // All own string-keyed property names, enumerable or not (arrays add
@@ -5603,6 +5643,541 @@ private Value nat_return_this(void* vmp, Value callee, Value thisv, Value* args,
     return thisv;
 }
 
+// --- iterator helpers -------------------------------------------------------
+//
+// Every iterator inherits one shared prototype, and that is where map, filter,
+// take, drop and flatMap live, next to the methods that run an iterator down.
+// The first five are lazy: they hand back a helper holding the iterator they
+// read from, and pull nothing until next() is called.
+
+const i32 IH_MAP = 0;
+const i32 IH_FILTER = 1;
+const i32 IH_TAKE = 2;
+const i32 IH_DROP = 3;
+const i32 IH_FLATMAP = 4;
+
+// A helper's state lives in properties whose names start with '%', which keeps
+// them out of enumeration.
+private Value ih_get(VM* vm, Value h, str name) {
+    Value res;
+    if !js_get_prop(value_as_object(h), bi_atom(vm, name), &res) { return value_undefined(); }
+    return res;
+}
+
+private void ih_set(VM* vm, Value h, str name, Value v) {
+    js_set_prop(value_as_object(h), bi_atom(vm, name), v);
+}
+
+private void ih_finish(VM* vm, Value h) {
+    ih_set(vm, h, "%done", value_bool(true));
+    ih_set(vm, h, "%src", value_undefined());
+    ih_set(vm, h, "%in", value_undefined());
+}
+
+// Closing a source we are done with. Whatever completion we were already
+// carrying survives, so a throw from the body is not replaced by return().
+private void ih_close(VM* vm, Value it) {
+    if !value_is_reference(it) { return; }
+    bool had = vm.has_pending;
+    Value keep = vm.pending;
+    vm.has_pending = false;
+    vm.pending = value_undefined();
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, keep);
+    gc_root(&vm.heap, it);
+    Value m;
+    if vm_get_prop_value(vm, it, bi_atom(vm, "return"), &m) && value_is_callable(m) {
+        Value dummy = value_undefined();
+        ignore vm_call_value(vm, m, it, &dummy, 0);
+    }
+    gc_root_reset(&vm.heap, rm);
+    if had {
+        vm.has_pending = true;
+        vm.pending = keep;
+    }
+}
+
+// These are methods on the iterator itself, so any object with a next()
+// qualifies: a hand-written iterator works as well as a built-in one.
+private bool ih_this(VM* vm, Value thisv) {
+    if value_is_reference(thisv) { return true; }
+    vm_throw_error(vm, ERR_TYPE, "iterator method called on a non-object");
+    return false;
+}
+
+private Value ih_new(VM* vm, Value src, Value cb, i32 kind, f64 lim) {
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, src);
+    gc_root(&vm.heap, cb);
+    JsObject* h = js_new_object(&vm.heap, vm.iter_helper_proto);
+    Value hv = value_cell(&h.head);
+    gc_root(&vm.heap, hv);
+    ih_set(vm, hv, "%src", src);
+    ih_set(vm, hv, "%cb", cb);
+    ih_set(vm, hv, "%kind", value_int(kind));
+    ih_set(vm, hv, "%i", value_int(0));
+    ih_set(vm, hv, "%lim", js_number_value(lim));
+    gc_root_reset(&vm.heap, rm);
+    return hv;
+}
+
+// What flatMap accepts back from its callback: an object, then its
+// Symbol.iterator if it has one. A primitive is refused, a string included.
+private bool ih_flatten(VM* vm, Value v, Value* res) {
+    if !value_is_reference(v) {
+        vm_throw_error(vm, ERR_TYPE, "flatMap expects an iterable, not a primitive");
+        return false;
+    }
+    Value m;
+    if !vm_get_prop_value(vm, v, vm_sym_iterator_id(vm), &m) { return false; }
+    if value_is_callable(m) {
+        Value dummy = value_undefined();
+        *res = vm_call_value(vm, m, v, &dummy, 0);
+        return !vm.has_pending;
+    }
+    *res = v;
+    return true;
+}
+
+private Value nat_ih_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "next on a non-helper");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    if js_truthy(ih_get(vm, thisv, "%done")) {
+        gc_root_reset(&vm.heap, rm);
+        return gen_result(vm, value_undefined(), true);
+    }
+    Value src = ih_get(vm, thisv, "%src");
+    gc_root(&vm.heap, src);
+    Value cb = ih_get(vm, thisv, "%cb");
+    gc_root(&vm.heap, cb);
+    i32 kind = value_as_int(ih_get(vm, thisv, "%kind"));
+    f64 lim = js_to_number(ih_get(vm, thisv, "%lim"));
+
+    // take stops on its own count, without pulling again
+    if kind == IH_TAKE && lim <= 0.0 {
+        ih_finish(vm, thisv);
+        ih_close(vm, src);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+        return gen_result(vm, value_undefined(), true);
+    }
+    // drop skips its prefix on the first pull, not when it was created
+    if kind == IH_DROP {
+        while lim > 0.0 {
+            Value dv;
+            bool ddone;
+            if !vm_iter_next(vm, src, &dv, &ddone) {
+                ih_finish(vm, thisv);
+                gc_root_reset(&vm.heap, rm);
+                return value_undefined();
+            }
+            if ddone {
+                ih_finish(vm, thisv);
+                gc_root_reset(&vm.heap, rm);
+                return gen_result(vm, value_undefined(), true);
+            }
+            lim = lim - 1.0;
+        }
+        ih_set(vm, thisv, "%lim", js_number_value(0.0));
+    }
+
+    i32 guard = 0;
+    while guard < 1000000000 {
+        guard++;
+        // flatMap drains the inner iterator before pulling from the source
+        if kind == IH_FLATMAP {
+            Value inner = ih_get(vm, thisv, "%in");
+            if value_is_reference(inner) {
+                gc_root(&vm.heap, inner);
+                Value iv;
+                bool idone;
+                if !vm_iter_next(vm, inner, &iv, &idone) {
+                    ih_finish(vm, thisv);
+                    ih_close(vm, src);
+                    gc_root_reset(&vm.heap, rm);
+                    return value_undefined();
+                }
+                if !idone {
+                    gc_root_reset(&vm.heap, rm);
+                    return gen_result(vm, iv, false);
+                }
+                ih_set(vm, thisv, "%in", value_undefined());
+            }
+        }
+        Value v;
+        bool done;
+        if !vm_iter_next(vm, src, &v, &done) {
+            ih_finish(vm, thisv);
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        if done {
+            ih_finish(vm, thisv);
+            gc_root_reset(&vm.heap, rm);
+            return gen_result(vm, value_undefined(), true);
+        }
+        gc_root(&vm.heap, v);
+        if kind == IH_TAKE {
+            ih_set(vm, thisv, "%lim", js_number_value(lim - 1.0));
+            gc_root_reset(&vm.heap, rm);
+            return gen_result(vm, v, false);
+        }
+        if kind == IH_DROP {
+            gc_root_reset(&vm.heap, rm);
+            return gen_result(vm, v, false);
+        }
+        f64 idx = js_to_number(ih_get(vm, thisv, "%i"));
+        ih_set(vm, thisv, "%i", js_number_value(idx + 1.0));
+        Value[2] ca = { v, js_number_value(idx) };
+        Value mapped = vm_call_value(vm, cb, value_undefined(), &ca[0], 2);
+        if vm.has_pending {
+            ih_finish(vm, thisv);
+            ih_close(vm, src);
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        gc_root(&vm.heap, mapped);
+        if kind == IH_MAP {
+            gc_root_reset(&vm.heap, rm);
+            return gen_result(vm, mapped, false);
+        }
+        if kind == IH_FILTER {
+            if js_truthy(mapped) {
+                gc_root_reset(&vm.heap, rm);
+                return gen_result(vm, v, false);
+            }
+            continue;
+        }
+        Value inner2;
+        if !ih_flatten(vm, mapped, &inner2) {
+            ih_finish(vm, thisv);
+            ih_close(vm, src);
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        ih_set(vm, thisv, "%in", inner2);
+    }
+    gc_root_reset(&vm.heap, rm);
+    return gen_result(vm, value_undefined(), true);
+}
+
+// Abandoning a helper closes the inner iterator and the source, in that order.
+private Value nat_ih_return(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if value_is_object(thisv) {
+        i32 rm = gc_root_mark(&vm.heap);
+        gc_root(&vm.heap, thisv);
+        Value src = ih_get(vm, thisv, "%src");
+        gc_root(&vm.heap, src);
+        Value inner = ih_get(vm, thisv, "%in");
+        gc_root(&vm.heap, inner);
+        ih_finish(vm, thisv);
+        ih_close(vm, inner);
+        ih_close(vm, src);
+        gc_root_reset(&vm.heap, rm);
+        if vm.has_pending { return value_undefined(); }
+    }
+    return gen_result(vm, value_undefined(), true);
+}
+
+private Value ih_method(VM* vm, Value thisv, Value* args, i32 argc, i32 kind) {
+    if !ih_this(vm, thisv) { return value_undefined(); }
+    Value cb = arg_at(args, argc, 0);
+    if !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "argument is not a function");
+        return value_undefined();
+    }
+    return ih_new(vm, thisv, cb, kind, 0.0);
+}
+
+// take and drop take a count: NaN or a negative one is a RangeError, and a
+// fractional one truncates towards zero.
+private Value ih_counted(VM* vm, Value thisv, Value* args, i32 argc, i32 kind) {
+    if !ih_this(vm, thisv) { return value_undefined(); }
+    f64 n = js_to_number(arg_at(args, argc, 0));
+    if vm.has_pending { return value_undefined(); }
+    if n != n {
+        vm_throw_error(vm, ERR_RANGE, "count is not a number");
+        return value_undefined();
+    }
+    f64 t = n < 0.0 ? 0.0 - floor(0.0 - n) : floor(n);
+    if t < 0.0 {
+        vm_throw_error(vm, ERR_RANGE, "count is negative");
+        return value_undefined();
+    }
+    return ih_new(vm, thisv, value_undefined(), kind, t);
+}
+
+private Value nat_iter_map(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_method(as_vm(vmp), thisv, args, argc, IH_MAP);
+}
+private Value nat_iter_filter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_method(as_vm(vmp), thisv, args, argc, IH_FILTER);
+}
+private Value nat_iter_flatmap(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_method(as_vm(vmp), thisv, args, argc, IH_FLATMAP);
+}
+private Value nat_iter_take(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_counted(as_vm(vmp), thisv, args, argc, IH_TAKE);
+}
+private Value nat_iter_drop(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_counted(as_vm(vmp), thisv, args, argc, IH_DROP);
+}
+
+// The methods that run the iterator down: 0 reduce, 1 toArray, 2 forEach,
+// 3 some, 4 every, 5 find. The three that can stop early close what is left.
+private Value ih_consume(VM* vm, Value thisv, Value* args, i32 argc, i32 op) {
+    if !ih_this(vm, thisv) { return value_undefined(); }
+    Value cb = arg_at(args, argc, 0);
+    if op != 1 && !value_is_callable(cb) {
+        vm_throw_error(vm, ERR_TYPE, "argument is not a function");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, thisv);
+    gc_root(&vm.heap, cb);
+    JsObject* arr = null;
+    if op == 1 {
+        arr = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&arr.head));
+    }
+    // Two stack slots hold the accumulator and the current element. The root
+    // stack would otherwise grow by one per element walked.
+    i32 slot = vm.sp;
+    vm_push(vm, value_undefined());
+    vm_push(vm, value_undefined());
+    bool have = op == 0 && argc >= 2;
+    if have { *(vm.stack + slot) = *(args + 1); }
+    Value res = value_undefined();
+    if op == 3 { res = value_bool(false); }
+    if op == 4 { res = value_bool(true); }
+    f64 idx = 0.0;
+    bool failed = false;
+    i32 guard = 0;
+    while guard < 1000000000 {
+        guard++;
+        Value v;
+        bool done;
+        if !vm_iter_next(vm, thisv, &v, &done) { failed = true; break; }
+        if done { break; }
+        *(vm.stack + slot + 1) = v;
+        if op == 1 {
+            js_array_set(arr, arr.elen, v);
+            continue;
+        }
+        // the first element seeds reduce when no initial value was given
+        if op == 0 && !have {
+            *(vm.stack + slot) = v;
+            have = true;
+            idx = 1.0;
+            continue;
+        }
+        Value[3] ca = { v, js_number_value(idx), value_undefined() };
+        i32 n = 2;
+        if op == 0 {
+            ca[0] = *(vm.stack + slot);
+            ca[1] = v;
+            ca[2] = js_number_value(idx);
+            n = 3;
+        }
+        Value r = vm_call_value(vm, cb, value_undefined(), &ca[0], n);
+        idx = idx + 1.0;
+        if vm.has_pending {
+            vm.sp = slot;
+            ih_close(vm, thisv);
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        if op == 0 { *(vm.stack + slot) = r; }
+        else if op == 3 && js_truthy(r) { res = value_bool(true); }
+        else if op == 4 && !js_truthy(r) { res = value_bool(false); }
+        else if op == 5 && js_truthy(r) { res = v; }
+        else { continue; }
+        if op >= 3 {
+            vm.sp = slot;
+            ih_close(vm, thisv);
+            gc_root_reset(&vm.heap, rm);
+            return res;
+        }
+    }
+    if failed {
+        vm.sp = slot;
+        gc_root_reset(&vm.heap, rm);
+        return value_undefined();
+    }
+    if op == 0 && !have {
+        vm.sp = slot;
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "reduce of an empty iterator with no initial value");
+        return value_undefined();
+    }
+    if op == 0 { res = *(vm.stack + slot); }
+    if op == 1 { res = value_cell(&arr.head); }
+    vm.sp = slot;
+    gc_root_reset(&vm.heap, rm);
+    return res;
+}
+
+private Value nat_iter_reduce(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 0);
+}
+private Value nat_iter_toarray(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 1);
+}
+private Value nat_iter_foreach(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 2);
+}
+private Value nat_iter_some(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 3);
+}
+private Value nat_iter_every(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 4);
+}
+private Value nat_iter_find(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return ih_consume(as_vm(vmp), thisv, args, argc, 5);
+}
+
+// Iterator itself is abstract: only a subclass reaches this.
+private Value nat_iterator_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(thisv) || value_as_object(thisv).proto == vm.iterator_proto {
+        vm_throw_error(vm, ERR_TYPE, "Iterator is abstract, subclass it instead");
+    }
+    return value_undefined();
+}
+
+private bool ih_is_iterator(VM* vm, Value v) {
+    JsObject* p = null;
+    if value_is_generator(v) {
+        p = value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto;
+    } else if value_is_object(v) {
+        p = value_as_object(v).proto;
+    }
+    while p != null {
+        if p == vm.iterator_proto { return true; }
+        p = p.proto;
+    }
+    return false;
+}
+
+private Value nat_iterwrap_next(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value src = value_as_native(callee).env0;
+    Value m;
+    if !vm_get_prop_value(vm, src, bi_atom(vm, "next"), &m) { return value_undefined(); }
+    if !value_is_callable(m) {
+        vm_throw_error(vm, ERR_TYPE, "iterator has no next method");
+        return value_undefined();
+    }
+    Value dummy = value_undefined();
+    return vm_call_value(vm, m, src, &dummy, 0);
+}
+
+private Value nat_iterwrap_return(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value src = value_as_native(callee).env0;
+    Value m;
+    if vm_get_prop_value(vm, src, bi_atom(vm, "return"), &m) && value_is_callable(m) {
+        Value dummy = value_undefined();
+        return vm_call_value(vm, m, src, &dummy, 0);
+    }
+    return gen_result(vm, value_undefined(), true);
+}
+
+// Iterator.from: an iterable or a bare iterator becomes something the helpers
+// work on. One that already inherits the shared prototype is handed straight
+// back; anything else is wrapped.
+private Value nat_iterator_from(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value v = arg_at(args, argc, 0);
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, v);
+    Value it;
+    if value_is_string(v) {
+        // a string is iterable here, unlike in flatMap
+        if !vm_get_iterator(vm, v, &it) {
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+    } else if !value_is_reference(v) {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "Iterator.from expects an iterator or an iterable");
+        return value_undefined();
+    } else {
+        Value m;
+        if !vm_get_prop_value(vm, v, vm_sym_iterator_id(vm), &m) {
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        if value_is_callable(m) {
+            Value dummy = value_undefined();
+            it = vm_call_value(vm, m, v, &dummy, 0);
+            if vm.has_pending {
+                gc_root_reset(&vm.heap, rm);
+                return value_undefined();
+            }
+        } else {
+            it = v;
+        }
+    }
+    gc_root(&vm.heap, it);
+    if ih_is_iterator(vm, it) {
+        gc_root_reset(&vm.heap, rm);
+        return it;
+    }
+    if !value_is_object(it) {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "Iterator.from expects an iterator or an iterable");
+        return value_undefined();
+    }
+    JsObject* w = js_new_object(&vm.heap, vm.iterator_proto);
+    Value wv = value_cell(&w.head);
+    gc_root(&vm.heap, wv);
+    JsNative* nx = js_new_native(&vm.heap, &nat_iterwrap_next, "next");
+    nx.env0 = it;
+    props_set_desc(&w.props, bi_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
+    JsNative* rt = js_new_native(&vm.heap, &nat_iterwrap_return, "return");
+    rt.env0 = it;
+    props_set_desc(&w.props, bi_atom(vm, "return"), value_cell(&rt.head), METHOD_ATTRS);
+    gc_root_reset(&vm.heap, rm);
+    return wv;
+}
+
+// `constructor` and the tag are accessors on the shared prototype, and their
+// setters refuse the prototype itself: writing either through an instance
+// gives that instance an own property instead.
+private Value nat_iter_ctor_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_as_native(callee).env0;
+}
+
+private Value nat_iter_tag_get(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return new_str(as_vm(vmp), "Iterator");
+}
+
+private Value ih_home_set(VM* vm, Value thisv, u32 key, Value v) {
+    if !value_is_object(thisv) || value_as_object(thisv) == vm.iterator_proto {
+        vm_throw_error(vm, ERR_TYPE, "cannot assign to the shared iterator prototype");
+        return value_undefined();
+    }
+    props_set_desc(&value_as_object(thisv).props, key, v, PROP_DEFAULT);
+    return value_undefined();
+}
+
+private Value nat_iter_ctor_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return ih_home_set(vm, thisv, bi_atom(vm, "constructor"), arg_at(args, argc, 0));
+}
+
+private Value nat_iter_tag_set(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    return ih_home_set(vm, thisv, vm_sym_to_string_tag_id(vm), arg_at(args, argc, 0));
+}
+
 // A live Map/Set iterator. It holds the collection rather than a snapshot, so
 // an entry deleted before the walk reaches it is skipped, and one appended
 // during the walk is still visited — the storage is append-only with a liveness
@@ -5642,15 +6217,13 @@ private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* arg
 // kind: 0 keys, 1 values, 2 entries
 private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
-    JsObject* it = js_new_object(&vm.heap, vm.object_proto);
+    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_map_iter_next, "next");
     nx.env0 = value_cell(&mp.head);
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
     js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
-    JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
-    js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
 }
@@ -5658,16 +6231,13 @@ private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
 private Value make_index_iterator(VM* vm, Value src, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, src);
-    JsObject* it = js_new_object(&vm.heap, vm.object_proto);
+    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
     js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
-    // an iterator is itself iterable
-    JsNative* si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
-    js_set_prop(it, vm_sym_iterator_id(vm), value_cell(&si.head));
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
 }
@@ -16971,6 +17541,18 @@ private Value nat_url_canparse(void* vmp, Value callee, Value thisv, Value* args
 
 // A getter/setter pair (non-enumerable, configurable), as the URL components
 // need: reading one derives it from the slots, writing one updates them.
+// A pair under a ready-made getter, and any key: the iterator prototype needs
+// one under a symbol.
+private void def_get_set_pair(VM* vm, JsObject* obj, u32 key, JsNative* getter, NativeFn setter) {
+    JsNative* s = js_new_native(&vm.heap, setter, "set");
+    vm_push(vm, value_cell(&s.head));
+    JsAccessor* ac = js_new_accessor(&vm.heap);
+    ac.get = value_cell(&getter.head);
+    ac.set = value_cell(&s.head);
+    props_set_desc(&obj.props, key, value_cell(&ac.head), PROP_CONFIGURABLE);
+    vm_pop(vm);
+}
+
 private void def_get_set(VM* vm, JsObject* obj, str name, NativeFn getter, NativeFn setter) {
     JsNative* g = js_new_native(&vm.heap, getter, name);
     vm_push(vm, value_cell(&g.head));
@@ -17349,6 +17931,7 @@ void builtins_install(VM* vm) {
     def_static(vm, object_ctor, "isExtensible", &nat_object_isextensible);
     def_method(vm, vm.object_proto, "hasOwnProperty", &nat_has_own);
     def_method(vm, vm.object_proto, "propertyIsEnumerable", &nat_property_is_enumerable);
+    def_method(vm, vm.object_proto, "isPrototypeOf", &nat_is_prototype_of);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
     def_method(vm, vm.object_proto, "valueOf", &nat_object_valueof);
     {
@@ -17640,8 +18223,42 @@ void builtins_install(VM* vm) {
     JsNative* str_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
     js_set_prop(vm.string_proto, iter_id, value_cell(&str_it.head));
 
+    // Iterator.prototype, which every iterator below inherits
+    vm.iterator_proto = js_new_object(&vm.heap, vm.object_proto);
+    JsNative* iter_ctor = def_global_fn(vm, "Iterator", &nat_iterator_ctor);
+    props_set_desc(&iter_ctor.props, vm.atom_prototype, value_cell(&vm.iterator_proto.head), 0);
+    def_static(vm, iter_ctor, "from", &nat_iterator_from);
+    def_method(vm, vm.iterator_proto, "map", &nat_iter_map);
+    def_method(vm, vm.iterator_proto, "filter", &nat_iter_filter);
+    def_method(vm, vm.iterator_proto, "take", &nat_iter_take);
+    def_method(vm, vm.iterator_proto, "drop", &nat_iter_drop);
+    def_method(vm, vm.iterator_proto, "flatMap", &nat_iter_flatmap);
+    def_method(vm, vm.iterator_proto, "reduce", &nat_iter_reduce);
+    def_method(vm, vm.iterator_proto, "toArray", &nat_iter_toarray);
+    def_method(vm, vm.iterator_proto, "forEach", &nat_iter_foreach);
+    def_method(vm, vm.iterator_proto, "some", &nat_iter_some);
+    def_method(vm, vm.iterator_proto, "every", &nat_iter_every);
+    def_method(vm, vm.iterator_proto, "find", &nat_iter_find);
+    JsNative* it_si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
+    props_set_desc(&vm.iterator_proto.props, iter_id, value_cell(&it_si.head), METHOD_ATTRS);
+    JsNative* it_cg = js_new_native(&vm.heap, &nat_iter_ctor_get, "constructor");
+    it_cg.env0 = value_cell(&iter_ctor.head);
+    vm_push(vm, value_cell(&it_cg.head));
+    def_get_set_pair(vm, vm.iterator_proto, bi_atom(vm, "constructor"), it_cg, &nat_iter_ctor_set);
+    vm_pop(vm);
+    JsNative* it_tg = js_new_native(&vm.heap, &nat_iter_tag_get, "[Symbol.toStringTag]");
+    vm_push(vm, value_cell(&it_tg.head));
+    def_get_set_pair(vm, vm.iterator_proto, vm_sym_to_string_tag_id(vm), it_tg, &nat_iter_tag_set);
+    vm_pop(vm);
+
+    // What map/filter/take/drop/flatMap return
+    vm.iter_helper_proto = js_new_object(&vm.heap, vm.iterator_proto);
+    def_tag(vm, vm.iter_helper_proto, "Iterator Helper");
+    def_method(vm, vm.iter_helper_proto, "next", &nat_ih_next);
+    def_method(vm, vm.iter_helper_proto, "return", &nat_ih_return);
+
     // Generator.prototype
-    vm.generator_proto = js_new_object(&vm.heap, vm.object_proto);
+    vm.generator_proto = js_new_object(&vm.heap, vm.iterator_proto);
     def_tag(vm, vm.generator_proto, "Generator");
     def_method(vm, vm.generator_proto, "next", &nat_gen_next);
     def_method(vm, vm.generator_proto, "return", &nat_gen_return);
