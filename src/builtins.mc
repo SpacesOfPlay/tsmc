@@ -4927,6 +4927,15 @@ private Value nat_function_ctor(void* vmp, Value callee, Value thisv, Value* arg
     return value_undefined();
 }
 
+private Value nat_fn_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    if !value_is_callable(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Function.prototype.toString called on a non-function");
+        return value_undefined();
+    }
+    return vm_function_source(vm, thisv);
+}
+
 private Value nat_fn_call(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value this_arg = arg_at(args, argc, 0);
@@ -4987,7 +4996,9 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
     for i32 i = 0; i < n; i++ {
         js_array_set(pre, i, *(args + 1 + i));
     }
-    JsNative* w = js_new_native(&vm.heap, &nat_bound_entry, "bound");
+    // the visible name is set as a property below; the internal one stays
+    // empty so toString reads "function () { [native code] }" like node's
+    JsNative* w = js_new_native(&vm.heap, &nat_bound_entry, "");
     w.env0 = thisv;
     w.env1 = arg_at(args, argc, 0);
     w.env2 = value_cell(&pre.head);
@@ -18125,6 +18136,7 @@ void builtins_install(VM* vm) {
     JsNative* function_ctor = def_global_fn(vm, "Function", &nat_function_ctor);
     props_set_desc(&function_ctor.props, vm.atom_prototype, value_cell(&vm.function_proto.head), 0);
     link_ctor(vm, vm.function_proto, function_ctor);
+    def_method(vm, vm.function_proto, "toString", &nat_fn_tostring);
     def_method(vm, vm.function_proto, "call", &nat_fn_call);
     def_method(vm, vm.function_proto, "apply", &nat_fn_apply);
     def_method(vm, vm.function_proto, "bind", &nat_fn_bind);

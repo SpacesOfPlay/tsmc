@@ -804,8 +804,7 @@ Value js_to_string_value(VM* vm, Value v) {
         have = true;
     }
     if value_is_function(v) || value_is_native(v) {
-        lit = "[Function]";
-        have = true;
+        return vm_function_source(vm, v);
     }
     if have {
         GcString* g = gc_new_string(&vm.heap, lit);
@@ -1858,6 +1857,37 @@ bool vm_enumerable_key(VM* vm, u32 key) {
 
 // A property shows up in enumeration when its key is visible and the
 // enumerable attribute is set (Object.defineProperty can clear it).
+// Function.prototype.toString: the text a function was written as. A native,
+// a bound function and anything else without a recorded span report the form
+// node uses for a builtin.
+Value vm_function_source(VM* vm, Value v) {
+    FnTemplate* t = null;
+    str nm;
+    nm.data = null;
+    nm.len = 0;
+    if value_is_function(v) {
+        t = value_as_function(v).tmpl;
+        if t != null { nm = t.name; }
+    } else if value_is_native(v) {
+        nm = value_as_native(v).name;
+    }
+    if t != null && t.src_end > t.src_start && t.src_end <= t.src_text.len {
+        str s;
+        s.data = t.src_text.data + t.src_start;
+        s.len = t.src_end - t.src_start;
+        GcString* g = gc_new_string(&vm.heap, s);
+        return value_cell(&g.head);
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "function ");
+    str_buf_add(&sb, nm);
+    str_buf_add(&sb, "() { [native code] }");
+    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return value_cell(&g.head);
+}
+
 bool prop_enumerable(VM* vm, Prop* pr) {
     if (pr.flags & PROP_ENUMERABLE) == 0 { return false; }
     return vm_enumerable_key(vm, pr.key);

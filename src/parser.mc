@@ -604,8 +604,12 @@ private void parse_params_into(Parser* p) {
 }
 
 // Type params, params, return type, then body or overload signature.
-private Node* parse_callable(Parser* p, i32 flags) {
+// `start` is where the whole form began (the `function` keyword, a method's
+// name), which is what Function.prototype.toString hands back. -1 keeps the
+// parameter list's own position.
+private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     Node* fun = nnew(p, N_FUNCTION);
+    if start >= 0 { fun.span.start = start; }
     fun.flags = flags;
     if p.cur.kind == TOK_LT { ts_type_params(p); }
     i32 mark = p.scratch.len;
@@ -621,8 +625,8 @@ private Node* parse_callable(Parser* p, i32 flags) {
     return nfin(p, fun);
 }
 
-// After the 'function' keyword.
-private Node* parse_function_rest(Parser* p, i32 flags, bool need_name) {
+// After the 'function' keyword; `start` is where that keyword was.
+private Node* parse_function_rest(Parser* p, i32 flags, bool need_name, i32 start) {
     if eat(p, TOK_STAR) { flags |= NF_GENERATOR; }
     str name;
     name.data = null;
@@ -633,7 +637,7 @@ private Node* parse_function_rest(Parser* p, i32 flags, bool need_name) {
     } else if need_name {
         perror(p, "expected function name");
     }
-    Node* fun = parse_callable(p, flags);
+    Node* fun = parse_callable(p, flags, start);
     fun.name = name;
     return fun;
 }
@@ -724,7 +728,7 @@ private Node* parse_object(Parser* p) {
         if at(p, TOK_LPAREN) || at(p, TOK_LT) {
             // a method definition, unlike `key: function (...)`, requires
             // its parameter names to be unique
-            pr.b = parse_callable(p, fnflags | NF_METHOD);
+            pr.b = parse_callable(p, fnflags | NF_METHOD, pr.span.start);
         } else if eat(p, TOK_COLON) {
             pr.b = parse_assign(p);
         } else if eat(p, TOK_EQ) {
@@ -814,9 +818,10 @@ private Node* parse_primary(Parser* p) {
     // contextual keyword, so the general branch below would swallow it and
     // leave `function` stranded.
     if k == TOK_KW_ASYNC && peek(p).kind == TOK_KW_FUNCTION && !peek(p).newline_before {
+        i32 fstart = p.cur.start;
         advance(p);
         advance(p);
-        return parse_function_rest(p, NF_ASYNC, false);
+        return parse_function_rest(p, NF_ASYNC, false, fstart);
     }
     if k == TOK_IDENT || is_ctx_ident(k) {
         Node* n = nnew(p, N_IDENT);
@@ -855,8 +860,9 @@ private Node* parse_primary(Parser* p) {
         return n;
     }
     if k == TOK_KW_FUNCTION {
+        i32 fstart = p.cur.start;
         advance(p);
-        return parse_function_rest(p, 0, false);
+        return parse_function_rest(p, 0, false, fstart);
     }
     if k == TOK_KW_CLASS { return parse_class(p, 0, false); }
     if k == TOK_KW_IMPORT {
@@ -1219,18 +1225,25 @@ Node* parse_assign(Parser* p) {
     }
     if k == TOK_KW_ASYNC && !peek(p).newline_before {
         Token pk = peek(p);
+        // an async arrow reads from `async`, not from its parameter list
+        i32 astart = p.cur.start;
         if (pk.kind == TOK_IDENT || is_ctx_ident(pk.kind)) && pk.kind != TOK_KW_ASYNC {
             PState st = psave(p);
             advance(p);
             if peek(p).kind == TOK_ARROW {
-                return ident_arrow(p, NF_ASYNC);
+                Node* ar = ident_arrow(p, NF_ASYNC);
+                ar.span.start = astart;
+                return ar;
             }
             prestore(p, st);
         } else if pk.kind == TOK_LPAREN || pk.kind == TOK_LT {
             PState st = psave(p);
             advance(p);
             Node* ar = try_arrow(p, NF_ASYNC);
-            if ar != null { return ar; }
+            if ar != null {
+                ar.span.start = astart;
+                return ar;
+            }
             prestore(p, st);
         }
     }
@@ -1471,6 +1484,10 @@ private Node* parse_class_member(Parser* p) {
     }
     Node* m = nnew(p, N_CLASS_MEMBER);
     i32 fnflags = 0;
+    // where the method's own text starts: at get/set/async if it has one,
+    // else at the star or the name. `static` and the TypeScript modifiers
+    // sit in front of that and are not part of it.
+    i32 fstart = -1;
     while true {
         i32 k = p.cur.kind;
         i32 add = -1;
@@ -1484,9 +1501,13 @@ private Node* parse_class_member(Parser* p) {
             || k == TOK_KW_PROTECTED || k == TOK_KW_OVERRIDE { add = 0; }
         if add < 0 { break; }
         if !starts_member_name(peek(p)) { break; }
+        if fstart < 0 && (add == NF_ASYNC || add == NF_GETTER || add == NF_SETTER) {
+            fstart = p.cur.start;
+        }
         m.flags |= add;
         advance(p);
     }
+    if fstart < 0 { fstart = p.cur.start; }
     if eat(p, TOK_STAR) { fnflags |= NF_GENERATOR; }
     if at(p, TOK_LBRACK) {
         // index signature: erased
@@ -1523,7 +1544,7 @@ private Node* parse_class_member(Parser* p) {
         if (m.flags & NF_GENERATOR) != 0 { fnflags |= NF_GENERATOR; }
         // NF_METHOD goes to the function, not the member: class and object
         // methods need unique parameter names
-        m.b = parse_callable(p, fnflags | NF_METHOD);
+        m.b = parse_callable(p, fnflags | NF_METHOD, fstart);
         if fnflags != 0 { m.flags |= fnflags; }
         return nfin(p, m);
     }
@@ -1827,12 +1848,14 @@ private Node* parse_export_decl(Parser* p) {
         n.flags |= NF_DEFAULT;
         advance(p);
         if at(p, TOK_KW_FUNCTION) {
+            i32 fstart = p.cur.start;
             advance(p);
-            n.a = parse_function_rest(p, 0, false);
+            n.a = parse_function_rest(p, 0, false, fstart);
         } else if at(p, TOK_KW_ASYNC) && peek(p).kind == TOK_KW_FUNCTION {
+            i32 fstart = p.cur.start;
             advance(p);
             advance(p);
-            n.a = parse_function_rest(p, NF_ASYNC, false);
+            n.a = parse_function_rest(p, NF_ASYNC, false, fstart);
         } else if at(p, TOK_KW_CLASS) {
             n.a = parse_class(p, 0, false);
         } else if at(p, TOK_KW_ABSTRACT) && peek(p).kind == TOK_KW_CLASS {
@@ -1916,13 +1939,15 @@ Node* parse_statement(Parser* p) {
         return parse_var_stmt(p);
     }
     if k == TOK_KW_FUNCTION {
+        i32 fstart = p.cur.start;
         advance(p);
-        return parse_function_rest(p, 0, true);
+        return parse_function_rest(p, 0, true, fstart);
     }
     if k == TOK_KW_ASYNC && peek(p).kind == TOK_KW_FUNCTION && !peek(p).newline_before {
+        i32 fstart = p.cur.start;
         advance(p);
         advance(p);
-        return parse_function_rest(p, NF_ASYNC, true);
+        return parse_function_rest(p, NF_ASYNC, true, fstart);
     }
     if k == TOK_KW_CLASS { return parse_class(p, 0, true); }
     if k == TOK_KW_ABSTRACT && peek(p).kind == TOK_KW_CLASS {

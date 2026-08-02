@@ -1391,7 +1391,15 @@ Value module_require(VM* vm, str importer_path, str spec) {
         str owned_name;
         owned_name.data = nb;
         owned_name.len = resolved.len;
-        compiler_set_source(&co, src, owned_name);
+        // The template is rooted for the whole run and its functions hand
+        // their source text back from this buffer, so it is copied rather
+        // than borrowed: the file bytes below are freed on the way out.
+        u8* sb = alloc<u8>(src.len > 0 ? src.len : 1);
+        if src.len > 0 { memcpy(sb, src.data, src.len); }
+        str owned_src;
+        owned_src.data = sb;
+        owned_src.len = src.len;
+        compiler_set_source(&co, owned_src, owned_name);
         FnTemplate* t = compile_cjs_module(&co, prog);
         vm_add_template_root(vm, t);
         gc_root_reset(&vm.heap, cm);

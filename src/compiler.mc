@@ -2019,6 +2019,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     // parsed as a method, so compile_class_expr clears this again for it
     if (f.flags & (NF_ARROW | NF_METHOD)) != 0 { t.not_ctor = true; }
     t.src_name = co.src_name;
+    // what toString hands back, taken from the span the parser recorded
+    t.src_text = co.src;
+    t.src_start = f.span.start;
+    t.src_end = f.span.end;
     // Function.length: count leading params up to the first with a
     // default value or the rest parameter.
     i32 arity = 0;
@@ -2159,6 +2163,9 @@ private void compile_class_expr(Compiler* co, Node* c) {
     }
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
     ct.is_class = true;
+    // a class prints as the whole class, not as its constructor
+    ct.src_start = c.span.start;
+    ct.src_end = c.span.end;
     ct.not_ctor = false;
     if c.name.len > 0 { tmpl_set_name(ct, c.name); }
     vec_push(&ch.subs, ct);
