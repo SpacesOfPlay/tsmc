@@ -1785,31 +1785,38 @@ bool vm_key_array_index(VM* vm, u32 key, u32* out) {
 }
 
 // Own property order per spec: array-index keys in ascending numeric order,
-// then every other key in insertion order. Reorders the list in place so the
-// enumeration sites can keep their plain loops. The scan is a no-op unless the
-// object actually holds out-of-order index keys, which is the common case.
+// then the string keys in insertion order, then the symbol keys in insertion
+// order. Reorders the list in place so the enumeration sites can keep their
+// plain loops. The scan is a no-op unless the object actually holds keys out
+// of order, which is the common case.
 void vm_props_order(VM* vm, PropList* p) {
     i32 nidx = 0;
     bool ordered = true;
     bool seen_other = false;
+    bool seen_sym = false;
     u32 prev = 0;
     for i32 i = 0; i < p.len; i++ {
+        u32 key = (p.items + i).key;
         u32 iv = 0;
-        if vm_key_array_index(vm, (p.items + i).key, &iv) {
-            if seen_other || (nidx > 0 && iv < prev) { ordered = false; }
+        if (key & 0x80000000) != 0 {
+            seen_sym = true;
+        } else if vm_key_array_index(vm, key, &iv) {
+            if seen_other || seen_sym || (nidx > 0 && iv < prev) { ordered = false; }
             prev = iv;
             nidx++;
         } else {
+            if seen_sym { ordered = false; }
             seen_other = true;
         }
     }
-    if nidx == 0 || ordered { return; }
+    if ordered { return; }
 
     Prop* out = alloc<Prop>(p.len);
     i32 n = 0;
     // index keys first, kept sorted as they are inserted
     for i32 i = 0; i < p.len; i++ {
         u32 iv = 0;
+        if ((p.items + i).key & 0x80000000) != 0 { continue; }
         if !vm_key_array_index(vm, (p.items + i).key, &iv) { continue; }
         i32 at = n;
         while at > 0 {
@@ -1822,10 +1829,17 @@ void vm_props_order(VM* vm, PropList* p) {
         *(out + at) = *(p.items + i);
         n++;
     }
-    // then the rest, in insertion order
+    // then the string keys, in insertion order
     for i32 i = 0; i < p.len; i++ {
         u32 iv = 0;
+        if ((p.items + i).key & 0x80000000) != 0 { continue; }
         if vm_key_array_index(vm, (p.items + i).key, &iv) { continue; }
+        *(out + n) = *(p.items + i);
+        n++;
+    }
+    // and the symbol keys last
+    for i32 i = 0; i < p.len; i++ {
+        if ((p.items + i).key & 0x80000000) == 0 { continue; }
         *(out + n) = *(p.items + i);
         n++;
     }
@@ -2020,24 +2034,66 @@ private bool inspect_ident_key(str k) {
     return true;
 }
 
+// Node's terminal width. Every layout decision below is relative to it: what
+// fits on one line stays on one line.
+const i32 INSPECT_WIDTH = 80;
+// How many entries of an array or a collection are shown before the rest are
+// counted off.
+const i32 INSPECT_MAX_ENTRIES = 100;
+// How much of a string is shown when it is being quoted.
+const i32 INSPECT_MAX_STRING = 10000;
+
+// One inspection's bookkeeping: what is currently being formatted (to spot a
+// cycle) and which of those a cycle pointed back at (position gives the id
+// node prints).
+private struct InspectCtx {
+    Vec<u64> seen;
+    Vec<u64> circ;
+}
+
+private i32 inspect_circ_id(InspectCtx* cx, u64 id) {
+    for i32 i = 0; i < cx.circ.len; i++ {
+        if vec_get(&cx.circ, i) == id { return i + 1; }
+    }
+    return 0;
+}
+
 private void inspect_quoted(str_buf* sb, str s) {
-    // Single quotes, unless the text carries one of its own and no double
-    // quote -- then double quotes read better than an escape. Node chooses the
-    // delimiter the same way.
+    // Single quotes, unless the text carries one of its own: then double
+    // quotes, or a backtick when it carries both. Node picks the delimiter the
+    // same way, and escapes the control characters whichever it picks.
     bool has_single = false;
     bool has_double = false;
+    bool has_back = false;
     for i32 i = 0; i < s.len; i++ {
         u8 c = *(s.data + i);
         if c == '\'' { has_single = true; }
         if c == '"' { has_double = true; }
+        if c == '`' { has_back = true; }
+        if c == '$' && i + 1 < s.len && *(s.data + i + 1) == '{' { has_back = true; }
     }
-    u8 q = has_single && !has_double ? cast(u8, '"') : cast(u8, '\'');
+    u8 q = cast(u8, '\'');
+    if has_single && !has_double { q = cast(u8, '"'); }
+    else if has_single && has_double && !has_back { q = cast(u8, '`'); }
+    i32 shown = s.len;
+    if shown > INSPECT_MAX_STRING { shown = INSPECT_MAX_STRING; }
+    str hexd = "0123456789ABCDEF";
     str_buf_add_byte(sb, q);
-    for i32 i = 0; i < s.len; i++ {
+    for i32 i = 0; i < shown; i++ {
         u8 c = *(s.data + i);
         if c == q { str_buf_add(sb, "\\"); str_buf_add_byte(sb, c); }
         else if c == '\\' { str_buf_add(sb, "\\\\"); }
         else if c == '\n' { str_buf_add(sb, "\\n"); }
+        else if c == '\t' { str_buf_add(sb, "\\t"); }
+        else if c == '\r' { str_buf_add(sb, "\\r"); }
+        else if c == 8 { str_buf_add(sb, "\\b"); }
+        else if c == 11 { str_buf_add(sb, "\\v"); }
+        else if c == 12 { str_buf_add(sb, "\\f"); }
+        else if c < 0x20 || c == 0x7F {
+            str_buf_add(sb, "\\x");
+            str_buf_add_byte(sb, *(hexd.data + (c >> 4)));
+            str_buf_add_byte(sb, *(hexd.data + (c & 15)));
+        }
         else {
             str one;
             one.data = s.data + i;
@@ -2046,13 +2102,19 @@ private void inspect_quoted(str_buf* sb, str s) {
         }
     }
     str_buf_add_byte(sb, q);
+    if s.len > shown {
+        i32 rest = s.len - shown;
+        string more;
+        if rest == 1 { more = format("... {} more character", rest); }
+        else { more = format("... {} more characters", rest); }
+        str_buf_add(sb, more);
+        free(more);
+    }
 }
 
-// Node-like single-line inspect. `nested` quotes strings; the seen set
-// guards cycles; depth bounds recursion.
 // The name console output prefixes an object with: the name of the
-// constructor owned by the nearest prototype that declares one. Empty for a
-// plain object (constructor Object), which is printed without a prefix.
+// constructor owned by the nearest prototype that declares one, and only when
+// the object really is one of those. Empty for a plain object.
 private str inspect_ctor_name(VM* vm, JsObject* o) {
     str none = "";
     u32 ca = atom_intern(&vm.atoms, "constructor");
@@ -2061,12 +2123,27 @@ private str inspect_ctor_name(VM* vm, JsObject* o) {
         Value* c = props_get(&p.props, ca);
         if c != null {
             str nm = none;
+            JsObject* home = null;
             if value_is_function(*c) {
                 FnTemplate* ft = value_as_function(*c).tmpl;
                 if ft != null { nm = ft.name; }
+                Value* pr = props_get(&value_as_function(*c).props, vm.atom_prototype);
+                if pr != null && value_is_object(*pr) { home = value_as_object(*pr); }
             } else if value_is_native(*c) {
                 nm = value_as_native(*c).name;
+                Value* pr = props_get(&value_as_native(*c).props, vm.atom_prototype);
+                if pr != null && value_is_object(*pr) { home = value_as_object(*pr); }
             }
+            // The declared constructor has to be one this object is an
+            // instance of. Object.create({constructor: f}) borrows the name
+            // without inheriting from f, and node ignores it.
+            bool owns = false;
+            JsObject* w = o.proto;
+            while w != null {
+                if w == home { owns = true; }
+                w = w.proto;
+            }
+            if !owns { return none; }
             if nm.len == 0 || str_equal(nm, "Object") { return none; }
             return nm;
         }
@@ -2084,6 +2161,170 @@ private bool inspect_proto_has(JsObject* o, JsObject* p) {
         cur = cur.proto;
     }
     return false;
+}
+
+// An inherited Symbol.toStringTag names the object in front of its braces.
+// An own one does not: it is shown as an ordinary key instead.
+private str inspect_tag(VM* vm, JsObject* o) {
+    str none = "";
+    u32 ta = vm_sym_to_string_tag_id(vm);
+    if props_get(&o.props, ta) != null { return none; }
+    JsObject* p = o.proto;
+    while p != null {
+        Value* t = props_get(&p.props, ta);
+        if t != null {
+            if value_is_string(*t) { return gc_string_view(value_as_string(*t)); }
+            return none;
+        }
+        p = p.proto;
+    }
+    return none;
+}
+
+private void inspect_pad(str_buf* sb, i32 n) {
+    for i32 i = 0; i < n; i++ { str_buf_add_byte(sb, cast(u8, ' ')); }
+}
+
+// Entries are written end to end into one buffer, with a start offset each
+// and a terminating offset, so a length is a subtraction.
+private str inspect_entry(str_buf* eb, Vec<i32>* off, i32 i) {
+    str s;
+    s.data = eb.data + vec_get(off, i);
+    s.len = vec_get(off, i + 1) - vec_get(off, i);
+    return s;
+}
+
+// Node lays short array entries out in columns rather than one per line. The
+// column count comes from the average entry width; each column is padded to
+// its widest member, to the right for numbers and to the left otherwise.
+// False when the entries are too wide for that to help.
+private bool inspect_group(str_buf* eb, Vec<i32>* off, i32 indent, bool numeric,
+                           bool has_more, str_buf* rows, Vec<i32>* roff) {
+    i32 n = off.len - 1;
+    i32 count = has_more ? n - 1 : n;
+    if count < 1 { return false; }
+    i32 total = 0;
+    i32 maxlen = 0;
+    for i32 i = 0; i < count; i++ {
+        i32 l = inspect_entry(eb, off, i).len;
+        total += l + 2;
+        if l > maxlen { maxlen = l; }
+    }
+    i32 amax = maxlen + 2;
+    if amax * 3 + indent >= INSPECT_WIDTH { return false; }
+    if cast(f64, total) / cast(f64, amax) <= 5.0 && maxlen > 6 { return false; }
+    f64 bias = sqrt(cast(f64, amax) - cast(f64, total) / cast(f64, n));
+    f64 bmax = cast(f64, amax) - 3.0 - bias;
+    if bmax < 1.0 { bmax = 1.0; }
+    i32 columns = cast(i32, floor(sqrt(2.5 * bmax * cast(f64, count)) / bmax + 0.5));
+    i32 fitting = (INSPECT_WIDTH - indent) / amax;
+    if columns > fitting { columns = fitting; }
+    if columns > 12 { columns = 12; }
+    if columns <= 1 { return false; }
+    Vec<i32> width = vec_new<i32>(columns);
+    for i32 c = 0; c < columns; c++ {
+        i32 w = 0;
+        i32 j = c;
+        while j < count {
+            i32 l = inspect_entry(eb, off, j).len;
+            if l > w { w = l; }
+            j += columns;
+        }
+        vec_push(&width, w + 2);
+    }
+    i32 i = 0;
+    while i < count {
+        i32 last = i + columns;
+        if last > count { last = count; }
+        vec_push(roff, rows.len);
+        for i32 j = i; j < last; j++ {
+            str e = inspect_entry(eb, off, j);
+            i32 w = vec_get(&width, j - i);
+            if j < last - 1 {
+                if numeric { inspect_pad(rows, w - 2 - e.len); }
+                str_buf_add(rows, e);
+                str_buf_add(rows, ", ");
+                if !numeric { inspect_pad(rows, w - 2 - e.len); }
+            } else {
+                if numeric { inspect_pad(rows, w - 2 - e.len); }
+                str_buf_add(rows, e);
+            }
+        }
+        i = last;
+    }
+    if has_more {
+        vec_push(roff, rows.len);
+        str_buf_add(rows, inspect_entry(eb, off, n - 1));
+    }
+    vec_push(roff, rows.len);
+    vec_free(&width);
+    return true;
+}
+
+// Entries onto one line if they fit in the width, else one per line at this
+// indentation. `head` is what sits in front of the brace (a constructor name,
+// a collection's size); `base` is a function's own rendering, which keeps its
+// braces only when it carries properties.
+private void inspect_layout(str_buf* sb, str prefix, str head, str base, bool arraylike,
+                            str_buf* eb, Vec<i32>* off, i32 indent,
+                            bool group, bool numeric, bool has_more) {
+    i32 n = off.len - 1;
+    if prefix.len > 0 { str_buf_add(sb, prefix); }
+    if base.len > 0 {
+        str_buf_add(sb, base);
+        if n == 0 { return; }
+        str_buf_add(sb, " ");
+    }
+    str_buf_add(sb, head);
+    if n == 0 {
+        str_buf_add(sb, arraylike ? "[]" : "{}");
+        return;
+    }
+    str_buf rows;
+    str_buf_init(&rows);
+    Vec<i32> roff = vec_new<i32>(8);
+    bool grouped = false;
+    if group && n > 6 {
+        grouped = inspect_group(eb, off, indent, numeric, has_more, &rows, &roff);
+    }
+    bool one_line = !grouped;
+    if one_line {
+        i32 total = n + n + indent + head.len + 1 + base.len + 10;
+        if total + n > INSPECT_WIDTH { one_line = false; }
+        for i32 i = 0; i < n; i++ {
+            if !one_line { break; }
+            str e = inspect_entry(eb, off, i);
+            total += e.len;
+            if total > INSPECT_WIDTH { one_line = false; }
+            for i32 k = 0; k < e.len; k++ {
+                if *(e.data + k) == '\n' { one_line = false; }
+            }
+        }
+    }
+    str_buf_add(sb, arraylike ? "[" : "{");
+    if one_line {
+        str_buf_add(sb, " ");
+        for i32 i = 0; i < n; i++ {
+            if i > 0 { str_buf_add(sb, ", "); }
+            str_buf_add(sb, inspect_entry(eb, off, i));
+        }
+        str_buf_add(sb, " ");
+    } else {
+        str_buf* src = grouped ? &rows : eb;
+        Vec<i32>* soff = grouped ? &roff : off;
+        i32 rn = soff.len - 1;
+        for i32 i = 0; i < rn; i++ {
+            if i > 0 { str_buf_add(sb, ","); }
+            str_buf_add(sb, "\n");
+            inspect_pad(sb, indent + 2);
+            str_buf_add(sb, inspect_entry(src, soff, i));
+        }
+        str_buf_add(sb, "\n");
+        inspect_pad(sb, indent);
+    }
+    str_buf_add(sb, arraylike ? "]" : "}");
+    str_buf_free(&rows);
+    vec_free(&roff);
 }
 
 // Renders an object whose meaning is not in its enumerable properties: an
@@ -2167,16 +2408,97 @@ private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
         if value_is_string(*pv) { str_buf_add(sb, "String: "); }
         else if value_is_bool(*pv) { str_buf_add(sb, "Boolean: "); }
         else { str_buf_add(sb, "Number: "); }
-        Vec<u64> inner = vec_new<u64>(2);
-        inspect_into(vm, sb, *pv, 0, true, &inner);
-        vec_free(&inner);
+        InspectCtx inner;
+        inner.seen = vec_new<u64>(2);
+        inner.circ = vec_new<u64>(2);
+        inspect_into(vm, sb, *pv, 0, true, &inner, 0);
+        vec_free(&inner.seen);
+        vec_free(&inner.circ);
         str_buf_add(sb, "]");
         return true;
     }
     return false;
 }
 
-private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, Vec<u64>* seen) {
+// A function's own rendering, before any properties it carries.
+private void inspect_fn_base(VM* vm, str_buf* sb, Value v) {
+    str nm;
+    nm.data = null;
+    nm.len = 0;
+    bool is_class = false;
+    bool is_gen = false;
+    bool is_async = false;
+    if value_is_native(v) { nm = value_as_native(v).name; }
+    else if value_as_function(v).tmpl != null {
+        FnTemplate* ft = value_as_function(v).tmpl;
+        nm = ft.name;
+        is_class = ft.is_class;
+        is_gen = ft.is_gen;
+        is_async = ft.is_async;
+    }
+    if is_class {
+        str_buf_add(sb, "[class ");
+        if nm.len > 0 { str_buf_add(sb, nm); } else { str_buf_add(sb, "(anonymous)"); }
+        // the class it extends, which is its own [[Prototype]]
+        Value fp = value_as_function(v).fproto;
+        if value_is_function(fp) && value_as_function(fp).tmpl != null
+            && value_as_function(fp).tmpl.name.len > 0 {
+            str_buf_add(sb, " extends ");
+            str_buf_add(sb, value_as_function(fp).tmpl.name);
+        }
+        str_buf_add(sb, "]");
+        return;
+    }
+    str_buf_add(sb, "[");
+    if is_async { str_buf_add(sb, "Async"); }
+    if is_gen { str_buf_add(sb, "Generator"); }
+    str_buf_add(sb, "Function");
+    if nm.len > 0 {
+        str_buf_add(sb, ": ");
+        str_buf_add(sb, nm);
+    } else {
+        str_buf_add(sb, " (anonymous)");
+    }
+    str_buf_add(sb, "]");
+}
+
+// Own enumerable properties, string-keyed and symbol-keyed, as "key: value"
+// entries. Shared by objects, functions that carry properties, and the tail
+// of an array.
+private void inspect_props(VM* vm, PropList* props, i32 depth, InspectCtx* cx, i32 indent,
+                           str_buf* eb, Vec<i32>* off) {
+    vm_props_order(vm, props);
+    for i32 i = 0; i < props.len; i++ {
+        Prop* pr = props.items + i;
+        if !prop_copyable(vm, pr) { continue; }
+        vec_push(off, eb.len);
+        if (pr.key & 0x80000000) != 0 {
+            string sym = vm_atom_display(vm, pr.key);
+            str_buf_add(eb, "[");
+            str_buf_add(eb, sym);
+            str_buf_add(eb, "]");
+            free(sym);
+        } else {
+            str kn = atom_name(&vm.atoms, pr.key);
+            if inspect_ident_key(kn) { str_buf_add(eb, kn); }
+            else { inspect_quoted(eb, kn); }
+        }
+        str_buf_add(eb, ": ");
+        if value_is_accessor(pr.val) {
+            JsAccessor* ac = value_as_accessor(pr.val);
+            bool has_get = value_is_callable(ac.get);
+            bool has_set = value_is_callable(ac.set);
+            if has_get && has_set { str_buf_add(eb, "[Getter/Setter]"); }
+            else if has_set { str_buf_add(eb, "[Setter]"); }
+            else { str_buf_add(eb, "[Getter]"); }
+        } else {
+            inspect_into(vm, eb, pr.val, depth - 1, true, cx, indent + 2);
+        }
+    }
+}
+
+private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
+                          InspectCtx* cx, i32 indent) {
     if value_is_string(v) {
         if nested { inspect_quoted(sb, gc_string_view(value_as_string(v))); }
         else { str_buf_add(sb, gc_string_view(value_as_string(v))); }
@@ -2202,157 +2524,256 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested, 
         gc_root_reset(&vm.heap, rm);
         return;
     }
-    if value_is_function(v) || value_is_native(v) {
-        str nm;
-        nm.data = null;
-        nm.len = 0;
-        if value_is_native(v) { nm = value_as_native(v).name; }
-        else if value_as_function(v).tmpl != null { nm = value_as_function(v).tmpl.name; }
-        if nm.len > 0 {
-            str_buf_add(sb, "[Function: ");
-            str_buf_add(sb, nm);
-            str_buf_add(sb, "]");
-        } else {
-            str_buf_add(sb, "[Function (anonymous)]");
-        }
+    bool composite = value_is_array(v) || value_is_object(v) || value_is_map(v)
+        || value_is_generator(v) || value_is_function(v) || value_is_native(v);
+    if !composite {
+        str_buf_add(sb, "[object]");
         return;
     }
-    if value_is_array(v) || value_is_object(v) {
-        u64 id = v.bits;
-        for i32 i = 0; i < seen.len; i++ {
-            if vec_get(seen, i) == id { str_buf_add(sb, "[Circular]"); return; }
+    // A value already being formatted is a cycle. Node numbers those and
+    // marks the outermost rendering with a matching label.
+    u64 id = v.bits;
+    for i32 i = 0; i < cx.seen.len; i++ {
+        if vec_get(&cx.seen, i) == id {
+            i32 cid = inspect_circ_id(cx, id);
+            if cid == 0 {
+                vec_push(&cx.circ, id);
+                cid = cx.circ.len;
+            }
+            string s = format("[Circular *{}]", cid);
+            str_buf_add(sb, s);
+            free(s);
+            return;
         }
+    }
+
+    str empty = "";
+    str_buf base;
+    str_buf_init(&base);
+    str_buf head;
+    str_buf_init(&head);
+    str_buf eb;
+    str_buf_init(&eb);
+    Vec<i32> off = vec_new<i32>(8);
+    bool arraylike = false;
+    bool group = false;
+    bool numeric = false;
+    bool has_more = false;
+    bool bail = false;
+
+    vec_push(&cx.seen, id);
+    if value_is_function(v) || value_is_native(v) {
+        inspect_fn_base(vm, &base, v);
+        PropList* props = value_is_native(v) ? &value_as_native(v).props : &value_as_function(v).props;
+        inspect_props(vm, props, depth, cx, indent, &eb, &off);
+    } else if value_is_generator(v) {
+        str_buf_add(&head, value_as_generator(v).is_async ? "Object [AsyncGenerator] " : "Object [Generator] ");
+    } else if value_is_map(v) {
+        JsMap* mp = value_as_map(v);
+        if mp.weak {
+            str_buf_add(&head, mp.is_set ? "WeakSet " : "WeakMap ");
+            vec_push(&off, eb.len);
+            str_buf_add(&eb, "<items unknown>");
+        } else {
+            str_buf_add(&head, mp.is_set ? "Set(" : "Map(");
+            string cnt = format("{}) ", mp.count);
+            str_buf_add(&head, cnt);
+            free(cnt);
+            i32 shown = 0;
+            for i32 i = 0; i < mp.len; i++ {
+                if !*(mp.live + i) { continue; }
+                if shown >= INSPECT_MAX_ENTRIES { break; }
+                shown++;
+                vec_push(&off, eb.len);
+                inspect_into(vm, &eb, *(mp.keys + i), depth - 1, true, cx, indent + 2);
+                if !mp.is_set {
+                    str_buf_add(&eb, " => ");
+                    inspect_into(vm, &eb, *(mp.vals + i), depth - 1, true, cx, indent + 2);
+                }
+            }
+            if mp.count > shown {
+                has_more = true;
+                vec_push(&off, eb.len);
+                string more;
+                if mp.count - shown == 1 { more = format("... {} more item", mp.count - shown); }
+                else { more = format("... {} more items", mp.count - shown); }
+                str_buf_add(&eb, more);
+                free(more);
+            }
+        }
+    } else {
         JsObject* o = value_as_object(v);
-        if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            // node shows what the proxy stands for, not the proxy
+            ignore vec_pop(&cx.seen);
+            str_buf_free(&base);
+            str_buf_free(&head);
+            str_buf_free(&eb);
+            vec_free(&off);
+            inspect_into(vm, sb, cast(JsProxy*, o).target, depth, nested, cx, indent);
+            return;
+        }
+        if vm.arraybuffer_proto != null && o.proto == vm.arraybuffer_proto && o.elen > 0
+            && value_is_bytes(*(o.elems)) {
+            // the bytes are the point of it, the way node shows them
+            str_buf_add(&head, "ArrayBuffer ");
+            GcBytes* gb = value_as_bytes(*(o.elems));
+            i32 blen = gb.len;
+            i32 shown = blen < INSPECT_MAX_ENTRIES ? blen : INSPECT_MAX_ENTRIES;
+            str hexd = "0123456789abcdef";
+            vec_push(&off, eb.len);
+            str_buf_add(&eb, "[Uint8Contents]: <");
+            for i32 i = 0; i < shown; i++ {
+                if i > 0 { str_buf_add(&eb, " "); }
+                u8 by = *(gb_data(gb) + i);
+                str_buf_add_byte(&eb, *(hexd.data + (by >> 4)));
+                str_buf_add_byte(&eb, *(hexd.data + (by & 15)));
+            }
+            if blen > shown {
+                string more;
+                if blen - shown == 1 { more = format(" ... {} more byte", blen - shown); }
+                else { more = format(" ... {} more bytes", blen - shown); }
+                str_buf_add(&eb, more);
+                free(more);
+            }
+            str_buf_add(&eb, ">");
+            vec_push(&off, eb.len);
+            string bl = format("byteLength: {}", blen);
+            str_buf_add(&eb, bl);
+            free(bl);
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
             i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
             i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
             if depth < 0 {
-                // Node shows [TypedArrayName] at the depth limit
                 str_buf_add(sb, "[");
                 str_buf_add(sb, ta_kind_name(kind));
                 str_buf_add(sb, "]");
-                return;
+                bail = true;
+            } else {
+                str_buf_add(&head, ta_kind_name(kind));
+                string hdr = format("({}) ", len);
+                str_buf_add(&head, hdr);
+                free(hdr);
+                arraylike = true;
+                group = true;
+                numeric = true;
+                i32 shown = len < INSPECT_MAX_ENTRIES ? len : INSPECT_MAX_ENTRIES;
+                for i32 i = 0; i < shown; i++ {
+                    vec_push(&off, eb.len);
+                    inspect_into(vm, &eb, vm_ta_get(vm, o, i), depth - 1, true, cx, indent + 2);
+                }
+                if len > shown {
+                    has_more = true;
+                    vec_push(&off, eb.len);
+                    string more;
+                    if len - shown == 1 { more = format("... {} more item", len - shown); }
+                    else { more = format("... {} more items", len - shown); }
+                    str_buf_add(&eb, more);
+                    free(more);
+                }
             }
-            str_buf_add(sb, ta_kind_name(kind));
-            string hdr = format("({}) ", len);
-            str_buf_add(sb, hdr);
-            free(hdr);
-            if len == 0 { str_buf_add(sb, "[]"); return; }
-            str_buf_add(sb, "[ ");
-            for i32 i = 0; i < len; i++ {
-                if i > 0 { str_buf_add(sb, ", "); }
-                inspect_into(vm, sb, vm_ta_get(vm, o, i), depth - 1, true, seen);
-            }
-            str_buf_add(sb, " ]");
-            return;
-        }
-        // Types whose whole value lives in internal slots print as that value.
-        // Falling through to the generic path shows the constructor name and
-        // an empty brace pair -- `Error {}` for a thrown error, which is worse
-        // than useless, since the message and stack are exactly what is wanted.
-        if inspect_special(vm, sb, o, v) { return; }
-
-        bool is_arr = (o.obj_flags & OBJF_ARRAY) != 0;
-        if depth < 0 {
-            str_buf_add(sb, is_arr ? "[Array]" : "[Object]");
-            return;
-        }
-        vec_push(seen, id);
-        if is_arr {
-            if o.elen == 0 { str_buf_add(sb, "[]"); }
-            else {
-                str_buf_add(sb, "[ ");
-                bool first = true;
-                i32 i = 0;
-                while i < o.elen {
-                    if !first { str_buf_add(sb, ", "); }
-                    first = false;
-                    if value_is_hole(js_array_raw(o, i)) {
-                        // coalesce a run of holes into "<N empty item(s)>"
-                        i32 run = 0;
-                        while i < o.elen && value_is_hole(js_array_raw(o, i)) {
-                            run++;
-                            i++;
-                        }
-                        string s;
-                        if run == 1 { s = format("<{} empty item>", run); }
-                        else { s = format("<{} empty items>", run); }
-                        str_buf_add(sb, s);
-                        free(s);
-                    } else {
-                        inspect_into(vm, sb, js_array_get(o, i), depth - 1, true, seen);
+        } else if inspect_special(vm, sb, o, v) {
+            bail = true;
+        } else if depth < 0 {
+            str_buf_add(sb, (o.obj_flags & OBJF_ARRAY) != 0 ? "[Array]" : "[Object]");
+            bail = true;
+        } else if (o.obj_flags & OBJF_ARRAY) != 0 {
+            arraylike = true;
+            group = true;
+            numeric = true;
+            i32 shown = o.elen < INSPECT_MAX_ENTRIES ? o.elen : INSPECT_MAX_ENTRIES;
+            i32 i = 0;
+            while i < shown {
+                vec_push(&off, eb.len);
+                if value_is_hole(js_array_raw(o, i)) {
+                    // a run of holes counts itself off
+                    i32 run = 0;
+                    while i < shown && value_is_hole(js_array_raw(o, i)) {
+                        run++;
                         i++;
                     }
-                }
-                str_buf_add(sb, " ]");
-            }
-        } else {
-            // Node prefixes an object with its constructor's name unless it is
-            // a plain one, and marks a null prototype.
-            if o.proto == null {
-                str_buf_add(sb, "[Object: null prototype] ");
-            } else {
-                str cn = inspect_ctor_name(vm, o);
-                if cn.len > 0 {
-                    str_buf_add(sb, cn);
-                    str_buf_add(sb, " ");
-                }
-            }
-            i32 n = 0;
-            str_buf tmp;
-            str_buf_init(&tmp);
-            vm_props_order(vm, &o.props);
-            for i32 i = 0; i < o.props.len; i++ {
-                u32 key = (o.props.items + i).key;
-                if !prop_enumerable(vm, o.props.items + i) { continue; }
-                if n > 0 { str_buf_add(&tmp, ", "); }
-                str kn = atom_name(&vm.atoms, key);
-                if inspect_ident_key(kn) { str_buf_add(&tmp, kn); }
-                else { inspect_quoted(&tmp, kn); }
-                str_buf_add(&tmp, ": ");
-                Value pv = (o.props.items + i).val;
-                if value_is_accessor(pv) {
-                    str_buf_add(&tmp, "[Getter]");
+                    string s;
+                    if run == 1 { s = format("<{} empty item>", run); }
+                    else { s = format("<{} empty items>", run); }
+                    str_buf_add(&eb, s);
+                    free(s);
+                    numeric = false;
                 } else {
-                    inspect_into(vm, &tmp, pv, depth - 1, true, seen);
+                    Value el = js_array_get(o, i);
+                    if !value_is_number(el) { numeric = false; }
+                    inspect_into(vm, &eb, el, depth - 1, true, cx, indent + 2);
+                    i++;
                 }
-                n++;
             }
-            if n == 0 { str_buf_add(sb, "{}"); }
-            else {
-                str_buf_add(sb, "{ ");
-                str_buf_add(sb, str_buf_to_str(&tmp));
-                str_buf_add(sb, " }");
+            if o.elen > shown {
+                has_more = true;
+                vec_push(&off, eb.len);
+                string more;
+                if o.elen - shown == 1 { more = format("... {} more item", o.elen - shown); }
+                else { more = format("... {} more items", o.elen - shown); }
+                str_buf_add(&eb, more);
+                free(more);
             }
-            str_buf_free(&tmp);
+            i32 before = off.len;
+            inspect_props(vm, &o.props, depth, cx, indent, &eb, &off);
+            if off.len > before { numeric = false; }
+        } else {
+            // a promise is its state, not its slots
+            Value* st = props_get(&o.props, vm.atom_pstate);
+            if st != null {
+                str_buf_add(&head, "Promise ");
+                i32 state = value_is_int(*st) ? value_as_int(*st) : 0;
+                vec_push(&off, eb.len);
+                if state == 0 { str_buf_add(&eb, "<pending>"); }
+                else {
+                    if state == 2 { str_buf_add(&eb, "<rejected> "); }
+                    Value* pval = props_get(&o.props, vm.atom_pvalue);
+                    if pval != null {
+                        inspect_into(vm, &eb, *pval, depth - 1, true, cx, indent + 2);
+                    }
+                }
+            } else {
+                if o.proto == null {
+                    str_buf_add(&head, "[Object: null prototype] ");
+                } else {
+                    str cn = inspect_ctor_name(vm, o);
+                    str tag = inspect_tag(vm, o);
+                    if tag.len > 0 && !str_equal(tag, cn) {
+                        str_buf_add(&head, cn.len > 0 ? cn : "Object");
+                        str_buf_add(&head, " [");
+                        str_buf_add(&head, tag);
+                        str_buf_add(&head, "] ");
+                    } else if cn.len > 0 {
+                        str_buf_add(&head, cn);
+                        str_buf_add(&head, " ");
+                    }
+                }
+                inspect_props(vm, &o.props, depth, cx, indent, &eb, &off);
+            }
         }
-        ignore vec_pop(seen);
-        return;
     }
-    if value_is_map(v) {
-        JsMap* mp = value_as_map(v);
-        if mp.is_set { str_buf_add(sb, "Set("); } else { str_buf_add(sb, "Map("); }
-        string cnt = format("{}", mp.count);
-        str_buf_add(sb, cnt);
-        free(cnt);
-        str_buf_add(sb, ") ");
-        if mp.count == 0 { str_buf_add(sb, "{}"); return; }
-        str_buf_add(sb, "{ ");
-        i32 n = 0;
-        for i32 i = 0; i < mp.len; i++ {
-            if !*(mp.live + i) { continue; }
-            if n > 0 { str_buf_add(sb, ", "); }
-            inspect_into(vm, sb, *(mp.keys + i), depth - 1, true, seen);
-            if !mp.is_set {
-                str_buf_add(sb, " => ");
-                inspect_into(vm, sb, *(mp.vals + i), depth - 1, true, seen);
-            }
-            n++;
+    ignore vec_pop(&cx.seen);
+    if !bail {
+        vec_push(&off, eb.len);
+        str_buf pre;
+        str_buf_init(&pre);
+        i32 cid = inspect_circ_id(cx, id);
+        if cid > 0 {
+            string s = format("<ref *{}> ", cid);
+            str_buf_add(&pre, s);
+            free(s);
         }
-        str_buf_add(sb, " }");
-        return;
+        str prefix = pre.len > 0 ? str_buf_to_str(&pre) : empty;
+        str headv = head.len > 0 ? str_buf_to_str(&head) : empty;
+        str basev = base.len > 0 ? str_buf_to_str(&base) : empty;
+        inspect_layout(sb, prefix, headv, basev, arraylike, &eb, &off, indent,
+            group, numeric, has_more);
+        str_buf_free(&pre);
     }
-    str_buf_add(sb, "[object]");
+    str_buf_free(&base);
+    str_buf_free(&head);
+    str_buf_free(&eb);
+    vec_free(&off);
 }
 
 // Display form for console: primitives as ToString (with -0 shown),
@@ -2376,9 +2797,12 @@ const i32 INSPECT_DEPTH = 2;
 Value vm_inspect_depth(VM* vm, Value v, i32 depth) {
     str_buf sb;
     str_buf_init(&sb);
-    Vec<u64> seen = vec_new<u64>(8);
-    inspect_into(vm, &sb, v, depth, false, &seen);
-    vec_free(&seen);
+    InspectCtx cx;
+    cx.seen = vec_new<u64>(8);
+    cx.circ = vec_new<u64>(4);
+    inspect_into(vm, &sb, v, depth, false, &cx, 0);
+    vec_free(&cx.seen);
+    vec_free(&cx.circ);
     GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
     str_buf_free(&sb);
     return value_cell(&g.head);
@@ -2387,7 +2811,7 @@ Value vm_inspect_depth(VM* vm, Value v, i32 depth) {
 Value js_console_string(VM* vm, Value v) {
     if value_is_object(v) || value_is_array(v) || value_is_map(v)
         || value_is_function(v) || value_is_native(v) || value_is_bigint(v)
-        || value_is_symbol(v)
+        || value_is_symbol(v) || value_is_generator(v)
         || (value_is_double(v) && value_as_f64(v) == 0.0 && 1.0 / value_as_f64(v) < 0.0) {
         return vm_inspect_depth(vm, v, INSPECT_DEPTH);
     }
