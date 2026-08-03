@@ -201,13 +201,33 @@ run_tests() {
     # GC stress: re-run every golden and differential script with
     # collect-on-every-allocation, catching use-after-free / missing roots.
     # Only a clean exit (0) is asserted, not output — slow but thorough.
+    #
+    # A script that never finishes is reported by name rather than left to
+    # hold the suite open. `timeout` is not on a stock macOS, so the wait is
+    # done by hand. GC_STRESS_TIMEOUT overrides the limit (seconds).
     step "gc stress"
     n_stress=0
     n_stress_fail=0
+    stress_limit="${GC_STRESS_TIMEOUT:-60}"
     for f in "$PROJECT_DIR"/test/run/*.ts "$PROJECT_DIR"/test/diff/*.js "$PROJECT_DIR"/test/diff/*.mjs; do
         [ -e "$f" ] || continue
         n_stress=$((n_stress + 1))
-        if ! "$OUT_EXE" --gc-stress "$f" > /dev/null 2>&1; then
+        "$OUT_EXE" --gc-stress "$f" > /dev/null 2>&1 &
+        stress_pid=$!
+        waited=0
+        while kill -0 "$stress_pid" 2>/dev/null && [ "$waited" -lt "$stress_limit" ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$stress_pid" 2>/dev/null; then
+            kill -9 "$stress_pid" 2>/dev/null
+            wait "$stress_pid" 2>/dev/null
+            fail "$(basename "$f") (--gc-stress still running after ${stress_limit}s)"
+            n_stress_fail=$((n_stress_fail + 1))
+            continue
+        fi
+        wait "$stress_pid"
+        if [ $? -ne 0 ]; then
             fail "$(basename "$f") (--gc-stress nonzero exit)"; n_stress_fail=$((n_stress_fail + 1))
         fi
     done

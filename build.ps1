@@ -183,10 +183,29 @@ function Run-Tests {
     $stressScripts = @($runTests) +
         @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.js") -ErrorAction SilentlyContinue) +
         @(Get-ChildItem (Join-Path $ProjectDir "test\diff\*.mjs") -ErrorAction SilentlyContinue) | Sort-Object Name
+    # A script that never finishes is reported by name rather than left to
+    # hold the suite open. GC_STRESS_TIMEOUT overrides the limit (seconds).
     $stressFail = 0
+    $stressLimit = if ($env:GC_STRESS_TIMEOUT) { [int]$env:GC_STRESS_TIMEOUT } else { 60 }
     foreach ($f in $stressScripts) {
-        & $OutExe "--gc-stress" $f.FullName > $null 2> $null
-        if ($LASTEXITCODE -ne 0) { Fail "$($f.BaseName) (--gc-stress exit $LASTEXITCODE)"; $stressFail++ }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $OutExe
+        $psi.Arguments = "--gc-stress `"$($f.FullName)`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # read both pipes as they fill: a chatty script would otherwise block
+        # on a full buffer, which looks exactly like the hang being watched for
+        $null = $proc.StandardOutput.ReadToEndAsync()
+        $null = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit($stressLimit * 1000)) {
+            $proc.Kill()
+            Fail "$($f.BaseName) (--gc-stress still running after ${stressLimit}s)"
+            $stressFail++
+            continue
+        }
+        if ($proc.ExitCode -ne 0) { Fail "$($f.BaseName) (--gc-stress exit $($proc.ExitCode))"; $stressFail++ }
     }
     if ($stressScripts.Count -eq 0) { Write-Host "  (none)" }
     elseif ($stressFail -eq 0) { Pass "$($stressScripts.Count) scripts clean under --gc-stress"; $pass++ }

@@ -131,7 +131,10 @@ async function main() {
     }
     res.end('quick');
   });
-  await new Promise((r) => server.listen(0, r));
+  // bound to the loopback address on purpose: listening on every interface
+  // asks the macOS firewall for permission, and a denied prompt leaves this
+  // waiting for a connection that never arrives
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = 'http://127.0.0.1:' + server.address().port;
 
   try {
