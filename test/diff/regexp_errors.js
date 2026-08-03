@@ -5,12 +5,9 @@
 // written, and a validation regex that never matches looks like a data
 // problem rather than a typo.
 //
-// Not checked: the v flag's set notation. [\p{ASCII}--[a-z]], [[a-z]&&[aeiou]],
-// nested classes and \q{} are refused here with a SyntaxError, where node
-// accepts them. That is a loud gap rather than a silent one — the previous
-// behaviour was to read them as something else entirely and match nothing —
-// but it is still a gap, and the cases below stay away from it. Simple v
-// patterns work and are checked.
+// The v flag's set notation lives in regexp_v_flag.js. The one part of it
+// still refused here is \q{...}, which makes a class match a whole string
+// rather than one character.
 
 const rows = [];
 function T(label, fn) {

@@ -98,7 +98,8 @@ struct RxParser {
     bool failed;
     bool unicode;           // the /u or /v flag: code-point mode
     bool sets;              // the /v flag: set notation, which is not supported
-    i32 max_backref;        // highest -style reference seen
+    i32 max_backref;        // highest backreference index seen
+    bool v_range;           // the v-mode operand just read was a range
     bool in_class;          // inside [...], where more escapes are legal
     Vec<RxClass> classes;   // owns range arrays until moved into prog
     Vec<RxGroupName> gnames;
@@ -343,6 +344,92 @@ private bool parse_uniprop(RxParser* p, Vec<RxRange>* rs, bool negated) {
     return true;
 }
 
+// Sorted by start, with anything overlapping or touching merged, which is
+// what lets the two set operations below walk a pair of lists in step.
+private void ranges_normalize(Vec<RxRange>* rs) {
+    for i32 i = 1; i < rs.len; i++ {
+        RxRange cur = vec_get(rs, i);
+        i32 j = i - 1;
+        while j >= 0 && (rs.data + j).lo > cur.lo {
+            *(rs.data + j + 1) = *(rs.data + j);
+            j--;
+        }
+        *(rs.data + j + 1) = cur;
+    }
+    i32 w = 0;
+    for i32 i = 0; i < rs.len; i++ {
+        RxRange r = vec_get(rs, i);
+        if r.hi < r.lo { continue; }
+        if w > 0 && r.lo <= (rs.data + w - 1).hi + 1 {
+            if r.hi > (rs.data + w - 1).hi { (rs.data + w - 1).hi = r.hi; }
+            continue;
+        }
+        *(rs.data + w) = r;
+        w++;
+    }
+    rs.len = w;
+}
+
+private void ranges_copy_back(Vec<RxRange>* dst, Vec<RxRange>* src) {
+    dst.len = 0;
+    for i32 i = 0; i < src.len; i++ { vec_push(dst, vec_get(src, i)); }
+}
+
+// a becomes a minus b.
+private void ranges_subtract(Vec<RxRange>* a, Vec<RxRange>* b) {
+    ranges_normalize(a);
+    ranges_normalize(b);
+    Vec<RxRange> out = vec_new<RxRange>(a.len + 1);
+    for i32 i = 0; i < a.len; i++ {
+        i32 lo = vec_get(a, i).lo;
+        i32 hi = vec_get(a, i).hi;
+        for i32 j = 0; j < b.len; j++ {
+            if lo > hi { break; }
+            RxRange cut = vec_get(b, j);
+            if cut.hi < lo || cut.lo > hi { continue; }
+            if cut.lo > lo { class_add(&out, lo, cut.lo - 1); }
+            lo = cut.hi + 1;
+        }
+        if lo <= hi { class_add(&out, lo, hi); }
+    }
+    ranges_copy_back(a, &out);
+    vec_free(&out);
+}
+
+// a becomes a and b.
+private void ranges_intersect(Vec<RxRange>* a, Vec<RxRange>* b) {
+    ranges_normalize(a);
+    ranges_normalize(b);
+    Vec<RxRange> out = vec_new<RxRange>(a.len + 1);
+    for i32 i = 0; i < a.len; i++ {
+        RxRange x = vec_get(a, i);
+        for i32 j = 0; j < b.len; j++ {
+            RxRange y = vec_get(b, j);
+            i32 lo = x.lo > y.lo ? x.lo : y.lo;
+            i32 hi = x.hi < y.hi ? x.hi : y.hi;
+            if lo <= hi { class_add(&out, lo, hi); }
+        }
+    }
+    ranges_copy_back(a, &out);
+    vec_free(&out);
+}
+
+// Everything the set does not hold, over the whole code-point space. The
+// byte-range complement below is the Annex B one and is not this.
+private void ranges_complement(Vec<RxRange>* rs) {
+    ranges_normalize(rs);
+    Vec<RxRange> out = vec_new<RxRange>(rs.len + 1);
+    i32 prev = 0;
+    for i32 i = 0; i < rs.len; i++ {
+        RxRange r = vec_get(rs, i);
+        if r.lo > prev { class_add(&out, prev, r.lo - 1); }
+        prev = r.hi + 1;
+    }
+    if prev <= 0x10FFFF { class_add(&out, prev, 0x10FFFF); }
+    ranges_copy_back(rs, &out);
+    vec_free(&out);
+}
+
 // Complement of [lo..hi] style set over 0..255 given the base ranges.
 private void add_negated(Vec<RxRange>* dst, Vec<RxRange>* base) {
     // mark covered bytes, then emit gaps
@@ -474,6 +561,166 @@ private bool is_class_escape(u8 c) {
         || c == 'p' || c == 'P';
 }
 
+// --- v-mode classes -------------------------------------------------------
+//
+// The v flag adds set notation: [[a-z][0-9]] unions, [a-z--[aeiou]] subtracts,
+// [[a-z]&&[aeiou]] intersects, and a class may nest. A class is a union of
+// operands unless it is a -- or && chain, and the two cannot be mixed.
+//
+// Not implemented: \q{...} string literals and the properties of strings, both
+// of which make a class match more than one character. Those are refused.
+
+// In v mode these have to be escaped to stand for themselves.
+private bool v_reserved(u8 c) {
+    return c == '(' || c == ')' || c == '{' || c == '}' || c == '/' || c == '|';
+}
+
+// A doubled punctuator is reserved for future operators; -- and && are the
+// two that exist, and are read before this is asked.
+private bool v_double_punct(u8 c) {
+    return c == '!' || c == '#' || c == '$' || c == '%' || c == '*' || c == '+'
+        || c == ',' || c == '.' || c == ':' || c == ';' || c == '<' || c == '='
+        || c == '>' || c == '?' || c == '@' || c == '^' || c == '`' || c == '~'
+        || c == '&' || c == '-';
+}
+
+// One operand: a nested class, a set escape, or a character or range.
+private void parse_v_operand(RxParser* p, Vec<RxRange>* out) {
+    u8 c = px_cur(p);
+    p.v_range = false;
+    if c == '[' {
+        p.pos++;
+        bool neg = false;
+        if px_cur(p) == '^' { neg = true; p.pos++; }
+        parse_v_body(p, out);
+        if px_cur(p) == ']' { p.pos++; } else { p.failed = true; }
+        if neg { ranges_complement(out); }
+        // a range inside the nested class does not make the class one
+        p.v_range = false;
+        return;
+    }
+    if c == '\\' {
+        p.pos++;
+        u8 e = px_cur(p);
+        if e == 'q' { p.failed = true; p.pos++; return; }
+        if e == 'd' { p.pos++; add_digit(out); return; }
+        if e == 'w' { p.pos++; add_word(out); return; }
+        if e == 's' { p.pos++; add_space(out); return; }
+        if e == 'D' || e == 'W' || e == 'S' {
+            p.pos++;
+            if e == 'D' { add_digit(out); }
+            else if e == 'W' { add_word(out); }
+            else { add_space(out); }
+            ranges_complement(out);
+            return;
+        }
+        if (e == 'p' || e == 'P') && px_at(p, p.pos + 1) == '{' {
+            ignore parse_uniprop(p, out, e == 'P');
+            return;
+        }
+        i32 lo = escape_char(p);
+        parse_v_range_tail(p, out, lo);
+        return;
+    }
+    if v_reserved(c) || c == ']' {
+        p.failed = true;
+        p.pos++;
+        return;
+    }
+    if v_double_punct(c) && px_at(p, p.pos + 1) == c {
+        p.failed = true;
+        p.pos += 2;
+        return;
+    }
+    i32 lo = px_read_cp(p);
+    parse_v_range_tail(p, out, lo);
+}
+
+// A single character, or the a-z it turned out to start.
+private void parse_v_range_tail(RxParser* p, Vec<RxRange>* out, i32 lo) {
+    p.v_range = false;
+    if px_cur(p) == '-' && px_at(p, p.pos + 1) != ']' && px_at(p, p.pos + 1) != '-'
+        && p.pos + 1 < p.src.len {
+        p.v_range = true;
+        p.pos++;
+        i32 hi;
+        if px_cur(p) == '\\' {
+            p.pos++;
+            if is_class_escape(px_cur(p)) { p.failed = true; }
+            hi = escape_char(p);
+        } else {
+            hi = px_read_cp(p);
+        }
+        if hi < lo { p.failed = true; }
+        class_add(out, lo, hi);
+        return;
+    }
+    class_add(out, lo, lo);
+}
+
+// The contents between the brackets. Stops on ']' without consuming it.
+private void parse_v_body(RxParser* p, Vec<RxRange>* out) {
+    if px_cur(p) == ']' { return; }
+    parse_v_operand(p, out);
+    if p.failed { return; }
+    bool first_was_range = p.v_range;
+    i32 chain = 0;   // 0 union, 1 difference, 2 intersection
+    if px_cur(p) == '-' && px_at(p, p.pos + 1) == '-' { chain = 1; }
+    else if px_cur(p) == '&' && px_at(p, p.pos + 1) == '&' { chain = 2; }
+    // an operand is a nested class, a set escape or a single character; a
+    // range is only ever part of a union, so [a-z--[aeiou]] has to be
+    // written [[a-z]--[aeiou]]
+    if chain != 0 && first_was_range { p.failed = true; return; }
+    i32 guard = 0;
+    while p.pos < p.src.len && px_cur(p) != ']' && guard < 10000 {
+        guard++;
+        if chain != 0 {
+            bool sub = px_cur(p) == '-' && px_at(p, p.pos + 1) == '-';
+            bool inter = px_cur(p) == '&' && px_at(p, p.pos + 1) == '&';
+            // one kind of chain per class, and every operand needs its operator
+            if (chain == 1 && !sub) || (chain == 2 && !inter) {
+                p.failed = true;
+                return;
+            }
+            p.pos += 2;
+            if px_cur(p) == '&' || (px_cur(p) == '-' && px_at(p, p.pos + 1) == '-') {
+                p.failed = true;
+                return;
+            }
+        } else if (px_cur(p) == '-' && px_at(p, p.pos + 1) == '-')
+            || (px_cur(p) == '&' && px_at(p, p.pos + 1) == '&') {
+            p.failed = true;
+            return;
+        }
+        Vec<RxRange> item = vec_new<RxRange>(4);
+        parse_v_operand(p, &item);
+        if chain != 0 && p.v_range { p.failed = true; }
+        if chain == 1 { ranges_subtract(out, &item); }
+        else if chain == 2 { ranges_intersect(out, &item); }
+        else { for i32 i = 0; i < item.len; i++ { vec_push(out, vec_get(&item, i)); } }
+        vec_free(&item);
+        if p.failed { return; }
+    }
+}
+
+private RxNode* parse_class_v(RxParser* p) {
+    p.pos++;   // '['
+    bool negate = false;
+    if px_cur(p) == '^' { negate = true; p.pos++; }
+    bool outer_in_class = p.in_class;
+    p.in_class = true;
+    Vec<RxRange> rs = vec_new<RxRange>(4);
+    parse_v_body(p, &rs);
+    p.in_class = outer_in_class;
+    if px_cur(p) == ']' { p.pos++; } else { p.failed = true; }
+    ranges_normalize(&rs);
+    i32 ci = register_class(p, &rs, negate);
+    vec_free(&rs);
+    RxNode* n = rx_node(RN_CLASS);
+    n.cls = ci;
+    return n;
+}
+
 // A set escape has just been read inside a class. In u mode it cannot be one
 // end of a range: [\d-a] is an error there, where Annex B reads the dash as a
 // literal.
@@ -487,11 +734,6 @@ private RxNode* parse_class(RxParser* p) {
     p.pos++;   // '['
     bool negate = false;
     if px_cur(p) == '^' { negate = true; p.pos++; }
-    // The v flag's set notation (nested classes, -- difference, && union of
-    // the intersection kind, \q{} string literals) is not implemented. It is
-    // refused here rather than read as something else: [\p{ASCII}--[a-z]]
-    // would otherwise quietly match nothing.
-    if p.sets { check_no_set_notation(p); }
     bool outer_in_class = p.in_class;
     p.in_class = true;
     Vec<RxRange> rs = vec_new<RxRange>(4);
@@ -571,29 +813,6 @@ private RxNode* parse_class(RxParser* p) {
     RxNode* n = rx_node(RN_CLASS);
     n.cls = ci;
     return n;
-}
-
-// Scans the class about to be parsed for v-mode set notation and refuses it.
-// `p.pos` is just past the opening '['.
-private void check_no_set_notation(RxParser* p) {
-    i32 i = p.pos;
-    i32 depth = 0;
-    while i < p.src.len {
-        u8 c = px_at(p, i);
-        if c == '\\' {
-            if px_at(p, i + 1) == 'q' { p.failed = true; return; }
-            i += 2;
-            continue;
-        }
-        if c == '[' { p.failed = true; return; }
-        if c == ']' {
-            if depth == 0 { return; }
-            depth--;
-        }
-        if c == '-' && px_at(p, i + 1) == '-' { p.failed = true; return; }
-        if c == '&' && px_at(p, i + 1) == '&' { p.failed = true; return; }
-        i++;
-    }
 }
 
 private i32 parse_int(RxParser* p) {
@@ -701,7 +920,7 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         if kind == RN_LOOKBEHIND { g.a = neg_look ? 1 : 0; }
         return g;
     }
-    if c == '[' { return parse_class(p); }
+    if c == '[' { return p.sets ? parse_class_v(p) : parse_class(p); }
     if c == '.' { p.pos++; return rx_node(RN_ANY); }
     if c == '^' { p.pos++; return rx_node(RN_BOL); }
     if c == '$' { p.pos++; return rx_node(RN_EOL); }
@@ -1108,6 +1327,7 @@ RegexProg* regex_compile(str pattern, str flags) {
     p.sets = false;
     p.in_class = false;
     p.max_backref = 0;
+    p.v_range = false;
     for i32 i = 0; i < flags.len; i++ {
         // v implies u's code-point mode, plus set notation on top
         if *(flags.data + i) == 'u' { p.unicode = true; }
