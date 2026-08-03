@@ -5628,12 +5628,15 @@ private Value nat_symbol_description(void* vmp, Value callee, Value thisv, Value
 // created on first use so Symbol.for(k) === Symbol.for(k).
 private Value nat_symbol_for(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    // The key is rooted before the registry is built, not after: creating the
+    // registry allocates, and a key held only in a caller's local would not
+    // survive a collection there.
+    i32 rm = gc_root_mark(&vm.heap);
     Value kv = js_to_string_value(vm, arg_at(args, argc, 0));
+    gc_root(&vm.heap, kv);
     if vm.symbol_registry == null {
         vm.symbol_registry = js_new_object(&vm.heap, null);
     }
-    i32 rm = gc_root_mark(&vm.heap);
-    gc_root(&vm.heap, kv);
     u32 a = atom_intern(&vm.atoms, sview(kv));
     Value existing;
     if js_get_prop(vm.symbol_registry, a, &existing) {
@@ -15237,8 +15240,11 @@ private JsObject* build_util_module(VM* vm) {
     // where nothing here consults it yet.
     Value insp;
     if js_get_prop(mod, bi_atom(vm, "inspect"), &insp) && value_is_native(insp) {
-        Value[1] ka = { new_str(vm, "nodejs.util.inspect.custom") };
+        Value kname = new_str(vm, "nodejs.util.inspect.custom");
+        vm_push(vm, kname);
+        Value[1] ka = { kname };
         Value sym = nat_symbol_for(cast(void*, vm), value_undefined(), value_undefined(), &ka[0], 1);
+        vm_pop(vm);
         props_set_desc(&value_as_native(insp).props, bi_atom(vm, "custom"), sym, 0);
         vm.util_inspect_fn = insp;
     }
@@ -18467,8 +18473,11 @@ void builtins_install(VM* vm) {
     JsNative* symbol_ctor = def_global_fn(vm, "Symbol", &nat_symbol_ctor);
     // util.inspect.custom, registered up front: inspect lives in the VM and
     // needs the key whether or not the util module was ever loaded
-    Value[1] icka = { new_str(vm, "nodejs.util.inspect.custom") };
+    Value icname_v = new_str(vm, "nodejs.util.inspect.custom");
+    vm_push(vm, icname_v);
+    Value[1] icka = { icname_v };
     Value ic = nat_symbol_for(cast(void*, vm), value_undefined(), value_undefined(), &icka[0], 1);
+    vm_pop(vm);
     vm_push(vm, ic);
     str icname;
     vm.sym_inspect_custom = reflect_key(vm, ic, &icname);

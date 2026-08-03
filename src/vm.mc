@@ -3193,7 +3193,10 @@ bool vm_process_emit(VM* vm, str name, Value a, Value b, i32 nargs) {
         gc_root_reset(&vm.heap, rm);
         return false;
     }
+    // the name is a fresh string and the call below allocates, so it has to
+    // be reachable from somewhere the collector looks
     GcString* nm = gc_new_string(&vm.heap, name);
+    gc_root(&vm.heap, value_cell(&nm.head));
     Value[3] ca = { value_cell(&nm.head), a, b };
     Value r = vm_call_value(vm, emit, proc, &ca[0], nargs + 1);
     gc_root_reset(&vm.heap, rm);
