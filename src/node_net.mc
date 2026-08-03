@@ -31,7 +31,11 @@ class Socket extends EventEmitter {
     this.destroyed = false;
   }
   __onReady(revents) {
-    if (this._connecting && (revents & POLLOUT)) {
+    // A finished connect is writable, but a refused one is only reported
+    // that way on some platforms; elsewhere it arrives as POLLHUP with no
+    // POLLOUT. Either way the verdict comes from the socket error, so both
+    // are taken as the connect having completed.
+    if (this._connecting && (revents & (POLLOUT | POLLBAD))) {
       const code = __net_connect_result(this._id);
       if (code === 0) {
         this._connecting = false;
