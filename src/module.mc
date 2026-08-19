@@ -53,14 +53,6 @@ when os(windows) {
         CloseHandle(h);
         return n > 0 && n < cap;
     }
-    extern "kernel32.dll" u32 GetFileAttributesA(u8* path);
-    private bool path_is_dir(str p) {
-        u8* c = str_to_cstr(p);
-        u32 a = GetFileAttributesA(c);
-        free(c);
-        if a == 0xFFFFFFFF { return false; }
-        return (a & 0x10) != 0;   // FILE_ATTRIBUTE_DIRECTORY
-    }
 }
 else when os(macos) || os(ios) {
     extern "libSystem.B.dylib" u8* sys_realpath(u8* path, u8* resolved) from "realpath";
@@ -82,7 +74,6 @@ else when os(wasm) {
     // false canon_into leaves canon_path on its lexical fallback, and
     // no-directory means a specifier resolves as a plain file.
     private bool canon_into(u8* cpath, u8* buf, i32 cap) { return false; }
-    private bool path_is_dir(str p) { return false; }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
@@ -91,15 +82,6 @@ else {
 }
 
 when os(macos) || os(ios) || os(linux) || os(android) {
-    // opendir succeeds only for directories — a layout-free type check.
-    private bool path_is_dir(str p) {
-        u8* c = str_to_cstr(p);
-        void* d = opendir(c);
-        free(c);
-        if d == null { return false; }
-        ignore closedir(d);
-        return true;
-    }
     // resolved buffer must hold PATH_MAX; callers pass 4096.
     private bool canon_into(u8* cpath, u8* buf, i32 cap) {
         return sys_realpath(cpath, buf) != null;
@@ -167,7 +149,8 @@ private str raw_from(str_buf* sb) {
 }
 
 // Joins base dir + relative specifier and normalizes ./ and ../ .
-private str path_join(str dir, str spec) {
+// Distinct from file.mc's path_join, which does not normalize.
+private str path_norm_join(str dir, str spec) {
     str_buf sb;
     str_buf_init(&sb);
     str_buf_add(&sb, dir);
@@ -237,7 +220,7 @@ private str try_candidate(str joined, str suffix) {
 // exact-path try; the rest add an inferred extension or /index.
 private str resolve_specifier(str importer, str spec) {
     str dir = dir_of(importer);
-    str joined = path_join(dir, spec);
+    str joined = path_norm_join(dir, spec);
     str[8] tries = { "", ".ts", ".js", ".mjs", ".mts",
         "/index.ts", "/index.js", "/index.mts" };
     str r;
@@ -739,7 +722,7 @@ private str path_under(str dir, str sub) {
     str_buf_add(&sb, "/");
     str_buf_add(&sb, sub);
     str combined = str_buf_to_str(&sb);
-    str r = path_join(combined, "");
+    str r = path_norm_join(combined, "");
     str_buf_free(&sb);
     return r;
 }

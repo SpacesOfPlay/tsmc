@@ -1,6 +1,6 @@
 # Tests
 
-Run everything with `./build.ps1 test` (Windows) or `./build.sh test`
+Run everything with `minc test`
 (Linux/macOS). The suite must be green before any change lands.
 
 ## Tiers

@@ -1,7 +1,7 @@
 # Benchmarks
 
 Timing workloads for tracking interpreter performance. Run with
-`./build.ps1 bench` (Windows) or `./build.sh bench` (Linux/macOS) —
+`minc bench` —
 each script is timed with the built `tsmc` and its output printed.
 
 Not a CI gate; a tool for spotting regressions and measuring

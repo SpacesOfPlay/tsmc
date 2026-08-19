@@ -139,7 +139,7 @@ project-specific.
   error, 3 not implemented yet.
 - **Tests:** `test/unit/*.mc` standalone programs exiting 0 on pass;
   `test/run/*.ts` + `.expected` golden stdout tests. See
-  `test/README.md`. Keep the suite green: `./build.ps1 test`.
+  `test/README.md`. Keep the suite green: `minc test`.
 
 ## Where to look
 

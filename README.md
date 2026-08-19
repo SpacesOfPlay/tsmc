@@ -101,15 +101,20 @@ Requires the minc compiler, see above. The `MINC` environment variable
 overrides the install dir.
 
 ```
-./build.ps1 build      # Windows      -> build/tsmc.exe
-./build.sh build       # Linux/macOS  -> build/tsmc
-./build.ps1 plugins    # Windows      -> build/tsmc-plugins.exe
-./build.sh plugins     # Linux/macOS  -> build/tsmc-plugins
-./build.ps1 test       # build + run the full test suite (incl. GC stress)
-./build.ps1 diff       # differential test vs a reference node
-./build.ps1 bench      # time bench/*.ts
-./build.ps1 t262       # ECMAScript conformance (test262) — see below
-./build.ps1 clean      # remove build/
+minc build      # -> build/tsmc[.exe]
+minc test       # build + run the full test suite (incl. GC stress)
+minc bench      # time bench/*.ts
+minc clean      # remove build/
+```
+
+The remaining targets have no minc verb, so run the build script
+directly:
+
+```
+minc build.mc -o build/build.exe   # once
+build/build.exe plugins            # -> build/tsmc-plugins[.exe]
+build/build.exe diff               # differential test vs a reference node
+build/build.exe t262               # ECMAScript conformance (test262), see below
 ```
 
 ## Tests
@@ -134,9 +139,9 @@ commit into `vendor/test262/` (gitignored), so any clone reproduces the
 same tests:
 
 ```
-./build.ps1 t262                                 # default: test/language
-./build.sh  t262 test/built-ins/Array
-./build.sh  t262 test/language --limit 500       # sample the first N
+build/build.exe t262                            # default: test/language
+build/build.exe t262 test/built-ins/Array
+build/build.exe t262 test/language --limit 500   # sample the first N
 ```
 
 On Windows the runner is a portable bash script (`tools/test262.sh`)
