@@ -4,8 +4,8 @@ A plugin is minc source that tsmc compiles and loads when a script requires
 it. `require('./demo.mc')` returns a module whose functions are native code.
 
 ```
-./build.ps1 plugins        # Windows      -> build/tsmc-plugins.exe
-./build.sh plugins         # Linux/macOS  -> build/tsmc-plugins
+minc build.mc -o build/build.exe   # once
+build/build.exe plugins            # -> build/tsmc-plugins[.exe]
 ./build/tsmc-plugins.exe examples/plugin/demo.js
 ```
 
@@ -60,4 +60,4 @@ allocation after the unrooted window is.
 - **`require` only.** The ESM resolver has no plugin branch, so `import` of a
   `.mc` file tries to parse it as JavaScript.
 - **Not in the test suite.** It needs a plugin-enabled build and the
-  compiler library, so `./build.ps1 test` does not cover it.
+  compiler library, so `minc test` does not cover it.
