@@ -39,6 +39,11 @@ when os(windows) {
         void* memchr(void* s, i32 c, u64 n);
         u64 strlen(u8* s);
         i32 atoi(u8* s);
+        void abort();
+    }
+    // Math lives in UCRT, and a public extern pair must agree with
+    // lib/math.mc's windows arm on library, symbol and signature.
+    extern "ucrtbase.dll" {
         // fabs, sqrt: provided by the runtime.
         f64 floor(f64 x);
         f64 ceil(f64 x);
@@ -51,10 +56,6 @@ when os(windows) {
         f64 tan(f64 x);
         f64 log(f64 x);
         f64 exp(f64 x);
-        void abort();
-    }
-    // C99 math (round/log2/f32 variants) is in UCRT, not msvcrt.
-    extern "ucrtbase.dll" {
         f64 round(f64 x);
         f64 log2(f64 x);
         f32 sinf(f32 x);
