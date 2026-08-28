@@ -60,6 +60,7 @@ enum Op {
     OP_GETPROP,      // u16 const idx (name)
     OP_SETPROP,      // u16 const idx; pops obj, keeps value
     OP_DEFMETHOD,    // u16 const idx; like SETPROP but non-enumerable
+    OP_DEFMETHOD_DYN,// [obj, key, fn] pops key+fn, keeps obj
     OP_GETINDEX, OP_SETINDEX,
     OP_GETMETHOD,    // u16 const idx; pops obj, pushes fn then obj
     OP_GETMETHOD_DYN,// pops key, obj; pushes fn then obj

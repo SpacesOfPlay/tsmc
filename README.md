@@ -120,11 +120,11 @@ build/build.exe t262               # ECMAScript conformance (test262), see below
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 31
-scripts are checked against golden output. 158 differential scripts run
+scripts are checked against golden output. 159 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-189 scripts then run again under `--gc-stress`, which collects on every
+190 scripts then run again under `--gc-stress`, which collects on every
 allocation.
 
 ## Conformance (test262)
@@ -148,14 +148,19 @@ On Windows the runner is a portable bash script (`tools/test262.sh`)
 run through Git Bash. It assembles each test with its harness includes,
 runs the strict and sloppy variants, and honours the `negative`
 frontmatter. Tests that need a feature the interpreter doesn't implement
-(TypedArrays, Proxy/Reflect, Intl, `eval`, …) are **skipped**, not
-failed — the honest metric is the pass rate over the tests that ran.
-Failing test paths are written to `build/test262-fails.txt`. Pin a
-different revision with the `T262_COMMIT` environment variable.
+(Temporal, Intl, SharedArrayBuffer and Atomics, WeakRef, `eval`, …) are
+**skipped**, not failed — the honest metric is the pass rate over the
+tests that ran, so the skip list at the top of the script is worth
+reading before the number below. Failing test paths are written to
+`build/test262-fails.txt`. The run is split into shards (`--jobs`,
+default half the cores). Pin a different revision with the
+`T262_COMMIT` environment variable.
 
-On the default `test/language` run, 12,679 of the 16,235 tests that ran
-pass (about 78%); 7,478 more are skipped as unsupported. This is a
-current snapshot and will change as the interpreter does.
+On the default `test/language` run, 16,888 of the 21,037 tests that ran
+pass (about 80%); 2,677 more are skipped as unsupported. The remaining
+failures are concentrated in destructuring patterns and in class element
+grammar. This is a current snapshot and will change as the interpreter
+does.
 
 ## Layout
 

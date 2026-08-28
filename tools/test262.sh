@@ -6,12 +6,16 @@
 # pinned commit into vendor/test262/ (gitignored), so any clone can
 # reproduce the exact same tests. Set T262_COMMIT to pin a different one.
 #
-#   tools/test262.sh [subpath] [--limit N] [--verbose]
+#   tools/test262.sh [subpath] [--limit N] [--jobs N] [--verbose]
 #
 # subpath defaults to test/language (core semantics — closest to what the
 # interpreter implements). Examples:
 #   tools/test262.sh test/language --limit 500
 #   tools/test262.sh test/built-ins/Array
+#
+# The tests are split into --jobs shards that run side by side; the default
+# is half the cores, so the machine stays usable. --limit samples the first
+# N tests and runs on one shard, so the sample is the same every time.
 #
 # A test is skipped (not failed) when it needs a feature the interpreter
 # does not implement (see SKIP_FEATURES) or a harness mode we do not run
@@ -34,35 +38,84 @@ TSMC="$PROJECT_DIR/build/tsmc.exe"
 
 SUBPATH="test/language"
 LIMIT=0
+JOBS=0
 VERBOSE=0
+pending=""
 for arg in "$@"; do
     case "$arg" in
         --limit=*) LIMIT="${arg#--limit=}" ;;
-        --limit)   LIMIT=-1 ;;               # next positional is the number
+        --jobs=*)  JOBS="${arg#--jobs=}" ;;
+        --limit)   pending=limit ;;          # next positional is the number
+        --jobs)    pending=jobs ;;
         --verbose) VERBOSE=1 ;;
-        [0-9]*)    if [ "$LIMIT" = "-1" ]; then LIMIT="$arg"; else SUBPATH="$arg"; fi ;;
+        [0-9]*)
+            case "$pending" in
+                limit) LIMIT="$arg" ;;
+                jobs)  JOBS="$arg" ;;
+                *)     SUBPATH="$arg" ;;
+            esac
+            pending="" ;;
         *)         SUBPATH="$arg" ;;
     esac
 done
+
+if [ "$JOBS" -lt 1 ]; then
+    cores="$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 2)"
+    JOBS=$((cores / 2))
+fi
+[ "$JOBS" -lt 1 ] && JOBS=1
+# A sample has to be the first N tests, which only one shard can decide.
+[ "$LIMIT" -gt 0 ] && JOBS=1
 
 step() { printf '\033[36m:: %s\033[0m\n' "$1"; }
 fail() { printf '\033[31m  %s\033[0m\n' "$1"; }
 
 # Whole feature families the interpreter does not implement. A test tagged
-# with any of these is skipped rather than counted as a failure.
-SKIP_FEATURES="TypedArray ArrayBuffer SharedArrayBuffer DataView Atomics \
-Proxy Reflect WeakRef FinalizationRegistry WeakMap WeakSet \
-Intl decorators dynamic-import import-assertions import-attributes \
-IsHTMLDDA tail-call-optimization Array.fromAsync iterator-helpers \
-regexp-lookbehind regexp-unicode-property-escapes regexp-v-flag \
-regexp-modifiers legacy-regexp __getter__ __setter__ __proto__ \
-BigInt64Array BigInt.asIntN symbols-as-weakmap-keys \
-resizable-arraybuffer explicit-resource-management \
-uint8array-base64 Temporal ShadowRealm Array.prototype.at"
+# with any of these is skipped rather than counted as a failure. An entry
+# may end in * to cover a family and its sub-tags.
+#
+# Keep this list honest in both directions: a family that lands here stops
+# being measured, so drop an entry as soon as the feature works.
 
-# Harness includes that pull in a skipped family.
-SKIP_INCLUDES="testTypedArray.js detachArrayBuffer.js testBigIntTypedArray.js \
-testAtomics.js atomicsHelper.js nativeFunctionMatcher.js"
+# buffers and the shared-memory model
+SKIP_FEATURES="SharedArrayBuffer Atomics* Float16Array BigInt64Array \
+BigInt.asIntN resizable-arraybuffer arraybuffer-transfer \
+immutable-arraybuffer uint8array-base64 \
+align-detached-buffer-semantics-with-web-reality"
+
+# host services the runner has no way to provide: a second realm, a forced
+# collection, module loaders beyond plain source
+SKIP_FEATURES="$SKIP_FEATURES cross-realm host-gc-required ShadowRealm \
+source-phase-imports source-phase-imports-module-source import-defer \
+import-attributes import-assertions import-text import-bytes json-modules"
+
+# libraries and language extensions this runtime does not ship
+SKIP_FEATURES="$SKIP_FEATURES Temporal Intl* decorators WeakRef \
+FinalizationRegistry explicit-resource-management IsHTMLDDA \
+tail-call-optimization"
+
+# proposals not implemented yet
+SKIP_FEATURES="$SKIP_FEATURES Array.fromAsync joint-iteration \
+iterator-sequencing upsert await-dictionary Error.isError Math.sumPrecise \
+promise-try json-parse-with-source RegExp.escape error-stack-accessor"
+
+# regex features the engine does not accept
+SKIP_FEATURES="$SKIP_FEATURES regexp-modifiers regexp-duplicate-named-groups \
+regexp-match-indices legacy-regexp"
+
+# protocol hooks that are not consulted: the species constructor, and the
+# well-known methods String defers to
+SKIP_FEATURES="$SKIP_FEATURES Symbol.species Symbol.unscopables \
+Symbol.isConcatSpreadable Symbol.replace Symbol.match Symbol.split \
+Symbol.search"
+
+# Annex B leftovers we do not define
+SKIP_FEATURES="$SKIP_FEATURES __getter__ __setter__ caller"
+
+# Harness includes that pull in a skipped family, or that do not load at all
+# (fnGlobalObject.js reaches the global through the Function constructor).
+SKIP_INCLUDES="detachArrayBuffer.js testBigIntTypedArray.js \
+testAtomics.js atomicsHelper.js fnGlobalObject.js"
 
 if [ ! -x "$TSMC" ]; then
     fail "tsmc not built — run ./build.sh build (or build.ps1 build) first"
@@ -92,13 +145,26 @@ step "running $SUBPATH  (tsmc, pinned test262 ${T262_COMMIT:0:12})"
 HBASE="$VENDOR/harness"
 BASE_HARNESS="$(cat "$HBASE/sta.js" "$HBASE/assert.js")"
 # tsmc has no print(), which is what doneprintHandle.js reports through.
+# A script's top-level declarations are not properties of the global object
+# here, so $DONE is published by hand: asyncHelpers.js looks for it there
+# before it will run an async test.
 ASYNC_HARNESS="function print(s) { console.log(s); }
-$(cat "$HBASE/doneprintHandle.js")"
+$(cat "$HBASE/doneprintHandle.js")
+globalThis.\$DONE = \$DONE;"
 # A test that never settles would otherwise wedge the run.
 if command -v timeout >/dev/null 2>&1; then T262_RUN="timeout 10"; else T262_RUN=""; fi
-TMP="$(mktemp --suffix=.js)"
-FAILS="$PROJECT_DIR/build/test262-fails.txt"
-: > "$FAILS"
+# The assembled test is written beside the original, not into the system temp
+# dir, so a relative specifier in an import() still finds its _FIXTURE file.
+# A shard keeps one such file at a time and drops it when the directory
+# changes. A killed run can leave one behind, so they are swept first and
+# never picked up as tests.
+find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
+TMP=""
+TMPDIR_SEEN=""
+SHARD=0
+WORK="$PROJECT_DIR/build/t262-work"
+FAILS="$WORK/fails.0"
+FAILS_OUT="$PROJECT_DIR/build/test262-fails.txt"
 trap 'rm -f "$TMP"' EXIT
 
 pass=0; failc=0; skip=0
@@ -137,6 +203,12 @@ run_variant() {   # <body-with-harness> <negative-phase> <negative-type> <async>
 
 run_one() {
     local f="$1"
+    local d="${f%/*}"
+    if [ "$d" != "$TMPDIR_SEEN" ]; then
+        [ -n "$TMP" ] && rm -f "$TMP"
+        TMPDIR_SEEN="$d"
+        TMP="$d/.t262-tmp-$SHARD.js"
+    fi
     local fm; fm="$(frontmatter "$f")"
 
     local flags feats incs
@@ -151,10 +223,10 @@ run_one() {
     esac
     local isasync=0
     case ",$flags," in *,async,*) isasync=1 ;; esac
-    # skip: unsupported feature families
+    # skip: unsupported feature families (entries may be globs)
     for ft in $feats; do
         for s in $SKIP_FEATURES; do
-            if [ "$ft" = "$s" ]; then skip=$((skip + 1)); return; fi
+            case "$ft" in $s) skip=$((skip + 1)); return ;; esac
         done
     done
     # skip: harness includes we can't satisfy
@@ -209,13 +281,67 @@ run_one() {
     fi
 }
 
-n=0
-while IFS= read -r f; do
-    n=$((n + 1))
-    run_one "$f"
-    if [ $((n % 200)) -eq 0 ]; then printf '  %d run (%d pass, %d fail, %d skip)\r' "$n" "$pass" "$failc" "$skip"; fi
-    if [ "$LIMIT" -gt 0 ] && [ "$((pass + failc))" -ge "$LIMIT" ]; then break; fi
-done < <(find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' | sort)
+# One shard: its own counters, its own fails file, its own temp file.
+# Progress is published as a line the parent adds up.
+run_shard() {
+    SHARD="$1"
+    FAILS="$WORK/fails.$SHARD"
+    : > "$FAILS"
+    pass=0; failc=0; skip=0
+    TMP=""; TMPDIR_SEEN=""
+    local n=0
+    while IFS= read -r f; do
+        n=$((n + 1))
+        run_one "$f"
+        if [ $((n % 50)) -eq 0 ]; then publish; fi
+        if [ "$LIMIT" -gt 0 ] && [ "$((pass + failc))" -ge "$LIMIT" ]; then break; fi
+    done < "$WORK/list.$SHARD"
+    publish
+}
+
+publish() {
+    printf '%d %d %d\n' "$pass" "$failc" "$skip" > "$WORK/pending.$SHARD"
+    mv -f "$WORK/pending.$SHARD" "$WORK/counts.$SHARD"
+}
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*.js' | sort > "$WORK/all.txt"
+total="$(wc -l < "$WORK/all.txt")"
+if [ "$total" -eq 0 ]; then
+    fail "no tests under $SUBPATH"
+    exit 1
+fi
+[ "$JOBS" -gt "$total" ] && JOBS="$total"
+per=$(( (total + JOBS - 1) / JOBS ))
+# contiguous blocks, so a shard stays inside one directory as long as it can
+awk -v per="$per" -v out="$WORK/list." '{ print > (out int((NR - 1) / per)) }' "$WORK/all.txt"
+
+[ "$JOBS" -gt 1 ] && step "$total files, $JOBS shards"
+pids=""
+i=0
+while [ "$i" -lt "$JOBS" ]; do
+    run_shard "$i" &
+    pids="$pids $!"
+    i=$((i + 1))
+done
+
+alive=1
+while [ "$alive" = "1" ]; do
+    sleep 3
+    alive=0
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+    cat "$WORK"/counts.* 2>/dev/null | awk \
+        '{p += $1; f += $2; s += $3} END {printf "  %d run (%d pass, %d fail, %d skip)\r", p + f, p, f, s}'
+done
+wait
+
+pass=0; failc=0; skip=0
+for c in "$WORK"/counts.*; do
+    read -r p f s < "$c"
+    pass=$((pass + p)); failc=$((failc + f)); skip=$((skip + s))
+done
+cat "$WORK"/fails.* | sort > "$FAILS_OUT"
+find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
 
 ran=$((pass + failc))
 printf '\n'

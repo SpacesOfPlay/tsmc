@@ -2236,7 +2236,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
                     i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
                     ch_op_u16(ch, aop, 0);   // class accessors are non-enumerable
                 } else {
-                    ch_op(ch, OP_SETINDEX);
+                    ch_op(ch, OP_DEFMETHOD_DYN);
                 }
                 ch_op(ch, OP_POP);
             } else if is_acc {

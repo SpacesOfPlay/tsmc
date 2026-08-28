@@ -1768,6 +1768,16 @@ private u32 key_to_atom(VM* vm, Value key) {
     return a;
 }
 
+// A method is a writable, configurable, non-enumerable property. Kept out
+// of the interpreter loop so the opcode does not widen its frame.
+private void def_method(Value objv, u32 a, Value v) {
+    PropList* props = null;
+    if value_is_object(objv) { props = &value_as_object(objv).props; }
+    else if value_is_function(objv) { props = &value_as_function(objv).props; }
+    else if value_is_native(objv) { props = &value_as_native(objv).props; }
+    if props != null { props_set_desc(props, a, v, PROP_WRITABLE | PROP_CONFIGURABLE); }
+}
+
 // Installs `fnv` as the getter or setter of `a` on `objv`, reusing an existing
 // accessor there so a get/set pair defined separately lands on one property.
 private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, bool enumer) {
@@ -4110,16 +4120,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
                 Value v = vpeek(vm, 0);
-                Value objv = vpeek(vm, 1);
-                PropList* props = null;
-                if value_is_object(objv) { props = &value_as_object(objv).props; }
-                else if value_is_function(objv) { props = &value_as_function(objv).props; }
-                else if value_is_native(objv) { props = &value_as_native(objv).props; }
-                if props != null {
-                    props_set_desc(props, a, v, PROP_WRITABLE | PROP_CONFIGURABLE);
-                }
+                def_method(vpeek(vm, 1), a, v);
                 vm.sp -= 2;
                 vpush(vm, v);
+            }
+            case OP_DEFMETHOD_DYN: {
+                // a class method with a computed name is still non-enumerable
+                u32 a = key_to_atom(vm, vpeek(vm, 1));
+                if vm.has_pending { break case; }
+                def_method(vpeek(vm, 2), a, vpeek(vm, 0));
+                vm.sp -= 2;
             }
             case OP_GETINDEX: {
                 Value key = vpeek(vm, 0);
