@@ -54,7 +54,7 @@ i32 main() {
 
     str source;
     source.data = src.data;
-    source.len = src.len;
+    source.len = cast(i32, src.len);
 
     VM m;
     vm_init(&m);
