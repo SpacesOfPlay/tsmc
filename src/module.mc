@@ -359,7 +359,7 @@ private bool pkg_type_is_module(VM* vm, str path) {
             if fd.data != null {
                 str text;
                 text.data = fd.data;
-                text.len = fd.len;
+                text.len = cast(i32, fd.len);
                 bool ok = false;
                 i32 rm = gc_root_mark(&vm.heap);
                 Value j = builtins_json_parse(vm, text, &ok);
@@ -399,7 +399,7 @@ private bool esm_source_file(VM* vm, str path) {
     if fd.data == null { return false; }
     str s;
     s.data = fd.data;
-    s.len = fd.len;
+    s.len = cast(i32, fd.len);
     bool r = has_module_syntax(s);
     free(fd.data);
     return r;
@@ -456,7 +456,7 @@ private i32 load_module(Loader* ld, str path) {
     mod.cjs = false;
     mod.cjs_spec = null_str();
     mod.src_data = fd.data;
-    mod.src_len = fd.len;
+    mod.src_len = cast(i32, fd.len);
     mod.state = MOD_NEW;
     mod.ok = false;
     vec_init<i32>(&mod.dep_idx, 4);
@@ -466,7 +466,7 @@ private i32 load_module(Loader* ld, str path) {
 
     str src;
     src.data = fd.data;
-    src.len = fd.len;
+    src.len = cast(i32, fd.len);
 
     Parser p;
     parser_init(&p, src, &ld.diags, &mod.arena);
@@ -758,7 +758,7 @@ private str load_as_dir(VM* vm, str dir) {
         if fd.data != null {
             str text;
             text.data = fd.data;
-            text.len = fd.len;
+            text.len = cast(i32, fd.len);
             bool ok = false;
             Value j = builtins_json_parse(vm, text, &ok);
             free(fd.data);
@@ -880,7 +880,7 @@ private str resolve_package(VM* vm, str pkg_dir, str subpath, bool esm) {
         if fd.data != null {
             str text;
             text.data = fd.data;
-            text.len = fd.len;
+            text.len = cast(i32, fd.len);
             bool ok = false;
             i32 rm = gc_root_mark(&vm.heap);
             Value j = builtins_json_parse(vm, text, &ok);
@@ -1376,7 +1376,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     if is_json {
         str text;
         text.data = fd.data;
-        text.len = fd.len;
+        text.len = cast(i32, fd.len);
         bool ok = false;
         i32 jm = gc_root_mark(&vm.heap);
         Value parsed = builtins_json_parse(vm, text, &ok);
@@ -1421,7 +1421,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     bump_init(&arena);
     str src;
     src.data = fd.data;
-    src.len = fd.len;
+    src.len = cast(i32, fd.len);
     Parser p;
     parser_init(&p, src, &d, &arena);
     Node* prog = parse_program(&p);
@@ -1786,7 +1786,7 @@ private Value module_dynamic_import_ns(VM* vm, str spec, str referrer, bool* ok,
         if fd.data != null {
             str s;
             s.data = fd.data;
-            s.len = fd.len;
+            s.len = cast(i32, fd.len);
             is_esm = has_module_syntax(s);
             free(fd.data);
         }

@@ -28,66 +28,6 @@ import tsmc_plugin_abi;
 import plugin;
 import "tls/picotls.mc";   // cifra SHA-384/512 for the crypto module's digests
 
-// Platform math not covered by the math module: hyperbolic functions
-// and the accurate log1p/expm1, used by the extra Math.* methods.
-when os(windows) {
-    extern "ucrtbase.dll" f64 sinh(f64 x);
-    extern "ucrtbase.dll" f64 cosh(f64 x);
-    extern "ucrtbase.dll" f64 tanh(f64 x);
-    extern "ucrtbase.dll" f64 asinh(f64 x);
-    extern "ucrtbase.dll" f64 acosh(f64 x);
-    extern "ucrtbase.dll" f64 atanh(f64 x);
-    extern "ucrtbase.dll" f64 log1p(f64 x);
-    extern "ucrtbase.dll" f64 expm1(f64 x);
-}
-else when os(linux) {
-    extern "libm.so.6" f64 sinh(f64 x);
-    extern "libm.so.6" f64 cosh(f64 x);
-    extern "libm.so.6" f64 tanh(f64 x);
-    extern "libm.so.6" f64 asinh(f64 x);
-    extern "libm.so.6" f64 acosh(f64 x);
-    extern "libm.so.6" f64 atanh(f64 x);
-    extern "libm.so.6" f64 log1p(f64 x);
-    extern "libm.so.6" f64 expm1(f64 x);
-}
-else when os(android) {
-    extern "libm.so" f64 sinh(f64 x);
-    extern "libm.so" f64 cosh(f64 x);
-    extern "libm.so" f64 tanh(f64 x);
-    extern "libm.so" f64 asinh(f64 x);
-    extern "libm.so" f64 acosh(f64 x);
-    extern "libm.so" f64 atanh(f64 x);
-    extern "libm.so" f64 log1p(f64 x);
-    extern "libm.so" f64 expm1(f64 x);
-}
-else when os(macos) || os(ios) {
-    extern "libSystem.B.dylib" f64 sinh(f64 x);
-    extern "libSystem.B.dylib" f64 cosh(f64 x);
-    extern "libSystem.B.dylib" f64 tanh(f64 x);
-    extern "libSystem.B.dylib" f64 asinh(f64 x);
-    extern "libSystem.B.dylib" f64 acosh(f64 x);
-    extern "libSystem.B.dylib" f64 atanh(f64 x);
-    extern "libSystem.B.dylib" f64 log1p(f64 x);
-    extern "libSystem.B.dylib" f64 expm1(f64 x);
-}
-else when os(wasm) {
-    // No libm to link against: the standard identities over the exp /
-    // log / sqrt builtins. log1p/expm1 lose the small-x accuracy the
-    // libm versions have, which Math.log1p/expm1 inherit here.
-    private f64 sinh(f64 x) { return (exp(x) - exp(0.0 - x)) / 2.0; }
-    private f64 cosh(f64 x) { return (exp(x) + exp(0.0 - x)) / 2.0; }
-    private f64 tanh(f64 x) { return sinh(x) / cosh(x); }
-    private f64 asinh(f64 x) { return log(x + sqrt(x * x + 1.0)); }
-    private f64 acosh(f64 x) { return log(x + sqrt(x * x - 1.0)); }
-    private f64 atanh(f64 x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
-    private f64 log1p(f64 x) { return log(1.0 + x); }
-    private f64 expm1(f64 x) { return exp(x) - 1.0; }
-}
-else {
-    // No arm for this target. Add a `when os(...)` arm above rather
-    // than letting it fall back to another platform's libm.
-    tsmc_unsupported_target__add_a_when_os_arm _unsupported_math;
-}
 
 private VM* as_vm(void* p) {
     return cast(VM*, p);
@@ -13555,7 +13495,7 @@ private Value nat_fs_read_file(void* vmp, Value callee, Value thisv, Value* args
         return value_undefined();
     }
     i32 enc = fs_enc_arg(vm, arg_at(args, argc, 1));
-    JsObject* b = value_as_object(buf_from_bytes(vm, fd.data, fd.len));
+    JsObject* b = value_as_object(buf_from_bytes(vm, fd.data, cast(i32, fd.len)));
     free(fd.data);
     Value r;
     if enc >= 0 { r = bytes_to_str(vm, b, enc, 0, b.elen); }
@@ -13605,7 +13545,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     str_buf_init(&bytes);
     FileData old = file_read(path);
     if old.data != null {
-        str_buf_add_bytes(&bytes, old.data, old.len);
+        str_buf_add_bytes(&bytes, old.data, cast(i32, old.len));
         free(old.data);
     }
     fs_data_bytes(vm, &bytes, arg_at(args, argc, 1), enc);
