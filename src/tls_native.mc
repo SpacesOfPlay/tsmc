@@ -22,22 +22,25 @@ const i32 TLS_ERR = 8;
 const i32 TLS_WANT_WRITE = 16;
 
 // The sandbox has no sockets (the net library has no wasm arm), so a
-// session could never handshake; stubbing the API here keeps the vendored
-// picotls tree and its libc shims out of the wasm module entirely.
-// __tls_connect sees the null session and reports -1 to the JS layer.
+// session could never handshake. The API is stubbed: __tls_connect sees
+// the null session and reports -1 to the JS layer.
 when os(wasm) {
     struct TlsSession { bool established; bool failed; }
+    const i32 TLS_ERR_NOT_TLS = 400;
     void tls_set_ecdsa_pin(u8* spki32) { }
     TlsSession* tls_session_new(u8* sni, bool insecure) { return null; }
     void tls_session_free(TlsSession* s) { }
     bool tls_wants_write(TlsSession* s) { return false; }
     i32 tls_pump(TlsSession* s, i64 fd) { return TLS_ERR; }
     bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) { return false; }
-    i32 tls_read(TlsSession* s, u8* out, i32 max) { return 0 - 1; }
+    i32 tls_read(TlsSession* s, u8* out, i32 max) { return -1; }
     bool tls_established(TlsSession* s) { return false; }
     bool tls_failed(TlsSession* s) { return true; }
     i32 tls_chain_error(TlsSession* s) { return 0; }
-    i32 tls_server_ctx_new(u8* cert_der, u64 cert_len, u8* key_der, u64 key_len) { return 0 - 1; }
+    i32 tls_error_code(TlsSession* s) { return 0; }
+    str tls_alert_str(i32 alert) { return ""; }
+    i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
+                           u8* key_der, u64 key_len) { return -1; }
     void tls_server_ctx_free(i32 id) { }
     TlsSession* tls_server_session_new(i32 ctx_id) { return null; }
 }

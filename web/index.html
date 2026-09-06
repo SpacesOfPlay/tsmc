@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tsmc playground</title>
+<style>
+  /* VS Code's Dark Modern chrome around Dark+ token colours. */
+  :root {
+    color-scheme: dark;
+    --bg: #181818; --editor: #1f1f1f; --fg: #cccccc; --code: #d4d4d4;
+    --muted: #9d9d9d; --line: #2b2b2b; --gutter: #6e7681;
+    --btn: #313131; --btn-line: #3c3c3c; --accent: #0078d4; --accent-hover: #026ec1;
+    --err: #f14c4c; --selection: #264f78; --caret: #aeafad;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header { padding: 10px 16px 6px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; display: inline; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  header a { color: #4daafc; }
+  .bar { display: flex; gap: 8px; align-items: center; padding: 8px 16px; flex-wrap: wrap; }
+  button, select {
+    appearance: none; -webkit-appearance: none;
+    font: inherit; padding: 4px 12px; border: 1px solid var(--btn-line);
+    border-radius: 2px; background-color: var(--btn); color: var(--fg); cursor: pointer;
+  }
+  button:hover, select:hover { background-color: #3c3c3c; }
+  button.primary { background-color: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background-color: var(--accent-hover); }
+  button:disabled, button:disabled:hover { opacity: 0.45; cursor: default; background-color: var(--btn); }
+  button.primary:disabled { background-color: var(--accent); }
+  /* With the platform's popup-button look turned off, the chevron is ours to draw. */
+  select {
+    padding-right: 26px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23cccccc' stroke-width='1.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 9px center; background-size: 10px 6px;
+  }
+  #status { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+
+  /* The editor is a textarea with transparent text over a pre that shows
+     the same text coloured. All three columns share one font so the
+     lines line up; ligatures are off so token spans do not shift them. */
+  #gutter, #hl, #src, #out {
+    font: 14px/20px "Cascadia Code", "Cascadia Mono", Consolas, "SF Mono", Menlo,
+          "DejaVu Sans Mono", "Liberation Mono", monospace;
+    font-variant-ligatures: none; tab-size: 2; white-space: pre; margin: 0;
+  }
+  #editor { display: grid; grid-template-columns: auto 1fr; background: var(--editor); min-height: 0; }
+  #gutter {
+    padding: 12px 10px 12px 14px; color: var(--gutter); text-align: right;
+    overflow: hidden; user-select: none;
+  }
+  #code { position: relative; min-width: 0; }
+  #hl, #src { position: absolute; inset: 0; padding: 12px 14px 12px 4px; border: 0; }
+  #hl { color: var(--code); overflow: hidden; pointer-events: none; }
+  #src {
+    background: transparent; color: transparent; caret-color: var(--caret);
+    resize: none; outline: none; overflow: auto;
+  }
+  #src::selection { background: var(--selection); }
+  #out { padding: 12px 14px; background: var(--editor); color: var(--fg); overflow: auto; }
+  #out .err { color: var(--err); }
+  #out .note { color: var(--muted); }
+
+  .kw { color: #569cd6; }  .kwc { color: #c586c0; }  .type { color: #4ec9b0; }
+  .fn { color: #dcdcaa; }  .var { color: #9cdcfe; }  .str { color: #ce9178; }
+  .num { color: #b5cea8; } .comment { color: #6a9955; } .regex { color: #d16969; }
+  .tpl { color: #569cd6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tsmc playground</h1>
+  <p>
+    A TypeScript runtime written in minc, compiled to WASM. Your script
+    runs in this tab. Bare imports are fetched from npm on first use.
+    <a href="https://github.com/SpacesOfPlay/tsmc">Source</a>
+  </p>
+</header>
+<div class="bar">
+  <select id="examples" aria-label="Examples"><option value="" hidden>your script</option></select>
+  <button id="run" class="primary" title="Ctrl+Enter">Run</button>
+  <button id="stop" disabled>Stop</button>
+  <span id="status">loading…</span>
+</div>
+<main>
+  <div id="editor">
+    <div id="gutter" aria-hidden="true"></div>
+    <div id="code">
+      <pre id="hl" aria-hidden="true"></pre>
+      <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off"
+                autocorrect="off" wrap="off" aria-label="Script"></textarea>
+    </div>
+  </div>
+  <pre id="out" aria-live="polite"></pre>
+</main>
+
+<script type="text/plain" id="ex-hello" data-title="hello">interface Shape { area(): number; }
+
+class Circle implements Shape {
+  constructor(private r: number) {}
+  area(): number { return Math.PI * this.r ** 2; }
+}
+class Rect implements Shape {
+  constructor(private w: number, private h: number) {}
+  area(): number { return this.w * this.h; }
+}
+enum Color { Red, Green = 5, Blue }
+
+function total<T extends Shape>(xs: T[]): number {
+  return xs.reduce((s, x) => s + x.area(), 0);
+}
+
+const shapes: Shape[] = [new Circle(1), new Rect(2, 3), new Circle(0.5)];
+console.log('total area', total(shapes).toFixed(4));
+console.log('enum', Color.Blue, Color[Color.Green]);
+
+function* fib(): Generator<number> {
+  let [a, b] = [0, 1];
+  for (;;) { yield a; [a, b] = [b, a + b]; }
+}
+const first: number[] = [];
+for (const n of fib()) { if (n > 100) break; first.push(n); }
+console.log('fib', first.join(' '));
+
+const m = new Map<string, number>([['a', 1], ['b', 2]]);
+console.log(JSON.stringify({ m: [...m], big: (2n ** 70n).toString() }));
+</script>
+
+<script type="text/plain" id="ex-async" data-title="async">export {};  // a module, so await is allowed at the top level
+
+const wait = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+async function* ticks(n: number): AsyncGenerator<number> {
+  for (let i = 1; i <= n; i++) { await wait(5); yield i; }
+}
+
+console.log('sync first');
+queueMicrotask(() => console.log('microtask'));
+setTimeout(() => console.log('timer'), 0);
+Promise.resolve().then(() => console.log('then'));
+
+const results = await Promise.all([wait(10).then(() => 'a'), wait(1).then(() => 'b')]);
+console.log('all', results);
+
+for await (const t of ticks(3)) console.log('tick', t);
+
+try {
+  await Promise.any([Promise.reject(new Error('x')), Promise.reject(new Error('y'))]);
+} catch (e) {
+  console.log((e as AggregateError).errors.map((x) => x.message));
+}
+console.log('done');
+</script>
+
+<script type="text/plain" id="ex-iter" data-title="iterators and sets">const evens = [1, 2, 3, 4, 5, 6, 7, 8].values()
+  .filter((x) => x % 2 === 0)
+  .map((x) => x * x)
+  .take(3)
+  .toArray();
+console.log('evens squared', evens);
+
+const a = new Set([1, 2, 3, 4]);
+const b = new Set([3, 4, 5]);
+console.log('union', [...a.union(b)], 'intersection', [...a.intersection(b)]);
+console.log('difference', [...a.difference(b)], 'disjoint', a.isDisjointFrom(new Set([9])));
+
+const { x, y = 10, ...rest } = { x: 1, z: 3, w: 4 };
+console.log(x, y, rest);
+
+const words = 'the quick brown fox jumps over the lazy dog'.split(' ');
+const byLength = Object.groupBy(words, (w) => w.length);
+console.log(byLength);
+
+outer: for (let i = 0; i < 3; i++) {
+  for (let j = 0; j < 3; j++) {
+    if (i * j === 2) { console.log('break at', i, j); break outer; }
+  }
+}
+console.log([3, 1, 2].toSorted(), 'abc'.at(-1), structuredClone({ d: new Date(0) }));
+</script>
+
+<script type="text/plain" id="ex-text" data-title="strings and regex">const log = 'GET /index.html 200 512\nPOST /api/items 201 48\nGET /missing 404 12';
+const re = /^(?<method>\w+) (?<path>\S+) (?<status>\d{3}) (?<bytes>\d+)$/gm;
+for (const m of log.matchAll(re)) {
+  const { method, path, status, bytes } = m.groups!;
+  console.log(method.padEnd(5), path.padEnd(14), status, Number(bytes).toString().padStart(4));
+}
+
+console.log('café'.normalize('NFD').length, [...'👋🏽'].length, 'ß'.toUpperCase());
+console.log(/\p{Script=Greek}/u.test('α'), 'a-b_c'.replace(/[-_]/g, ' '));
+
+const bytes = new TextEncoder().encode('tsmc');
+console.log(bytes, new TextDecoder().decode(bytes), btoa('tsmc'));
+console.log(crypto.randomUUID().length, crypto.getRandomValues(new Uint8Array(4)).length);
+
+const tpl = (s: TemplateStringsArray, ...v: unknown[]) => s.raw.join('|') + ' ' + v.join(',');
+console.log(tpl`a${1}b${2}c`);
+</script>
+
+<script type="text/plain" id="ex-errors" data-title="errors">class ParseError extends Error {
+  constructor(message: string, public line: number) {
+    super(message);
+    this.name = 'ParseError';
+  }
+}
+
+function parse(src: string): number[] {
+  return src.split('\n').map((l, i) => {
+    const n = Number(l);
+    if (Number.isNaN(n)) throw new ParseError(`not a number: ${JSON.stringify(l)}`, i + 1);
+    return n;
+  });
+}
+
+try {
+  parse('1\n2\nthree');
+} catch (e) {
+  if (e instanceof ParseError) console.log(`${e.name} on line ${e.line}: ${e.message}`);
+}
+
+function cleanup(): string {
+  try { return 'from try'; } finally { console.log('finally runs'); }
+}
+console.log(cleanup());
+
+process.on('exit', (code) => console.log('exit handler saw', code));
+
+// An uncaught error ends the run with exit code 1 and a stack trace.
+parse('4\nx');
+</script>
+
+<script type="text/plain" id="ex-markdown" data-title="npm: markdown-it">// A bare import is resolved against npm: the package and what it depends
+// on are fetched on first use, then run by tsmc like any other module.
+import MarkdownIt from 'markdown-it';
+
+const md = new MarkdownIt();
+const source = `# Hello from *tsmc*
+
+A list:
+
+- one
+- \`two\`
+
+> rendered by markdown-it, fetched from the npm registry
+`;
+console.log(md.render(source));
+</script>
+
+<script type="text/plain" id="ex-yaml" data-title="npm: js-yaml">// A version range after the name pins the package: this asks for 4.x.
+import yaml from 'js-yaml@4';
+
+const doc = yaml.load(`
+name: tsmc
+targets: [windows, linux, macos, wasm]
+tests:
+  golden: 31
+  differential: 159
+`) as { name: string; targets: string[]; tests: Record<string, number> };
+
+console.log(doc.name, doc.targets.length, 'targets');
+console.log(yaml.dump({ ...doc, checked: new Date(0) }));
+</script>
+
+<script type="text/plain" id="ex-ramda" data-title="npm: ramda">import * as R from 'ramda';
+
+interface Person { name: string; age: number; }
+const people: Person[] = [
+  { name: 'Ada', age: 36 }, { name: 'Linus', age: 28 }, { name: 'Grace', age: 45 },
+];
+
+const oldest = R.pipe(R.sortBy(R.prop('age')), R.last, R.prop('name'));
+console.log('oldest', oldest(people));
+console.log(R.groupBy((p: Person) => (p.age < 40 ? 'under 40' : '40 and over'), people));
+console.log(R.compose(R.join('-'), R.map(R.toUpper), R.split(' '))('functional style'));
+</script>
+
+<script type="text/plain" id="ex-loop" data-title="runaway loop (use Stop)">let i = 0;
+for (;;) {
+  if (++i % 1_000_000 === 0) console.log('still going', i);
+}
+</script>
+
+<script src="highlight.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const src = $('src'), hl = $('hl'), gutter = $('gutter'), out = $('out'), status = $('status');
+  const runBtn = $('run'), stopBtn = $('stop'), examples = $('examples');
+
+  // --- editor ----------------------------------------------------------
+  let lineCount = 0;
+  const render = () => {
+    const text = src.value;
+    hl.innerHTML = TsmcHighlight.highlight(text) + '\u200b';
+    const n = text.split('\n').length;
+    if (n !== lineCount) {
+      lineCount = n;
+      let g = '';
+      for (let i = 1; i <= n; i++) g += i + '\n';
+      gutter.textContent = g;
+    }
+    sync();
+  };
+  const sync = () => {
+    hl.scrollTop = src.scrollTop;
+    hl.scrollLeft = src.scrollLeft;
+    gutter.scrollTop = src.scrollTop;
+  };
+  const save = () => { try { localStorage.setItem('tsmc.src', src.value); } catch (e) {} };
+  // The dropdown follows the text: the example it matches, else "your script".
+  let syncSelect = () => {};
+  const changed = () => { render(); save(); syncSelect(); };
+
+  src.addEventListener('scroll', sync);
+  src.addEventListener('input', changed);
+  src.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); return; }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      src.setRangeText('  ', src.selectionStart, src.selectionEnd, 'end');
+      changed();
+      return;
+    }
+    if (e.key === 'Enter') {
+      // keep the indent; open a block after { [ ( and close it when the
+      // matching bracket is right after the caret
+      e.preventDefault();
+      const s = src.selectionStart;
+      const v = src.value;
+      const lineStart = v.lastIndexOf('\n', s - 1) + 1;
+      const indent = /^[ \t]*/.exec(v.slice(lineStart, s))[0];
+      const pair = { '{': '}', '[': ']', '(': ')' };
+      const opens = s > 0 && pair[v[s - 1]] !== undefined;
+      const closes = opens && v[s] === pair[v[s - 1]];
+      let ins = '\n' + indent + (opens ? '  ' : '');
+      if (closes) ins += '\n' + indent;
+      src.setRangeText(ins, s, src.selectionEnd, 'end');
+      if (closes) {
+        const caret = s + 1 + indent.length + 2;
+        src.setSelectionRange(caret, caret);
+      }
+      changed();
+    }
+  });
+
+  // --- examples --------------------------------------------------------
+  const blocks = [...document.querySelectorAll('script[type="text/plain"]')];
+  for (const b of blocks) {
+    const o = document.createElement('option');
+    o.value = b.id;
+    o.textContent = b.dataset.title;
+    examples.appendChild(o);
+  }
+  const text = (id) => document.getElementById(id).textContent.replace(/^\n/, '');
+  syncSelect = () => {
+    const b = blocks.find((x) => text(x.id) === src.value);
+    examples.value = b ? b.id : '';
+  };
+  examples.onchange = () => {
+    if (!examples.value) return;
+    src.value = text(examples.value);
+    src.scrollTop = 0;
+    src.scrollLeft = 0;
+    changed();
+  };
+
+  let saved = null;
+  try { saved = localStorage.getItem('tsmc.src'); } catch (e) {}
+  src.value = saved || text(blocks[0].id);
+  render();
+  syncSelect();
+
+  // --- output ----------------------------------------------------------
+  let pending = [];
+  let raf = 0;
+  const flush = () => {
+    raf = 0;
+    const frag = document.createDocumentFragment();
+    for (const [cls, s] of pending) {
+      if (cls) {
+        const span = document.createElement('span');
+        span.className = cls;
+        span.textContent = s;
+        frag.appendChild(span);
+      } else {
+        frag.appendChild(document.createTextNode(s));
+      }
+    }
+    pending = [];
+    out.appendChild(frag);
+    out.scrollTop = out.scrollHeight;
+  };
+  const emit = (cls, s) => { pending.push([cls, s]); if (!raf) raf = requestAnimationFrame(flush); };
+
+  // --- worker ----------------------------------------------------------
+  let module = null;
+  let worker = null;
+  let running = false;
+  let t0 = 0;
+
+  const newWorker = () => {
+    worker = new Worker('tsmc_worker.js');
+    try { worker.postMessage({ type: 'init', module }); }
+    catch (e) { worker.postMessage({ type: 'init', url: 'tsmc.wasm' }); }
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'out') emit(m.fd === 2 ? 'err' : '', m.text);
+      else if (m.type === 'status') status.textContent = m.text + '…';
+      else if (m.type === 'exit') {
+        let s = `exit ${m.code} · ${m.ms.toFixed(1)} ms`;
+        if (m.requests) s += ` · ${m.requests} requests, ${(m.bytes / 1024).toFixed(0)} KB in ${m.fetchMs.toFixed(0)} ms`;
+        if (m.packages.length) emit('note', '\npackages: ' + m.packages.map((p) => `${p.name}@${p.version}`).join(' ') + '\n');
+        finish(s);
+      }
+    };
+    worker.onerror = (e) => { emit('err', 'worker error: ' + e.message + '\n'); finish('failed'); };
+  };
+
+  const finish = (msg) => {
+    running = false;
+    runBtn.disabled = false;
+    stopBtn.disabled = true;
+    status.textContent = msg;
+  };
+
+  const run = () => {
+    if (running || !worker) return;
+    running = true;
+    runBtn.disabled = true;
+    stopBtn.disabled = false;
+    out.textContent = '';
+    pending = [];
+    status.textContent = 'running…';
+    t0 = performance.now();
+    worker.postMessage({ type: 'run', files: { '/main.ts': src.value }, args: ['main.ts'] });
+  };
+
+  const stop = () => {
+    if (!running) return;
+    worker.terminate();
+    newWorker();
+    flush();
+    emit('note', `\nstopped after ${(performance.now() - t0).toFixed(0)} ms\n`);
+    finish('stopped');
+  };
+
+  runBtn.onclick = run;
+  stopBtn.onclick = stop;
+
+  fetch('tsmc.wasm')
+    .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+    .then((b) => WebAssembly.compile(b))
+    .then((m) => {
+      module = m;
+      newWorker();
+      status.textContent = 'ready';
+    })
+    .catch((e) => { status.textContent = 'could not load tsmc.wasm: ' + e.message; });
+})();
+</script>
+</body>
+</html>

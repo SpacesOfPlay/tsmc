@@ -13,8 +13,10 @@ Run everything with `minc test`
   build scripts.
 - **`run/<name>.ts` + `run/<name>.expected`** — golden end-to-end tests.
   The runner executes the script with tsmc and diffs stdout against the
-  `.expected` file. Exit code must be 0. These activate once the VM
-  milestone lands.
+  `.expected` file. Exit code must be 0.
+- **wasm** — the module is cross-compiled on every run. With node
+  present, the golden tests also run through it (`tools/wasm_run.js`),
+  except the two that need an environment or a socket.
 
 ## Conventions
 

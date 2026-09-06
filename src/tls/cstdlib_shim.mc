@@ -56,6 +56,9 @@ when os(windows) {
     extern "libc.so" i32 fprintf(void* stream, u8* fmt, ...);
 } else when os(macos) || os(ios) {
     extern "libSystem.B.dylib" i32 fprintf(void* stream, u8* fmt, ...);
+} else when os(wasm) {
+    // No stream to write to. The one caller is a path the port never takes.
+    i32 fprintf(void* stream, u8* fmt) { return 0; }
 }
 
 // No system allocator on wasm; the C shapes go over the builtin one.

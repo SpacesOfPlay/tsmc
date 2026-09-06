@@ -4,6 +4,7 @@
 //   minc build      compile build/tsmc
 //   minc test       build, then unit + cli + golden + gc-stress
 //   minc bench      build, then time bench/*.ts
+//   minc wasm       build tsmc.wasm and the page into build/web, serve it
 //   minc clean      remove build/
 //
 // plugins, diff and t262 have no minc verb. Compile this script once
@@ -190,6 +191,27 @@ i32 compile(str src, str exe, str define) {
     return rc;
 }
 
+// NODE names the binary; otherwise the first node on PATH. A candidate
+// that does not answer --version counts as absent.
+string find_node() {
+    string node = env_get("NODE");
+    if node.len == 0 {
+        free(node);
+        // by full name on Windows, so a directory called node on PATH is
+        // not taken for the binary
+        when os(windows) { node = path_which("node.exe"); }
+        else { node = path_which("node"); }
+    }
+    if node.len == 0 { return node; }
+    ProcCmd v = { .args = { str_from(node.data, node.len), "--version" }, .capture = true };
+    ProcResult r = proc_run(&v);
+    bool ok = r.spawned && r.exit_code == 0;
+    proc_result_free(&r);
+    if ok { return node; }
+    free(node);
+    return string("");
+}
+
 // "<dir>/<name><ext>", without leaking the joined name.
 string join_named(str dir, str name, str ext) {
     string base = str_concat(name, ext);
@@ -214,6 +236,63 @@ void build_tsmc() {
         exit(1);
     }
     pass(str_from(exe.data, exe.len));
+    return;
+}
+
+// --- wasm -------------------------------------------------------------
+
+string out_wasm() {
+    return path_join("build", "tsmc.wasm");
+}
+
+i32 compile_wasm(str src, str dst) {
+    ProcCmd c = { .args = { cc(), src, "--target", "wasm", "-o", dst }, .capture = true };
+    ProcResult r = proc_run(&c);
+    i32 rc = r.exit_code;
+    if rc != 0 { out(str_from(r.out.data, r.out.len)); }
+    proc_result_free(&r);
+    return rc;
+}
+
+void build_wasm() {
+    step("build tsmc.wasm");
+    assert_toolchain();
+    ignore dir_create("build");
+    string wasm = out_wasm();
+    defer free(wasm);
+    if compile_wasm("src/main.mc", str_from(wasm.data, wasm.len)) != 0 {
+        outln("compile failed");
+        exit(1);
+    }
+    pass(str_from(wasm.data, wasm.len));
+    return;
+}
+
+void copy_or_die(str src, str dst) {
+    if file_copy(src, dst) { return; }
+    out("  copy failed: ");
+    outln(src);
+    exit(1);
+}
+
+// build/web: the page from web/ with the module beside it, ready to
+// serve locally or to publish as a static site.
+void assemble_web() {
+    step("assemble build/web");
+    ignore dir_create("build/web");
+    DirList files = dir_list_ext("web", "");
+    for i32 i = 0; i < files.count; i++ {
+        string src = path_join("web", files.items[i]);
+        string dst = path_join("build/web", files.items[i]);
+        copy_or_die(str_from(src.data, src.len), str_from(dst.data, dst.len));
+        free(src);
+        free(dst);
+    }
+    dir_list_free(&files);
+    string wasm = out_wasm();
+    copy_or_die(str_from(wasm.data, wasm.len), "build/web/tsmc.wasm");
+    free(wasm);
+    pass("build/web");
     return;
 }
 
@@ -342,6 +421,28 @@ void run_cli_smoke(str exe) {
 }
 
 // Run test/run/<name>.ts, diff stdout against <name>.expected.
+// Runs c and compares its stdout with the .expected file beside src.
+void golden_check(str stem, str src, ProcCmd* c) {
+    string expected_path = path_with_ext(src, ".expected");
+    defer free(expected_path);
+    if !path_exists(str_from(expected_path.data, expected_path.len)) {
+        fail(stem, " (no .expected)");
+        return;
+    }
+    ProcResult r = proc_run(c);
+    string want = file_read_str(str_from(expected_path.data, expected_path.len));
+    defer free(want);
+    if r.exit_code != 0 {
+        fail(stem, " (nonzero exit)");
+    } else if !same_text(str_from(r.out.data, r.out.len), str_from(want.data, want.len)) {
+        fail(stem, " (diff)");
+    } else {
+        pass(stem);
+    }
+    proc_result_free(&r);
+    return;
+}
+
 void run_golden_tests(str exe, DirList* scripts) {
     step("run tests");
     if scripts.count == 0 {
@@ -350,32 +451,65 @@ void run_golden_tests(str exe, DirList* scripts) {
     }
     for i32 i = 0; i < scripts.count; i++ {
         str name = scripts.items[i];
-        str stem = path_stem(name);
         string src = path_join("test/run", name);
         defer free(src);
-        string expected_path = path_with_ext(str_from(src.data, src.len), ".expected");
-        defer free(expected_path);
-        if !path_exists(str_from(expected_path.data, expected_path.len)) {
-            fail(stem, " (no .expected)");
-        } else {
-            ProcCmd c = {
-                .args = { exe, str_from(src.data, src.len) },
-                .capture = true,
-                .split_stderr = true
-            };
-            ProcResult r = proc_run(&c);
-            string want = file_read_str(str_from(expected_path.data, expected_path.len));
-            defer free(want);
-            if r.exit_code != 0 {
-                fail(stem, " (nonzero exit)");
-            } else if !same_text(str_from(r.out.data, r.out.len), str_from(want.data, want.len)) {
-                fail(stem, " (diff)");
-            } else {
-                pass(stem);
-            }
-            proc_result_free(&r);
-        }
+        ProcCmd c = {
+            .args = { exe, str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        golden_check(path_stem(name), str_from(src.data, src.len), &c);
     }
+    return;
+}
+
+// Two golden tests need what the sandbox does not have: an environment
+// (process) and a socket (tls_plaintext_reply).
+private bool wasm_skips(str stem) {
+    return str_equal(stem, "process") || str_equal(stem, "tls_plaintext_reply");
+}
+
+// The module is cross-compiled on every test run, so it cannot rot
+// unnoticed. With node present the golden tests run through it too.
+void run_wasm_tests(DirList* scripts) {
+    build_wasm();
+    step("wasm run tests (node)");
+    string node = find_node();
+    defer free(node);
+    if node.len == 0 {
+        outln("  skipped - node not found (set NODE)");
+        return;
+    }
+    string wasm = out_wasm();
+    defer free(wasm);
+    for i32 i = 0; i < scripts.count; i++ {
+        str name = scripts.items[i];
+        str stem = path_stem(name);
+        if wasm_skips(stem) { continue; }
+        // "/" throughout: the path is a name inside the sandbox
+        string src = str_concat("test/run/", name);
+        defer free(src);
+        ProcCmd c = {
+            .args = { str_from(node.data, node.len), "tools/wasm_run.js",
+                      str_from(wasm.data, wasm.len), str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        golden_check(stem, str_from(src.data, src.len), &c);
+    }
+    // the package view, against a registry faked in the script
+    ProcCmd c = {
+        .args = { str_from(node.data, node.len), "tools/cdn_fs_check.js", str_from(wasm.data, wasm.len) },
+        .capture = true
+    };
+    ProcResult r = proc_run(&c);
+    if r.exit_code == 0 {
+        pass("cdn_fs");
+    } else {
+        out(str_from(r.out.data, r.out.len));
+        fail("cdn_fs", " (see output)");
+    }
+    proc_result_free(&r);
     return;
 }
 
@@ -469,6 +603,7 @@ i32 run_tests() {
     DirList diff_scripts = list_diff_scripts();
 
     run_golden_tests(e, &run_scripts);
+    run_wasm_tests(&run_scripts);
     run_gc_stress(e, &run_scripts, &diff_scripts);
 
     dir_list_free(&run_scripts);
@@ -532,11 +667,7 @@ i32 run_bench() {
 i32 run_diff() {
     build_tsmc();
     step("differential (vs node)");
-    string node = env_get("NODE");
-    if node.len == 0 {
-        free(node);
-        node = path_which("node");
-    }
+    string node = find_node();
     if node.len == 0 {
         outln("  skipped - node not found (set NODE)");
         free(node);
@@ -620,13 +751,34 @@ i32 run_t262(i32 argc, i32 first_extra) {
 
 // --- entry -------------------------------------------------------------
 
+// minc wasm: the module and the page into build/web, then served by the
+// native binary. --no-serve stops after assembling.
+i32 run_wasm(i32 argc, i32 first_extra) {
+    build_wasm();
+    assemble_web();
+    if argc > first_extra && str_equal(str_from_cstr(get_arg(first_extra)), "--no-serve") {
+        return 0;
+    }
+    build_tsmc();
+    string exe = out_exe();
+    defer free(exe);
+    step("serve");
+    ProcCmd c = { .args = { str_from(exe.data, exe.len), "tools/serve.ts", "build/web" } };
+    ProcResult r = proc_run(&c);
+    i32 rc = r.exit_code;
+    proc_result_free(&r);
+    return rc;
+}
+
 void usage() {
-    outln("usage: minc <build|test|bench|clean>");
+    outln("usage: minc <build|test|bench|wasm|clean>");
     outln("  or:  build/build.exe <plugins|diff|t262>   (no minc verb for these)");
     outln("  build   compile build/tsmc");
     outln("  plugins compile build/tsmc-plugins (loads minc plugins)");
-    outln("  test    build, then run unit + cli + golden run tests");
+    outln("  test    build, then run unit + cli + golden + wasm + gc-stress tests");
     outln("  bench   build, then time bench/*.ts");
+    outln("  wasm    build tsmc.wasm and the page into build/web, then serve it");
+    outln("          (--no-serve: stop after assembling)");
     outln("  diff    build, then diff test/diff/*.js vs node");
     outln("  t262    build, then run test262 (fetched to vendor/ on first use)");
     outln("  clean   remove build/");
@@ -654,6 +806,7 @@ i32 main() {
     }
     if str_equal(verb, "test") { return run_tests(); }
     if str_equal(verb, "bench") { return run_bench(); }
+    if str_equal(verb, "wasm") { return run_wasm(argc, 2); }
     if str_equal(verb, "diff") { return run_diff(); }
     if str_equal(verb, "t262") { return run_t262(argc, 2); }
 

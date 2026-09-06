@@ -33,6 +33,7 @@ import node_webevents;
 import node_webcrypto;
 import node_tls;
 import node_https;
+import "wasm_host.mc";
 
 // Canonical file identity for module dedup: resolves symlinks and
 // on-disk case, so two spellings of the same file load as one module.
@@ -70,10 +71,14 @@ else when os(android) {
     extern "libc.so" i32 closedir(void* dp);
 }
 else when os(wasm) {
-    // Sandbox: no directories and nothing to canonicalize against. A
-    // false canon_into leaves canon_path on its lexical fallback, and
-    // no-directory means a specifier resolves as a plain file.
-    private bool canon_into(u8* cpath, u8* buf, i32 cap) { return false; }
+    // Sandbox: canon_into is defined below path_norm_join, which it
+    // needs. Directories are whatever the host's file view says they are.
+    private bool dir_there(str path) {
+        u8* c = str_to_cstr(path);
+        bool ok = host_is_dir(c) != 0;
+        free(c);
+        return ok;
+    }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
@@ -86,6 +91,10 @@ when os(macos) || os(ios) || os(linux) || os(android) {
     private bool canon_into(u8* cpath, u8* buf, i32 cap) {
         return sys_realpath(cpath, buf) != null;
     }
+}
+
+when !os(wasm) {
+    private bool dir_there(str path) { return path_is_dir(path); }
 }
 
 const i32 MOD_NEW = 0;
@@ -215,7 +224,32 @@ private str try_candidate(str joined, str suffix) {
     return none;
 }
 
-// Resolves a relative specifier; returns a heap str (.data freed by
+private bool spec_is_absolute(str s) {
+    if s.len >= 1 && (*(s.data) == '/' || *(s.data) == '\\') { return true; }
+    when os(windows) {
+        if s.len >= 3 {
+            u8 c = *(s.data);
+            bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            if letter && *(s.data + 1) == ':' { return true; }
+        }
+    }
+    return false;
+}
+
+private bool spec_is_dot(str s) {
+    if s.len >= 2 && *(s.data) == '.' && (*(s.data + 1) == '/' || *(s.data + 1) == '\\') { return true; }
+    if s.len >= 3 && *(s.data) == '.' && *(s.data + 1) == '.'
+        && (*(s.data + 2) == '/' || *(s.data + 2) == '\\') { return true; }
+    return false;
+}
+
+// A specifier that names a file by path. Anything else is a builtin or a
+// package, and is never looked for beside the importer.
+private bool spec_is_path(str s) {
+    return spec_is_dot(s) || spec_is_absolute(s);
+}
+
+// Resolves a path specifier; returns a heap str (.data freed by
 // the caller) or {null, 0} if no file matches. The empty suffix is the
 // exact-path try; the rest add an inferred extension or /index.
 private str resolve_specifier(str importer, str spec) {
@@ -231,6 +265,24 @@ private str resolve_specifier(str importer, str spec) {
     }
     free(joined.data);
     return r;
+}
+
+when os(wasm) {
+    // No realpath in the sandbox, whose working directory is "/": the
+    // canonical form is the lexical one, made absolute.
+    private bool canon_into(u8* cpath, u8* buf, i32 cap) {
+        str p = str_from_cstr(cpath);
+        str a;
+        if p.len > 0 && *(p.data) == '/' { a = path_norm_join(p, ""); }
+        else { a = path_norm_join("/", p); }
+        bool ok = a.len < cap;
+        if ok {
+            if a.len > 0 { memcpy(buf, a.data, a.len); }
+            *(buf + a.len) = 0;
+        }
+        free(a.data);
+        return ok;
+    }
 }
 
 // Canonical identity key (heap str) for module dedup. The lexical path
@@ -525,9 +577,13 @@ private i32 load_module(Loader* ld, str path) {
             vec_push(&mod.dep_idx, dep);
             continue;
         }
-        // An ESM file path first, then require's resolver, which is what
-        // reaches node_modules and a package subpath.
-        str resolved = resolve_specifier(mod.path, spec);
+        // A path resolves as an ESM file first. A bare name goes straight
+        // to require's resolver, which is what reaches node_modules and a
+        // package subpath.
+        str resolved;
+        resolved.data = null;
+        resolved.len = 0;
+        if spec_is_path(spec) { resolved = resolve_specifier(mod.path, spec); }
         if resolved.data == null { resolved = resolve_require(ld.vm, mod.path, spec, true); }
         if resolved.data == null {
             eprint("tsmc: cannot resolve '{}' from '{}'\n", spec, mod.path);
@@ -719,7 +775,10 @@ private str path_under(str dir, str sub) {
     str_buf sb;
     str_buf_init(&sb);
     str_buf_add(&sb, dir);
-    str_buf_add(&sb, "/");
+    // a root already ends in its separator; adding one would double it
+    u8 last = 0;
+    if dir.len > 0 { last = *(dir.data + dir.len - 1); }
+    if last != '/' && last != '\\' { str_buf_add(&sb, "/"); }
     str_buf_add(&sb, sub);
     str combined = str_buf_to_str(&sb);
     str r = path_norm_join(combined, "");
@@ -730,7 +789,7 @@ private str path_under(str dir, str sub) {
 // LOAD_AS_FILE(base): base itself (only if a regular file, not a
 // directory), then base + a source/data extension.
 private str load_as_file(str base) {
-    if file_there(base) && !path_is_dir(base) { return owned_str(base); }
+    if file_there(base) && !dir_there(base) { return owned_str(base); }
     str[5] tries = { ".js", ".ts", ".cjs", ".mjs", ".json" };
     for i32 e = 0; e < 5; e++ {
         str c = try_candidate(base, tries[e]);
@@ -951,7 +1010,9 @@ private void split_pkg(str spec, str* pkg, str* subpath) {
 // LOAD_NODE_MODULES: walk up from `start_dir` trying
 // <d>/node_modules/<pkg>[/<subpath>] at each level. Heap path or null.
 private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath, bool esm) {
-    str cur = owned_str(start_dir);
+    // The walk goes up to the root of the filesystem, so it starts from
+    // the absolute directory, not the one the script was named by.
+    str cur = canon_path(start_dir.len > 0 ? start_dir : ".");
     str result = null_str();
     i32 guard = 0;
     while guard < 64 {
@@ -960,7 +1021,7 @@ private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath, bool 
         str base = path_under(nm, pkg);
         str f = null_str();
         bool stop = false;
-        if path_is_dir(base) {
+        if dir_there(base) {
             // package directory found here: resolve within it — exports
             // (authoritative: non-listed subpaths are blocked), else the
             // legacy main / index / subpath-as-file. Stop walking.
@@ -985,25 +1046,6 @@ private str load_node_modules(VM* vm, str start_dir, str pkg, str subpath, bool 
     }
     if cur.data != null { free(cur.data); }
     return result;
-}
-
-private bool spec_is_absolute(str s) {
-    if s.len >= 1 && (*(s.data) == '/' || *(s.data) == '\\') { return true; }
-    when os(windows) {
-        if s.len >= 3 {
-            u8 c = *(s.data);
-            bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-            if letter && *(s.data + 1) == ':' { return true; }
-        }
-    }
-    return false;
-}
-
-private bool spec_is_dot(str s) {
-    if s.len >= 2 && *(s.data) == '.' && (*(s.data + 1) == '/' || *(s.data + 1) == '\\') { return true; }
-    if s.len >= 3 && *(s.data) == '.' && *(s.data + 1) == '.'
-        && (*(s.data + 2) == '/' || *(s.data + 2) == '\\') { return true; }
-    return false;
 }
 
 // Full CJS resolution of `spec` from a module at `importer_path`. Returns a
@@ -1771,7 +1813,8 @@ private Value module_dynamic_import_ns(VM* vm, str spec, str referrer, bool* ok,
         return value_cell(&ns.head);
     }
 
-    str resolved = resolve_specifier(referrer, spec);
+    str resolved = null_str();
+    if spec_is_path(spec) { resolved = resolve_specifier(referrer, spec); }
     if resolved.data == null {
         // not an ESM file path — defer to the require resolver (packages, CJS)
         Value ex = module_require(vm, referrer, spec);

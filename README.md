@@ -85,6 +85,25 @@ pointer travels into the GC heap and unloading would leave those cells
 pointing at unmapped pages. `examples/plugin` has a worked example and
 the rooting rule a plugin has to follow.
 
+## In the browser
+
+The interpreter also compiles to WebAssembly, and `web/` is a playground
+around it: a page where a script runs in a worker. A bare import
+resolves against npm: the packages a script names, and what they depend
+on, are fetched from the registry on first use and unpacked in memory,
+where the module resolver walks them like an installed tree. Nothing
+else leaves the page. `minc wasm` builds the module, assembles the page into
+`build/web/`, and serves it with the native binary through
+`tools/serve.ts`. The workflow in `.github/workflows/pages.yml` publishes
+the same directory to GitHub Pages.
+
+The wasm build is the whole interpreter with a sandbox in place of the
+operating system: a read-only file view supplied by the page, a clock,
+console output, and a CSPRNG. No sockets, no writes, no environment. The
+host side is `web/tsmc_host.js`, which also runs under node
+(`tools/wasm_run.js`) so the golden tests can run through the module.
+`doc/PLAN_M45_wasm_playground.md` has the host contract and the numbers.
+
 ## Install minc
 
 ```
@@ -104,6 +123,7 @@ overrides the install dir.
 minc build      # -> build/tsmc[.exe]
 minc test       # build + run the full test suite (incl. GC stress)
 minc bench      # time bench/*.ts
+minc wasm       # -> build/web: the wasm build and the playground, served locally
 minc clean      # remove build/
 ```
 
@@ -119,13 +139,14 @@ build/build.exe t262               # ECMAScript conformance (test262), see below
 
 ## Tests
 
-27 unit tests in minc exercise the interpreter from the inside. 31
+27 unit tests in minc exercise the interpreter from the inside. 32
 scripts are checked against golden output. 159 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-190 scripts then run again under `--gc-stress`, which collects on every
-allocation.
+191 scripts then run again under `--gc-stress`, which collects on every
+allocation. The wasm build is cross-compiled on every run, and the golden
+tests run through it under node when node is present.
 
 ## Conformance (test262)
 
@@ -169,7 +190,8 @@ src/       interpreter source (modern minc)
 doc/       design documents and milestone plans
 test/      unit tests (minc), golden run tests, and differential (.js) tests
 examples/  a TypeScript HTTPS server, and a native module in minc
-tools/     test262 conformance runner
+web/       the browser playground: page, worker, and the wasm host
+tools/     test262 conformance runner, wasm node runner, static server
 minc/      local minc deploy: compiler + lib/ + docs (gitignored)
 build/     build artifacts (gitignored)
 vendor/    fetched test262 checkout (gitignored)

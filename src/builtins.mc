@@ -27,6 +27,7 @@ import tls_chain;
 import tsmc_plugin_abi;
 import plugin;
 import "tls/picotls.mc";   // cifra SHA-384/512 for the crypto module's digests
+import "wasm_host.mc";
 
 
 private VM* as_vm(void* p) {
@@ -13203,14 +13204,14 @@ when os(windows) {
     }
 }
 else when os(wasm) {
-    // Sandbox: the host import surface is read-only (open/read/close),
-    // so mutations fail and directories are always empty. Callers
-    // surface these as the usual fs errors.
+    // Sandbox: the host's file view is read-only, so mutations fail and
+    // listings are empty. It does say whether a path is a directory.
+    // Callers surface the failures as the usual fs errors.
     private bool fs_mkdir1(u8* p) { return false; }
     private bool fs_rmdir1(u8* p) { return false; }
     private bool fs_unlink1(u8* p) { return false; }
     private bool fs_rename1(u8* a, u8* b) { return false; }
-    private bool fs_is_dir(u8* p) { return false; }
+    private bool fs_is_dir(u8* p) { return host_is_dir(p) != 0; }
     private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
     private void fs_readdir_into(VM* vm, str dir, JsObject* arr) { }
 }
@@ -15547,10 +15548,9 @@ else when os(android) {
     }
 }
 else when os(wasm) {
-    // No entropy import in the host surface. Reporting unavailable makes
-    // crypto.randomBytes/randomUUID throw, which is the right outcome —
-    // a non-CSPRNG substitute here would be worse than an error.
-    private bool os_random(u8* buf, i32 n) { return false; }
+    // Entropy comes from the host's CSPRNG. When it reports failure the
+    // crypto functions throw rather than fall back to a weaker source.
+    private bool os_random(u8* buf, i32 n) { return host_random_bytes(buf, n) != 0; }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather

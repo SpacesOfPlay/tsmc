@@ -1,0 +1,43 @@
+# Builds the wasm playground and publishes build/web to GitHub Pages.
+# The repository's Pages setting has to be "GitHub Actions" for the
+# deploy step to be allowed.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minc
+        run: |
+          curl -fsSL https://minc.dev/install | bash
+          echo "$HOME/.minc" >> "$GITHUB_PATH"
+      - name: Build the module and the page
+        run: minc wasm -- --no-serve
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
