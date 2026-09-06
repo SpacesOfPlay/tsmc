@@ -98,6 +98,8 @@ struct Compiler {
     StrMap<ModImport> mod_imports;   // valid while in_module
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
+    i32* line_starts;   // byte offset where each line of src begins
+    i32 n_lines;
 }
 
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
@@ -114,12 +116,31 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.src.data = null;
     co.src.len = 0;
     co.src_name = "";
+    co.line_starts = null;
+    co.n_lines = 0;
 }
 
-// Source text + filename for stack-trace positions.
+// Source text + filename for stack-trace positions. The line table makes
+// a position lookup a binary search; scanning from the start of the file
+// for each one made compilation quadratic in file size.
 void compiler_set_source(Compiler* co, str src, str src_name) {
     co.src = src;
     co.src_name = src_name;
+    i32 n = 1;
+    for i32 i = 0; i < src.len; i++ {
+        if *(src.data + i) == '\n' { n++; }
+    }
+    i32* starts = cast(i32*, bump_alloc(co.arena, n * 4));
+    *starts = 0;
+    i32 k = 1;
+    for i32 i = 0; i < src.len; i++ {
+        if *(src.data + i) == '\n' {
+            *(starts + k) = i + 1;
+            k++;
+        }
+    }
+    co.line_starts = starts;
+    co.n_lines = n;
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
@@ -127,10 +148,19 @@ private void cerror(Compiler* co, Node* n, str msg) {
 }
 
 // Records the source position of a node at the current code offset.
+// Line and column count the way diag_line_col does: the last line that
+// starts at or before the offset, and bytes since its start, both 1-based.
 private void emit_pos(Compiler* co, Node* n) {
     if co.src.data == null { return; }
-    LineCol lc = diag_line_col(co.src, n.span.start);
-    ch_record_pos(&co.cur.ch, lc.line, lc.col);
+    i32 off = n.span.start;
+    if off > co.src.len { off = co.src.len; }
+    i32 lo = 0;
+    i32 hi = co.n_lines - 1;
+    while lo < hi {
+        i32 mid = (lo + hi + 1) / 2;
+        if *(co.line_starts + mid) <= off { lo = mid; } else { hi = mid - 1; }
+    }
+    ch_record_pos(&co.cur.ch, lo + 1, off - *(co.line_starts + lo) + 1);
 }
 
 private str take_label(Compiler* co) {
