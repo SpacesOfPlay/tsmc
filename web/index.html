@@ -421,6 +421,7 @@ for (;;) {
         let s = `exit ${m.code} · ${m.ms.toFixed(1)} ms`;
         if (m.requests) s += ` · ${m.requests} requests, ${(m.bytes / 1024).toFixed(0)} KB in ${m.fetchMs.toFixed(0)} ms`;
         if (m.packages.length) emit('note', '\npackages: ' + m.packages.map((p) => `${p.name}@${p.version}`).join(' ') + '\n');
+        flush();   // the output is complete the moment the status says so
         finish(s);
       }
     };

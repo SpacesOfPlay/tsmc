@@ -1768,6 +1768,34 @@ private u32 key_to_atom(VM* vm, Value key) {
     return a;
 }
 
+// a + b for two string values: one cell holding both payloads. When a
+// high surrogate at the end of a meets a low one at the start of b the
+// bytes go through gc_new_string instead, which spells the pair as the
+// code point. Kept out of the interpreter loop for its frame's sake.
+private GcString* concat_strings(VM* vm, Value sa, Value sb) {
+    str va = gc_string_view(value_as_string(sa));
+    str vb = gc_string_view(value_as_string(sb));
+    if wtf8_pair_at_junction(va, vb) {
+        str_buf buf;
+        str_buf_init(&buf);
+        str_buf_add(&buf, va);
+        str_buf_add(&buf, vb);
+        GcString* joined = gc_new_string(&vm.heap, str_buf_to_str(&buf));
+        str_buf_free(&buf);
+        return joined;
+    }
+    GcString* g = cast(GcString*, gc_alloc(&vm.heap, GC_STRING,
+        sizeof(GcString) + va.len + vb.len));
+    g.len = va.len + vb.len;
+    g.u16len = value_as_string(sa).u16len + value_as_string(sb).u16len;
+    g.cur_u = 0;
+    g.cur_off = 0;
+    u8* dst = cast(u8*, g) + sizeof(GcString);
+    if va.len > 0 { memcpy(dst, va.data, va.len); }
+    if vb.len > 0 { memcpy(dst + va.len, vb.data, vb.len); }
+    return g;
+}
+
 // A method is a writable, configurable, non-enumerable property. Kept out
 // of the interpreter loop so the opcode does not widen its frame.
 private void def_method(Value objv, u32 a, Value v) {
@@ -3539,15 +3567,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, sa);
                     Value sb = js_to_string_value(vm, b);
                     vpush(vm, sb);
-                    str va = gc_string_view(value_as_string(sa));
-                    str vb = gc_string_view(value_as_string(sb));
-                    GcString* g = cast(GcString*, gc_alloc(&vm.heap, GC_STRING,
-                        sizeof(GcString) + va.len + vb.len));
-                    g.len = va.len + vb.len;
-                    g.u16len = value_as_string(sa).u16len + value_as_string(sb).u16len;
-                    u8* dst = cast(u8*, g) + sizeof(GcString);
-                    if va.len > 0 { memcpy(dst, va.data, va.len); }
-                    if vb.len > 0 { memcpy(dst + va.len, vb.data, vb.len); }
+                    GcString* g = concat_strings(vm, sa, sb);
                     vm.sp -= 4;
                     vpush(vm, value_cell(&g.head));
                 } else if value_is_bigint(a) || value_is_bigint(b) {
@@ -4169,7 +4189,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             } else {
                                 str_buf sb;
                                 str_buf_init(&sb);
-                                u16_slice_into(&sb, view, idx, idx + 1);
+                                u16_slice_into_cur(&sb, view, idx, idx + 1, &s.cur_u, &s.cur_off);
                                 GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
                                 str_buf_free(&sb);
                                 vm.sp -= 2;
@@ -5057,7 +5077,7 @@ private void spread_string_into(VM* vm, JsObject* d, Value sv) {
     for i32 i = 0; i < g.u16len; i++ {
         str_buf sb;
         str_buf_init(&sb);
-        u16_slice_into(&sb, view, i, i + 1);
+        u16_slice_into_cur(&sb, view, i, i + 1, &g.cur_u, &g.cur_off);
         GcString* ch1 = gc_new_string(&vm.heap, str_buf_to_str(&sb));
         str_buf_free(&sb);
         vpush(vm, value_cell(&ch1.head));

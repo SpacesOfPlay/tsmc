@@ -198,23 +198,35 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
 
 // --- cell kinds ----------------------------------------------------
 
-// String: byte payload follows the struct inline. Immutable.
+// String: byte payload follows the struct inline. Immutable, apart from
+// the cursor, which caches where the last unit lookup landed so a loop
+// over non-ASCII text does not rescan from the start each step.
 struct GcString {
     GcCell head;
     i32 len;       // byte length (UTF-8/WTF-8 storage)
     i32 u16len;    // cached UTF-16 code-unit count; == len iff ASCII
+    i32 cur_u;     // cursor: a UTF-16 unit index ...
+    i32 cur_off;   // ... and the byte offset of the code point there
 }
 
 GcString* gc_new_string(GcHeap* h, str s) {
     GcCell* c = gc_alloc(h, GC_STRING, sizeof(GcString) + s.len);
     GcString* gs = cast(GcString*, c);
     gs.len = s.len;
+    gs.cur_u = 0;
+    gs.cur_off = 0;
     if s.len > 0 {
         memcpy(cast(u8*, gs) + sizeof(GcString), s.data, s.len);
     }
     str view;
     view.data = cast(u8*, gs) + sizeof(GcString);
     view.len = s.len;
+    // halves of an astral code point that met in this string become the
+    // code point; the cell keeps its allocation, the payload shrinks
+    if s.len >= 6 && wtf8_has_surrogate(view) {
+        gs.len = wtf8_merge_pairs(view.data, s.len);
+        view.len = gs.len;
+    }
     gs.u16len = u16_count(view);
     return gs;
 }

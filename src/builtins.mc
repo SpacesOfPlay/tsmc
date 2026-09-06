@@ -2316,6 +2316,16 @@ private Value nat_string_fromcodepoint(void* vmp, Value callee, Value thisv, Val
     return r;
 }
 
+// The UTF-16 unit at `idx` of a string cell, or -1 when out of range.
+// ASCII strings (u16len == byte len) index directly; the rest resume
+// from the cell's cursor.
+private i32 gs_unit_at(GcString* g, i32 idx) {
+    if idx < 0 || idx >= g.u16len { return -1; }
+    str s = gc_string_view(g);
+    if g.u16len == g.len { return cast(i32, *(s.data + idx)); }
+    return u16_unit_at_cur(s, idx, &g.cur_u, &g.cur_off);
+}
+
 // Builds the UTF-16 unit range [start, end) of a string value as a new
 // string. ASCII strings (u16len == byte len) index directly.
 private Value str_u16_range(VM* vm, Value sv, i32 start, i32 end) {
@@ -2332,7 +2342,7 @@ private Value str_u16_range(VM* vm, Value sv, i32 start, i32 end) {
     }
     str_buf sb;
     str_buf_init(&sb);
-    u16_slice_into(&sb, s, start, end);
+    u16_slice_into_cur(&sb, s, start, end, &g.cur_u, &g.cur_off);
     Value r = new_str(vm, str_buf_to_str(&sb));
     str_buf_free(&sb);
     return r;
@@ -2360,9 +2370,8 @@ private Value nat_str_charcodeat(void* vmp, Value callee, Value thisv, Value* ar
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
     i32 i = to_int_arg(arg_at(args, argc, 0));
-    i32 unit = u16_unit_at(s, i);
+    i32 unit = gs_unit_at(value_as_string(sv2), i);
     gc_root_reset(&vm.heap, rm);
     if unit >= 0 { return value_int(unit); }
     return value_number(0.0 / 0.0);
@@ -2373,14 +2382,14 @@ private Value nat_str_codepointat(void* vmp, Value callee, Value thisv, Value* a
     i32 rm = gc_root_mark(&vm.heap);
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
-    str s = sview(sv2);
+    GcString* g = value_as_string(sv2);
     i32 i = to_int_arg(arg_at(args, argc, 0));
-    i32 hi = u16_unit_at(s, i);
+    i32 hi = gs_unit_at(g, i);
     gc_root_reset(&vm.heap, rm);
     if hi < 0 { return value_undefined(); }
     // a leading high surrogate followed by a low surrogate combines
     if hi >= 0xD800 && hi <= 0xDBFF {
-        i32 lo = u16_unit_at(s, i + 1);
+        i32 lo = gs_unit_at(g, i + 1);
         if lo >= 0xDC00 && lo <= 0xDFFF {
             return value_int(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
         }

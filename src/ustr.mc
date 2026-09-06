@@ -46,6 +46,70 @@ private i32 cp_units(i32 cp) {
     return cp > 0xFFFF ? 2 : 1;
 }
 
+// --- cursor-resumed lookups --------------------------------------------
+//
+// A cursor is a unit index and the byte offset of the code point that
+// starts there. A caller keeps one per string, starting at (0, 0), and
+// a lookup walks from it in either direction, so a loop over a string
+// costs the distance moved rather than the distance from the start.
+
+// Moves the cursor to the code point holding unit `idx`, or to the end
+// of the string when idx is past the last unit.
+private void u16_seek(str s, i32 idx, i32* cu, i32* co) {
+    if idx < 0 { idx = 0; }
+    while *cu > idx && *co > 0 {
+        // back over one code point: the lead byte before the continuation
+        // bytes, unless the forward decoder would not have read it as one
+        // sequence, in which case the last byte stands on its own
+        i32 last = *co - 1;
+        i32 lead = last;
+        while lead > 0 && (*(s.data + lead) & 0xC0) == 0x80 { lead--; }
+        i32 n;
+        i32 cp = utf8_decode(s, lead, &n);
+        if lead + n != *co {
+            lead = last;
+            cp = utf8_decode(s, lead, &n);
+        }
+        *co = lead;
+        *cu -= cp_units(cp);
+    }
+    while *co < s.len {
+        i32 n;
+        i32 cp = utf8_decode(s, *co, &n);
+        i32 w = cp_units(cp);
+        if idx < *cu + w { return; }
+        *cu += w;
+        *co += n;
+    }
+}
+
+// The UTF-16 code unit at `idx`, resumed from the cursor; -1 when out of
+// range. Astral code points expose a high then low surrogate.
+i32 u16_unit_at_cur(str s, i32 idx, i32* cu, i32* co) {
+    if idx < 0 { return -1; }
+    u16_seek(s, idx, cu, co);
+    if *co >= s.len { return -1; }
+    i32 n;
+    i32 cp = utf8_decode(s, *co, &n);
+    if cp_units(cp) == 1 { return cp; }
+    i32 v = cp - 0x10000;
+    if idx == *cu { return 0xD800 + (v >> 10); }
+    return 0xDC00 + (v & 0x3FF);
+}
+
+// Byte offset of the `idx`-th UTF-16 unit, resumed from the cursor and
+// clamped to [0, s.len]. An idx on the low half of an astral pair maps
+// past the pair, the first boundary at or after it.
+i32 u16_offset_cur(str s, i32 idx, i32* cu, i32* co) {
+    if idx <= 0 { return 0; }
+    u16_seek(s, idx, cu, co);
+    if *co >= s.len { return s.len; }
+    if idx == *cu { return *co; }
+    i32 n;
+    ignore utf8_decode(s, *co, &n);
+    return *co + n;
+}
+
 // Number of UTF-16 code units in the string.
 i32 u16_count(str s) {
     i32 units = 0;
@@ -59,43 +123,19 @@ i32 u16_count(str s) {
     return units;
 }
 
-// The UTF-16 code unit at index `idx`, or -1 if out of range. Astral
-// code points expose a high then low surrogate.
+// The UTF-16 code unit at index `idx`, or -1 if out of range, walked
+// from the start.
 i32 u16_unit_at(str s, i32 idx) {
-    if idx < 0 { return -1; }
-    i32 u = 0;
-    i32 off = 0;
-    while off < s.len {
-        i32 n;
-        i32 cp = utf8_decode(s, off, &n);
-        i32 w = cp_units(cp);
-        if idx < u + w {
-            if w == 1 { return cp; }
-            i32 v = cp - 0x10000;
-            if idx == u { return 0xD800 + (v >> 10); }
-            return 0xDC00 + (v & 0x3FF);
-        }
-        u += w;
-        off += n;
-    }
-    return -1;
+    i32 cu = 0;
+    i32 co = 0;
+    return u16_unit_at_cur(s, idx, &cu, &co);
 }
 
-// Byte offset of the `idx`-th UTF-16 unit, clamped to [0, s.len]. When
-// idx falls on the low half of an astral pair the code point's start
-// offset is returned (callers that split there use u16_slice_into).
+// Byte offset of the `idx`-th UTF-16 unit, walked from the start.
 i32 u16_offset(str s, i32 idx) {
-    if idx <= 0 { return 0; }
-    i32 u = 0;
-    i32 off = 0;
-    while off < s.len {
-        if u >= idx { return off; }
-        i32 n;
-        i32 cp = utf8_decode(s, off, &n);
-        u += cp_units(cp);
-        off += n;
-    }
-    return s.len;
+    i32 cu = 0;
+    i32 co = 0;
+    return u16_offset_cur(s, idx, &cu, &co);
 }
 
 // Converts a byte offset to its UTF-16 unit index.
@@ -149,6 +189,43 @@ bool wtf8_has_surrogate(str s) {
     return false;
 }
 
+// Rewrites each adjacent high+low surrogate pair, two WTF-8 sequences,
+// as the astral code point they spell, one UTF-8 sequence, in place.
+// Returns the new byte length. In UTF-16 terms the pair and the code
+// point are the same string, and equality compares bytes, so a string
+// assembled from halves has to end up with the same bytes as the whole.
+i32 wtf8_merge_pairs(u8* data, i32 len) {
+    i32 r = 0;
+    i32 w = 0;
+    while r < len {
+        if r + 5 < len && *(data + r) == 0xED && (*(data + r + 1) & 0xF0) == 0xA0
+            && *(data + r + 3) == 0xED && (*(data + r + 4) & 0xF0) == 0xB0 {
+            i32 hi = 0xD000 | ((cast(i32, *(data + r + 1)) & 0x3F) << 6) | (cast(i32, *(data + r + 2)) & 0x3F);
+            i32 lo = 0xD000 | ((cast(i32, *(data + r + 4)) & 0x3F) << 6) | (cast(i32, *(data + r + 5)) & 0x3F);
+            i32 cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+            *(data + w) = cast(u8, 0xF0 | (cp >> 18));
+            *(data + w + 1) = cast(u8, 0x80 | ((cp >> 12) & 0x3F));
+            *(data + w + 2) = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+            *(data + w + 3) = cast(u8, 0x80 | (cp & 0x3F));
+            r += 6;
+            w += 4;
+        } else {
+            if w != r { *(data + w) = *(data + r); }
+            r++;
+            w++;
+        }
+    }
+    return w;
+}
+
+// True when a ends with a high surrogate and b starts with a low one:
+// their concatenation spells an astral code point.
+bool wtf8_pair_at_junction(str a, str b) {
+    if a.len < 3 || b.len < 3 { return false; }
+    return *(a.data + a.len - 3) == 0xED && (*(a.data + a.len - 2) & 0xF0) == 0xA0
+        && *(b.data) == 0xED && (*(b.data + 1) & 0xF0) == 0xB0;
+}
+
 // Copies `s` into `sb`, replacing WTF-8 lone-surrogate sequences with
 // U+FFFD — for writing to a strict UTF-8 sink.
 void wtf8_sanitize_into(str_buf* sb, str s) {
@@ -168,12 +245,15 @@ void wtf8_sanitize_into(str_buf* sb, str s) {
     }
 }
 
-// Appends the UTF-16 unit range [start, end) of `s` as bytes. A range
-// boundary inside an astral pair emits a lone surrogate as WTF-8.
-void u16_slice_into(str_buf* sb, str s, i32 start, i32 end) {
+// Appends the UTF-16 unit range [start, end) of `s` as bytes, resumed
+// from the cursor, which is left at `start`. A range boundary inside an
+// astral pair emits a lone surrogate as WTF-8.
+void u16_slice_into_cur(str_buf* sb, str s, i32 start, i32 end, i32* cu, i32* co) {
     if start < 0 { start = 0; }
-    i32 u = 0;
-    i32 off = 0;
+    if end <= start { return; }
+    u16_seek(s, start, cu, co);
+    i32 u = *cu;
+    i32 off = *co;
     while off < s.len && u < end {
         i32 n;
         i32 cp = utf8_decode(s, off, &n);
@@ -200,4 +280,11 @@ void u16_slice_into(str_buf* sb, str s, i32 start, i32 end) {
         u += w;
         off += n;
     }
+}
+
+// The unit range [start, end) of `s`, walked from the start.
+void u16_slice_into(str_buf* sb, str s, i32 start, i32 end) {
+    i32 cu = 0;
+    i32 co = 0;
+    u16_slice_into_cur(sb, s, start, end, &cu, &co);
 }

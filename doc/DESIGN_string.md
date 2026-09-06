@@ -20,11 +20,20 @@ Keep UTF-8 storage; expose UTF-16 semantics at the JS boundary only.
   pure ASCII, in which case unit index == byte offset (the fast path
   every helper takes first).
 
+- `GcString.cur_u` / `cur_off` are a **cursor**: the unit index of the
+  last lookup and the byte offset of the code point there. A lookup
+  resumes from it in either direction, so a loop over non-ASCII text
+  costs the distance moved per step, not a rescan from the start. The
+  cursor is the one mutable part of a string cell and is only a cache:
+  any cursor position gives the same answers.
+
 Storing u16 wide strings instead would tax every string crossing the
 engine boundary (lexer literals, atoms, console, JSON) with a
 conversion, to fix a deviation that only surfaces in unit-level
 introspection of non-ASCII text. UTF-8 storage with a cached unit count
-keeps the boundary conversion-free and the ASCII path O(1).
+keeps the boundary conversion-free and the ASCII path O(1); the cursor
+keeps the non-ASCII path linear for the loops that packages actually
+write, such as a base64 decoder reading a byte string with `charCodeAt`.
 
 ## Code-unit accounting
 
@@ -54,10 +63,12 @@ the astral code point.
 ## Helpers (`src/ustr.mc`)
 
 `u16_count`, `u16_unit_at`, `u16_offset` (unit index → byte offset),
-`u16_slice` (build the substring for a unit range, emitting WTF-8 at a
-split surrogate), `cp_at`/`cp_advance` (code-point walk for iteration),
-and `wtf8_put`/`wtf8_put_unit` builders. Pure functions over `str`; the
-builtin surface calls these and never indexes bytes directly.
+`u16_slice_into` (build the substring for a unit range, emitting WTF-8
+at a split surrogate), `cp_at`/`cp_advance` (code-point walk for
+iteration), and `wtf8_put`/`wtf8_put_unit` builders. Each lookup has a
+`_cur` form that takes the cursor pair and moves it; the plain form
+walks from the start. Pure functions over `str`; the builtin surface
+calls these and never indexes bytes directly.
 
 ## JS-visible surface (UTF-16 indices)
 

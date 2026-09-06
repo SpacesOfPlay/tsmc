@@ -123,9 +123,19 @@ sandbox's: no sockets, no writes.
 Measured in the page against the live registry: markdown-it with its
 six dependencies is 14 requests and 733 KB, ready in 1.3 s; js-yaml and
 ramda are 2 requests each, under half a second. A second run of a loaded
-package makes no request. Interpreting markdown-it's bundle takes the
-wasm build about 1.8 s per run, which is the cost of parsing a few
-hundred kilobytes of JavaScript, not of the fetch.
+package makes no request.
+
+The first markdown-it runs took 1.8 s in the page even with the packages
+loaded, and a per-module breakdown of the native build put 914 of its
+1,022 ms in one generated file of `entities`: a base64 decoder reading a
+24,000-byte string with `charCodeAt`. Parsing and compiling the whole
+245 KB graph was 116 ms. Every unit lookup on a non-ASCII string walked
+from byte zero, and `charCodeAt` had no ASCII fast path at all, so such
+loops were quadratic. The string cell now carries a cursor that lookups
+resume from (`doc/DESIGN_string.md`); the same loop costs 2 ms instead
+of 294, and the graph loads in 145 ms natively and about 260 ms through
+the wasm build. `test/diff/string_index_cursor.js` pins the semantics
+against node and `bench/strindex.ts` the cost.
 
 The package view exposed a resolver habit: a bare specifier used to be
 tried as a sibling file before the `node_modules` walk, so a script named
