@@ -7,6 +7,7 @@
 
 import vec;
 import str;
+import map;
 import file;
 import diag;
 import bump;
@@ -129,6 +130,15 @@ struct Loader {
     DiagList diags;
     bool failed;
     i32 printed;   // diags already reported, each against its own module's source
+    // Indexes into mods, keyed by strings the modules own: the canonical
+    // path of every module, and the lexical path of each ES module, so an
+    // import edge to a loaded module costs a lookup rather than a realpath.
+    StrMap<i32> by_canon;
+    StrMap<i32> by_path;
+    // Directory -> 1 when the nearest package.json says "type": "module".
+    // Keys are owned here; a package's files ask this once per directory.
+    StrMap<i32> pkg_type;
+    Vec<str> pkg_dirs;
 }
 
 // --- path handling -----------------------------------------------------------
@@ -308,10 +318,18 @@ private str canon_path(str path) {
 // --- loading -----------------------------------------------------------------
 
 private i32 find_module(Loader* ld, str canon) {
-    for i32 i = 0; i < ld.mods.len; i++ {
-        if str_equal(vec_get(&ld.mods, i).canon, canon) { return i; }
-    }
-    return -1;
+    i32* idx = strmap_get(&ld.by_canon, canon);
+    return idx == null ? -1 : *idx;
+}
+
+// Adds a module to the table. An ES module is also findable by the
+// lexical path it was resolved to, which is what the next edge presents.
+private i32 register_module(Loader* ld, Module* mod, bool by_path) {
+    i32 idx = ld.mods.len;
+    vec_push(&ld.mods, mod);
+    strmap_set(&ld.by_canon, mod.canon, idx);
+    if by_path { strmap_set(&ld.by_path, mod.path, idx); }
+    return idx;
 }
 
 private bool str_has_prefix(str s, str pre) {
@@ -389,18 +407,14 @@ private i32 load_builtin_module(Loader* ld, str name) {
     bump_init(&mod.arena);
     mod.tmpl = null;
     mod.ns = ns;
-    i32 idx = ld.mods.len;
-    vec_push(&ld.mods, mod);
-    return idx;
+    return register_module(ld, mod, false);
 }
 
 // Does the nearest package.json above `path` say "type": "module"? That is
 // what makes a .js file ESM when its own syntax gives nothing away, a body
 // with top-level await and no import or export being the realistic case.
-private bool pkg_type_is_module(VM* vm, str path) {
-    // dir_of returns a view into `path`, and the walk below frees what it
-    // holds, so start from a copy.
-    str cur = owned_str(dir_of(path));
+private bool pkg_type_walk(VM* vm, str dir) {
+    str cur = owned_str(dir);
     i32 guard = 0;
     bool found = false;
     while guard < 64 {
@@ -440,32 +454,42 @@ private bool pkg_type_is_module(VM* vm, str path) {
     return false;
 }
 
+// The answer is per directory, and a package asks it for every file it
+// has, so it is walked once and remembered.
+private bool pkg_type_is_module(Loader* ld, str path) {
+    str dir = dir_of(path);
+    i32* known = strmap_get(&ld.pkg_type, dir);
+    if known != null { return *known == 1; }
+    bool found = pkg_type_walk(ld.vm, dir);
+    str key = owned_str(dir);
+    vec_push(&ld.pkg_dirs, key);
+    strmap_set(&ld.pkg_type, key, found ? 1 : 0);
+    return found;
+}
+
 // Is this file an ES module? The extension decides when it can, then the
 // package type, then the source is sniffed, which is what dynamic import
-// does.
-private bool esm_source_file(VM* vm, str path) {
+// does. When the file had to be read for that, its bytes are left in
+// *out for the caller to load from or free.
+private bool esm_source_file(Loader* ld, str path, FileData* out) {
+    out.data = null;
+    out.len = 0;
     if path_is_mjs(path) { return true; }
     if path_is_cjs(path) || path_is_json(path) { return false; }
-    if pkg_type_is_module(vm, path) { return true; }
+    if pkg_type_is_module(ld, path) { return true; }
     FileData fd = file_read(path);
     if fd.data == null { return false; }
     str s;
     s.data = fd.data;
     s.len = cast(i32, fd.len);
-    bool r = has_module_syntax(s);
-    free(fd.data);
-    return r;
+    *out = fd;
+    return has_module_syntax(s);
 }
 
 // Registers a CommonJS dependency without running it. Keyed by the target's
-// canonical path, so importing and requiring the same file is one module.
-private i32 load_cjs_module(Loader* ld, str importer, str spec, str resolved) {
-    str canon = canon_path(resolved);
-    i32 existing = find_module(ld, canon);
-    if existing >= 0 {
-        free(canon.data);
-        return existing;
-    }
+// canonical path, which it takes over, so importing and requiring the same
+// file is one module.
+private i32 load_cjs_module(Loader* ld, str importer, str spec, str canon) {
     Module* mod = new(Module);
     mod.path = owned_str(importer);
     mod.canon = canon;
@@ -479,9 +503,7 @@ private i32 load_cjs_module(Loader* ld, str importer, str spec, str resolved) {
     bump_init(&mod.arena);
     mod.tmpl = null;
     mod.ns = null;
-    i32 idx = ld.mods.len;
-    vec_push(&ld.mods, mod);
-    return idx;
+    return register_module(ld, mod, false);
 }
 
 // Loads path (and its deps) into the loader; returns the module index
@@ -490,8 +512,16 @@ private i32 load_module(Loader* ld, str path) {
     str canon = canon_path(path);
     i32 existing = find_module(ld, canon);
     if existing >= 0 { free(canon.data); return existing; }
+    FileData none;
+    none.data = null;
+    none.len = 0;
+    return load_module_from(ld, path, canon, none);
+}
 
-    FileData fd = file_read(path);
+// Loads a module known not to be in the table. Takes over canon, and the
+// file's bytes when the caller already read them; reads them otherwise.
+private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
+    if fd.data == null { fd = file_read(path); }
     if fd.data == null {
         eprint("tsmc: cannot read module '{}'\n", path);
         ld.failed = true;
@@ -513,8 +543,7 @@ private i32 load_module(Loader* ld, str path) {
     mod.ok = false;
     vec_init<i32>(&mod.dep_idx, 4);
     bump_init(&mod.arena);
-    i32 my_idx = ld.mods.len;
-    vec_push(&ld.mods, mod);
+    i32 my_idx = register_module(ld, mod, true);
 
     str src;
     src.data = fd.data;
@@ -591,12 +620,32 @@ private i32 load_module(Loader* ld, str path) {
             vec_push(&mod.dep_idx, -1);
             continue;
         }
-        // A CommonJS target exports through module.exports, which the ESM
-        // loader would not see at all: it would parse, export nothing, and
-        // hand back an empty namespace.
-        i32 dep = esm_source_file(ld.vm, resolved)
-            ? load_module(ld, resolved)
-            : load_cjs_module(ld, mod.path, spec, resolved);
+        // Most edges of a big package point at a module already loaded,
+        // and its lexical path says so; the rest go through the canonical
+        // path, then one sniff and one read. A CommonJS target exports
+        // through module.exports, which the ESM loader would not see at
+        // all: it would parse, export nothing, and hand back an empty
+        // namespace.
+        i32 dep = -1;
+        i32* known = strmap_get(&ld.by_path, resolved);
+        if known != null {
+            dep = *known;
+        } else {
+            str canon = canon_path(resolved);
+            i32 existing = find_module(ld, canon);
+            if existing >= 0 {
+                free(canon.data);
+                dep = existing;
+            } else {
+                FileData fd;
+                if esm_source_file(ld, resolved, &fd) {
+                    dep = load_module_from(ld, resolved, canon, fd);
+                } else {
+                    if fd.data != null { free(fd.data); }
+                    dep = load_cjs_module(ld, mod.path, spec, canon);
+                }
+            }
+        }
         vec_push(&mod.dep_idx, dep);
         free(resolved.data);
     }
@@ -1970,6 +2019,10 @@ i32 module_run_entry(VM* vm, str src, str path) {
     diags_init(&ld.diags);
     ld.failed = false;
     ld.printed = 0;
+    strmap_init<i32>(&ld.by_canon);
+    strmap_init<i32>(&ld.by_path);
+    strmap_init<i32>(&ld.pkg_type);
+    vec_init<str>(&ld.pkg_dirs, 8);
     vm_set_esm_loader(vm, cast(void*, &ld));
     vm_set_dynimport_hook(vm, &dynimport_hook);
 
@@ -2002,6 +2055,13 @@ i32 module_run_entry(VM* vm, str src, str path) {
     }
 
     vm_set_esm_loader(vm, null);
+    strmap_free(&ld.by_canon);
+    strmap_free(&ld.by_path);
+    strmap_free(&ld.pkg_type);
+    for i32 i = 0; i < ld.pkg_dirs.len; i++ {
+        free(vec_get(&ld.pkg_dirs, i).data);
+    }
+    vec_free(&ld.pkg_dirs);
     for i32 i = 0; i < ld.mods.len; i++ {
         module_free(vec_get(&ld.mods, i));
     }
