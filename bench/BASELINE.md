@@ -68,3 +68,23 @@ total − startup floor.
   the `fib` ratio implies.
 - **Startup is a genuine strength** and did not regress with the M14–M16
   feature work.
+
+## Loading packages (2026-09-06, minc 0.9.14, same machine)
+
+Loading a real package was dominated by three costs that were not the
+interpreter's throughput. Native wall clock, `min` of 3, whole process:
+
+| workload | before | after | what changed |
+|---|---|---|---|
+| `charCodeAt` loop over 15,000 chars | 294 ms | 2 ms | lookups resume from a per-string cursor; ASCII reads the byte |
+| compile 12,000 plain statements | 753 ms | 4 ms | a line table per file instead of a scan per recorded position |
+| `import 'markdown-it'` (7 packages, 245 KB) | 1,022 ms | 90 ms | both of the above |
+| `import 'js-yaml'` (107 KB bundle) | 135 ms | 60 ms | line table |
+| `import * as R from 'ramda'` (368 files, 1,029 edges) | 355 ms | 165 ms | module table consulted per edge; package type cached per directory; one read per module |
+| ten `setTimeout(1)` in sequence | ~160 ms | 19 ms | `timeBeginPeriod(1)` on the first wait (Windows) |
+
+What remains in the ramda number: the ~55 ms process floor, 368 file
+reads (~34 ms), a realpath per new module (~26 ms) and one existence
+check per import edge (~40 ms). `bench/strindex.ts` tracks the string
+cost; the loader and compiler have no dedicated benchmark yet, the
+package examples in `web/` are the practical one.

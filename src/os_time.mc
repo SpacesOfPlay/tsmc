@@ -11,6 +11,7 @@ when os(windows) {
     private extern "kernel32.dll" i32 QueryPerformanceFrequency(i64* p);
     private extern "kernel32.dll" void Sleep(u32 ms);
     private extern "kernel32.dll" void GetSystemTimeAsFileTime(u64* p);
+    private extern "winmm.dll" u32 timeBeginPeriod(u32 ms);
 
     i64 os_wall_ms() {
         u64 ft = 0;
@@ -33,8 +34,18 @@ when os(windows) {
         return secs * 1000000000 + rem * 1000000000 / uf;
     }
 
+    // Sleep rounds up to the scheduler tick, 15.6 ms unless the process
+    // has asked for a finer one. The first wait asks, so a short timer
+    // fires when it is due rather than at the next tick.
+    private bool g_fine_tick = false;
+
     void vm_wait_ms(i64 ms) {
-        if ms > 0 { Sleep(cast(u32, ms)); }
+        if ms <= 0 { return; }
+        if !g_fine_tick {
+            ignore timeBeginPeriod(1);
+            g_fine_tick = true;
+        }
+        Sleep(cast(u32, ms));
     }
 }
 else when os(wasm) {

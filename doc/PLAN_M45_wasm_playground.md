@@ -137,6 +137,15 @@ of 294, and the graph loads in 145 ms natively and about 260 ms through
 the wasm build. `test/diff/string_index_cursor.js` pins the semantics
 against node and `bench/strindex.ts` the cost.
 
+A review of the other examples found two more general costs. Compiling
+was quadratic in file size, because every recorded source position
+counted newlines from the start of the file; a line table built once per
+file made it linear, and js-yaml's bundle compiles in 2 ms instead of
+75. The ES module loader did a canonical path, a package.json walk and a
+read for every import edge, even to a module already loaded; ramda's
+1,029 edges now cost a map lookup each, and it imports in 165 ms
+instead of 355. `bench/BASELINE.md` has the numbers.
+
 The package view exposed a resolver habit: a bare specifier used to be
 tried as a sibling file before the `node_modules` walk, so a script named
 `ramda.ts` that imported `ramda` imported itself and saw an empty
