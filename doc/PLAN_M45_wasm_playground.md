@@ -1,7 +1,7 @@
 # M45 — the wasm build and a browser playground
 
-Status: build, host and page in place; the Pages deploy is wired but has
-not run yet.
+Status: live at https://spacesofplay.github.io/tsmc/, deployed by the
+Pages workflow on every push to main.
 
 ## Why
 
@@ -215,9 +215,8 @@ node for debugging, with `WASM_TRACE=1` printing every probe.
 
 ## Follow-ups
 
-1. Turn Pages on in the repository settings and let the workflow run.
-2. Editor niceties the overlay does not give: bracket matching, find,
+1. Editor niceties the overlay does not give: bracket matching, find,
    and multi-line indent. Past that point an editor component is the
    honest answer, at the cost of a CDN dependency.
-3. A multi-file view in the page.
-4. Blocking timers, if the page ever runs with shared memory.
+2. A multi-file view in the page.
+3. Blocking timers, if the page ever runs with shared memory.

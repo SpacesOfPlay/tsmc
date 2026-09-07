@@ -92,7 +92,8 @@ the rooting rule a plugin has to follow.
 ## In the browser
 
 The interpreter also compiles to WebAssembly, and `web/` is a playground
-around it: a page where a script runs in a worker. A bare import
+around it, live at https://spacesofplay.github.io/tsmc/: a page where a
+script runs in a worker. A bare import
 resolves against npm: the packages a script names, and what they depend
 on, are fetched from the registry on first use and unpacked in memory,
 where the module resolver walks them like an installed tree. Nothing
