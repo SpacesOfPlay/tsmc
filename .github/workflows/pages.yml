@@ -23,6 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install minc
+        env:
+          MINC_NO_PATH: "1"
+          MINC_VSCODE: "0"
         run: |
           curl -fsSL https://minc.dev/install | bash
           echo "$HOME/.minc" >> "$GITHUB_PATH"

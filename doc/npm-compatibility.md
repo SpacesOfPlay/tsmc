@@ -3,8 +3,8 @@
 tsmc runs `.js`/`.ts` files Bun-style and `require` resolves `node_modules`
 with the CommonJS algorithm (`package.json` `main`/`exports`, the
 `node_modules` walk), so many pure-JavaScript npm packages run unmodified.
-An ESM `import` takes a relative path only, so a package is reachable through
-`require` alone.
+An ESM `import` resolves a bare specifier through the same walk, and the
+browser playground serves the same tree from npm at run time.
 This page is an **empirical** list: every entry below was actually executed
 under tsmc and its output compared byte-for-byte against Node. It is a
 snapshot, not a guarantee — see [Reproducing](#reproducing) to re-run it.
@@ -22,6 +22,7 @@ Confirmed running with output identical to Node.
 ### Utility & data
 | package | notes |
 |---|---|
+| `lodash-es@4.18.1` | 640 ES modules, loaded in the playground (2026-09) |
 | `ms@2.1.3` | time-string parse/format |
 | `bytes@3.1.2` | byte-size parse/format |
 | `deepmerge@4.3.1` | recursive object merge |
@@ -32,7 +33,7 @@ Confirmed running with output identical to Node.
 | `pino-std-serializers@7.0.0` | log serializers (symbol-keyed properties) |
 | `fast-deep-equal@3.1.3` | recursive deep equality |
 | `fast-json-stable-stringify@2.1.0` | stable JSON serialization |
-| `immer@10.1.1` | immutable updates via Proxy (object **and array** drafts) |
+| `immer@10.1.1`, `immer@11.1.18` | immutable updates via Proxy (object **and array** drafts) |
 | `bignumber.js@9.1.2` | arbitrary-precision decimals |
 | `decimal.js@10.4.3` | arbitrary-precision decimals |
 | `chalk@4.1.2` | terminal string styling (all color models + chaining) |
@@ -66,18 +67,19 @@ Confirmed running with output identical to Node.
 |---|---|
 | `mustache@4.2.0` | logic-less templates |
 | `marked@12.0.2` | Markdown → HTML (uses private class methods) |
-| `markdown-it@14.1.0` | Markdown → HTML (plugin architecture) |
+| `markdown-it@14.1.0`, `markdown-it@15.0.1` | Markdown → HTML (plugin architecture) |
 
 ### Validation & versioning
 | package | notes |
 |---|---|
+| `zod@4.5.4`, `zod@3.25.76` | schema validation; TypeScript namespace output, `export * as`, live export bindings (2026-09) |
 | `validator@13.12.0` | string validators (isEmail, isUUID, …) |
 | `semver@7.6.3` | semantic-version compare/range |
 
 ### Dates
 | package | notes |
 |---|---|
-| `date-fns@3.6.0` | date math + formatting (no `Intl`) |
+| `date-fns@3.6.0`, `date-fns@4.4.0` | date math + formatting (no `Intl`); 305 modules through the playground (2026-09) |
 | `dayjs@1.11.13` | date library |
 
 ### Numbers

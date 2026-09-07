@@ -3573,6 +3573,16 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
 
     Node* d = s.a;
     if is_default {
+        // export default class Name: a declaration, so the module can use
+        // the name; initializing the binding writes it as `default`
+        if d.kind == N_CLASS && d.name.len > 0 {
+            i32 li = find_local(co.cur, d.name);
+            if li >= 0 {
+                compile_class_expr(co, d);
+                emit_init_binding(co, li);
+                return;
+            }
+        }
         // export default <expr | class-expr | function-expr>
         emit_load_name(co, ns_name, null);
         compile_expr(co, d);

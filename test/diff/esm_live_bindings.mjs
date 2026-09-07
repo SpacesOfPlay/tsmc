@@ -46,3 +46,9 @@ import * as re from './esm_live/reexport.mjs';
 console.log('namespace re-export:', z.answer, z.twice(4), zdef === z, answer);
 console.log('star as:', re.grouped.answer, re.grouped === z);
 console.log('unassigned var:', unassigned, 'unassigned' in re, Object.keys(re).sort().join(','));
+
+import DShape, { made, replace } from './esm_live/defclass.mjs';
+import * as dc from './esm_live/defclass.mjs';
+console.log('default class:', DShape.kind, made instanceof DShape);
+replace();
+console.log('default class after replace:', DShape.kind, dc.default.kind, made instanceof DShape);
