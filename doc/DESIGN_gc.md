@@ -56,6 +56,22 @@ reports the first such touch on stderr. The test runner holds each
 stress run's output against a plain run, since a stale read can also
 corrupt output without failing.
 
+## Cell memory
+
+Cells come in a few dozen sizes and turn over constantly. The sweep
+does not hand a dead cell back to the program allocator; it keeps it on
+a free list for its size class, and `gc_alloc` takes from that list
+before asking for fresh memory. Classes step by 16 bytes up to 1 KB and
+by a quarter of each doubling up to 128 KB; a larger cell, a big string
+or buffer, is allocated and freed directly. A cell's recorded size is
+its class size, so accounting and the stress poison cover the whole
+block. This keeps the heap's churn away from the program allocator,
+which on the wasm and linux targets scans a single first-fit list for
+every request; measured there, loading date-fns fell from 680 to about
+200 ms and from 620 to under 100 ms, while Windows, whose allocator has
+size classes of its own, was unchanged. Memory held on the lists is
+returned at `gc_destroy`.
+
 ## Roots
 
 - An explicit root stack (`Vec<Value>`) with push/mark/reset — the

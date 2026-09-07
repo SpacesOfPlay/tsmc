@@ -97,7 +97,21 @@ Allocating less, same day, native wall clock:
 | lodash-es loaded through wasm | 50.6 MB | 17.5 MB | a module's parse arena starts at a size drawn from its source |
 
 Through the wasm build the regex loop went from 7.7 s to 1.0 s; what
-remains there is the allocator behind every `new RegExp` object. Through the wasm build the same loop went from
+remains there is the allocator behind every `new RegExp` object.
+
+Dead cells are now kept on per-size-class free lists inside the heap
+and reused before the program allocator is asked (`doc/DESIGN_gc.md`).
+Where that allocator scans one first-fit list per request this is the
+difference between usable and not:
+
+| `import 'date-fns'` (305 modules) | before | after |
+|---|---|---|
+| Windows | 180 ms | 180 ms |
+| Linux, local filesystem (WSL) | 617 ms | 98 ms |
+| wasm under node | 683 ms | 214 ms |
+
+The Windows numbers are unchanged, as expected: its allocator already
+has size classes. `bench/regexloop.ts` on Linux went from 85 to 67 ms. Through the wasm build the same loop went from
 seconds and an out-of-bounds trap to 46 ms, since it no longer asks the
 allocator for a bigger block at every step.
 

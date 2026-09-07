@@ -142,32 +142,33 @@ against the live registry, the run itself and the first fetch:
 
 | package | run | first fetch |
 |---|---|---|
-| markdown-it, 7 packages | 116 ms | 733 KB, 0.3 s |
+| markdown-it, 7 packages | 89 ms | 733 KB, 0.3 s |
 | js-yaml | 11 ms | 223 KB, 0.05 s |
-| ramda | 44 ms | 218 KB, 0.2 s |
+| ramda | 31 ms | 218 KB, 0.2 s |
 | immer | 5 ms | 252 KB, 0.6 s |
-| decimal.js | 10 ms | 69 KB, 0.6 s |
+| decimal.js | 8 ms | 69 KB, 0.6 s |
 | mustache | 2 ms | 34 KB, 0.4 s |
 | dayjs with two plugins | 6 ms | 145 KB, 0.4 s |
-| uuid | 6 ms | 15 KB, 0.4 s |
-| lodash-es, 640 modules | 95 ms | 147 KB, 0.4 s |
-| date-fns, 305 modules loaded | 618 ms | 1.5 MB, 0.5 s |
+| uuid | 5 ms | 15 KB, 0.4 s |
+| lodash-es, 640 modules | 51 ms | 147 KB, 0.4 s |
+| date-fns, 305 modules loaded | 120 ms | 1.5 MB, 0.5 s |
 
-date-fns is the outlier, and the reason is outside this repository: the
-wasm target's allocator keeps one first-fit free list with no splitting
-or coalescing, so freed memory is never reused for a different size and
-every allocation scans the blocks that did not fit. A probe that frees
-50,000 blocks of 64 bytes and then asks for 25,000 of 128 reuses none of
-them and takes 1.5 s; a block regrown from 100 bytes to 200 KB in 2,000
-steps leaves 199 MB of memory for 4 MB of live data. In the page that
-shows as date-fns's 50 KB package.json taking 63 ms to parse and a loop
-compiling 3,000 regexes taking seconds. Natively none of that happens.
-Until the allocator grows size classes, the page is best with packages
-whose load allocates little; everything above except date-fns is under
-120 ms. A string built with `+=` used to end in an out-of-bounds trap
-there for the same reason; concatenation now extends a shared buffer
-(`doc/DESIGN_string.md`), which also took the native cost of 100,000
-appends from 1.1 s to 12 ms.
+date-fns first measured at 618 ms, and the reason was outside this
+repository: the wasm target's allocator, which the linux target shares,
+keeps one first-fit free list with no splitting or coalescing, so freed
+memory is never reused for a different size and every allocation scans
+the blocks that did not fit. A probe that frees 50,000 blocks of 64
+bytes and then asks for 25,000 of 128 reuses none of them and takes
+1.5 s; a block regrown from 100 bytes to 200 KB in 2,000 steps leaves
+199 MB of memory for 4 MB of live data. The report is filed with the
+compiler. Two things in this repository took most of the sting out:
+concatenation extends a shared buffer (`doc/DESIGN_string.md`), which
+also took the native cost of 100,000 appends from 1.1 s to 12 ms, and
+dead cells are kept on size-class free lists inside the heap
+(`doc/DESIGN_gc.md`), which is what brought date-fns to 120 ms. What
+the allocator still sees from us is property maps, vectors and string
+buffers, which call it by name; a loop of 3,000 `new RegExp` takes a
+second in the page for that reason, and 5 ms natively.
 
 zod is not among the examples: its current versions compile TypeScript
 namespaces to `export var util; (function (util) { … })(util || (util = {}))`,

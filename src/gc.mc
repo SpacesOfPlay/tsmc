@@ -35,6 +35,11 @@ type GcWeakSweepFn = fn(GcHeap*, void*): void;
 
 const i64 GC_MIN_THRESHOLD = 262144;
 
+// cell size classes: 64 of 16 bytes up to 1 KB, then 4 per doubling to 128 KB
+const i32 GC_CLASS_SMALL = 64;
+const i32 GC_CLASS_COUNT = 92;
+const i64 GC_CLASS_MAX = 131072;
+
 struct GcHeap {
     GcCell* all;
     i64 bytes_live;
@@ -50,6 +55,53 @@ struct GcHeap {
     GcWeakMarkFn weak_mark;   // ephemeron marking (WeakMap/WeakSet)
     GcWeakSweepFn weak_sweep; // drops dead-keyed weak entries
     void* mark_ctx;
+    GcCell*[GC_CLASS_COUNT] free_cells;   // dead cells by size class, reused first
+}
+
+// --- cell allocator ------------------------------------------------
+//
+// Cells come in a few dozen sizes and turn over constantly, and the
+// program allocator on some targets scans one first-fit free list for
+// every request. Dead cells are kept here instead, on a free list per
+// size class, and reused before the program allocator is asked again.
+// Classes step by 16 bytes to 1 KB, then by a quarter of each doubling
+// up to 128 KB; a larger cell goes straight to the program allocator.
+
+// The class of a cell size, or -1 when it is above the largest class.
+private i32 gc_class_of(i64 size) {
+    if size <= 1024 { return cast(i32, (size + 15) / 16) - 1; }
+    if size > GC_CLASS_MAX { return -1; }
+    i64 base = 1024;
+    i32 d = 0;
+    while size > base * 2 {
+        base = base * 2;
+        d++;
+    }
+    i64 step = base / 4;
+    i32 q = cast(i32, (size - base + step - 1) / step) - 1;
+    return GC_CLASS_SMALL + d * 4 + q;
+}
+
+// The block size a class allocates; a class size maps back to itself.
+private i64 gc_class_size(i32 cls) {
+    if cls < GC_CLASS_SMALL { return cast(i64, cls + 1) * 16; }
+    i32 d = (cls - GC_CLASS_SMALL) / 4;
+    i32 q = (cls - GC_CLASS_SMALL) % 4;
+    i64 base = 1024;
+    for i32 i = 0; i < d; i++ { base = base * 2; }
+    return base + base / 4 * cast(i64, q + 1);
+}
+
+// A dead cell's memory goes back on its class list, or to the program
+// allocator when it has no class.
+private void gc_cell_release(GcHeap* h, GcCell* c) {
+    i32 cls = gc_class_of(c.size);
+    if cls < 0 {
+        free(c);
+        return;
+    }
+    c.next = h.free_cells[cls];
+    h.free_cells[cls] = c;
 }
 
 void gc_init(GcHeap* h) {
@@ -67,6 +119,7 @@ void gc_init(GcHeap* h) {
     h.weak_mark = null;
     h.weak_sweep = null;
     h.mark_ctx = null;
+    for i32 i = 0; i < GC_CLASS_COUNT; i++ { h.free_cells[i] = null; }
 }
 
 void gc_destroy(GcHeap* h) {
@@ -80,6 +133,15 @@ void gc_destroy(GcHeap* h) {
     h.all = null;
     h.bytes_live = 0;
     h.n_cells = 0;
+    for i32 i = 0; i < GC_CLASS_COUNT; i++ {
+        GcCell* f = h.free_cells[i];
+        while f != null {
+            GcCell* n = f.next;
+            free(f);
+            f = n;
+        }
+        h.free_cells[i] = null;
+    }
     vec_free(&h.roots);
     vec_free(&h.mark_stack);
 }
@@ -178,7 +240,7 @@ void gc_collect(GcHeap* h) {
                 memset(cast(u8*, c), 0xAB, c.size);
                 c.kind = -1;
             } else {
-                free(c);
+                gc_cell_release(h, c);
             }
         }
     }
@@ -193,14 +255,22 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
     if h.stress || h.bytes_live >= h.next_gc {
         gc_collect(h);
     }
-    GcCell* c = cast(GcCell*, alloc(size));
-    memset(cast(u8*, c), 0, size);
+    i32 cls = gc_class_of(size);
+    i64 block = cls >= 0 ? gc_class_size(cls) : size;
+    GcCell* c = null;
+    if cls >= 0 && h.free_cells[cls] != null {
+        c = h.free_cells[cls];
+        h.free_cells[cls] = c.next;
+    } else {
+        c = cast(GcCell*, alloc(block));
+    }
+    memset(cast(u8*, c), 0, block);
     c.next = h.all;
     h.all = c;
-    c.size = size;
+    c.size = block;
     c.kind = kind;
     c.mark = 0;
-    h.bytes_live += size;
+    h.bytes_live += block;
     h.n_cells++;
     return c;
 }
