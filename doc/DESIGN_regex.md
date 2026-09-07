@@ -59,4 +59,7 @@ range list per binary property). Not supported, and raising
 Script value short aliases, the remaining binary properties, and
 `v`-mode set notation. Backreferences to unset groups match empty
 (per spec). No compiled-pattern portability concerns — progs are
-owned by the VM and freed at teardown.
+owned by the VM and freed at teardown, one per distinct pattern and
+flag set: a literal evaluated in a loop, or `new RegExp` of the same
+text, finds its program in `vm.regex_cache` and compiles nothing. Only
+the object, with its own `lastIndex`, is fresh per evaluation.

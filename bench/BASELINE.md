@@ -85,7 +85,19 @@ interpreter's throughput. Native wall clock, `min` of 3, whole process:
 | `s += 'ab'` 100,000 times | 1,099 ms | 67 ms | concatenation results share a growing buffer; each piece copied once |
 
 `bench/strbuild.ts` (100,000 lines by `+=`, 20,000 template pieces)
-runs in about 120 ms. Through the wasm build the same loop went from
+runs in about 120 ms.
+
+Allocating less, same day, native wall clock:
+
+| workload | before | after | what changed |
+|---|---|---|---|
+| 3,000 `new RegExp` of 9 patterns | 8.6 ms | 4.6 ms | one compiled program per pattern and flags, shared by every object |
+| 200,000 `String(i)` | 56 ms | 47 ms | an integer is spelled into a stack buffer, no intermediate heap string |
+| `bench/regexloop.ts` | 155 ms | 118 ms | both, plus one-byte strings from a shared table |
+| lodash-es loaded through wasm | 50.6 MB | 17.5 MB | a module's parse arena starts at a size drawn from its source |
+
+Through the wasm build the regex loop went from 7.7 s to 1.0 s; what
+remains there is the allocator behind every `new RegExp` object. Through the wasm build the same loop went from
 seconds and an out-of-bounds trap to 46 ms, since it no longer asks the
 allocator for a bigger block at every step.
 

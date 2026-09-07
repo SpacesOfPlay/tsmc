@@ -192,6 +192,9 @@ struct VM {
     JsObject* usp_proto;       // URLSearchParams.prototype
     JsObject* require_cache;    // CommonJS module cache: canon path -> module obj
     Vec<RegexProgPtr> regexps;
+    StrMap<i32> regex_cache;    // "flags\nsource" -> index into regexps
+    Vec<str> regex_keys;        // owned keys of regex_cache
+    GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
     u32 atom_rx;
     u32 atom_source;
     u32 atom_flags;
@@ -337,6 +340,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.object_proto != null { gc_mark_cell(h, &vm.object_proto.head); }
     if vm.array_proto != null { gc_mark_cell(h, &vm.array_proto.head); }
     if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
+    for i32 c = 0; c < 128; c++ {
+        if vm.ascii_chars[c] != null { gc_mark_cell(h, &vm.ascii_chars[c].head); }
+    }
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
@@ -794,6 +800,27 @@ Value js_to_string_value(VM* vm, Value v) {
         str lit;
         if num_special(d, &lit) {
             GcString* g = gc_new_string(&vm.heap, lit);
+            return value_cell(&g.head);
+        }
+        // an integer, the common case, is spelled into a stack buffer and
+        // becomes the cell directly; anything else takes the full formatter
+        if d == floor(d) && d > -1e15 && d < 1e15 && !(d == 0.0 && 1.0 / d < 0.0) {
+            u8[24] digits;
+            i32 n = 24;
+            i64 iv = cast(i64, d);
+            bool neg = iv < 0;
+            u64 u = neg ? cast(u64, -iv) : cast(u64, iv);
+            if u == 0 { n--; digits[n] = '0'; }
+            while u > 0 {
+                n--;
+                digits[n] = cast(u8, 48 + cast(i32, u % 10));
+                u = u / 10;
+            }
+            if neg { n--; digits[n] = '-'; }
+            str ds;
+            ds.data = &digits[n];
+            ds.len = 24 - n;
+            GcString* g = gc_new_string(&vm.heap, ds);
             return value_cell(&g.head);
         }
         string s = js_num_format(d);
@@ -3112,6 +3139,15 @@ void vm_init(VM* vm) {
     vm.usp_proto = null;
     vm.require_cache = null;
     vec_init<RegexProgPtr>(&vm.regexps, 4);
+    strmap_init<i32>(&vm.regex_cache);
+    vec_init<str>(&vm.regex_keys, 8);
+    for i32 c = 0; c < 128; c++ {
+        u8 b = cast(u8, c);
+        str one;
+        one.data = &b;
+        one.len = 1;
+        vm.ascii_chars[c] = gc_new_string(&vm.heap, one);
+    }
     vm.atom_rx = atom_intern(&vm.atoms, "%rx");
     vm.atom_source = atom_intern(&vm.atoms, "source");
     vm.atom_flags = atom_intern(&vm.atoms, "flags");
@@ -3187,6 +3223,11 @@ void vm_destroy(VM* vm) {
         regex_free(vec_get(&vm.regexps, i));
     }
     vec_free(&vm.regexps);
+    strmap_free(&vm.regex_cache);
+    for i32 i = 0; i < vm.regex_keys.len; i++ {
+        free(vec_get(&vm.regex_keys, i).data);
+    }
+    vec_free(&vm.regex_keys);
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
@@ -4170,14 +4211,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         GcString* s = value_as_string(objv);
                         if idx < s.u16len {
                             str view = gc_string_view(s);
-                            // fast path: ASCII strings index by byte
+                            // fast path: ASCII strings index by byte, and
+                            // the character is a shared cell
                             if s.u16len == s.len {
-                                str one;
-                                one.data = view.data + idx;
-                                one.len = 1;
-                                GcString* g = gc_new_string(&vm.heap, one);
+                                Value ch = vm_ascii_char(vm, *(view.data + idx));
                                 vm.sp -= 2;
-                                vpush(vm, value_cell(&g.head));
+                                vpush(vm, ch);
                             } else {
                                 str_buf sb;
                                 str_buf_init(&sb);
@@ -4693,6 +4732,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
     return 0;
 }
 
+// The shared one-byte string for an ASCII byte. Indexing, charAt and
+// split("") hand these out instead of allocating a cell per character.
+Value vm_ascii_char(VM* vm, u8 c) {
+    return value_cell(&vm.ascii_chars[c].head);
+}
+
 // Runs a compiled script template. 0 ok, 1 uncaught exception.
 i32 vm_run_template(VM* vm, FnTemplate* t) {
     i32 saved_sp = vm.sp;
@@ -5067,14 +5112,20 @@ private void spread_string_into(VM* vm, JsObject* d, Value sv) {
     GcString* g = value_as_string(sv);
     str view = gc_string_view(g);
     for i32 i = 0; i < g.u16len; i++ {
-        str_buf sb;
-        str_buf_init(&sb);
-        u16_slice_into_cur(&sb, view, i, i + 1, &g.cur_u, &g.cur_off);
-        GcString* ch1 = gc_new_string(&vm.heap, str_buf_to_str(&sb));
-        str_buf_free(&sb);
-        vpush(vm, value_cell(&ch1.head));
+        Value chv;
+        if g.u16len == g.len {
+            chv = vm_ascii_char(vm, *(view.data + i));
+        } else {
+            str_buf sb;
+            str_buf_init(&sb);
+            u16_slice_into_cur(&sb, view, i, i + 1, &g.cur_u, &g.cur_off);
+            GcString* ch1 = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+            str_buf_free(&sb);
+            chv = value_cell(&ch1.head);
+        }
+        vpush(vm, chv);
         string ks = format("{}", i);
-        js_set_prop(d, atom_intern(&vm.atoms, ks), value_cell(&ch1.head));
+        js_set_prop(d, atom_intern(&vm.atoms, ks), chv);
         free(ks);
         vm.sp--;
     }
@@ -6286,13 +6337,34 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
         vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression flags");
         return value_undefined();
     }
-    RegexProg* prog = regex_compile(source, flags);
-    if prog == null {
-        vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression");
-        return value_undefined();
+    // Programs live as long as the VM, so one per distinct pattern and
+    // flag set serves every object made from it: a literal in a hot
+    // function, or new RegExp of the same text, compiles once.
+    str_buf kb;
+    str_buf_init(&kb);
+    str_buf_add(&kb, flags);
+    str_buf_add(&kb, "\n");
+    str_buf_add(&kb, source);
+    str key = str_buf_to_str(&kb);
+    i32 idx = -1;
+    i32* known = strmap_get(&vm.regex_cache, key);
+    if known != null {
+        idx = *known;
+        str_buf_free(&kb);
+    } else {
+        RegexProg* compiled = regex_compile(source, flags);
+        if compiled == null {
+            str_buf_free(&kb);
+            vm_throw_error(vm, ERR_SYNTAX, "invalid regular expression");
+            return value_undefined();
+        }
+        idx = vm.regexps.len;
+        vec_push(&vm.regexps, compiled);
+        str owned = str_buf_to_str(&kb);   // the buffer's bytes become the key
+        vec_push(&vm.regex_keys, owned);
+        strmap_set(&vm.regex_cache, owned, idx);
     }
-    i32 idx = vm.regexps.len;
-    vec_push(&vm.regexps, prog);
+    RegexProg* prog = vec_get(&vm.regexps, idx);
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
     vpush(vm, value_cell(&re.head));
     props_set_desc(&re.props, vm.atom_rx, value_int(idx), 0);

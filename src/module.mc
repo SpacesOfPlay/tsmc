@@ -542,7 +542,8 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     mod.state = MOD_NEW;
     mod.ok = false;
     vec_init<i32>(&mod.dep_idx, 4);
-    bump_init(&mod.arena);
+    // the parse of a file takes a few times its size in nodes
+    bump_init_sized(&mod.arena, cast(i32, fd.len) * 12);
     i32 my_idx = register_module(ld, mod, true);
 
     str src;

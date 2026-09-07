@@ -1068,7 +1068,8 @@ private JsObject* this_arraylike(VM* vm, Value thisv) {
             str piece;
             piece.data = s.data + off;
             piece.len = n;
-            js_array_set(a, a.elen, new_str(vm, piece));
+            Value ch = n == 1 && *piece.data < 128 ? vm_ascii_char(vm, *piece.data) : new_str(vm, piece);
+            js_array_set(a, a.elen, ch);
             off += n;
         }
         gc_root_reset(&vm.heap, rm);
@@ -2405,6 +2406,7 @@ private Value str_u16_range(VM* vm, Value sv, i32 start, i32 end) {
     if end > g.u16len { end = g.u16len; }
     if end < start { end = start; }
     if g.u16len == g.len {
+        if end - start == 1 { return vm_ascii_char(vm, *(s.data + start)); }
         str sub;
         sub.data = s.data + start;
         sub.len = end - start;

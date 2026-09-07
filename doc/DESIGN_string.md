@@ -38,6 +38,11 @@ Keep UTF-8 storage; expose UTF-16 semantics at the JS boundary only.
   buffer of its own with twice the room. Buffers are reference-counted
   by the string cells and freed by the finalizer with the last one.
 
+- The VM keeps one cell per ASCII byte (`vm.ascii_chars`), and
+  indexing, `charAt`, `split("")`, spread and the array-like walk over
+  an ASCII string hand those out instead of allocating. String identity
+  is not observable from JavaScript, so sharing is free.
+
 Storing u16 wide strings instead would tax every string crossing the
 engine boundary (lexer literals, atoms, console, JSON) with a
 conversion, to fix a deviation that only surfaces in unit-level
