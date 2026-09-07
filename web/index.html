@@ -92,6 +92,7 @@
   <select id="examples" aria-label="Examples"><option value="" hidden>your script</option></select>
   <button id="run" class="primary" title="Ctrl+Enter">Run</button>
   <button id="stop" disabled>Stop</button>
+  <button id="share" title="Copy a link that carries this script">Share</button>
   <span id="status">loading…</span>
 </div>
 <main>
@@ -389,7 +390,7 @@ for (;;) {
   'use strict';
   const $ = (id) => document.getElementById(id);
   const src = $('src'), hl = $('hl'), gutter = $('gutter'), out = $('out'), status = $('status');
-  const runBtn = $('run'), stopBtn = $('stop'), examples = $('examples');
+  const runBtn = $('run'), stopBtn = $('stop'), examples = $('examples'), share = $('share');
 
   // --- editor ----------------------------------------------------------
   let lineCount = 0;
@@ -413,7 +414,9 @@ for (;;) {
   const save = () => { try { localStorage.setItem('tsmc.src', src.value); } catch (e) {} };
   // The dropdown follows the text: the example it matches, else "your script".
   let syncSelect = () => {};
-  const changed = () => { render(); save(); syncSelect(); };
+  // A shared link carries its script in the hash; the first edit drops it.
+  const dropHash = () => { if (location.hash) history.replaceState(null, '', location.pathname + location.search); };
+  const changed = () => { render(); save(); syncSelect(); dropHash(); };
 
   src.addEventListener('scroll', sync);
   src.addEventListener('input', changed);
@@ -468,11 +471,55 @@ for (;;) {
     changed();
   };
 
+  // --- share link ------------------------------------------------------
+  // The script travels in the URL hash, deflated and base64url-encoded
+  // (z=), or plain where the browser cannot deflate (s=).
+  const b64url = (bytes) => {
+    let t = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) t += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(t).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  const unb64url = (t) => Uint8Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+  const through = async (bytes, stream) =>
+    new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+  const encodeHash = async (t) => {
+    const bytes = new TextEncoder().encode(t);
+    if (typeof CompressionStream === 'undefined') return 's=' + b64url(bytes);
+    return 'z=' + b64url(await through(bytes, new CompressionStream('deflate-raw')));
+  };
+  const decodeHash = async (hash) => {
+    const m = /^#(z|s)=([A-Za-z0-9_-]+)$/.exec(hash);
+    if (!m) return null;
+    let bytes = unb64url(m[2]);
+    if (m[1] === 'z') bytes = await through(bytes, new DecompressionStream('deflate-raw'));
+    return new TextDecoder().decode(bytes);
+  };
+  share.onclick = async () => {
+    try {
+      history.replaceState(null, '', '#' + await encodeHash(src.value));
+      let copied = false;
+      try { await navigator.clipboard.writeText(location.href); copied = true; } catch (e) {}
+      status.textContent = copied ? 'link copied' : 'link in the address bar';
+    } catch (e) {
+      status.textContent = 'could not make a link: ' + e.message;
+    }
+  };
+
   let saved = null;
   try { saved = localStorage.getItem('tsmc.src'); } catch (e) {}
   src.value = saved || text(blocks[0].id);
   render();
   syncSelect();
+  if (location.hash.length > 1) {
+    decodeHash(location.hash).then((t) => {
+      if (t === null) return;
+      src.value = t;
+      src.scrollTop = 0;
+      render();
+      save();
+      syncSelect();
+    }).catch(() => {});
+  }
 
   // --- output ----------------------------------------------------------
   let pending = [];

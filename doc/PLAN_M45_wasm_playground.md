@@ -77,6 +77,11 @@ does not end itself, since the event loop runs to completion inside
 `main`, and it is enough: memory is bounded by the browser and nothing
 of the page is reachable from the worker.
 
+Share turns the script into a link: the text goes into the URL hash,
+deflated and base64url-encoded, and the link is copied. Opening it loads
+the script, and the first edit drops the hash so the address does not
+claim to be something it no longer is.
+
 The script becomes `/main.ts` in an in-memory file view. Timers work.
 `setTimeout` with a long delay spins, because the sandbox has no way to
 block; the page does not notice, the worker's CPU does.
@@ -215,5 +220,4 @@ node for debugging, with `WASM_TRACE=1` printing every probe.
    and multi-line indent. Past that point an editor component is the
    honest answer, at the cost of a CDN dependency.
 3. A multi-file view in the page.
-4. A share link: the script in the URL hash.
-5. Blocking timers, if the page ever runs with shared memory.
+4. Blocking timers, if the page ever runs with shared memory.
