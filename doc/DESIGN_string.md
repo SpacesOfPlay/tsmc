@@ -27,6 +27,17 @@ Keep UTF-8 storage; expose UTF-16 semantics at the JS boundary only.
   cursor is the one mutable part of a string cell and is only a cache:
   any cursor position gives the same answers.
 
+- `GcString.data` points at the bytes: inline after the cell for a
+  string made from bytes, or into a **shared buffer** (`StrBuffer`) for
+  the result of a concatenation of 128 bytes or more. Every string in a
+  buffer is a prefix of it. When the left operand of `+` is the newest
+  string of its buffer and the buffer has room, the right operand's
+  bytes go in after it and the result shares them, so `s += piece` in a
+  loop copies each piece once instead of copying `s` every step. A
+  string that is not the newest, or whose buffer is full, starts a
+  buffer of its own with twice the room. Buffers are reference-counted
+  by the string cells and freed by the finalizer with the last one.
+
 Storing u16 wide strings instead would tax every string crossing the
 engine boundary (lexer literals, atoms, console, JSON) with a
 conversion, to fix a deviation that only surfaces in unit-level

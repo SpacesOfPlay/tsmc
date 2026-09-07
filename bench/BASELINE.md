@@ -82,6 +82,12 @@ interpreter's throughput. Native wall clock, `min` of 3, whole process:
 | `import 'js-yaml'` (107 KB bundle) | 135 ms | 60 ms | line table |
 | `import * as R from 'ramda'` (368 files, 1,029 edges) | 355 ms | 165 ms | module table consulted per edge; package type cached per directory; one read per module |
 | ten `setTimeout(1)` in sequence | ~160 ms | 19 ms | `timeBeginPeriod(1)` on the first wait (Windows) |
+| `s += 'ab'` 100,000 times | 1,099 ms | 67 ms | concatenation results share a growing buffer; each piece copied once |
+
+`bench/strbuild.ts` (100,000 lines by `+=`, 20,000 template pieces)
+runs in about 120 ms. Through the wasm build the same loop went from
+seconds and an out-of-bounds trap to 46 ms, since it no longer asks the
+allocator for a bigger block at every step.
 
 What remains in the ramda number: the ~55 ms process floor, 368 file
 reads (~34 ms), a realpath per new module (~26 ms) and one existence

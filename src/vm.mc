@@ -1768,10 +1768,11 @@ private u32 key_to_atom(VM* vm, Value key) {
     return a;
 }
 
-// a + b for two string values: one cell holding both payloads. When a
-// high surrogate at the end of a meets a low one at the start of b the
-// bytes go through gc_new_string instead, which spells the pair as the
-// code point. Kept out of the interpreter loop for its frame's sake.
+// a + b for two string values. When a high surrogate at the end of a
+// meets a low one at the start of b the bytes go through gc_new_string,
+// which spells the pair as the code point; otherwise the heap joins them,
+// sharing bytes where it can. Kept out of the interpreter loop for its
+// frame's sake.
 private GcString* concat_strings(VM* vm, Value sa, Value sb) {
     str va = gc_string_view(value_as_string(sa));
     str vb = gc_string_view(value_as_string(sb));
@@ -1784,16 +1785,7 @@ private GcString* concat_strings(VM* vm, Value sa, Value sb) {
         str_buf_free(&buf);
         return joined;
     }
-    GcString* g = cast(GcString*, gc_alloc(&vm.heap, GC_STRING,
-        sizeof(GcString) + va.len + vb.len));
-    g.len = va.len + vb.len;
-    g.u16len = value_as_string(sa).u16len + value_as_string(sb).u16len;
-    g.cur_u = 0;
-    g.cur_off = 0;
-    u8* dst = cast(u8*, g) + sizeof(GcString);
-    if va.len > 0 { memcpy(dst, va.data, va.len); }
-    if vb.len > 0 { memcpy(dst + va.len, vb.data, vb.len); }
-    return g;
+    return gc_string_concat(&vm.heap, value_as_string(sa), value_as_string(sb));
 }
 
 // A method is a writable, configurable, non-enumerable property. Kept out

@@ -444,6 +444,10 @@ void js_trace(GcHeap* h, GcCell* c) {
 }
 
 void js_finalize(GcCell* c) {
+    if c.kind == GC_STRING {
+        gc_string_release(cast(GcString*, c));
+        return;
+    }
     if c.kind == GC_OBJECT {
         JsObject* o = cast(JsObject*, c);
         props_free(&o.props);

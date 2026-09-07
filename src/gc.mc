@@ -198,15 +198,30 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
 
 // --- cell kinds ----------------------------------------------------
 
-// String: byte payload follows the struct inline. Immutable, apart from
-// the cursor, which caches where the last unit lookup landed so a loop
-// over non-ASCII text does not rescan from the start each step.
+// Bytes that several strings share, each a prefix of them. The result
+// of a concatenation owns spare room here, and the next concatenation
+// that extends it appends in place instead of copying, so a loop that
+// builds a string with += copies each piece once. Freed with the last
+// string that refers to it.
+struct StrBuffer {
+    u8* data;
+    i32 used;
+    i32 cap;
+    i32 refs;
+}
+
+// String: immutable, apart from the cursor, which caches where the last
+// unit lookup landed so a loop over non-ASCII text does not rescan from
+// the start each step. The bytes sit inline after the struct, or in a
+// shared buffer.
 struct GcString {
     GcCell head;
     i32 len;       // byte length (UTF-8/WTF-8 storage)
     i32 u16len;    // cached UTF-16 code-unit count; == len iff ASCII
     i32 cur_u;     // cursor: a UTF-16 unit index ...
     i32 cur_off;   // ... and the byte offset of the code point there
+    u8* data;
+    StrBuffer* buf;   // null when the bytes are inline
 }
 
 GcString* gc_new_string(GcHeap* h, str s) {
@@ -215,11 +230,13 @@ GcString* gc_new_string(GcHeap* h, str s) {
     gs.len = s.len;
     gs.cur_u = 0;
     gs.cur_off = 0;
+    gs.data = cast(u8*, gs) + sizeof(GcString);
+    gs.buf = null;
     if s.len > 0 {
-        memcpy(cast(u8*, gs) + sizeof(GcString), s.data, s.len);
+        memcpy(gs.data, s.data, s.len);
     }
     str view;
-    view.data = cast(u8*, gs) + sizeof(GcString);
+    view.data = gs.data;
     view.len = s.len;
     // halves of an astral code point that met in this string become the
     // code point; the cell keeps its allocation, the payload shrinks
@@ -233,9 +250,63 @@ GcString* gc_new_string(GcHeap* h, str s) {
 
 str gc_string_view(GcString* s) {
     str r;
-    r.data = cast(u8*, s) + sizeof(GcString);
+    r.data = s.data;
     r.len = s.len;
     return r;
+}
+
+// Drops a string's hold on its shared buffer; the finalizer's part.
+void gc_string_release(GcString* g) {
+    if g.buf == null { return; }
+    g.buf.refs--;
+    if g.buf.refs == 0 {
+        free(g.buf.data);
+        free(g.buf);
+    }
+    g.buf = null;
+}
+
+// Results shorter than this are plain inline copies; a shared buffer
+// with room to grow is worth its two allocations only past it.
+private const i32 STR_SHARE_MIN = 128;
+
+// a + b. When a is the newest string of its buffer and the buffer has
+// room, b's bytes go in right after it and the result shares them;
+// every string in a buffer is a prefix of it, so a keeps its meaning.
+// Otherwise the result starts a buffer of its own, with room to grow.
+// Both operands must be rooted by the caller.
+GcString* gc_string_concat(GcHeap* h, GcString* a, GcString* b) {
+    i32 total = a.len + b.len;
+    if total < STR_SHARE_MIN {
+        GcString* g = cast(GcString*, gc_alloc(h, GC_STRING, sizeof(GcString) + total));
+        g.len = total;
+        g.u16len = a.u16len + b.u16len;
+        g.data = cast(u8*, g) + sizeof(GcString);
+        g.buf = null;
+        if a.len > 0 { memcpy(g.data, a.data, a.len); }
+        if b.len > 0 { memcpy(g.data + a.len, b.data, b.len); }
+        return g;
+    }
+    StrBuffer* buf = a.buf;
+    if buf != null && buf.used == a.len && buf.cap - buf.used >= b.len {
+        if b.len > 0 { memcpy(buf.data + buf.used, b.data, b.len); }
+        buf.used = total;
+    } else {
+        buf = new(StrBuffer);
+        buf.cap = total * 2;
+        buf.data = alloc<u8>(buf.cap);
+        if a.len > 0 { memcpy(buf.data, a.data, a.len); }
+        if b.len > 0 { memcpy(buf.data + a.len, b.data, b.len); }
+        buf.used = total;
+        buf.refs = 0;
+    }
+    GcString* g = cast(GcString*, gc_alloc(h, GC_STRING, sizeof(GcString)));
+    g.len = total;
+    g.u16len = a.u16len + b.u16len;
+    g.data = buf.data;
+    g.buf = buf;
+    buf.refs++;
+    return g;
 }
 
 // Pair: the minimal traceable cell. Real object kinds arrive with

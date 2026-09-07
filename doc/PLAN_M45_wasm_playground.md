@@ -160,12 +160,14 @@ every allocation scans the blocks that did not fit. A probe that frees
 50,000 blocks of 64 bytes and then asks for 25,000 of 128 reuses none of
 them and takes 1.5 s; a block regrown from 100 bytes to 200 KB in 2,000
 steps leaves 199 MB of memory for 4 MB of live data. In the page that
-shows as date-fns's 50 KB package.json taking 63 ms to parse, a loop of
-200,000 short strings taking minutes, and a string built with `+=` past
-a hundred thousand steps ending in an out-of-bounds trap. Natively none
-of that happens. Until the allocator grows size classes, the page is
-best with packages whose load allocates little; everything above except
-date-fns is under 120 ms.
+shows as date-fns's 50 KB package.json taking 63 ms to parse and a loop
+compiling 3,000 regexes taking seconds. Natively none of that happens.
+Until the allocator grows size classes, the page is best with packages
+whose load allocates little; everything above except date-fns is under
+120 ms. A string built with `+=` used to end in an out-of-bounds trap
+there for the same reason; concatenation now extends a shared buffer
+(`doc/DESIGN_string.md`), which also took the native cost of 100,000
+appends from 1.1 s to 12 ms.
 
 zod is not among the examples: its current versions compile TypeScript
 namespaces to `export var util; (function (util) { … })(util || (util = {}))`,
