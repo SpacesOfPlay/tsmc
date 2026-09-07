@@ -138,6 +138,23 @@ i32 u16_offset(str s, i32 idx) {
     return u16_offset_cur(s, idx, &cu, &co);
 }
 
+// Converts a byte offset to its UTF-16 unit index, resuming from a cursor
+// (unit index *cu at byte offset *co) that it moves along.
+i32 u16_byte_to_unit_cur(str s, i32 byte_off, i32* cu, i32* co) {
+    i32 u = *cu;
+    i32 off = *co;
+    if byte_off < off { u = 0; off = 0; }
+    while off < byte_off && off < s.len {
+        i32 n;
+        i32 cp = utf8_decode(s, off, &n);
+        u += cp_units(cp);
+        off += n;
+    }
+    *cu = u;
+    *co = off;
+    return u;
+}
+
 // Converts a byte offset to its UTF-16 unit index.
 i32 u16_byte_to_unit(str s, i32 byte_off) {
     i32 u = 0;

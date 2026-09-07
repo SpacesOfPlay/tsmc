@@ -8656,10 +8656,25 @@ private Value nat_regexp_ctor(void* vmp, Value callee, Value thisv, Value* args,
 // Runs the compiled prog; on match builds a result array with index +
 // input, advances lastIndex for global/sticky. Returns null value on
 // no match. `re` and `subject` stay rooted by the caller.
+// [start, end] of a capture in UTF-16 units, or undefined for a group that
+// did not take part.
+private Value match_span(VM* vm, GcString* sg, bool ascii, i32 gs, i32 ge) {
+    if gs < 0 { return value_undefined(); }
+    str s = gc_string_view(sg);
+    JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+    js_array_set(pair, 0, value_int(ascii ? gs : u16_byte_to_unit_cur(s, gs, &sg.cur_u, &sg.cur_off)));
+    js_array_set(pair, 1, value_int(ascii ? ge : u16_byte_to_unit_cur(s, ge, &sg.cur_u, &sg.cur_off)));
+    return value_cell(&pair.head);
+}
+
 private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
     RegexProg* prog = vm_regexp_prog(vm, re);
     if prog == null { return value_null(); }
-    str s = sview(subjectv);
+    GcString* sg = value_as_string(subjectv);
+    str s = gc_string_view(sg);
+    // lastIndex, index and the indices are UTF-16 unit offsets; the matcher
+    // works in bytes, and the string's cursor carries the conversions
+    bool ascii = sg.u16len == sg.len;
     i32 start = 0;
     Value liv;
     if js_get_prop(value_as_object(re), vm_atom_lastindex(vm), &liv) {
@@ -8668,7 +8683,15 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
     if start < 0 { start = 0; }
     i32 ncap = 2 * (regex_ngroups(prog) + 1);
     i32* caps = alloc<i32>(ncap);
-    bool ok = regex_exec(prog, s, start, caps);
+    bool ok = false;
+    if start <= sg.u16len {
+        i32 start_b = ascii ? start : u16_offset_cur(s, start, &sg.cur_u, &sg.cur_off);
+        // a sticky match cannot begin inside a surrogate pair, which has no
+        // byte offset of its own
+        bool mid_pair = !ascii && regex_is_sticky(prog)
+            && u16_byte_to_unit_cur(s, start_b, &sg.cur_u, &sg.cur_off) != start;
+        if !mid_pair { ok = regex_exec(prog, s, start_b, caps); }
+    }
     if !ok {
         free(caps);
         if regex_is_global(prog) || regex_is_sticky(prog) {
@@ -8692,7 +8715,8 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
             js_array_set(arr, g, new_str(vm, sub));
         }
     }
-    js_set_prop(arr, vm_atom_index(vm), value_int(*(caps + 0)));
+    i32 index_u = ascii ? *(caps + 0) : u16_byte_to_unit_cur(s, *(caps + 0), &sg.cur_u, &sg.cur_off);
+    js_set_prop(arr, vm_atom_index(vm), value_int(index_u));
     js_set_prop(arr, bi_atom(vm, "input"), subjectv);
     // result.groups: undefined unless the pattern has named groups
     if regex_has_named(prog) {
@@ -8716,8 +8740,30 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
     } else {
         js_set_prop(arr, bi_atom(vm, "groups"), value_undefined());
     }
+    // result.indices (d flag): [start, end] per group, and the same by name
+    // under indices.groups
+    if regex_has_indices(prog) {
+        JsObject* ind = js_new_array(&vm.heap, vm.array_proto);
+        js_set_prop(arr, bi_atom(vm, "indices"), value_cell(&ind.head));
+        for i32 g = 0; g <= ng; g++ {
+            js_array_set(ind, g, match_span(vm, sg, ascii, *(caps + 2 * g), *(caps + 2 * g + 1)));
+        }
+        if regex_has_named(prog) {
+            JsObject* ig = js_new_object(&vm.heap, null);
+            js_set_prop(ind, bi_atom(vm, "groups"), value_cell(&ig.head));
+            for i32 g = 1; g <= ng; g++ {
+                str nm = regex_group_name(prog, g);
+                if nm.len > 0 {
+                    js_set_prop(ig, bi_atom(vm, nm), match_span(vm, sg, ascii, *(caps + 2 * g), *(caps + 2 * g + 1)));
+                }
+            }
+        } else {
+            js_set_prop(ind, bi_atom(vm, "groups"), value_undefined());
+        }
+    }
     if regex_is_global(prog) || regex_is_sticky(prog) {
-        js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(*(caps + 1)));
+        i32 end_u = ascii ? *(caps + 1) : u16_byte_to_unit_cur(s, *(caps + 1), &sg.cur_u, &sg.cur_off);
+        js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(end_u));
     }
     free(caps);
     gc_root_reset(&vm.heap, rm);

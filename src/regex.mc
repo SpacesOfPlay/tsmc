@@ -82,6 +82,7 @@ struct RegexProg {
     bool unicode;
     bool global;
     bool sticky;
+    bool has_indices;        // d: a match result carries group indices
 }
 
 // --- parser ---------------------------------------------------------------
@@ -1438,6 +1439,7 @@ RegexProg* regex_compile(str pattern, str flags) {
     prog.global = false;
     prog.sticky = false;
     prog.unicode = false;
+    prog.has_indices = false;
     for i32 i = 0; i < flags.len; i++ {
         u8 f = *(flags.data + i);
         if f == 'i' { prog.ignore_case = true; }
@@ -1445,6 +1447,7 @@ RegexProg* regex_compile(str pattern, str flags) {
         if f == 's' { prog.dotall = true; }
         if f == 'g' { prog.global = true; }
         if f == 'y' { prog.sticky = true; }
+        if f == 'd' { prog.has_indices = true; }
         if f == 'u' || f == 'v' { prog.unicode = true; }
     }
     return prog;
@@ -1470,6 +1473,7 @@ void regex_free(RegexProg* prog) {
 i32 regex_ngroups(RegexProg* prog) { return prog.n_groups; }
 bool regex_is_global(RegexProg* prog) { return prog.global; }
 bool regex_is_sticky(RegexProg* prog) { return prog.sticky; }
+bool regex_has_indices(RegexProg* prog) { return prog.has_indices; }
 bool regex_has_named(RegexProg* prog) { return prog.has_named; }
 str regex_group_name(RegexProg* prog, i32 gidx) {
     if gidx < 0 || gidx > prog.n_groups { str e; e.data = null; e.len = 0; return e; }
