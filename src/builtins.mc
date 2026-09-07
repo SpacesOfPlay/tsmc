@@ -1050,7 +1050,9 @@ private JsObject* this_array(VM* vm, Value thisv) {
 // arguments object and `Array.prototype.slice.call(x)` work (and later a
 // proxy's element reads trap). Only used by methods that do not mutate the
 // receiver — mutating methods keep the strict this_array. Returns null (and
-// throws) if the receiver is neither an array nor array-like.
+// throws) if the receiver is neither an array nor array-like. A materialized
+// array is reachable from nothing, so the caller roots it before it
+// allocates again.
 private JsObject* this_arraylike(VM* vm, Value thisv) {
     if value_is_array(thisv) { return value_as_object(thisv); }
     // a string receiver is array-like too: Array.prototype.map.call('ab', f)
@@ -1499,6 +1501,10 @@ private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 start = rel_index(argc > 0 ? to_int_sat(*(args)) : 0, a.elen);
     i32 end = a.elen;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
@@ -1592,6 +1598,10 @@ private Value nat_arr_join(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     str sep = ",";
     i32 rm = gc_root_mark(&vm.heap);
     Value sepv = arg_at(args, argc, 0);
@@ -1620,6 +1630,10 @@ private Value nat_arr_indexof(void* vmp, Value callee, Value thisv, Value* args,
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value needle = arg_at(args, argc, 0);
     i32 start_at = argc > 1 ? rel_index(to_int_sat(*(args + 1)), a.elen) : 0;
     for i32 i = start_at; i < a.elen; i++ {
@@ -1633,6 +1647,10 @@ private Value nat_arr_includes(void* vmp, Value callee, Value thisv, Value* args
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value needle = arg_at(args, argc, 0);
     // the optional second argument is where the search starts; negative counts
     // back from the end
@@ -1669,6 +1687,10 @@ private Value nat_arr_lastindexof(void* vmp, Value callee, Value thisv, Value* a
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value needle = arg_at(args, argc, 0);
     i32 start = a.elen - 1;
     if argc > 1 && !value_is_undefined(*(args + 1)) {
@@ -1696,6 +1718,10 @@ private Value nat_arr_toreversed(void* vmp, Value callee, Value thisv, Value* ar
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&r.head));
@@ -1710,6 +1736,10 @@ private Value nat_arr_with(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 idx = to_int_arg(arg_at(args, argc, 0));
     if idx < 0 { idx += a.elen; }
     if idx < 0 || idx >= a.elen {
@@ -1729,6 +1759,10 @@ private Value nat_arr_with(void* vmp, Value callee, Value thisv, Value* args, i3
 private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) {
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -1818,6 +1852,10 @@ private Value nat_arr_reduce(void* vmp, Value callee, Value thisv, Value* args, 
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -1854,6 +1892,10 @@ private Value nat_arr_reduceright(void* vmp, Value callee, Value thisv, Value* a
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -1889,6 +1931,10 @@ private Value nat_arr_at(void* vmp, Value callee, Value thisv, Value* args, i32 
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 i = to_int_arg(arg_at(args, argc, 0));
     if i < 0 { i += a.elen; }
     if i < 0 || i >= a.elen { return value_undefined(); }
@@ -1899,6 +1945,10 @@ private Value nat_arr_findlast(void* vmp, Value callee, Value thisv, Value* args
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -1918,6 +1968,10 @@ private Value nat_arr_findlastindex(void* vmp, Value callee, Value thisv, Value*
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -1950,6 +2004,10 @@ private Value nat_arr_flat(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 depth = argc > 0 && !value_is_undefined(*(args)) ? to_int_sat(*(args)) : 1;
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
@@ -1963,6 +2021,10 @@ private Value nat_arr_flatmap(void* vmp, Value callee, Value thisv, Value* args,
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     Value fun = arg_at(args, argc, 0);
     if !value_is_callable(fun) {
         vm_throw_error(vm, ERR_TYPE, "callback is not a function");
@@ -2062,6 +2124,10 @@ private Value nat_arr_tospliced(void* vmp, Value callee, Value thisv, Value* arg
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 len = a.elen;
     i32 start = argc > 0 ? to_int_sat(*(args)) : 0;
     if start < 0 { start = len + start; }
@@ -2159,6 +2225,10 @@ private Value nat_arr_tosorted(void* vmp, Value callee, Value thisv, Value* args
     VM* vm = as_vm(vmp);
     JsObject* a = this_arraylike(vm, thisv);
     if a == null { return value_undefined(); }
+    // a materialized array-like is reachable from nothing else
+    i32 arm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, value_cell(&a.head));
+    defer gc_root_reset(&vm.heap, arm);
     i32 rm = gc_root_mark(&vm.heap);
     JsObject* r = arr_dense_copy(vm, a);
     Value rv = value_cell(&r.head);
@@ -5864,8 +5934,9 @@ private Value nat_ih_next(void* vmp, Value callee, Value thisv, Value* args, i32
                     return value_undefined();
                 }
                 if !idone {
+                    Value res = gen_result(vm, iv, false);
                     gc_root_reset(&vm.heap, rm);
-                    return gen_result(vm, iv, false);
+                    return res;
                 }
                 ih_set(vm, thisv, "%in", value_undefined());
             }
@@ -5885,12 +5956,14 @@ private Value nat_ih_next(void* vmp, Value callee, Value thisv, Value* args, i32
         gc_root(&vm.heap, v);
         if kind == IH_TAKE {
             ih_set(vm, thisv, "%lim", js_number_value(lim - 1.0));
+            Value res = gen_result(vm, v, false);
             gc_root_reset(&vm.heap, rm);
-            return gen_result(vm, v, false);
+            return res;
         }
         if kind == IH_DROP {
+            Value res = gen_result(vm, v, false);
             gc_root_reset(&vm.heap, rm);
-            return gen_result(vm, v, false);
+            return res;
         }
         f64 idx = js_to_number(ih_get(vm, thisv, "%i"));
         ih_set(vm, thisv, "%i", js_number_value(idx + 1.0));
@@ -5904,13 +5977,15 @@ private Value nat_ih_next(void* vmp, Value callee, Value thisv, Value* args, i32
         }
         gc_root(&vm.heap, mapped);
         if kind == IH_MAP {
+            Value res = gen_result(vm, mapped, false);
             gc_root_reset(&vm.heap, rm);
-            return gen_result(vm, mapped, false);
+            return res;
         }
         if kind == IH_FILTER {
             if js_truthy(mapped) {
+                Value res = gen_result(vm, v, false);
                 gc_root_reset(&vm.heap, rm);
-                return gen_result(vm, v, false);
+                return res;
             }
             continue;
         }
@@ -8945,6 +9020,8 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
                     sub.data = s.data + gs;
                     sub.len = ge - gs;
                     *(ca + g) = new_str(vm, sub);
+                    // ca is plain memory the collector does not see
+                    gc_root(&vm.heap, *(ca + g));
                 }
             }
             *(ca + ng + 1) = value_int(ms);
@@ -14804,6 +14881,7 @@ private Value nat_callbackified(void* vmp, Value callee, Value thisv, Value* arg
     if vm_is_promise(vm, p) {
         JsNative* onok = js_new_native(&vm.heap, &nat_callbackify_ok, "");
         onok.env0 = cbv;
+        gc_root(&vm.heap, value_cell(&onok.head));   // the next allocation would sweep it
         JsNative* onerr = js_new_native(&vm.heap, &nat_callbackify_err, "");
         onerr.env0 = cbv;
         ignore vm_promise_then(vm, p, value_cell(&onok.head), value_cell(&onerr.head));

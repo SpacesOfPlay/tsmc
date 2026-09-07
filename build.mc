@@ -514,10 +514,11 @@ void run_wasm_tests(DirList* scripts) {
 }
 
 // Re-run every golden and differential script with collect-on-every-
-// allocation, catching use-after-free / missing roots. Only a clean
-// exit is asserted, not output — slow but thorough. A script that
-// never finishes is reported by name rather than left to hold the
-// suite open; GC_STRESS_TIMEOUT overrides the limit (seconds).
+// allocation, which also poisons what it sweeps, so a use-after-free or
+// a missing root fails at once or corrupts the output; each run's output
+// is held against a plain run of the same script. A script that never
+// finishes is reported by name rather than left to hold the suite open;
+// GC_STRESS_TIMEOUT overrides the limit (seconds).
 void run_gc_stress(str exe, DirList* run_scripts, DirList* diff_scripts) {
     step("gc stress");
     i32 limit = 60;
@@ -551,6 +552,12 @@ void run_gc_stress(str exe, DirList* run_scripts, DirList* diff_scripts) {
             str name = list.items[i];
             string src = path_join(dir, name);
             defer free(src);
+            ProcCmd plain = {
+                .args = { exe, str_from(src.data, src.len) },
+                .capture = true,
+                .timeout_ms = limit * 1000
+            };
+            ProcResult p = proc_run(&plain);
             ProcCmd c = {
                 .args = { exe, "--gc-stress", str_from(src.data, src.len) },
                 .capture = true,
@@ -563,7 +570,11 @@ void run_gc_stress(str exe, DirList* run_scripts, DirList* diff_scripts) {
             } else if r.exit_code != 0 {
                 fail(path_stem(name), " (--gc-stress nonzero exit)");
                 bad = bad + 1;
+            } else if !p.timed_out && !same_text(str_from(p.out.data, p.out.len), str_from(r.out.data, r.out.len)) {
+                fail(path_stem(name), " (--gc-stress output differs)");
+                bad = bad + 1;
             }
+            proc_result_free(&p);
             proc_result_free(&r);
         }
     }

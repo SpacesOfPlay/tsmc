@@ -170,7 +170,16 @@ void gc_collect(GcHeap* h) {
         } else {
             *link = c.next;
             if h.finalizer != null { h.finalizer(c); }
-            free(c);
+            if h.stress {
+                // Stress mode keeps a dead cell's memory and poisons it, so
+                // a reference that outlived its root reads an invalid kind
+                // and fails at once rather than whenever the memory is
+                // reused.
+                memset(cast(u8*, c), 0xAB, c.size);
+                c.kind = -1;
+            } else {
+                free(c);
+            }
         }
     }
     h.bytes_live = live_bytes;

@@ -598,7 +598,10 @@ void map_reserve(JsMap* mp) {
 
 bool value_is_kind(Value v, i32 kind) {
     if !value_is_cell(v) { return false; }
-    return value_as_cell(v).kind == kind;
+    i32 k = value_as_cell(v).kind;
+    // only --gc-stress leaves a swept cell behind, poisoned to kind -1
+    if k == -1 { eprint("gc: a freed cell was reached, asked for kind {}\n", kind); }
+    return k == kind;
 }
 
 bool value_is_string(Value v)  { return value_is_kind(v, GC_STRING); }

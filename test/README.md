@@ -17,6 +17,10 @@ Run everything with `minc test`
 - **wasm** — the module is cross-compiled on every run. With node
   present, the golden tests also run through it (`tools/wasm_run.js`),
   except the two that need an environment or a socket.
+- **GC stress** — every golden and differential script runs again under
+  `--gc-stress`, which collects on every allocation and poisons what it
+  sweeps, and its output must match a plain run. A value used after its
+  last root is gone fails here, whatever the memory happened to hold.
 
 ## Conventions
 

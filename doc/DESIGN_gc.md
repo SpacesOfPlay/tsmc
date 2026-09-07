@@ -48,7 +48,13 @@ survivors, recompute live bytes.
 Trigger: `bytes_live >= next_gc` at allocation time, with
 `next_gc = max(2 × live_after_sweep, 256 KiB)`. A `stress` flag
 collects on every allocation — tests run with it on to surface
-missing roots immediately.
+missing roots immediately. Under stress the sweep keeps a dead cell's
+memory instead of freeing it, fills it with `0xAB` and sets its kind to
+-1, so a reference that outlived its root reads an invalid kind at once
+rather than whatever the allocator put there next; `value_is_kind`
+reports the first such touch on stderr. The test runner holds each
+stress run's output against a plain run, since a stale read can also
+corrupt output without failing.
 
 ## Roots
 
