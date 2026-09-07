@@ -2,6 +2,8 @@
 
 A TypeScript runtime written in [minc](https://minc.dev).
 
+Live demo: https://spacesofplay.github.io/tsmc/
+
 `tsmc script.ts` runs TypeScript the way Bun and Deno do: type
 annotations are parsed and erased, nothing is type-checked, and the TS
 constructs with runtime semantics (`enum`, `namespace`, constructor
