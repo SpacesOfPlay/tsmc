@@ -1884,6 +1884,88 @@ private void get_import(VM* vm, FnTemplate* t, i32 name_ci, i32 mi) {
     vpush(vm, out);
 }
 
+// --- private members ---------------------------------------------------------
+// A private name is a hidden property "%#name@class" (see the compiler):
+// a field is an own property of the instance, a method sits on the
+// prototype, a static one on the class. An access checks the object
+// carries the name first, which is what makes the name the class's own.
+
+// The message for a private access on an object that lacks the name. The
+// atom is "%#name@class" for a field, with "@i:Class" or "@s:Class" behind
+// it for an instance or static method; a method's error names the class.
+private string private_missing_message(VM* vm, u32 a, bool write) {
+    str full = atom_name(&vm.atoms, a);
+    i32 at1 = full.len;
+    i32 at2 = full.len;
+    for i32 i = 2; i < full.len; i++ {
+        if *(full.data + i) == '@' {
+            if at1 == full.len { at1 = i; } else { at2 = i; break; }
+        }
+    }
+    if at2 < full.len && at2 + 2 < full.len {
+        str cname;
+        cname.data = full.data + at2 + 3;
+        cname.len = full.len - (at2 + 3);
+        if *(full.data + at2 + 1) == 's' { return format("Receiver must be class {}", cname); }
+        return format("Receiver must be an instance of class {}", cname);
+    }
+    str shown;
+    shown.data = full.data + 1;
+    shown.len = at1 - 1;
+    if write { return format("Cannot write private member {} to an object whose class did not declare it", shown); }
+    return format("Cannot read private member {} from an object whose class did not declare it", shown);
+}
+
+private bool has_private(VM* vm, Value objv, u32 a) {
+    if value_is_function(objv) || value_is_native(objv) { return fn_has_prop(vm, objv, a); }
+    if value_is_object(objv) { return js_has_prop(value_as_object(objv), a); }
+    return false;
+}
+
+private void private_missing(VM* vm, u32 a, bool write) {
+    string msg = private_missing_message(vm, a, write);
+    str mv = msg;
+    vm_throw_error(vm, ERR_TYPE, mv);
+    free(msg);
+}
+
+// [obj] -> [val]
+private void private_get(VM* vm, FnTemplate* t, i32 ci) {
+    u32 a = cast(u32, value_as_int(*(t.consts + ci)));
+    Value objv = vpeek(vm, 0);
+    if !has_private(vm, objv, a) { private_missing(vm, a, false); return; }
+    Value out;
+    if vm_get_prop_value(vm, objv, a, &out) {
+        vm.sp--;
+        vpush(vm, out);
+    }
+}
+
+// [obj, val] -> [val]
+private void private_set(VM* vm, FnTemplate* t, i32 ci) {
+    u32 a = cast(u32, value_as_int(*(t.consts + ci)));
+    Value v = vpeek(vm, 0);
+    Value objv = vpeek(vm, 1);
+    if !has_private(vm, objv, a) { private_missing(vm, a, true); return; }
+    if set_prop_atom(vm, objv, a, v) {
+        vm.sp -= 2;
+        vpush(vm, v);
+    }
+}
+
+// [obj] -> [fn, obj]
+private void private_method(VM* vm, FnTemplate* t, i32 ci) {
+    u32 a = cast(u32, value_as_int(*(t.consts + ci)));
+    Value objv = vpeek(vm, 0);
+    if !has_private(vm, objv, a) { private_missing(vm, a, false); return; }
+    Value out;
+    if vm_get_prop_value(vm, objv, a, &out) {
+        vm.sp--;
+        vpush(vm, out);
+        vpush(vm, objv);
+    }
+}
+
 private void def_method(Value objv, u32 a, Value v) {
     PropList* props = null;
     if value_is_object(objv) { props = &value_as_object(objv).props; }
@@ -4352,6 +4434,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, objv);
                 }
             }
+            case OP_GETPRIVATE: { private_get(vm, t, rd_u16(code, ip)); ip += 2; }
+            case OP_SETPRIVATE: { private_set(vm, t, rd_u16(code, ip)); ip += 2; }
+            case OP_GETMETHOD_PRIV: { private_method(vm, t, rd_u16(code, ip)); ip += 2; }
             case OP_GETMETHOD_DYN: {
                 Value key = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);

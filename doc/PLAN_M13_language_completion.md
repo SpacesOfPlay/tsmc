@@ -76,13 +76,20 @@ learning `N_PRIVATE_IDENT`:
 - **Read/write** `this.#x` — the `N_MEMBER`/assignment paths emit
   `OP_GETPROP`/`OP_SETPROP` on `"%#x"`.
 
-### Not doing (documented)
+### The brand, added later
 
-Not spec-strict privacy: the key is a mangled string, so there is no
-per-class brand — two classes' `#x` share a key, `#x in obj` is a plain
-own-key test, and accessing a private field on a foreign instance reads
-`undefined` instead of throwing. Real single-class encapsulation works;
-these are rare cross-class edges.
+The first version had no per-class brand: two classes' `#x` shared a key,
+and a private read on a foreign instance gave `undefined`. The key now
+carries the declaring class, `"%#x@<class number>"`, and the compiler
+resolves a private name through the enclosing class bodies, innermost
+first, like a binding; a name no enclosing class declares is a compile
+error. Reads, writes and calls go through `OP_GETPRIVATE`,
+`OP_SETPRIVATE` and `OP_GETMETHOD_PRIV`, which check that the object
+carries the name and otherwise throw node's TypeError. `#x in obj` uses
+the same key, so it answers per class. Definitions keep define semantics.
+What remains: the number is per class *declaration*, so two classes made
+by evaluating one class expression twice share names, where the language
+gives each evaluation its own. `test/diff/private_brand.js`.
 
 ---
 

@@ -21,6 +21,10 @@ import bump;
 import object;
 import bigint;
 
+// Numbers class declarations across every compile in the process, so a
+// private name is the declaring class's own.
+i32 g_class_seq = 0;
+
 struct CBind {
     str name;
     i32 slot;
@@ -83,6 +87,23 @@ struct FScope {
 
 // A name imported into the current module: read live from a
 // dependency namespace slot.
+// A private name a class declares: kind 0 is a field, 1 an instance
+// method or accessor, 2 a static one. The kind chooses the error a
+// foreign receiver gets.
+struct PrivName {
+    str name;
+    i32 kind;
+}
+
+// The private names one class declares, the number that makes them its
+// own and the class's own name for messages; the compiler keeps a stack
+// of these while inside class bodies.
+struct PrivScope {
+    Vec<PrivName> names;
+    i32 id;
+    str class_name;
+}
+
 struct ModImport {
     str slot_name;   // "%modK"
     str prop;        // exported name in the source module
@@ -112,6 +133,7 @@ struct Compiler {
     str ns_name;                     // the module namespace binding
     StrMap<i32> export_heads;        // local name -> first ExportName
     Vec<ExportName> export_names;
+    Vec<PrivScope> priv_scopes;      // enclosing class bodies, innermost last
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
     i32* line_starts;   // byte offset where each line of src begins
@@ -133,6 +155,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.ns_name = "";
     strmap_init<i32>(&co.export_heads);
     vec_init<ExportName>(&co.export_names, 8);
+    vec_init<PrivScope>(&co.priv_scopes, 4);
     co.src.data = null;
     co.src.len = 0;
     co.src_name = "";
@@ -402,10 +425,40 @@ private i32 num_key_const(Compiler* co, f64 num) {
     return ci;
 }
 
-// Private names are stored under "%#name": the '%' hides them from
-// enumeration, the '#' keeps them clear of the engine's %-internals.
-private i32 private_key_const(Compiler* co, str name) {
-    string s = format("%#{}", name);
+// Private names are stored under "%#name@class": the '%' hides them from
+// enumeration, the '#' keeps them clear of the engine's %-internals, and
+// the class number makes the name the declaring class's own. A method or
+// accessor adds "@i:Class" (static: "@s:Class"), which is what its
+// foreign-receiver error names. A name resolves through the enclosing
+// classes, innermost first, like a binding.
+private i32 private_key_const(Compiler* co, Node* at, str name) {
+    i32 id = 0 - 1;
+    i32 kind = 0;
+    str cname = "";
+    for i32 i = co.priv_scopes.len - 1; i >= 0 && id < 0; i-- {
+        PrivScope ps = vec_get(&co.priv_scopes, i);
+        for i32 j = 0; j < ps.names.len; j++ {
+            PrivName pn = vec_get(&ps.names, j);
+            if str_equal(pn.name, name) {
+                id = ps.id;
+                kind = pn.kind;
+                cname = ps.class_name;
+                break;
+            }
+        }
+    }
+    if id < 0 {
+        cerror(co, at, "private name is not declared in an enclosing class");
+        id = 0;
+    }
+    string s;
+    if kind == 0 {
+        s = format("%#{}@{}", name, id);
+    } else if kind == 1 {
+        s = format("%#{}@{}@i:{}", name, id, cname);
+    } else {
+        s = format("%#{}@{}@s:{}", name, id, cname);
+    }
     str view = s;
     u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
     memcpy(copy, view.data, view.len);
@@ -418,7 +471,7 @@ private i32 private_key_const(Compiler* co, str name) {
 
 private i32 prop_key_const(Compiler* co, Node* key) {
     if key.kind == N_NUMBER { return num_key_const(co, key.num); }
-    if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key.name); }
+    if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key, key.name); }
     return name_const(co, key.name);
 }
 
@@ -780,7 +833,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         return;
     }
     if !declare_mode && (k == N_MEMBER || k == N_INDEX) {
-        if k == N_MEMBER && (pat.flags & (NF_OPT_CHAIN | NF_PRIVATE)) != 0 {
+        if k == N_MEMBER && (pat.flags & NF_OPT_CHAIN) != 0 {
             cerror(co, pat, "invalid assignment target");
             ch_op(ch, OP_POP);
             return;
@@ -791,7 +844,11 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         compile_expr(co, pat.a);
         if k == N_MEMBER {
             ch_op_u16(ch, OP_GETLOCAL, tmp);
-            ch_op_u16(ch, OP_SETPROP, name_const(co, pat.name));
+            if (pat.flags & NF_PRIVATE) != 0 {
+                ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, pat, pat.name));
+            } else {
+                ch_op_u16(ch, OP_SETPROP, name_const(co, pat.name));
+            }
         } else {
             compile_expr(co, pat.b);
             ch_op_u16(ch, OP_GETLOCAL, tmp);
@@ -1021,7 +1078,7 @@ private void compile_assign(Compiler* co, Node* n) {
             compile_expr(co, t.a);
             compile_expr(co, n.b);
             if (t.flags & NF_PRIVATE) != 0 {
-                ch_op_u16(ch, OP_SETPROP, private_key_const(co, t.name));
+                ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
             } else {
                 ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
             }
@@ -1065,18 +1122,18 @@ private void compile_assign(Compiler* co, Node* n) {
                 cerror(co, t, "invalid assignment target");
                 return;
             }
-            i32 kc = (t.flags & NF_PRIVATE) != 0
-                ? private_key_const(co, t.name) : name_const(co, t.name);
+            bool priv = (t.flags & NF_PRIVATE) != 0;
+            i32 kc = priv ? private_key_const(co, t, t.name) : name_const(co, t.name);
             i32 t_obj = alloc_slot(co.cur);
             compile_expr(co, t.a);
             ch_op_u16(ch, OP_SETLOCAL, t_obj);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
-            ch_op_u16(ch, OP_GETPROP, kc);
+            ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             compile_expr(co, n.b);
-            ch_op_u16(ch, OP_SETPROP, kc);
+            ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
             ch_patch(ch, j);
             co.cur.cur_slots--;
             return;
@@ -1122,13 +1179,14 @@ private void compile_assign(Compiler* co, Node* n) {
         return;
     }
     if t.kind == N_MEMBER {
-        i32 kc = (t.flags & NF_PRIVATE) != 0 ? private_key_const(co, t.name) : name_const(co, t.name);
+        bool priv = (t.flags & NF_PRIVATE) != 0;
+        i32 kc = priv ? private_key_const(co, t, t.name) : name_const(co, t.name);
         compile_expr(co, t.a);
         ch_op(ch, OP_DUP);
-        ch_op_u16(ch, OP_GETPROP, kc);
+        ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
         compile_expr(co, n.b);
         ch_op(ch, op);
-        ch_op_u16(ch, OP_SETPROP, kc);
+        ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
         return;
     }
     if t.kind == N_INDEX {
@@ -1161,11 +1219,12 @@ private void compile_update(Compiler* co, Node* n) {
     if t.kind == N_MEMBER || t.kind == N_INDEX {
         i32 tmp = alloc_slot(co.cur);
         i32 mkc = 0;
+        bool mpriv = t.kind == N_MEMBER && (t.flags & NF_PRIVATE) != 0;
         if t.kind == N_MEMBER {
-            mkc = (t.flags & NF_PRIVATE) != 0 ? private_key_const(co, t.name) : name_const(co, t.name);
+            mkc = mpriv ? private_key_const(co, t, t.name) : name_const(co, t.name);
             compile_expr(co, t.a);
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, mkc);
+            ch_op_u16(ch, mpriv ? OP_GETPRIVATE : OP_GETPROP, mkc);
         } else {
             compile_expr(co, t.a);
             compile_expr(co, t.b);
@@ -1176,7 +1235,7 @@ private void compile_update(Compiler* co, Node* n) {
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, step);
         if t.kind == N_MEMBER {
-            ch_op_u16(ch, OP_SETPROP, mkc);
+            ch_op_u16(ch, mpriv ? OP_SETPRIVATE : OP_SETPROP, mkc);
         } else {
             ch_op(ch, OP_SETINDEX);
         }
@@ -1222,9 +1281,11 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
         if (n.flags & NF_OPT_CHAIN) != 0 {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
-        i32 mk = (n.flags & NF_PRIVATE) != 0
-            ? private_key_const(co, n.name) : name_const(co, n.name);
-        ch_op_u16(ch, OP_GETPROP, mk);
+        if (n.flags & NF_PRIVATE) != 0 {
+            ch_op_u16(ch, OP_GETPRIVATE, private_key_const(co, n, n.name));
+        } else {
+            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+        }
         return;
     }
     if k == N_INDEX {
@@ -1243,9 +1304,11 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
             if (callee.flags & NF_OPT_CHAIN) != 0 {
                 vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
             }
-            i32 mk = (callee.flags & NF_PRIVATE) != 0
-                ? private_key_const(co, callee.name) : name_const(co, callee.name);
-            ch_op_u16(ch, OP_GETMETHOD, mk);
+            if (callee.flags & NF_PRIVATE) != 0 {
+                ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
+            } else {
+                ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+            }
         } else if callee.kind == N_INDEX {
             emit_chain_base(co, callee.a, nils);
             if (callee.flags & NF_OPT_CHAIN) != 0 {
@@ -1367,9 +1430,11 @@ private void compile_call(Compiler* co, Node* n) {
     }
     if callee.kind == N_MEMBER {
         compile_expr(co, callee.a);
-        i32 mk = (callee.flags & NF_PRIVATE) != 0
-            ? private_key_const(co, callee.name) : name_const(co, callee.name);
-        ch_op_u16(ch, OP_GETMETHOD, mk);
+        if (callee.flags & NF_PRIVATE) != 0 {
+            ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
+        } else {
+            ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+        }
     } else if callee.kind == N_INDEX {
         compile_expr(co, callee.a);
         compile_expr(co, callee.b);
@@ -1685,7 +1750,7 @@ private void compile_expr(Compiler* co, Node* n) {
         if n.op == TOK_KW_IN && n.a.kind == N_PRIVATE_IDENT {
             // #name in obj: brand check for the private field's hidden atom.
             compile_expr(co, n.b);
-            ch_op_u16(ch, OP_HASPRIVATE, private_key_const(co, n.a.name));
+            ch_op_u16(ch, OP_HASPRIVATE, private_key_const(co, n.a, n.a.name));
             return;
         }
         compile_expr(co, n.a);
@@ -1786,9 +1851,11 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
             return;
         }
-        if (n.flags & NF_PRIVATE) != 0 {
+        // a private read outside an optional chain; `o?.#x` takes the
+        // chain path below, which knows the private link
+        if (n.flags & NF_PRIVATE) != 0 && !chain_has_opt(n) {
             compile_expr(co, n.a);
-            ch_op_u16(ch, OP_GETPROP, private_key_const(co, n.name));
+            ch_op_u16(ch, OP_GETPRIVATE, private_key_const(co, n, n.name));
             return;
         }
         if chain_has_opt(n) {
@@ -2209,6 +2276,26 @@ private void compile_class_expr(Compiler* co, Node* c) {
         ch_op(ch, OP_POP);
     }
 
+    // The class's private names, visible to the body and anything nested in
+    // it. The heritage above was compiled outside them, as the language says.
+    PrivScope ps;
+    ps.id = g_class_seq;
+    g_class_seq++;
+    // the syntactic name; a name taken from the binding does not count
+    ps.class_name = c.name.len > 0 && (c.flags & NF_NAME_INFERRED) == 0 ? c.name : "anonymous";
+    vec_init<PrivName>(&ps.names, 4);
+    for i32 i = 0; i < c.kids.len; i++ {
+        Node* m = *(c.kids.items + i);
+        if m.kind == N_CLASS_MEMBER && m.a != null && m.a.kind == N_PRIVATE_IDENT {
+            bool is_fn = m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0;
+            PrivName pn;
+            pn.name = m.a.name;
+            pn.kind = !is_fn ? 0 : ((m.flags & NF_STATIC) != 0 ? 2 : 1);
+            vec_push(&ps.names, pn);
+        }
+    }
+    vec_push(&co.priv_scopes, ps);
+
     // Inner class-name binding: inside the class body the class name refers to
     // the class itself, initialized before static blocks and static field
     // initializers run — unlike the outer binding a class *statement* adds,
@@ -2385,6 +2472,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     fs.cur_slots = saved_slots;
     fs.depth--;
     co.strict = saved_strict;
+    PrivScope done = vec_pop(&co.priv_scopes);
+    vec_free(&done.names);
 }
 
 // --- statements ------------------------------------------------------------------------
@@ -2415,6 +2504,7 @@ private void infer_name(Node* init, str name) {
     if init == null || name.len == 0 { return; }
     if (init.kind == N_FUNCTION || init.kind == N_CLASS) && init.name.len == 0 {
         init.name = name;
+        init.flags = init.flags | NF_NAME_INFERRED;
     }
 }
 

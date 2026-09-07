@@ -42,6 +42,9 @@ enum Op {
     OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_USHR,
     OP_INSTANCEOF, OP_IN,
     OP_HASPRIVATE,   // u16 const idx (private atom); pops obj, pushes #name in obj
+    OP_GETPRIVATE,   // u16 const idx; [obj] -> [val]; TypeError when the object lacks it
+    OP_SETPRIVATE,   // u16 const idx; [obj, val] -> [val]; TypeError when absent
+    OP_GETMETHOD_PRIV,// u16 const idx; [obj] -> [fn, obj]; TypeError when absent
 
     OP_JUMP,         // u16 target
     OP_JUMPF,        // pop; jump when falsy
