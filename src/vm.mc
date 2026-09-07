@@ -1817,6 +1817,73 @@ private GcString* concat_strings(VM* vm, Value sa, Value sb) {
 
 // A method is a writable, configurable, non-enumerable property. Kept out
 // of the interpreter loop so the opcode does not widen its frame.
+// Names a function defined under a computed key the way a static key
+// names it at compile time: the key's text, a symbol as [description],
+// behind the accessor prefix. A function that has a name keeps it.
+private void name_by_key(VM* vm, Value fnv, u32 key, str prefix) {
+    if !value_is_function(fnv) { return; }
+    JsFunction* f = value_as_function(fnv);
+    if f.tmpl != null && f.tmpl.name.len > 0 { return; }
+    if props_get(&f.props, vm.atom_name) != null { return; }
+    string s;
+    if (key & 0x80000000) != 0 {
+        Value sv = vec_get(&vm.symbols, key & 0x7fffffff);
+        Value d = value_is_symbol(sv) ? value_as_symbol(sv).desc : value_undefined();
+        if value_is_string(d) {
+            s = format("{}[{}]", prefix, gc_string_view(value_as_string(d)));
+        } else {
+            s = format("{}", prefix);
+        }
+    } else {
+        s = format("{}{}", prefix, atom_name(&vm.atoms, key));
+    }
+    str v = s;
+    GcString* g = gc_new_string(&vm.heap, v);
+    free(s);
+    props_set_desc(&f.props, vm.atom_name, value_cell(&g.head), PROP_CONFIGURABLE);
+}
+
+// [obj, key, val] -> [obj]: a computed-key property of an object literal.
+// With name_it, an anonymous function or class value takes the key as its
+// name.
+private void def_prop_dyn(VM* vm, bool name_it) {
+    Value v = vpeek(vm, 0);
+    u32 a = key_to_atom(vm, vpeek(vm, 1));
+    if vm.has_pending { return; }
+    if name_it { name_by_key(vm, v, a, ""); }
+    Value objv = vpeek(vm, 2);
+    if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
+    vm.sp -= 2;
+}
+
+// The `this` a frame reports: sloppy-mode code sees the global object in
+// place of undefined or null, as a plain call leaves it.
+private Value this_of(VM* vm, Value tv, bool sloppy) {
+    if sloppy && (value_is_undefined(tv) || value_is_null(tv)) {
+        Value* gt = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "globalThis"));
+        if gt != null { return *gt; }
+    }
+    return tv;
+}
+
+// [ns] -> [value]: a module import read, which must find the name. A
+// module exports a name only once its body has run that far, and a name
+// it never exports would otherwise read as undefined; both throw the
+// message the compiler recorded as const mi.
+private void get_import(VM* vm, FnTemplate* t, i32 name_ci, i32 mi) {
+    u32 a = cast(u32, value_as_int(*(t.consts + name_ci)));
+    Value nsv = vpeek(vm, 0);
+    Value out;
+    if !vm_get_prop_value(vm, nsv, a, &out) { return; }
+    if value_is_undefined(out) && value_is_object(nsv)
+        && props_get(&value_as_object(nsv).props, a) == null {
+        vm_throw_error(vm, ERR_REF, gc_string_view(value_as_string(*(t.consts + mi))));
+        return;
+    }
+    vm.sp--;
+    vpush(vm, out);
+}
+
 private void def_method(Value objv, u32 a, Value v) {
     PropList* props = null;
     if value_is_object(objv) { props = &value_as_object(objv).props; }
@@ -3437,7 +3504,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, vpeek(vm, 1));
                 vpush(vm, vpeek(vm, 1));
             }
-            case OP_THIS: { vpush(vm, fr.this_val); }
+            case OP_THIS: { vpush(vm, this_of(vm, fr.this_val, t.sloppy)); }
             case OP_ARGUMENTS: { vpush(vm, fr.arguments_obj); }
             case OP_CURFUNC: {
                 if fr.fun != null { vpush(vm, value_cell(&fr.fun.head)); }
@@ -4157,6 +4224,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, out);
                 }
             }
+            case OP_GETIMPORT: {
+                get_import(vm, t, rd_u16(code, ip), rd_u16(code, ip + 2));
+                ip += 4;
+            }
             case OP_SETPROP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
@@ -4181,6 +4252,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 // a class method with a computed name is still non-enumerable
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
+                name_by_key(vm, vpeek(vm, 0), a, "");
                 def_method(vpeek(vm, 2), a, vpeek(vm, 0));
                 vm.sp -= 2;
             }
@@ -4354,13 +4426,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
             }
             case OP_DEFPROP_DYN: {
-                Value v = vpop(vm);
-                Value kv = vpeek(vm, 0);
-                u32 a = key_to_atom(vm, kv);
-                if vm.has_pending { break case; }
-                vm.sp--;
-                Value objv = vpeek(vm, 0);
-                if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
+                ip += 2;
+                def_prop_dyn(vm, rd_u16(code, ip - 2) != 0);
             }
             case OP_DEFGETTER, OP_DEFSETTER: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
@@ -4376,6 +4443,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
+                name_by_key(vm, vpeek(vm, 0), a, op == OP_DEFGETTER_DYN ? "get " : "set ");
                 def_accessor(vm, vpeek(vm, 2), a, vpeek(vm, 0), op == OP_DEFGETTER_DYN, enumer);
                 vm.sp -= 2;
             }
@@ -4753,7 +4821,9 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.ret_ip = 0;
     fr.cur_ip = 0;
     fr.base = base;
-    fr.this_val = value_undefined();
+    // a script's top-level `this` is its module.exports, as in CommonJS
+    Value* ex = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "exports"));
+    fr.this_val = ex != null ? *ex : value_undefined();
     fr.arguments_obj = value_undefined();
     fr.is_ctor = false;
     fr.new_target = value_undefined();

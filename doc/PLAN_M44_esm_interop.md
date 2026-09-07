@@ -197,3 +197,11 @@ transcript it does now, which is the real regression test for the example.
   here got wrong: node 22 needs `--experimental-strip-types` for a `.cts`
   or `.ts` file, and refuses the first `interface` without it. Only
   `check.cjs` is portable, being plain JavaScript.
+
+## A later correction
+
+The CommonJS target of an import was requested again by its specifier,
+so an exports map with both a `require` and a `default` branch gave the
+import the `require` file where node gives it the `default` one. The
+loader now hands `require` the file the import resolved to; `condpkg` in
+`test/diff/esm_pkg` keeps it that way.

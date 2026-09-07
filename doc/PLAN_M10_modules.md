@@ -55,11 +55,14 @@ script (the existing path), so single-file programs are unaffected.
   (`export var ns; (function (ns) { … })(ns || (ns = {}))`) left
   importers with `undefined`. Stores now write through (see Model);
   `test/diff/esm_live_bindings.mjs` holds the shapes against node.
-- No module-level TDZ across cycles: a cyclic early read yields
-  `undefined` rather than throwing.
-- Relative and absolute paths only — no bare specifiers, no
-  `node_modules`, no import maps. `import()` dynamic import, top-level
-  `await`, and import assertions stay unsupported (diagnostics).
+- An import read checks that the namespace has the name. A cyclic early
+  read of a `let`, `const` or class export throws a ReferenceError that
+  names the import and its specifier, and so does a name the module
+  never exports, which node rejects at link time instead. A hoisted
+  function export is not reachable before its module has run, where
+  node has it (`test/diff/esm_import_cycle.mjs`).
+- Bare specifiers and `node_modules` (M44), `import()` and top-level
+  `await` (M41) came later; import attributes stay unsupported.
 - `export *` copies `default` too (minor); named re-export is exact.
 
 ## Implementation note

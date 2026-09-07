@@ -86,6 +86,9 @@ struct FScope {
 struct ModImport {
     str slot_name;   // "%modK"
     str prop;        // exported name in the source module
+    str spec;        // the import's specifier, for messages
+    Value msg;       // the read-failure message, built on first use
+    bool has_msg;
 }
 
 // One exported name of a module-scope binding; a binding exported under
@@ -103,6 +106,7 @@ struct Compiler {
     FScope* cur;
     str pending_label;
     bool in_module;
+    bool strict;        // strict-mode code: modules, classes, after "use strict"
     bool static_this;   // inside a static block / field: `this` is the class ctor
     StrMap<ModImport> mod_imports;   // valid while in_module
     str ns_name;                     // the module namespace binding
@@ -123,6 +127,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.pending_label.data = null;
     co.pending_label.len = 0;
     co.in_module = false;
+    co.strict = false;
     co.static_this = false;
     strmap_init<ModImport>(&co.mod_imports);
     co.ns_name = "";
@@ -672,7 +677,8 @@ private void emit_load_ident(Compiler* co, Node* n) {
         ModImport* mi = strmap_get<ModImport>(&co.mod_imports, n.name);
         if mi != null {
             emit_load_name(co, mi.slot_name, n);
-            ch_op_u16(&fs.ch, OP_GETPROP, name_const(co, mi.prop));
+            ch_op_u16(&fs.ch, OP_GETIMPORT, name_const(co, mi.prop));
+            ch_u16(&fs.ch, ch_add_const(&fs.ch, import_message(co, mi)));
             return;
         }
     }
@@ -1551,7 +1557,10 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_DUP);
                 compile_expr(co, p.a);
                 if p.b != null { compile_expr(co, p.b); } else { ch_op(ch, OP_UNDEF); }
-                ch_op(ch, OP_DEFPROP_DYN);
+                // an anonymous function or class takes the key as its name
+                bool anon = p.b != null && (p.b.kind == N_FUNCTION || p.b.kind == N_CLASS)
+                    && p.b.name.len == 0;
+                ch_op_u16(ch, OP_DEFPROP_DYN, anon ? 1 : 0);
                 ch_op(ch, OP_POP);
                 continue;
             }
@@ -1950,6 +1959,12 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         if prm.b != null || (prm.flags & NF_REST) != 0
             || prm.a == null || prm.a.kind != N_IDENT { simple_params = false; }
     }
+    // strict-mode code stays strict inside; a sloppy function body may
+    // opt in with a directive
+    bool saved_strict = co.strict;
+    if !co.strict && f.a != null && f.a.kind == N_BLOCK && has_use_strict(&f.a.kids) {
+        co.strict = true;
+    }
     if !simple_params || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
         Vec<str> pnames = vec_new<str>(4);
         for i32 i = 0; i < f.kids.len; i++ {
@@ -2085,6 +2100,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     FnTemplate* t = chunk_finish(&fs.ch, f.name, n_params, fs.n_slots, fs.has_rest,
         fs.is_gen, fs.is_async);
     t.needs_arguments = fs.needs_arguments;
+    t.sloppy = !co.strict;
+    co.strict = saved_strict;
     // arrows and shorthand methods have no [[Construct]]; the class ctor is
     // parsed as a method, so compile_class_expr clears this again for it
     if (f.flags & (NF_ARROW | NF_METHOD)) != 0 { t.not_ctor = true; }
@@ -2175,6 +2192,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     FScope* fs = co.cur;
     Chunk* ch = &fs.ch;
     bool derived = c.a != null;
+    bool saved_strict = co.strict;
+    co.strict = true;   // class bodies are strict-mode code
 
     fs.depth++;
     i32 saved_binds = fs.binds.len;
@@ -2321,6 +2340,9 @@ private void compile_class_expr(Compiler* co, Node* c) {
                 ch_u16(ch, 0);   // class accessors are non-enumerable
                 ch_op(ch, OP_POP);
             } else {
+                // the key names the method, as in an object literal
+                if m.a.kind == N_IDENT || m.a.kind == N_STRING { infer_name(m.b, m.a.name); }
+                else if m.a.kind == N_NUMBER { infer_name(m.b, num_key_text(co, m.a.num)); }
                 compile_function(co, m.b, false);
                 ch_op_u16(ch, OP_DEFMETHOD, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
@@ -2362,6 +2384,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     fs.binds.len = saved_binds;
     fs.cur_slots = saved_slots;
     fs.depth--;
+    co.strict = saved_strict;
 }
 
 // --- statements ------------------------------------------------------------------------
@@ -3197,6 +3220,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
+    co.strict = has_use_strict(&prog.kids);
     scan_inner(&fs.inner, prog, true);
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
@@ -3208,6 +3232,8 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     empty.len = 0;
     FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false, false, false);
     t.src_name = co.src_name;
+    t.sloppy = !co.strict;
+    co.strict = false;
     co.cur = null;
     fscope_free(&fs);
     return t;
@@ -3221,6 +3247,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
+    co.strict = has_use_strict(&prog.kids);
     scan_inner(&fs.inner, prog, true);
     str[5] pnames = { "exports", "require", "module", "__dirname", "__filename" };
     for i32 i = 0; i < 5; i++ { strmap_set<i32>(&fs.inner, pnames[i], 1); }
@@ -3240,6 +3267,8 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     empty.data = null;
     empty.len = 0;
     FnTemplate* t = chunk_finish(&fs.ch, empty, 5, fs.n_slots, false, false, false);
+    t.sloppy = !co.strict;
+    co.strict = false;
     t.src_name = co.src_name;
     co.cur = null;
     fscope_free(&fs);
@@ -3253,11 +3282,41 @@ private bool node_has_source(Node* n) {
 }
 
 // Registers a live import: the name reads slot_name.prop at each use.
-private void register_import(Compiler* co, str slot_name, str prop, str local) {
+private void register_import(Compiler* co, str slot_name, str spec, str prop, str local) {
     ModImport mi;
     mi.slot_name = slot_name;
     mi.prop = prop;
+    mi.spec = spec;
+    mi.has_msg = false;
     strmap_set<ModImport>(&co.mod_imports, local, mi);
+}
+
+// The message an import read throws with when the namespace has no such
+// property: the module does not export the name, or has not run yet
+// because the graph has a cycle. One string per import, shared by every
+// read site.
+private Value import_message(Compiler* co, ModImport* mi) {
+    if !mi.has_msg {
+        string s = format("cannot read import '{}' from '{}': not exported, or not yet initialized in a module cycle",
+            mi.prop, mi.spec);
+        str v = s;
+        GcString* gs = gc_new_string(co.heap, v);
+        free(s);
+        mi.msg = value_cell(&gs.head);
+        gc_root(co.heap, mi.msg);
+        mi.has_msg = true;
+    }
+    return mi.msg;
+}
+
+// A "use strict" directive at the start of a body.
+private bool has_use_strict(NodeList* list) {
+    for i32 i = 0; i < list.len; i++ {
+        Node* s = *(list.items + i);
+        if s.kind != N_EXPR_STMT || s.a == null || s.a.kind != N_STRING { return false; }
+        if str_equal(s.a.name, "use strict") { return true; }
+    }
+    return false;
 }
 
 private void add_export_name(Compiler* co, str local, str exported) {
@@ -3369,6 +3428,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     str ns_name = hidden_name(co, "%ns", 0);
     co.ns_name = ns_name;
     co.in_module = true;
+    co.strict = true;   // module code is strict-mode code
     collect_exports(co, prog);
     Vec<str> mod_names = vec_new<str>(4);
     for i32 i = 0; i < n_deps; i++ {
@@ -3411,7 +3471,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
         if slotp == null { continue; }
         str slot_name = vec_get(&mod_names, *slotp);
         if s.a != null {
-            register_import(co, slot_name, "default", s.a.name);
+            register_import(co, slot_name, s.name, "default", s.a.name);
         }
         if s.b != null {
             i32 bi = declare(co, s.b.name, true, false);
@@ -3422,7 +3482,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
         }
         for i32 j = 0; j < s.kids.len; j++ {
             Node* sp = *(s.kids.items + j);
-            register_import(co, slot_name, sp.name, sp.a.name);
+            register_import(co, slot_name, s.name, sp.name, sp.a.name);
         }
     }
 
@@ -3491,6 +3551,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
     t.src_name = co.src_name;
     co.cur = null;
     co.in_module = false;
+    co.strict = false;
     vec_free(&mod_slots);
     vec_free(&mod_names);
     strmap_free<i32>(&spec_slot);

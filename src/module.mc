@@ -642,8 +642,11 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
                 if esm_source_file(ld, resolved, &fd) {
                     dep = load_module_from(ld, resolved, canon, fd);
                 } else {
+                    // require gets the file this import resolved to, not the
+                    // specifier: resolving again under require's conditions
+                    // could pick another branch of an exports map
                     if fd.data != null { free(fd.data); }
-                    dep = load_cjs_module(ld, mod.path, spec, canon);
+                    dep = load_cjs_module(ld, mod.path, resolved, canon);
                 }
             }
         }
@@ -1338,7 +1341,7 @@ private Value run_js_builtin(VM* vm, str name, str src) {
             cjs_args[3] = dnv;
             cjs_args[4] = dnv;
             JsFunction* f = js_new_function(&vm.heap, t, 0);
-            ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
+            ignore vm_call_value(vm, value_cell(&f.head), cjs_args[0], &cjs_args[0], 5);   // this = exports
         } else {
             diags_print(&d, name, src);
         }
@@ -1558,7 +1561,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
             cjs_args[3] = dnv;
             cjs_args[4] = fnv;
             JsFunction* f = js_new_function(&vm.heap, t, 0);
-            ignore vm_call_value(vm, value_cell(&f.head), value_undefined(), &cjs_args[0], 5);
+            ignore vm_call_value(vm, value_cell(&f.head), cjs_args[0], &cjs_args[0], 5);   // this = exports
         } else {
             diags_print(&d, resolved, src);
             vm_throw_error(vm, ERR_SYNTAX, "error compiling required module");

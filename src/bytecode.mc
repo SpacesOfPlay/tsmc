@@ -58,6 +58,8 @@ enum Op {
     OP_NEWOBJ,
     OP_NEWARR,       // u16 element count popped
     OP_GETPROP,      // u16 const idx (name)
+    OP_GETIMPORT,    // u16 const idx (name), u16 const idx (message); a
+                     // module import read: the name must be present
     OP_SETPROP,      // u16 const idx; pops obj, keeps value
     OP_DEFMETHOD,    // u16 const idx; like SETPROP but non-enumerable
     OP_DEFMETHOD_DYN,// [obj, key, fn] pops key+fn, keeps obj
@@ -77,7 +79,7 @@ enum Op {
     // Object literals define their own properties rather than assigning them,
     // so an inherited setter (notably __proto__) is not invoked.
     OP_DEFPROP,      // u16 name; [obj, val] pops val, keeps obj
-    OP_DEFPROP_DYN,  // [obj, key, val] pops key+val, keeps obj
+    OP_DEFPROP_DYN,  // u16 name-it; [obj, key, val] pops key+val, keeps obj
     // Accessor definition. The trailing u16 is 1 when the property is
     // enumerable (object literals) and 0 when it is not (class bodies).
     OP_DEFGETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj
@@ -137,6 +139,8 @@ struct FnTemplate {
     bool is_class;       // a class constructor: reachable only via `new`/super()
     bool not_ctor;       // arrow/method/generator/async: `new` is a TypeError
     bool needs_arguments; // references `arguments`; build it at call time
+    bool sloppy;         // not strict-mode code: a plain call's `this` is
+                         // the global object
     u8* code;
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook
@@ -268,6 +272,7 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
     t.is_async = is_async;
     t.is_class = false;
     t.not_ctor = is_gen || is_async;
+    t.sloppy = false;
     if name.len > 0 {
         u8* nb = alloc<u8>(name.len);
         memcpy(nb, name.data, name.len);

@@ -2,10 +2,12 @@
 import pkg from 'esmonly';
 import { state } from 'esmonly';
 import dual from 'dual';
+import cond from 'condpkg';
 
 export const report = [
   'esm-only package: ' + pkg.state,
   'named from it: ' + state,
   'same module twice: ' + (pkg.state === state),
   'dual takes the import branch: ' + dual.side,
+  'a CommonJS target keeps the import branch: ' + cond.entry,
 ];

@@ -18,7 +18,11 @@ The language: classes, generators, async/await, async generators and
 dynamic `import()`), Proxy and Reflect, BigInt, typed arrays,
 `Map`/`Set`/`WeakMap`/`WeakSet` with the set operations, the iterator
 helpers, `arguments`, and regular expressions with Unicode property
-escapes and the `v` flag's set notation.
+escapes and the `v` flag's set notation. A script is sloppy-mode code
+unless it opts in with `"use strict"`; modules and class bodies are
+strict. The mode decides what a plain call sees as `this`: the global
+object in sloppy code, undefined in strict code. A primitive `this` is
+not boxed.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
@@ -140,11 +144,11 @@ build/build.exe t262               # ECMAScript conformance (test262), see below
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 32
-scripts are checked against golden output. 163 differential scripts run
+scripts are checked against golden output. 167 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-195 scripts then run again under `--gc-stress`, which collects on every
+198 scripts then run again under `--gc-stress`, which collects on every
 allocation and poisons what it sweeps, and must print what they printed
 without it. The wasm build is cross-compiled on every run, and the golden
 tests run through it under node when node is present.
