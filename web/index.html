@@ -357,6 +357,24 @@ console.log('365 days later:', format(addDays(d, 365), 'yyyy-MM-dd'));
 console.log('to 2025:', differenceInDays(new Date(2025, 0, 1), d), 'days;', formatDistance(new Date(2020, 0, 1), d), 'before');
 </script>
 
+<script type="text/plain" id="ex-zod" data-title="npm: zod">// A schema is a value: parse returns the data or throws, safeParse lists the issues.
+import { z } from 'zod';
+
+const User = z.object({
+  name: z.string().min(2),
+  age: z.number().int().positive(),
+  email: z.string().email(),
+  tags: z.array(z.string()).default([]),
+});
+type User = z.infer<typeof User>;
+
+const ada: User = User.parse({ name: 'Ada', age: 36, email: 'ada@example.com' });
+console.log(ada);
+
+const bad = User.safeParse({ name: 'A', age: -1, email: 'nope' });
+if (!bad.success) for (const issue of bad.error.issues) console.log(issue.path.join('.'), '->', issue.message);
+</script>
+
 <script type="text/plain" id="ex-loop" data-title="runaway loop (use Stop)">let i = 0;
 for (;;) {
   if (++i % 1_000_000 === 0) console.log('still going', i);

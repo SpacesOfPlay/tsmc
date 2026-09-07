@@ -15,12 +15,18 @@ object plus its dependencies' namespace objects as arguments:
 - **Imports** bind as ordinary module-local consts, initialized in a
   prologue from the dependency namespaces (`local = %modK.exported`;
   `* as ns` binds the whole object; `default` reads `%modK.default`).
-- **Exports** are ordinary locals that also mirror onto `%ns` at their
-  declaration: `export const x = …` compiles to a local `x` plus
-  `%ns.x = x`. Functions mirror after hoisting; classes and `let`/
-  `var` at their declaration.
+- **Exports** are ordinary locals that write through to `%ns`. The
+  compiler collects the module's export table before hoisting and flags
+  each module-scope binding it names; every store to a flagged binding,
+  at its declaration or later, from the module body or through an
+  upvalue from a nested function, is followed by `%ns.x = x` for each
+  name the binding is exported under. Importers read the namespace, so
+  the export is a live binding. A name in an `export {}` list that is
+  not a module binding (an import, a global) is copied once at the
+  statement.
 - **Re-exports** (`export { a } from "m"`, `export * from "m"`) copy
-  from a dependency namespace onto `%ns`.
+  from a dependency namespace onto `%ns`; `export * as n from "m"`
+  stores the dependency namespace object itself as `%ns.n`.
 
 No per-identifier namespace routing: within a module, an exported name
 is a normal local. This keeps the compiler change contained and needs
@@ -43,11 +49,12 @@ script (the existing path), so single-file programs are unaffected.
 
 ## Known deviations (documented)
 
-- **Imports snapshot at evaluation time**, not live bindings: an
-  importer sees a dependency's exported value as of when the importer
-  evaluates. Correct for `const`/function/class exports (the norm);
-  a later reassignment of an exported `let` is not observed across
-  modules. Within a module the binding is live.
+- Exports were first mirrored once at their declaration, so a later
+  reassignment of an exported `let` or `var` was not observed across
+  modules; TypeScript's namespace output
+  (`export var ns; (function (ns) { … })(ns || (ns = {}))`) left
+  importers with `undefined`. Stores now write through (see Model);
+  `test/diff/esm_live_bindings.mjs` holds the shapes against node.
 - No module-level TDZ across cycles: a cyclic early read yields
   `undefined` rather than throwing.
 - Relative and absolute paths only — no bare specifiers, no

@@ -137,7 +137,7 @@ of 294, and the graph loads in 145 ms natively and about 260 ms through
 the wasm build. `test/diff/string_index_cursor.js` pins the semantics
 against node and `bench/strindex.ts` the cost.
 
-The page carries ten package examples. Measured in headless Edge
+The page carries eleven package examples. Measured in headless Edge
 against the live registry, the run itself and the first fetch:
 
 | package | run | first fetch |
@@ -152,6 +152,7 @@ against the live registry, the run itself and the first fetch:
 | uuid | 5 ms | 15 KB, 0.4 s |
 | lodash-es, 640 modules | 51 ms | 147 KB, 0.4 s |
 | date-fns, 305 modules loaded | 120 ms | 1.5 MB, 0.5 s |
+| zod 4 | 58 ms | 1.0 MB, 1.1 s |
 
 date-fns first measured at 618 ms, and the reason was outside this
 repository: the wasm target's allocator, which the linux target shares,
@@ -170,12 +171,19 @@ the allocator still sees from us is property maps, vectors and string
 buffers, which call it by name; a loop of 3,000 `new RegExp` takes a
 second in the page for that reason, and 5 ms natively.
 
-zod is not among the examples: its current versions compile TypeScript
+zod took three compiler fixes. Its current versions compile TypeScript
 namespaces to `export var util; (function (util) { … })(util || (util = {}))`,
-and the loader binds an export once at its declaration, so the importer
-sees `undefined`. Live bindings, where a store to an exported binding
-also updates the namespace, are the fix; they belong with the module
-work, not here.
+and the loader bound an export once at its declaration, so the importer
+saw `undefined`. Exports are now live bindings: every store to an
+exported binding also writes the namespace object
+(`doc/PLAN_M10_modules.md`). Its index uses `export * as util from`,
+which was compiled as a plain `export *`; it now stores the dependency
+namespace under the name. And a method named like a module function,
+`int(params) { return this.check(int(params)); }`, called itself: a
+method's name is its key, not a binding in its body, and only a named
+function expression sees its own name. `test/diff/esm_live_bindings.mjs`
+and `test/diff/method_name_scope.js` hold the three against node. zod 3
+and zod 4 run natively and in the page, where zod 4 is an example.
 
 A review of the other examples found two more general costs. Compiling
 was quadratic in file size, because every recorded source position
