@@ -284,6 +284,79 @@ console.log(R.groupBy((p: Person) => (p.age < 40 ? 'under 40' : '40 and over'), 
 console.log(R.compose(R.join('-'), R.map(R.toUpper), R.split(' '))('functional style'));
 </script>
 
+<script type="text/plain" id="ex-immer" data-title="npm: immer">// Immutable updates through a Proxy draft: the untouched parts are shared.
+import { produce } from 'immer';
+
+const base = { todos: [{ id: 1, text: 'write it', done: false }], filter: 'all' };
+const next = produce(base, (draft) => {
+  draft.todos.push({ id: 2, text: 'ship it', done: false });
+  draft.todos[0].done = true;
+});
+console.log('base', base.todos.length, base.todos[0].done);
+console.log('next', next.todos.length, next.todos[0].done);
+console.log('shared where untouched:', base.filter === next.filter, '| copied where touched:', base.todos !== next.todos);
+</script>
+
+<script type="text/plain" id="ex-decimal" data-title="npm: decimal.js">import Decimal from 'decimal.js';
+
+console.log('floats:', 0.1 + 0.2, '  decimal:', new Decimal(0.1).plus(0.2).toString());
+console.log('sqrt 2:', new Decimal(2).sqrt().toFixed(40));
+console.log('1/3:', new Decimal(1).div(3).toSignificantDigits(50).toString());
+console.log('2^100:', new Decimal(2).pow(100).toString());
+</script>
+
+<script type="text/plain" id="ex-mustache" data-title="npm: mustache">import Mustache from 'mustache';
+
+const template = `# {{title}}
+{{#items}}
+- {{name}}: {{#ok}}works{{/ok}}{{^ok}}not yet{{/ok}}
+{{/items}}`;
+const view = {
+  title: 'tsmc in the browser',
+  items: [{ name: 'wasm', ok: true }, { name: 'npm', ok: true }, { name: 'sockets', ok: false }],
+};
+console.log(Mustache.render(template, view));
+</script>
+
+<script type="text/plain" id="ex-dayjs" data-title="npm: dayjs">import dayjs from 'dayjs';
+import relativeTime from 'dayjs/plugin/relativeTime';
+import isLeapYear from 'dayjs/plugin/isLeapYear';
+dayjs.extend(relativeTime);
+dayjs.extend(isLeapYear);
+
+const d = dayjs('2024-02-29T12:34:56Z');
+console.log(d.format('dddd, MMMM D YYYY'), '| leap year:', d.isLeapYear());
+console.log('a year later:', d.add(1, 'year').format('YYYY-MM-DD'), '| end of month:', d.endOf('month').format('D'));
+console.log(dayjs('2020-01-01').from(d), '|', d.diff('2020-01-01', 'day'), 'days');
+</script>
+
+<script type="text/plain" id="ex-uuid" data-title="npm: uuid">// v4 draws from the page's CSPRNG; v5 hashes a name with SHA-1.
+import { v4 as uuidv4, v5 as uuidv5, validate, version } from 'uuid';
+
+const id = uuidv4();
+console.log(id, '| valid:', validate(id), '| version:', version(id));
+console.log('name-based:', uuidv5('tsmc.dev', uuidv5.DNS));
+console.log('not one:', validate('hello'));
+</script>
+
+<script type="text/plain" id="ex-lodash" data-title="npm: lodash-es">// 640 ES modules, loaded one file at a time.
+import { chunk, groupBy, sortBy, camelCase, uniqBy, mapValues } from 'lodash-es';
+
+console.log(chunk([1, 2, 3, 4, 5, 6, 7], 3));
+console.log(groupBy(['one', 'two', 'three', 'four', 'five'], 'length'));
+console.log(sortBy([{ n: 'b', v: 2 }, { n: 'a', v: 1 }, { n: 'c', v: 0 }], 'v').map((x) => x.n).join(''));
+console.log(camelCase('hello wasm world'), uniqBy([{ id: 1 }, { id: 1 }, { id: 2 }], 'id').length);
+console.log(mapValues({ a: 1, b: 2 }, (v) => v * 10));
+</script>
+
+<script type="text/plain" id="ex-datefns" data-title="npm: date-fns">import { format, addDays, differenceInDays, formatDistance, isLeapYear } from 'date-fns';
+
+const d = new Date(2024, 1, 29, 12, 0, 0);
+console.log(format(d, 'EEEE, MMMM do yyyy'), '| leap year:', isLeapYear(d));
+console.log('365 days later:', format(addDays(d, 365), 'yyyy-MM-dd'));
+console.log('to 2025:', differenceInDays(new Date(2025, 0, 1), d), 'days;', formatDistance(new Date(2020, 0, 1), d), 'before');
+</script>
+
 <script type="text/plain" id="ex-loop" data-title="runaway loop (use Stop)">let i = 0;
 for (;;) {
   if (++i % 1_000_000 === 0) console.log('still going', i);

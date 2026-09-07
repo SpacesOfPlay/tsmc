@@ -137,6 +137,43 @@ of 294, and the graph loads in 145 ms natively and about 260 ms through
 the wasm build. `test/diff/string_index_cursor.js` pins the semantics
 against node and `bench/strindex.ts` the cost.
 
+The page carries ten package examples. Measured in headless Edge
+against the live registry, the run itself and the first fetch:
+
+| package | run | first fetch |
+|---|---|---|
+| markdown-it, 7 packages | 116 ms | 733 KB, 0.3 s |
+| js-yaml | 11 ms | 223 KB, 0.05 s |
+| ramda | 44 ms | 218 KB, 0.2 s |
+| immer | 5 ms | 252 KB, 0.6 s |
+| decimal.js | 10 ms | 69 KB, 0.6 s |
+| mustache | 2 ms | 34 KB, 0.4 s |
+| dayjs with two plugins | 6 ms | 145 KB, 0.4 s |
+| uuid | 6 ms | 15 KB, 0.4 s |
+| lodash-es, 640 modules | 95 ms | 147 KB, 0.4 s |
+| date-fns, 305 modules loaded | 618 ms | 1.5 MB, 0.5 s |
+
+date-fns is the outlier, and the reason is outside this repository: the
+wasm target's allocator keeps one first-fit free list with no splitting
+or coalescing, so freed memory is never reused for a different size and
+every allocation scans the blocks that did not fit. A probe that frees
+50,000 blocks of 64 bytes and then asks for 25,000 of 128 reuses none of
+them and takes 1.5 s; a block regrown from 100 bytes to 200 KB in 2,000
+steps leaves 199 MB of memory for 4 MB of live data. In the page that
+shows as date-fns's 50 KB package.json taking 63 ms to parse, a loop of
+200,000 short strings taking minutes, and a string built with `+=` past
+a hundred thousand steps ending in an out-of-bounds trap. Natively none
+of that happens. Until the allocator grows size classes, the page is
+best with packages whose load allocates little; everything above except
+date-fns is under 120 ms.
+
+zod is not among the examples: its current versions compile TypeScript
+namespaces to `export var util; (function (util) { … })(util || (util = {}))`,
+and the loader binds an export once at its declaration, so the importer
+sees `undefined`. Live bindings, where a store to an exported binding
+also updates the namespace, are the fix; they belong with the module
+work, not here.
+
 A review of the other examples found two more general costs. Compiling
 was quadratic in file size, because every recorded source position
 counted newlines from the start of the file; a line table built once per

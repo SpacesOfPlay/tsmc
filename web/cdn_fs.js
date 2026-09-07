@@ -301,7 +301,7 @@
       },
       packages: () => order.map((k) => {
         const p = pkgs.get(k);
-        return { name: p.name, version: p.version, files: p.touched.size, bytes: p.bytes };
+        return { key: k, name: p.name, version: p.version, files: p.touched.size, bytes: p.bytes };
       }),
       stats: () => ({ requests: stats.requests, bytes: stats.bytes }),
     };

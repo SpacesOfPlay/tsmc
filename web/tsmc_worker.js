@@ -32,14 +32,21 @@ self.onmessage = async (e) => {
     await cdn.prefetch(TsmcCdnFs.scan(Object.values(m.files).join('\n')));
     const fetchMs = performance.now() - t0;
     const base = TsmcHost.memoryFs(m.files);
+    // the packages this run read from, not everything the worker has loaded
+    const used = new Set();
     const view = {
-      read: (p) => base.read(p) || cdn.read(p),
+      read: (p) => {
+        const r = base.read(p) || cdn.read(p);
+        if (r && p.startsWith('/node_modules/')) used.add(TsmcCdnFs.packageName(p.slice('/node_modules/'.length)));
+        return r;
+      },
       stat: (p) => base.stat(p) || cdn.stat(p),
     };
     const r = await TsmcHost.run(module, { fs: view, args: m.args, write });
     const after = cdn.stats();
     postMessage({
-      type: 'exit', code: r.code, ms: r.ms, fetchMs, packages: cdn.packages(),
+      type: 'exit', code: r.code, ms: r.ms, fetchMs,
+      packages: cdn.packages().filter((p) => used.has(p.key)),
       requests: after.requests - before.requests, bytes: after.bytes - before.bytes,
     });
   } catch (e) {
