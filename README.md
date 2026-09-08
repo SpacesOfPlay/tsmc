@@ -188,11 +188,11 @@ reading before the number below. Failing test paths are written to
 default half the cores). Pin a different revision with the
 `T262_COMMIT` environment variable.
 
-On the default `test/language` run, 16,888 of the 21,037 tests that ran
-pass (about 80%); 2,677 more are skipped as unsupported. The remaining
-failures are concentrated in destructuring patterns and in class element
-grammar. This is a current snapshot and will change as the interpreter
-does.
+On the default `test/language` run, 18,817 of the 21,037 tests that ran
+pass (about 89%); 2,677 more are skipped as unsupported. The remaining
+failures are mostly early errors the parser does not report, the `with`
+statement, and a long tail of protocol details. This is a current
+snapshot and will change as the interpreter does.
 
 ## Layout
 
