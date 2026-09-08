@@ -2153,6 +2153,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
 
     if f.a != null && f.a.kind == N_BLOCK {
         hoist_vars(co, f.a);
+        // a generator binds its parameters at the call and waits here for
+        // the first next(); an error above belongs to the caller
+        if fs.is_gen { ch_op(&fs.ch, OP_GEN_START); }
         compile_block_stmts_ex(co, &f.a.kids, fields, n_fields);
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_RETURN);

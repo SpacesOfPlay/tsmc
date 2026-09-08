@@ -25,7 +25,15 @@ the saved image is always a single frame — nested calls cannot
 suspend across it.
 
 Calling a function whose template is flagged generator builds the
-generator object from the normalized arguments instead of a frame.
+generator object from the normalized arguments, then runs the frame at
+once as far as `OP_GEN_START`, which the compiler places after the
+parameter bindings and the implicit `this`/`arguments` bindings. That
+opcode suspends like a yield but with no value and in the start state,
+so a default that throws or a pattern with nothing to destructure fails
+the call itself, the way the language binds parameters, and the first
+`next()` resumes at the body without an input to discard. An async
+function that is not a generator skips this: its driver starts it
+immediately anyway, and a parameter error there rejects the promise.
 `next`/`return`/`throw` are natives on `Generator.prototype`;
 `return()` skips open `finally` blocks (documented deviation).
 

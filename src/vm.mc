@@ -4207,8 +4207,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
-                            if ft.is_async { value_as_generator(gv).is_async = true; }
-                            vpush(vm, gv);
+                            if !vm.has_pending { vpush(vm, gv); }
                         } else if ft.is_async {
                             Value rp = make_async_from_call(vm, f, argc);
                             vpush(vm, rp);
@@ -4769,6 +4768,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 JsObject* arr = forin_keys(vm, src);
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
+            }
+            case OP_GEN_START: {
+                if fr.gen == null {
+                    vm_throw_error(vm, ERR_TYPE, "generator body outside a generator");
+                } else {
+                    gen_start_suspend(vm, fr, ip);
+                    vm.sp = fr.base - 2;
+                    vpush(vm, value_undefined());
+                    vm.fp--;
+                    if vm.fp < stop_fp { return 0; }
+                    fr = vm.frames + (vm.fp - 1);
+                    t = fr.tmpl;
+                    code = t.code;
+                    ip = (vm.frames + vm.fp).ret_ip;
+                }
             }
             case OP_YIELD, OP_AWAIT: {
                 JsGenerator* g = fr.gen;
@@ -5448,9 +5462,47 @@ private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
     }
     g.saved_len = n;
     g.resume_ip = 0;
+    g.is_async = ft.is_gen && ft.is_async;
     vm.sp -= ft.n_params + 2;
+    Value gv = value_cell(&g.head);
+    if ft.is_gen {
+        // Bind the parameters now, as the language does: a default that
+        // throws, or a pattern with nothing to destructure, fails the call
+        // itself. The body waits at OP_GEN_START for the first next().
+        // An async function (not a generator) starts through its driver
+        // instead, so its parameter errors reject the promise.
+        gc_root(&vm.heap, gv);
+        ignore vm_gen_resume_mode(vm, g, value_undefined(), false, false);
+        if vm.has_pending {
+            gc_root_reset(&vm.heap, arm);
+            return value_undefined();
+        }
+    }
     gc_root_reset(&vm.heap, arm);
-    return value_cell(&g.head);
+    return gv;
+}
+
+// A generator suspends once its parameters are bound, before the body.
+// Saved like a yield, but with no value on the stack and in the start
+// state, so the first next() resumes here with no input to discard.
+private void gen_start_suspend(VM* vm, Frame* fr, i32 ip) {
+    JsGenerator* g = fr.gen;
+    i32 depth = vm.sp - fr.base;
+    if g.saved != null { free(g.saved); }
+    g.saved = alloc<Value>(depth > 0 ? depth : 1);
+    for i32 i = 0; i < depth; i++ {
+        *(g.saved + i) = *(vm.stack + fr.base + i);
+    }
+    g.saved_len = depth;
+    g.resume_ip = ip;
+    // no try block of the body is open yet
+    if g.handler_data != null {
+        free(g.handler_data);
+        g.handler_data = null;
+    }
+    g.n_handlers = 0;
+    g.state = GEN_START;
+    g.unwind_return = false;
 }
 
 // Runs the generator to its next suspension or completion. The result
