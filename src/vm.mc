@@ -140,6 +140,9 @@ struct VM {
     u32 atom_length;
     u32 atom_prototype;
     u32 atom_name;
+    u32 atom_undefined_g;   // the global object's read-only value properties
+    u32 atom_nan_g;
+    u32 atom_infinity_g;
     u32 atom_message;
     // well-known prototypes; null until builtins_install
     JsObject* object_proto;
@@ -1548,7 +1551,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
         }
         if (o.obj_flags & OBJF_GLOBAL) != 0 {
             // writing a property of the global object creates or updates the
-            // binding a bare name resolves to
+            // binding a bare name resolves to; the three value properties
+            // of the global object are read-only
+            if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
+                vm_throw_error(vm, ERR_TYPE, "cannot assign to read only property of the global object");
+                return false;
+            }
             intmap_set<Value>(&vm.globals, a, v);
             return true;
         }
@@ -1848,6 +1856,24 @@ private void name_by_key(VM* vm, Value fnv, u32 key, str prefix) {
     GcString* g = gc_new_string(&vm.heap, v);
     free(s);
     props_set_desc(&f.props, vm.atom_name, value_cell(&g.head), PROP_CONFIGURABLE);
+}
+
+// [obj, val] -> [obj]: defines a data property. A frozen object takes no
+// definition, and a non-extensible one takes none it does not have.
+private void def_prop(VM* vm, u32 a) {
+    Value v = vpop(vm);
+    Value objv = vpeek(vm, 0);
+    if value_is_object(objv) {
+        JsObject* o = value_as_object(objv);
+        bool fresh = props_get(&o.props, a) == null;
+        if ((o.obj_flags & OBJF_FROZEN) != 0) || (fresh && (o.obj_flags & OBJF_NONEXT) != 0) {
+            vm_throw_error(vm, ERR_TYPE, "cannot define property, object is not extensible");
+            return;
+        }
+        js_set_prop(o, a, v);
+    } else if value_props(objv) != null {
+        props_set(value_props(objv), a, v);
+    }
 }
 
 // [obj, key, val] -> [obj]: a computed-key property of an object literal.
@@ -3276,6 +3302,9 @@ void vm_init(VM* vm) {
     vm.atom_length = atom_intern(&vm.atoms, "length");
     vm.atom_prototype = atom_intern(&vm.atoms, "prototype");
     vm.atom_name = atom_intern(&vm.atoms, "name");
+    vm.atom_undefined_g = atom_intern(&vm.atoms, "undefined");
+    vm.atom_nan_g = atom_intern(&vm.atoms, "NaN");
+    vm.atom_infinity_g = atom_intern(&vm.atoms, "Infinity");
     vm.atom_message = atom_intern(&vm.atoms, "message");
     vm.object_proto = null;
     vm.array_proto = null;
@@ -4548,10 +4577,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_DEFPROP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                Value v = vpop(vm);
-                Value objv = vpeek(vm, 0);
-                if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
-                else if value_props(objv) != null { props_set(value_props(objv), a, v); }
+                def_prop(vm, a);
             }
             case OP_REQUIRE_OBJ: {
                 require_object(vm);
@@ -5342,7 +5368,11 @@ private void iter_step(VM* vm, i32 di) {
     }
     Value val;
     bool done = false;
-    if !vm_iter_next(vm, iter, &val, &done) { return; }
+    if !vm_iter_next(vm, iter, &val, &done) {
+        // the iterator itself failed: it counts as spent, so no close follows
+        *(vm.stack + di) = value_bool(true);
+        return;
+    }
     *(vm.stack + di) = value_bool(done);
     vm.sp--;
     vpush(vm, done ? value_undefined() : val);
@@ -5361,8 +5391,9 @@ private void iter_rest(VM* vm, i32 di) {
             js_array_set(arr, arr.elen, val);
         }
     }
-    if vm.has_pending { return; }
+    // spent either way: exhausted, or failed on its own, which no close follows
     *(vm.stack + di) = value_bool(true);
+    if vm.has_pending { return; }
     Value res = vpop(vm);   // arr
     vm.sp--;                // iter
     vpush(vm, res);

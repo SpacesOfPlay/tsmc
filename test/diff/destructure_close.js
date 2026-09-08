@@ -67,3 +67,17 @@ console.log('array order:', order.join(' '), keyed.k);
 order.length = 0;
 ({ a: (order.push('obj'), obj).p, [(order.push('key'), 'b')]: (order.push('keyed'), keyed)[(order.push('k2'), 'b')] = 'd' } = { get a() { order.push('get a'); return 'A'; }, get b() { order.push('get b'); return undefined; } });
 console.log('object order:', order.join(' '), keyed.b);
+
+// an iterator whose own next() throws is spent: no return() follows
+m = make({ next: () => { throw new URIError('next broke'); } });
+console.log('next() throws:', at(() => { let d; [d] = m.iterable; }), m.log.join(','), '|', at(() => { let e; [, e] = m.iterable; }), m.log.join(','));
+m = make({ next: () => { throw new URIError('next broke'); } });
+console.log('next() throws under rest:', at(() => { let r; [...r] = m.iterable; }), m.log.join(','));
+
+// a class field cannot be defined on a frozen or sealed instance
+class Frozen { f = Object.freeze(this); g = 1; }
+class Sealed { f = Object.preventExtensions(this); g = 1; }
+console.log('field on a frozen this:', at(() => new Frozen()), '| on a non-extensible this:', at(() => new Sealed()));
+
+// the global object's value properties are read-only
+console.log('global undefined:', (function () { 'use strict'; try { globalThis.undefined = 1; return 'no throw'; } catch (e) { return e.constructor.name; } })(), typeof undefined, (function () { 'use strict'; try { globalThis.NaN = 1; return 'no throw'; } catch (e) { return e.constructor.name; } })(), isNaN(NaN));
