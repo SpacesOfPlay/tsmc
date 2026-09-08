@@ -348,6 +348,7 @@ struct JsGenerator {
     // apart: a yield hands its value to the consumer, an await does not.
     bool is_async;
     bool awaiting;       // the last suspend was an await
+    bool delegating;     // suspended inside yield*: a resume brings its kind
     bool draining;       // a request is in flight
     // A return completion can suspend: `finally { yield x }` parks the body
     // mid-unwind. The flag belongs to the generator, not the VM, or the
@@ -559,6 +560,7 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
     g.state = GEN_START;
     g.is_async = false;
     g.awaiting = false;
+    g.delegating = false;
     g.draining = false;
     g.unwind_return = false;
     g.queue = value_undefined();

@@ -1931,53 +1931,128 @@ private void compile_expr(Compiler* co, Node* n) {
             i32 t_it = alloc_slot(co.cur);
             ch_op_u16(ch, OP_SETLOCAL, t_it);
             ch_op(ch, OP_POP);
+            // What resumed this generator: the input, and the completion's
+            // kind (0 next, 1 throw, 2 return), which the loop forwards to
+            // the delegate's method of that name.
             i32 t_sent = alloc_slot(co.cur);
             ch_op(ch, OP_UNDEF);
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
-            // never set: the delegate is only left early, so it always wants
-            // closing when this unwinds
+            i32 t_mode = alloc_slot(co.cur);
+            ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(0)));
+            ch_op_u16(ch, OP_SETLOCAL, t_mode);
+            ch_op(ch, OP_POP);
+            // never set: the close on a missing throw method always runs
             i32 t_done = alloc_slot(co.cur);
             ch_op(ch, OP_FALSE);
             ch_op_u16(ch, OP_SETLOCAL, t_done);
             ch_op(ch, OP_POP);
-            // an abrupt resume (a throw, or the return completion from
-            // .return()) unwinds into the handler below, which closes the
-            // delegate before carrying on
-            i32 jclose = ch_jump(ch, OP_TRY_PUSH);
+
             i32 lstart = ch_pos(ch);
-            i32 jdone = 0;
+            ch_op_u16(ch, OP_GETLOCAL, t_mode);
+            ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(1)));
+            ch_op(ch, OP_SEQ);
+            i32 jthrow = ch_jump(ch, OP_JUMPT);
+            ch_op_u16(ch, OP_GETLOCAL, t_mode);
+            ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(2)));
+            ch_op(ch, OP_SEQ);
+            i32 jret = ch_jump(ch, OP_JUMPT);
+            // next(sent). In an async generator the delegate is walked with
+            // the async protocol: each result is awaited. A sync iterable
+            // still works, since OP_GET_AITER falls back to Symbol.iterator
+            // and awaiting a plain result is a no-op.
             if adelegate {
                 ch_op_u16(ch, OP_GETLOCAL, t_it);
                 ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
                 ch_op_u16(ch, OP_GETLOCAL, t_sent);
                 ch_op_u16(ch, OP_CALL, 1);
                 ch_op(ch, OP_AWAIT);
-                ch_op(ch, OP_ITER_CHECK);  // [res]
+                ch_op(ch, OP_ITER_CHECK);      // [res]
                 ch_op(ch, OP_DUP);
                 ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
-                jdone = ch_jump(ch, OP_JUMPT);
-                ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             } else {
                 ch_op_u16(ch, OP_GETLOCAL, t_it);
                 ch_op_u16(ch, OP_GETLOCAL, t_sent);
                 ch_op(ch, OP_ITER_SEND);       // [value, done]
-                jdone = ch_jump(ch, OP_JUMPT);
             }
-            ch_op(ch, OP_YIELD);           // yield value; keep the resume input
+            i32 jdone = ch_jump(ch, OP_JUMPT);
+            if adelegate { ch_op_u16(ch, OP_GETPROP, name_const(co, "value")); }
+            i32 lyield = ch_pos(ch);           // [value]
+            ch_op(ch, OP_YIELD_DELEGATE);      // resumes with [input, kind]
+            ch_op_u16(ch, OP_SETLOCAL, t_mode);
+            ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_JUMP, lstart);
-            ch_patch(ch, jdone);           // [value] — the final iterator value
+            ch_patch(ch, jdone);               // [value] or [res]: the delegate is done
             if adelegate { ch_op_u16(ch, OP_GETPROP, name_const(co, "value")); }
-            ch_op(ch, OP_TRY_POP);
             i32 jend = ch_jump(ch, OP_JUMP);
-            ch_patch(ch, jclose);
+
+            // throw(sent): forwarded when the delegate has the method; else
+            // the delegate is closed and the caller gets a TypeError
+            ch_patch(ch, jthrow);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "throw"));
+            ch_op(ch, OP_TYPEOF);
+            ch_op_u16(ch, OP_CONST, str_const(co, "function"));
+            ch_op(ch, OP_SEQ);
+            i32 jnothrow = ch_jump(ch, OP_JUMPF);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETMETHOD, name_const(co, "throw"));
+            ch_op_u16(ch, OP_GETLOCAL, t_sent);
+            ch_op_u16(ch, OP_CALL, 1);
+            if adelegate { ch_op(ch, OP_AWAIT); }
+            ch_op(ch, OP_ITER_CHECK);          // [res]
+            ch_op(ch, OP_DUP);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            i32 jthrowdone = ch_jump(ch, OP_JUMPT);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_patch(ch, jthrowdone);          // [res]
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            i32 jend2 = ch_jump(ch, OP_JUMP);
+            ch_patch(ch, jnothrow);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
             ch_op_u16(ch, OP_ITER_CLOSE, t_done);
+            ch_op_u16(ch, OP_GETGLOBAL, name_const(co, "TypeError"));
+            ch_op_u16(ch, OP_CONST, str_const(co, "The iterator does not provide a 'throw' method."));
+            ch_op_u16(ch, OP_NEW, 1);
             ch_op(ch, OP_THROW);
-            ch_patch(ch, jend);
-            co.cur.cur_slots -= 3;
+
+            // return(sent): forwarded when the delegate has the method, and
+            // a done result returns from this generator; without the method
+            // the generator returns what it was sent. Either way its own
+            // finally blocks run.
+            ch_patch(ch, jret);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "return"));
+            ch_op(ch, OP_TYPEOF);
+            ch_op_u16(ch, OP_CONST, str_const(co, "function"));
+            ch_op(ch, OP_SEQ);
+            i32 jnoret = ch_jump(ch, OP_JUMPF);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETMETHOD, name_const(co, "return"));
+            ch_op_u16(ch, OP_GETLOCAL, t_sent);
+            ch_op_u16(ch, OP_CALL, 1);
+            if adelegate { ch_op(ch, OP_AWAIT); }
+            ch_op(ch, OP_ITER_CHECK);          // [res]
+            ch_op(ch, OP_DUP);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            i32 jretdone = ch_jump(ch, OP_JUMPT);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_patch(ch, jretdone);            // [res]
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            inline_finallys(co, 0);
+            ch_op(ch, OP_RETURN);
+            ch_patch(ch, jnoret);
+            ch_op_u16(ch, OP_GETLOCAL, t_sent);
+            inline_finallys(co, 0);
+            ch_op(ch, OP_RETURN);
+
+            ch_patch(ch, jend);                // [value]: the yield* result
+            ch_patch(ch, jend2);
+            co.cur.cur_slots -= 4;
             return;
         }
         if n.a != null {

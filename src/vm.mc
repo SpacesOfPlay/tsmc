@@ -4784,12 +4784,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     ip = (vm.frames + vm.fp).ret_ip;
                 }
             }
-            case OP_YIELD, OP_AWAIT: {
+            case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: {
                 JsGenerator* g = fr.gen;
                 if g == null {
                     vm_throw_error(vm, ERR_TYPE, "yield outside a generator");
                 } else {
                     g.awaiting = op == OP_AWAIT;
+                    g.delegating = op == OP_YIELD_DELEGATE;
                     i32 depth = vm.sp - fr.base - 1;
                     if g.saved != null { free(g.saved); }
                     g.saved = alloc<Value>(depth > 0 ? depth : 1);
@@ -5560,10 +5561,16 @@ Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, boo
     nf.gen = g;
     vm.fp++;
     g.state = GEN_RUNNING;
-    if !from_start && !is_throw && !is_return {
+    if !from_start && g.delegating {
+        // suspended inside yield*: the delegation loop forwards the
+        // completion to the inner iterator, so it gets the kind as a value
+        // rather than an injected throw or return
+        g.delegating = false;
         vpush(vm, input);
-    }
-    if is_throw {
+        vpush(vm, value_int(is_throw ? 1 : (is_return ? 2 : 0)));
+    } else if !from_start && !is_throw && !is_return {
+        vpush(vm, input);
+    } else if is_throw {
         vm.unwind_return = false;
         vm_throw(vm, input);
     } else if is_return {

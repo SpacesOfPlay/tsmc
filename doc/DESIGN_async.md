@@ -37,6 +37,17 @@ immediately anyway, and a parameter error there rejects the promise.
 `next`/`return`/`throw` are natives on `Generator.prototype`;
 `return()` skips open `finally` blocks (documented deviation).
 
+`yield*` compiles to a loop that owns the delegate. Its yields are
+`OP_YIELD_DELEGATE`, which marks the generator as delegating, and a
+resume of a delegating generator pushes the input and the completion's
+kind instead of injecting a throw or a return. The loop then calls the
+delegate's `next`, `throw` or `return` with the input: a `throw` without
+the method closes the delegate and raises a TypeError, a `return`
+without it returns the input from the outer generator, and a `return`
+the delegate finishes returns the delegate's value, through the outer
+generator's own finally blocks. An async generator walks the delegate
+with the async protocol, awaiting each result.
+
 ## Iterator protocol and symbols
 
 Symbols are cells (`GC_SYMBOL`) with a unique id in a reserved key

@@ -147,11 +147,11 @@ build/build.exe t262               # ECMAScript conformance (test262), see below
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 32
-scripts are checked against golden output. 171 differential scripts run
+scripts are checked against golden output. 172 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. All
-202 scripts then run again under `--gc-stress`, which collects on every
+203 scripts then run again under `--gc-stress`, which collects on every
 allocation and poisons what it sweeps, and must print what they printed
 without it. The wasm build is cross-compiled on every run, and the golden
 tests run through it under node when node is present, followed by the
