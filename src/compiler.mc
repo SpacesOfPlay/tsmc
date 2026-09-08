@@ -846,6 +846,74 @@ private bool super_available(Compiler* co) {
 
 // --- destructuring ---------------------------------------------------------------
 
+// An assignment target that is a property reference. The language
+// evaluates the reference before it fetches the value it will hold, so
+// its object and key go into slots first.
+private bool target_is_ref(Node* t) {
+    return t != null && (t.kind == N_MEMBER || t.kind == N_INDEX) && (t.flags & NF_OPT_CHAIN) == 0;
+}
+
+private void emit_ref_prepare(Compiler* co, Node* t, i32* t_obj, i32* t_key) {
+    Chunk* ch = &co.cur.ch;
+    *t_obj = alloc_slot(co.cur);
+    compile_expr(co, t.a);
+    ch_op_u16(ch, OP_SETLOCAL, *t_obj);
+    ch_op(ch, OP_POP);
+    *t_key = -1;
+    if t.kind == N_INDEX {
+        *t_key = alloc_slot(co.cur);
+        compile_expr(co, t.b);
+        ch_op_u16(ch, OP_SETLOCAL, *t_key);
+        ch_op(ch, OP_POP);
+    }
+}
+
+// [value] -> []: stores through a prepared reference, then frees its slots
+private void emit_ref_store(Compiler* co, Node* t, i32 t_obj, i32 t_key) {
+    Chunk* ch = &co.cur.ch;
+    i32 t_val = alloc_slot(co.cur);
+    ch_op_u16(ch, OP_SETLOCAL, t_val);
+    ch_op(ch, OP_POP);
+    ch_op_u16(ch, OP_GETLOCAL, t_obj);
+    if t.kind == N_INDEX {
+        ch_op_u16(ch, OP_GETLOCAL, t_key);
+        ch_op_u16(ch, OP_GETLOCAL, t_val);
+        ch_op(ch, OP_SETINDEX);
+    } else {
+        ch_op_u16(ch, OP_GETLOCAL, t_val);
+        if (t.flags & NF_PRIVATE) != 0 {
+            ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
+        } else {
+            ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+        }
+    }
+    ch_op(ch, OP_POP);
+    co.cur.cur_slots -= (t_key >= 0 ? 3 : 2);
+}
+
+// [value] -> [value]: an undefined value takes the default
+private void emit_default_value(Compiler* co, Node* dflt) {
+    Chunk* ch = &co.cur.ch;
+    ch_op(ch, OP_DUP);
+    ch_op(ch, OP_UNDEF);
+    ch_op(ch, OP_SEQ);
+    i32 j = ch_jump(ch, OP_JUMPF);
+    ch_op(ch, OP_POP);
+    compile_expr(co, dflt);
+    ch_patch(ch, j);
+}
+
+// The target and default of an assignment element, which may carry the
+// default as an assignment expression (the cover grammar).
+private void split_assign_element(Node* e, Node** tgt, Node** dflt) {
+    *tgt = e;
+    *dflt = null;
+    if e != null && (e.kind == N_ASSIGN_PATTERN || (e.kind == N_ASSIGN && e.op == TOK_EQ)) {
+        *tgt = e.a;
+        *dflt = e.b;
+    }
+}
+
 // Consumes the value on top of the stack, storing per pattern leaf.
 // declare_mode initializes bindings; otherwise leaves are assignment
 // targets (ident, member, index).
@@ -919,6 +987,9 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         ch_op(ch, OP_FALSE);
         ch_op_u16(ch, OP_SETLOCAL, t_done);
         ch_op(ch, OP_POP);
+        // an element that throws, or a resume that returns into a pattern
+        // suspended on a yield, still releases the iterator
+        i32 jclose = ch_jump(ch, OP_TRY_PUSH);
         bool exhausted = false;
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* e = *(pat.kids.items + i);
@@ -935,21 +1006,51 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                 if i != pat.kids.len - 1 {
                     cerror(co, e, "a rest element must be last");
                 }
-                ch_op_u16(ch, OP_GETLOCAL, t_iter);
-                ch_op_u16(ch, OP_ITER_REST, t_done);
-                compile_destructure(co, e.a, declare_mode);
+                if !declare_mode && target_is_ref(e.a) {
+                    i32 r_obj = 0;
+                    i32 r_key = 0;
+                    emit_ref_prepare(co, e.a, &r_obj, &r_key);
+                    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+                    ch_op_u16(ch, OP_ITER_REST, t_done);
+                    emit_ref_store(co, e.a, r_obj, r_key);
+                } else {
+                    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+                    ch_op_u16(ch, OP_ITER_REST, t_done);
+                    compile_destructure(co, e.a, declare_mode);
+                }
                 exhausted = true;
                 break;
+            }
+            Node* tgt = null;
+            Node* dflt = null;
+            split_assign_element(e, &tgt, &dflt);
+            if !declare_mode && target_is_ref(tgt) {
+                i32 r_obj = 0;
+                i32 r_key = 0;
+                emit_ref_prepare(co, tgt, &r_obj, &r_key);
+                ch_op_u16(ch, OP_GETLOCAL, t_iter);
+                ch_op_u16(ch, OP_ITER_STEP, t_done);
+                if dflt != null { emit_default_value(co, dflt); }
+                emit_ref_store(co, tgt, r_obj, r_key);
+                continue;
             }
             ch_op_u16(ch, OP_GETLOCAL, t_iter);
             ch_op_u16(ch, OP_ITER_STEP, t_done);
             compile_destructure(co, e, declare_mode);
         }
+        ch_op(ch, OP_TRY_POP);
         // a pattern that stopped early releases the iterator
         if !exhausted {
             ch_op_u16(ch, OP_GETLOCAL, t_iter);
             ch_op_u16(ch, OP_ITER_CLOSE, t_done);
         }
+        i32 jend = ch_jump(ch, OP_JUMP);
+        ch_patch(ch, jclose);
+        // the completion's value is on the stack; close, then let it carry on
+        ch_op_u16(ch, OP_GETLOCAL, t_iter);
+        ch_op_u16(ch, OP_ITER_CLOSE_ABRUPT, t_done);
+        ch_op(ch, OP_RETHROW);
+        ch_patch(ch, jend);
         co.cur.cur_slots -= 2;
         return;
     }
@@ -1002,9 +1103,24 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                     continue;
                 }
             }
+            Node* tgt = null;
+            Node* dflt = null;
+            split_assign_element(target, &tgt, &dflt);
+            bool by_ref = !declare_mode && target_is_ref(tgt);
+            i32 t_k = -1;
             if (pp.flags & NF_COMPUTED) != 0 {
-                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                // the key is evaluated first, then a reference target
+                t_k = alloc_slot(co.cur);
                 compile_expr(co, keyn);
+                ch_op_u16(ch, OP_SETLOCAL, t_k);
+                ch_op(ch, OP_POP);
+            }
+            i32 r_obj = 0;
+            i32 r_key = 0;
+            if by_ref { emit_ref_prepare(co, tgt, &r_obj, &r_key); }
+            if t_k >= 0 {
+                ch_op_u16(ch, OP_GETLOCAL, tmp);
+                ch_op_u16(ch, OP_GETLOCAL, t_k);
                 ch_op(ch, OP_GETINDEX);
             } else {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
@@ -1014,7 +1130,13 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                     vec_push(&taken, cast(i32, a2));
                 }
             }
-            compile_destructure(co, target, declare_mode);
+            if by_ref {
+                if dflt != null { emit_default_value(co, dflt); }
+                emit_ref_store(co, tgt, r_obj, r_key);
+            } else {
+                compile_destructure(co, target, declare_mode);
+            }
+            if t_k >= 0 { co.cur.cur_slots--; }
         }
         vec_free(&taken);
         co.cur.cur_slots--;
@@ -3027,8 +3149,8 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_patch(ch, jclose);
     // the thrown value is on the stack; close, then let it carry on
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
-    ch_op(ch, OP_THROW);
+    ch_op_u16(ch, OP_ITER_CLOSE_ABRUPT, t_done);
+    ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
     fs.binds.len = saved_binds;
@@ -3108,8 +3230,8 @@ private void compile_for_of(Compiler* co, Node* n) {
     ch_patch(ch, jclose);
     // the thrown value is on the stack; close, then let it carry on
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op_u16(ch, OP_ITER_CLOSE, t_done);
-    ch_op(ch, OP_THROW);
+    ch_op_u16(ch, OP_ITER_CLOSE_ABRUPT, t_done);
+    ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
     fs.binds.len = saved_binds;
@@ -3357,12 +3479,12 @@ private void compile_stmt(Compiler* co, Node* n) {
                 i32 jend2 = ch_jump(ch, OP_JUMP);
                 ch_patch(ch, jfin);
                 compile_stmt(co, fin);
-                ch_op(ch, OP_THROW);
+                ch_op(ch, OP_RETHROW);
                 ch_patch(ch, jend2);
             }
         } else {
             compile_stmt(co, fin);
-            ch_op(ch, OP_THROW);
+            ch_op(ch, OP_RETHROW);
         }
         ch_patch(ch, jend);
         return;

@@ -111,6 +111,10 @@ enum Op {
     OP_GET_AITER,    // [v] -> iterator via Symbol.asyncIterator, else Symbol.iterator
     OP_GET_AITER_W,  // [v] -> [iterator, wrapped]: true when it came from Symbol.iterator
     OP_REQUIRE_OBJ,  // [v] -> [v]; TypeError when v is null or undefined
+    OP_ITER_CLOSE_ABRUPT, // u16 done slot; as ITER_CLOSE in a handler: a throw
+                     // completion keeps its own error over the iterator's
+    OP_RETHROW,      // pop; continues the completion a handler caught, a
+                     // return completion staying one (THROW is always a throw)
     OP_ITER_SEND,    // [iter, sent] -> [value, done] via iter.next(sent)
     OP_ITER_NEXT,    // [iter] -> [value, done]
     // Array destructuring drives the iterator through these. The u16 operand

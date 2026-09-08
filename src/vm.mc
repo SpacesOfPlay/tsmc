@@ -1050,6 +1050,9 @@ Value vm_make_error(VM* vm, i32 kind, str msg) {
 }
 
 void vm_throw_error(VM* vm, i32 kind, str msg) {
+    // a new error is a throw completion, even raised while a return
+    // completion was unwinding (an iterator's return() answering badly)
+    vm.unwind_return = false;
     vm_throw(vm, vm_make_error(vm, kind, msg));
 }
 
@@ -4520,7 +4523,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_TRY_POP: { vm.hp--; }
-            case OP_THROW: { vm_throw(vm, vpop(vm)); }
+            case OP_THROW: {
+                // a fresh throw, whatever completion was unwinding
+                vm.unwind_return = false;
+                vm_throw(vm, vpop(vm));
+            }
+            case OP_RETHROW: { vm_throw(vm, vpop(vm)); }
             case OP_SETPROTO: {
                 Value protov = vpop(vm);
                 Value objv = vpeek(vm, 0);
@@ -4918,6 +4926,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 dslot = rd_u16(code, ip);
                 ip += 2;
                 iter_close(vm, fr.base + dslot);
+            }
+            case OP_ITER_CLOSE_ABRUPT: {
+                i32 dslot = rd_u16(code, ip);
+                ip += 2;
+                iter_close_abrupt(vm, fr.base + dslot);
             }
             case OP_ITER_CHECK: {
                 iter_check_result(vm);
@@ -5401,19 +5414,43 @@ private void iter_check_result(VM* vm) {
     }
 }
 
-private void iter_close(VM* vm, i32 di) {
+// [iter] -> []: calls the iterator's return method unless the done flag
+// says it was exhausted. For a normal or return completion an error from
+// the method propagates and a result that is not an object is a
+// TypeError; for a throw completion (`throwing`) the completion in flight
+// wins, so the method's error and result are dropped.
+private void iter_close_mode(VM* vm, i32 di, bool throwing) {
     Value iter = vpeek(vm, 0);
     if !js_truthy(*(vm.stack + di)) {
         Value m;
         if vm_get_prop_value(vm, iter, atom_intern(&vm.atoms, "return"), &m) {
             if value_is_callable(m) {
                 Value dummy = value_undefined();
-                ignore vm_call_value(vm, m, iter, &dummy, 0);
+                Value r = vm_call_value(vm, m, iter, &dummy, 0);
+                if throwing {
+                    vm.has_pending = false;
+                    vm.pending = value_undefined();
+                } else if !vm.has_pending && !value_is_object(r) && !value_is_callable(r) {
+                    vm_throw_error(vm, ERR_TYPE, "iterator result is not an object");
+                }
             }
+        } else if throwing {
+            vm.has_pending = false;
+            vm.pending = value_undefined();
         }
     }
     if vm.has_pending { return; }
     vm.sp--;
+}
+
+private void iter_close(VM* vm, i32 di) {
+    iter_close_mode(vm, di, false);
+}
+
+// In a handler: a return completion closes like a normal one, a throw
+// completion keeps its own error.
+private void iter_close_abrupt(VM* vm, i32 di) {
+    iter_close_mode(vm, di, !vm.unwind_return);
 }
 
 bool vm_get_iterator(VM* vm, Value v, Value* out) {
