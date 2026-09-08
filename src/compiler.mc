@@ -2089,6 +2089,68 @@ private void compile_expr(Compiler* co, Node* n) {
 
 // --- functions ---------------------------------------------------------------------
 
+// A parameter list with a default, a pattern or a rest element binds
+// left to right, the way the language does: a default that reads itself
+// or a later parameter throws a ReferenceError. The incoming values wait
+// in hidden slots while every parameter holds a hole (a captured one a
+// cell with a hole, so a closure made in a default already sees the
+// cell), and each is bound in turn; once bound, its reads need no check.
+private void bind_params_in_order(Compiler* co, FScope* fs, Node* f, i32 n_params) {
+    Chunk* ch = &fs.ch;
+    // the names a pattern binds start in TDZ as well
+    for i32 i = 0; i < n_params; i++ {
+        Node* prm = *(f.kids.items + i);
+        if prm.a.kind != N_IDENT { declare_pattern(co, prm.a, 0); }
+    }
+    i32 first_tmp = fs.cur_slots;
+    for i32 i = 0; i < n_params; i++ {
+        i32 t = alloc_slot(fs);
+        ch_op_u16(ch, OP_GETLOCAL, i);
+        ch_op_u16(ch, OP_SETLOCAL, t);
+        ch_op(ch, OP_POP);
+    }
+    for i32 i = 0; i < n_params; i++ {
+        CBind b = vec_get(&fs.binds, i);
+        ch_op_u16(ch, b.is_cell ? OP_NEWCELL_HOLE : OP_SETHOLE, b.slot);
+    }
+    for i32 i = 0; i < n_params; i++ {
+        Node* prm = *(f.kids.items + i);
+        ch_op_u16(ch, OP_GETLOCAL, first_tmp + i);
+        if prm.b != null {
+            ch_op(ch, OP_DUP);
+            ch_op(ch, OP_UNDEF);
+            ch_op(ch, OP_SEQ);
+            i32 j = ch_jump(ch, OP_JUMPF);
+            ch_op(ch, OP_POP);
+            // named evaluation: an anonymous default takes the parameter's name
+            if prm.a != null && prm.a.kind == N_IDENT { infer_name(prm.b, prm.a.name); }
+            compile_expr(co, prm.b);
+            ch_patch(ch, j);
+        }
+        emit_init_binding(co, i);
+        if prm.a.kind == N_IDENT {
+            CBind* bp = fs.binds.data + i;
+            bp.tdz = false;
+        } else {
+            CBind pb = vec_get(&fs.binds, i);
+            ch_op_u16(ch, pb.is_cell ? OP_GETCELL : OP_GETLOCAL, pb.slot);
+            compile_destructure(co, prm.a, true);
+            Vec<str> names = vec_new<str>(4);
+            collect_pattern_names(prm.a, &names);
+            for i32 k = 0; k < names.len; k++ {
+                i32 li = find_local(fs, vec_get(&names, k));
+                if li >= 0 {
+                    CBind* np = fs.binds.data + li;
+                    np.tdz = false;
+                }
+            }
+            vec_free(&names);
+        }
+    }
+    // the hidden slots are dead from here on
+    fs.cur_slots = first_tmp;
+}
+
 // Compiles f into a template. `fields` (class members) inject
 // this-assignments into the body after a leading super() call.
 private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields, bool self_name) {
@@ -2134,7 +2196,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         vec_free(&pnames);
     }
 
-    // params
+    // params. A simple list is bound by the call itself; a list with a
+    // default, a pattern or a rest element binds its names one at a time,
+    // each in TDZ until its turn.
     i32 n_params = 0;
     for i32 i = 0; i < f.kids.len; i++ {
         Node* prm = *(f.kids.items + i);
@@ -2145,42 +2209,22 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             }
         }
         if prm.a.kind == N_IDENT {
-            ignore declare(co, prm.a.name, false, false);
+            ignore declare(co, prm.a.name, false, !simple_params);
         } else {
             ignore declare(co, hidden_name(co, "%p", i), false, false);
         }
         n_params++;
     }
-    // defaults
-    for i32 i = 0; i < f.kids.len; i++ {
-        Node* prm = *(f.kids.items + i);
-        if prm.b == null { continue; }
-        ch_op_u16(&fs.ch, OP_GETLOCAL, i);
-        ch_op(&fs.ch, OP_UNDEF);
-        ch_op(&fs.ch, OP_SEQ);
-        i32 j = ch_jump(&fs.ch, OP_JUMPF);
-        // named evaluation: an anonymous default takes the parameter's name
-        if prm.a != null && prm.a.kind == N_IDENT { infer_name(prm.b, prm.a.name); }
-        compile_expr(co, prm.b);
-        ch_op_u16(&fs.ch, OP_SETLOCAL, i);
-        ch_op(&fs.ch, OP_POP);
-        ch_patch(&fs.ch, j);
-    }
-    // boxing of captured params
-    for i32 i = 0; i < n_params; i++ {
-        CBind b = vec_get(&fs.binds, i);
-        if b.is_cell {
-            ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
+    if simple_params {
+        // boxing of captured params
+        for i32 i = 0; i < n_params; i++ {
+            CBind b = vec_get(&fs.binds, i);
+            if b.is_cell {
+                ch_op_u16(&fs.ch, OP_CELLIFY, b.slot);
+            }
         }
-    }
-    // pattern params destructure into their names
-    for i32 i = 0; i < f.kids.len; i++ {
-        Node* prm = *(f.kids.items + i);
-        if prm.a.kind == N_IDENT { continue; }
-        declare_pattern(co, prm.a, 2);
-        CBind pb = vec_get(&fs.binds, i);
-        ch_op_u16(&fs.ch, pb.is_cell ? OP_GETCELL : OP_GETLOCAL, pb.slot);
-        compile_destructure(co, prm.a, true);
+    } else {
+        bind_params_in_order(co, &fs, f, n_params);
     }
     // a named function EXPRESSION binds its own name inside its body (for
     // recursion), referring to the function itself; the name does not leak to
