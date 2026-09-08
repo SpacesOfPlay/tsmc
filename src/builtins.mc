@@ -703,6 +703,7 @@ private u32 reflect_key(VM* vm, Value kv, str* sk) {
 private bool fn_own_synth(VM* vm, Value ov, u32 key, Value* out) {
     if !value_is_callable(ov) { return false; }
     if key != vm.atom_length && key != vm.atom_name { return false; }
+    if vm_fn_synth_hidden(vm, ov, key) { return false; }
     return vm_get_prop_value(vm, ov, key, out);
 }
 
@@ -18466,6 +18467,9 @@ void builtins_install(VM* vm) {
     JsNative* function_ctor = def_global_fn(vm, "Function", &nat_function_ctor);
     props_set_desc(&function_ctor.props, vm.atom_prototype, value_cell(&vm.function_proto.head), 0);
     link_ctor(vm, vm.function_proto, function_ctor);
+    // what a function reads for name and length once its own are deleted
+    props_set_desc(&vm.function_proto.props, vm.atom_length, value_int(0), PROP_CONFIGURABLE);
+    props_set_desc(&vm.function_proto.props, vm.atom_name, new_str(vm, ""), PROP_CONFIGURABLE);
     def_method(vm, vm.function_proto, "toString", &nat_fn_tostring);
     def_method(vm, vm.function_proto, "call", &nat_fn_call);
     def_method(vm, vm.function_proto, "apply", &nat_fn_apply);

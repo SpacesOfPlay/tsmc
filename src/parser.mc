@@ -836,11 +836,28 @@ private Node* parse_primary(Parser* p) {
         advance(p);
         return n;
     }
-    if k == TOK_LBRACK { return parse_array(p); }
-    if k == TOK_LBRACE { return parse_object(p); }
+    // inside brackets, braces or parentheses `in` is an operator again,
+    // even in a for head where the bare expression may not use it
+    if k == TOK_LBRACK {
+        i32 saved_no_in = p.no_in;
+        p.no_in = 0;
+        Node* a = parse_array(p);
+        p.no_in = saved_no_in;
+        return a;
+    }
+    if k == TOK_LBRACE {
+        i32 saved_no_in = p.no_in;
+        p.no_in = 0;
+        Node* o = parse_object(p);
+        p.no_in = saved_no_in;
+        return o;
+    }
     if k == TOK_LPAREN {
         advance(p);
+        i32 saved_no_in = p.no_in;
+        p.no_in = 0;
         Node* e = parse_expression(p);
+        p.no_in = saved_no_in;
         expect(p, TOK_RPAREN, "expected ')'");
         // parentheses end an optional chain: in `(a?.b).c` the outer access is
         // its own reference and runs even when the inner one short-circuited

@@ -110,6 +110,7 @@ enum Op {
     OP_GET_ITER,     // [v] -> iterator via Symbol.iterator
     OP_GET_AITER,    // [v] -> iterator via Symbol.asyncIterator, else Symbol.iterator
     OP_GET_AITER_W,  // [v] -> [iterator, wrapped]: true when it came from Symbol.iterator
+    OP_REQUIRE_OBJ,  // [v] -> [v]; TypeError when v is null or undefined
     OP_ITER_SEND,    // [iter, sent] -> [value, done] via iter.next(sent)
     OP_ITER_NEXT,    // [iter] -> [value, done]
     // Array destructuring drives the iterator through these. The u16 operand

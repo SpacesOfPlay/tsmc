@@ -954,6 +954,8 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         return;
     }
     if k == N_OBJECT_PATTERN || (!declare_mode && k == N_OBJECT) {
+        // null and undefined cannot be destructured, even by an empty pattern
+        ch_op(ch, OP_REQUIRE_OBJ);
         i32 tmp = alloc_slot(co.cur);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, OP_POP);
@@ -2638,7 +2640,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
                 co.static_this = true;
                 if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
                 co.static_this = saved_st;
-                ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+                ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
             }
             ch_op(ch, OP_POP);
         }
@@ -2827,7 +2829,7 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
             ch_op(ch, OP_SETINDEX);
         } else {
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
-            ch_op_u16(ch, OP_SETPROP, prop_key_const(co, m.a));
+            ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
         }
         ch_op(ch, OP_POP);
     }

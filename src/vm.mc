@@ -1366,8 +1366,8 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = *p;
             return true;
         }
-        // synthesize name/length when not set explicitly
-        if a == vm.atom_name {
+        // synthesize name/length when not set explicitly, unless deleted
+        if a == vm.atom_name && !vm_fn_synth_hidden(vm, objv, a) {
             str nm = "";
             if value_is_native(objv) {
                 nm = value_as_native(objv).name;
@@ -1379,7 +1379,7 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = value_cell(&g.head);
             return true;
         }
-        if a == vm.atom_length {
+        if a == vm.atom_length && !vm_fn_synth_hidden(vm, objv, a) {
             i32 arity = 0;
             if value_is_function(objv) {
                 FnTemplate* ft = value_as_function(objv).tmpl;
@@ -1637,8 +1637,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             vm_throw_error(vm, ERR_TYPE, "cannot set property which has only a getter");
             return false;
         }
-        if value_is_function(objv) { props_set(&value_as_function(objv).props, a, v); }
-        else { props_set(&value_as_native(objv).props, a, v); }
+        PropList* fprops = value_props(objv);
+        if fn_synth_bit(vm, a) != 0 && props_get(fprops, a) == null && !vm_fn_synth_hidden(vm, objv, a) {
+            vm_throw_error(vm, ERR_TYPE, "cannot assign to read only property of a function");
+            return false;
+        }
+        props_set(fprops, a, v);
         return true;
     }
     if is_nullish(objv) {
@@ -1963,6 +1967,37 @@ private void private_method(VM* vm, FnTemplate* t, i32 ci) {
         vm.sp--;
         vpush(vm, out);
         vpush(vm, objv);
+    }
+}
+
+// A function's name and length are synthesized, not stored. Deleting one
+// sets a bit that hides it from then on; assigning one is refused, as the
+// property is not writable. A property defined explicitly shadows both.
+private u8 fn_synth_bit(VM* vm, u32 a) {
+    if a == vm.atom_name { return SYNTH_NAME; }
+    if a == vm.atom_length { return SYNTH_LENGTH; }
+    return 0;
+}
+
+private u8* fn_synth_flags(Value v) {
+    if value_is_function(v) { return &value_as_function(v).synth_off; }
+    if value_is_native(v) { return &value_as_native(v).synth_off; }
+    return null;
+}
+
+bool vm_fn_synth_hidden(VM* vm, Value v, u32 a) {
+    u8 bit = fn_synth_bit(vm, a);
+    u8* f = fn_synth_flags(v);
+    return bit != 0 && f != null && (*f & bit) != 0;
+}
+
+// [v] -> [v]: the value is about to be destructured, which needs an object
+private void require_object(VM* vm) {
+    Value v = vpeek(vm, 0);
+    if value_is_undefined(v) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot destructure 'undefined' as it is undefined.");
+    } else if value_is_null(v) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot destructure 'null' as it is null.");
     }
 }
 
@@ -4508,6 +4543,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value v = vpop(vm);
                 Value objv = vpeek(vm, 0);
                 if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
+                else if value_props(objv) != null { props_set(value_props(objv), a, v); }
+            }
+            case OP_REQUIRE_OBJ: {
+                require_object(vm);
             }
             case OP_DEFPROP_DYN: {
                 ip += 2;
@@ -4639,6 +4678,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value src = vpeek(vm, 0);
                 JsObject* r = js_new_object(&vm.heap, vm.object_proto);
                 vpush(vm, value_cell(&r.head));
+                // a string's own properties are its characters
+                if value_is_string(src) { spread_string_into(vm, r, src); }
                 if value_is_object(src) && value_is_object(exv) {
                     JsObject* s = value_as_object(src);
                     JsObject* ex = value_as_object(exv);
@@ -5126,6 +5167,11 @@ private bool delete_key(VM* vm, Value objv, u32 a) {
             if fe != null && (fe.flags & PROP_CONFIGURABLE) == 0 {
                 vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
                 return false;
+            }
+            if fe == null && fn_synth_bit(vm, a) != 0 {
+                // the synthesized name or length: configurable, so it goes
+                u8* f = fn_synth_flags(objv);
+                if f != null { *f = *f | fn_synth_bit(vm, a); }
             }
             ignore props_remove(fprops, a);
         }

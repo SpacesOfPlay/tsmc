@@ -255,7 +255,12 @@ struct JsFunction {
     i32 n_upvals;
     PropList props;
     Value fproto;          // [[Prototype]]: parent ctor for derived classes
+    u8 synth_off;          // SYNTH_NAME / SYNTH_LENGTH: the synthesized
+                           // property was deleted
 }
+
+const u8 SYNTH_NAME = 1;
+const u8 SYNTH_LENGTH = 2;
 
 // ctx is the owning VM; typed as void* to keep layering one-way.
 type NativeFn = fn(void*, Value, Value, Value*, i32): Value;
@@ -268,6 +273,7 @@ struct JsNative {
     Value env0;            // bound target / wrapper state
     Value env1;
     Value env2;
+    u8 synth_off;          // as on JsFunction
 }
 
 struct JsBox {
