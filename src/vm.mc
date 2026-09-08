@@ -5100,7 +5100,19 @@ private bool array_index_writable(VM* vm, JsObject* a, i32 idx) {
 // property succeeds; a non-configurable one is a TypeError under strict mode,
 // which is the only mode here. Returns false when it threw.
 private bool delete_key(VM* vm, Value objv, u32 a) {
-    if !value_is_object(objv) { return true; }
+    if !value_is_object(objv) {
+        // a function or a native carries properties of its own
+        PropList* fprops = value_props(objv);
+        if fprops != null {
+            Prop* fe = props_entry(fprops, a);
+            if fe != null && (fe.flags & PROP_CONFIGURABLE) == 0 {
+                vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
+                return false;
+            }
+            ignore props_remove(fprops, a);
+        }
+        return true;
+    }
     JsObject* o = value_as_object(objv);
     if (o.obj_flags & OBJF_PROXY) != 0 {
         ignore proxy_delete(vm, cast(JsProxy*, o), a);
@@ -5144,7 +5156,7 @@ private bool delete_index(VM* vm, Value objv, Value key) {
         }
         return true;
     }
-    if !value_is_object(objv) { return true; }
+    if !value_is_object(objv) && value_props(objv) == null { return true; }
     return delete_key(vm, objv, key_to_atom(vm, key));
 }
 

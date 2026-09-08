@@ -27,3 +27,16 @@ b['01'] = 'padded';
 b['1.5'] = 'frac';
 console.log(delete b['01'], hop(b, '01'), delete b['1.5'], hop(b, '1.5'), b.length);
 
+
+// a function carries properties of its own, and delete removes them in
+// both forms; a class's static members are such properties
+function f() {}
+f.tag = 1;
+f.other = 2;
+const key = 'tag';
+console.log('function:', delete f[key], hop(f, 'tag'), delete f.other, hop(f, 'other'), delete f.absent);
+class K { static m() {} static s = 1; }
+const mname = 'm';
+console.log('class statics:', delete K[mname], hop(K, 'm'), typeof K.m, delete K.s, hop(K, 's'));
+Object.defineProperty(f, 'fixed', { value: 1, configurable: false });
+console.log('non-configurable, strict:', (function () { 'use strict'; try { delete f['fixed']; return 'no throw'; } catch (e) { return e.constructor.name; } })(), hop(f, 'fixed'));
