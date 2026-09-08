@@ -113,6 +113,40 @@ struct ModImport {
     bool has_msg;
 }
 
+// What a module imports and re-exports, by name, for the loader's link
+// check (see module.mc). The names are views into the module's arena.
+struct LinkImport {
+    str spec;
+    str name;        // the imported name; "default" for a default import
+}
+
+struct LinkIndirect {
+    str exported;    // the name this module exports it under
+    str spec;        // the module it comes from
+    str name;        // the name there
+}
+
+struct ModLinks {
+    Vec<str> locals;              // exports of this module's own bindings
+    Vec<LinkImport> imports;      // named and default imports
+    Vec<LinkIndirect> indirect;   // export { a as b } from, and export { x } of an import
+    Vec<str> stars;               // export * from
+}
+
+void links_init(ModLinks* l) {
+    vec_init<str>(&l.locals, 4);
+    vec_init<LinkImport>(&l.imports, 4);
+    vec_init<LinkIndirect>(&l.indirect, 2);
+    vec_init<str>(&l.stars, 1);
+}
+
+void links_free(ModLinks* l) {
+    vec_free(&l.locals);
+    vec_free(&l.imports);
+    vec_free(&l.indirect);
+    vec_free(&l.stars);
+}
+
 // One exported name of a module-scope binding; a binding exported under
 // several names chains through `next`.
 struct ExportName {
@@ -3552,6 +3586,85 @@ private void add_export_name(Compiler* co, str local, str exported) {
     strmap_set<i32>(&co.export_heads, local, co.export_names.len - 1);
 }
 
+// Fills the link table from the module's import and export statements.
+// Runs once the imports are registered, so `export { x }` of an imported
+// name is recorded as the re-export it is. Type-only entries have no
+// binding and are left out.
+private void collect_links(Compiler* co, Node* prog, ModLinks* links) {
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        if (s.flags & NF_TYPE_ONLY) != 0 { continue; }
+        if s.kind == N_IMPORT && node_has_source(s) {
+            if s.a != null {
+                LinkImport li;
+                li.spec = s.name;
+                li.name = "default";
+                vec_push(&links.imports, li);
+            }
+            for i32 j = 0; j < s.kids.len; j++ {
+                Node* sp = *(s.kids.items + j);
+                if (sp.flags & NF_TYPE_ONLY) != 0 { continue; }
+                LinkImport li;
+                li.spec = s.name;
+                li.name = sp.name;
+                vec_push(&links.imports, li);
+            }
+            continue;
+        }
+        if s.kind != N_EXPORT { continue; }
+        if node_has_source(s) {
+            if (s.flags & NF_STAR) != 0 {
+                if s.b != null { vec_push(&links.locals, s.b.name); }
+                else { vec_push(&links.stars, s.name); }
+            } else {
+                for i32 j = 0; j < s.kids.len; j++ {
+                    Node* sp = *(s.kids.items + j);
+                    if (sp.flags & NF_TYPE_ONLY) != 0 { continue; }
+                    LinkIndirect ie;
+                    ie.exported = sp.a != null ? sp.a.name : sp.name;
+                    ie.spec = s.name;
+                    ie.name = sp.name;
+                    vec_push(&links.indirect, ie);
+                }
+            }
+            continue;
+        }
+        if s.a == null {
+            for i32 j = 0; j < s.kids.len; j++ {
+                Node* sp = *(s.kids.items + j);
+                if (sp.flags & NF_TYPE_ONLY) != 0 { continue; }
+                str exported = sp.a != null ? sp.a.name : sp.name;
+                ModImport* mi = strmap_get<ModImport>(&co.mod_imports, sp.name);
+                if mi != null {
+                    LinkIndirect ie;
+                    ie.exported = exported;
+                    ie.spec = mi.spec;
+                    ie.name = mi.prop;
+                    vec_push(&links.indirect, ie);
+                } else {
+                    vec_push(&links.locals, exported);
+                }
+            }
+            continue;
+        }
+        Node* d = s.a;
+        if (s.flags & NF_DEFAULT) != 0 {
+            vec_push(&links.locals, "default");
+            continue;
+        }
+        if d.kind == N_VAR {
+            Vec<str> names = vec_new<str>(4);
+            for i32 j = 0; j < d.kids.len; j++ {
+                collect_pattern_names((*(d.kids.items + j)).a, &names);
+            }
+            for i32 j = 0; j < names.len; j++ { vec_push(&links.locals, vec_get(&names, j)); }
+            vec_free(&names);
+        } else if (d.kind == N_FUNCTION || d.kind == N_CLASS) && d.name.len > 0 {
+            vec_push(&links.locals, d.name);
+        }
+    }
+}
+
 // Records every local name the module exports, and under which names,
 // before the bindings are declared: `declare` marks them from this table
 // and stores to them are then mirrored into the namespace.
@@ -3620,7 +3733,7 @@ private bool node_has_tla(Node* n) {
 
 // Compiles a module. out_specs receives the dependency specifiers in
 // slot order (the evaluator passes namespaces in that order).
-FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
+FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLinks* links) {
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
@@ -3709,6 +3822,8 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs) {
             register_import(co, slot_name, s.name, sp.name, sp.a.name);
         }
     }
+
+    if links != null { collect_links(co, prog, links); }
 
     // 4. hoist vars (unwrapping exports)
     for i32 i = 0; i < prog.kids.len; i++ {

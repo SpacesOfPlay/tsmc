@@ -120,9 +120,24 @@ struct Module {
     // dependency order, rather than while the graph is being loaded.
     bool cjs;
     str cjs_spec;         // owned
+    // what the module imports and re-exports, and its specifiers in slot
+    // order, for the link check, and its result: 0 unchecked, 1 linked,
+    // 2 failed with the message kept, since every import of the graph
+    // fails the same way
+    ModLinks links;
+    Vec<str> specs;
+    i32 link_state;
+    string link_error;
 }
 
 type ModulePtr = Module*;
+
+private void module_links_init(Module* mod) {
+    links_init(&mod.links);
+    vec_init<str>(&mod.specs, 4);
+    mod.link_state = 0;
+    mod.link_error = string("");
+}
 
 struct Loader {
     VM* vm;
@@ -392,6 +407,7 @@ private i32 load_builtin_module(Loader* ld, str name) {
     }
 
     Module* mod = new(Module);
+    module_links_init(mod);
     u8* pc = alloc<u8>(name.len > 0 ? name.len : 1);
     if name.len > 0 { memcpy(pc, name.data, name.len); }
     mod.path.data = pc;
@@ -491,6 +507,7 @@ private bool esm_source_file(Loader* ld, str path, FileData* out) {
 // file is one module.
 private i32 load_cjs_module(Loader* ld, str importer, str spec, str canon) {
     Module* mod = new(Module);
+    module_links_init(mod);
     mod.path = owned_str(importer);
     mod.canon = canon;
     mod.cjs = true;
@@ -530,6 +547,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     }
 
     Module* mod = new(Module);
+    module_links_init(mod);
     u8* pc = alloc<u8>(path.len > 0 ? path.len : 1);
     if path.len > 0 { memcpy(pc, path.data, path.len); }
     mod.path.data = pc;
@@ -573,8 +591,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     msrc.data = mod.src_data;
     msrc.len = mod.src_len;
     compiler_set_source(&co, msrc, mod.path);
-    Vec<str> specs = vec_new<str>(4);
-    mod.tmpl = compile_module(&co, prog, &specs);
+    mod.tmpl = compile_module(&co, prog, &mod.specs, &mod.links);
     vm_add_template_root(ld.vm, mod.tmpl);
     gc_root_reset(&ld.vm.heap, rmark);
 
@@ -584,7 +601,6 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     if ld.diags.n_errors > 0 {
         diags_print_from(&ld.diags, mod.path, src, ld.printed);
         ld.printed = ld.diags.list.len;
-        vec_free(&specs);
         lower_destroy(&lw);
         parser_destroy(&p);
         ld.failed = true;
@@ -594,8 +610,8 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     mod.state = MOD_LOADED;
 
     // resolve and load dependencies (specifier views live in the arena)
-    for i32 i = 0; i < specs.len; i++ {
-        str spec = vec_get(&specs, i);
+    for i32 i = 0; i < mod.specs.len; i++ {
+        str spec = vec_get(&mod.specs, i);
         // built-in modules (fs / path, incl. node: prefix) bind directly
         str bname = builtin_name(spec);
         if bname.data != null {
@@ -654,7 +670,6 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
         free(resolved.data);
     }
 
-    vec_free(&specs);
     lower_destroy(&lw);
     parser_destroy(&p);
     return my_idx;
@@ -704,12 +719,16 @@ private i32 eval_module(Loader* ld, i32 idx) {
     if st == 0 && mod.tmpl.is_async {
         st = vm_run_event_loop(ld.vm);
     }
+    if st == 0 { prune_star_exports(ld, idx); }
     return st;
 }
 
 private void module_free(Module* mod) {
     free(mod.path.data);
     free(mod.canon.data);
+    links_free(&mod.links);
+    vec_free(&mod.specs);
+    free(mod.link_error);
     if mod.cjs_spec.data != null { free(mod.cjs_spec.data); }
     if mod.src_data != null { free(mod.src_data); }
     vec_free(&mod.dep_idx);
@@ -717,11 +736,220 @@ private void module_free(Module* mod) {
     free(mod);
 }
 
+// --- link check --------------------------------------------------------------
+//
+// After a graph is loaded and before it runs, every named import and every
+// re-export by name has to resolve to one binding. Resolution follows the
+// language: a module's own exports first, then its re-exports by name, then
+// its `export *` modules, where a name found in two of them is ambiguous
+// and a request that comes back to itself is a cycle. A name that resolves
+// nowhere is an error for a JavaScript importer only: a TypeScript file may
+// import a type, which has no binding at run time.
+
+const i32 RES_FOUND = 0;
+const i32 RES_NONE = 1;
+const i32 RES_AMBIGUOUS = 2;
+const i32 RES_CYCLE = 3;
+
+struct ResKey {
+    i32 mod;
+    str name;
+}
+
+private i32 dep_of_spec(Module* mod, str spec) {
+    for i32 i = 0; i < mod.specs.len; i++ {
+        if str_equal(vec_get(&mod.specs, i), spec) { return vec_get(&mod.dep_idx, i); }
+    }
+    return -1;
+}
+
+private i32 resolve_export(Loader* ld, i32 idx, str name, Vec<ResKey>* seen, i32* out_mod, str* out_name) {
+    Module* mod = vec_get(&ld.mods, idx);
+    // a CommonJS or built-in module: what it exports is not known here
+    if mod.cjs || mod.tmpl == null {
+        *out_mod = idx;
+        *out_name = name;
+        return RES_FOUND;
+    }
+    for i32 i = 0; i < seen.len; i++ {
+        ResKey k = vec_get(seen, i);
+        if k.mod == idx && str_equal(k.name, name) { return RES_CYCLE; }
+    }
+    ResKey me;
+    me.mod = idx;
+    me.name = name;
+    vec_push(seen, me);
+    defer { seen.len = seen.len - 1; }
+    for i32 i = 0; i < mod.links.locals.len; i++ {
+        if str_equal(vec_get(&mod.links.locals, i), name) {
+            *out_mod = idx;
+            *out_name = name;
+            return RES_FOUND;
+        }
+    }
+    for i32 i = 0; i < mod.links.indirect.len; i++ {
+        LinkIndirect ie = vec_get(&mod.links.indirect, i);
+        if !str_equal(ie.exported, name) { continue; }
+        i32 dep = dep_of_spec(mod, ie.spec);
+        if dep < 0 { *out_mod = idx; *out_name = name; return RES_FOUND; }
+        return resolve_export(ld, dep, ie.name, seen, out_mod, out_name);
+    }
+    if str_equal(name, "default") { return RES_NONE; }
+    i32 found_mod = -1;
+    str found_name = "";
+    for i32 i = 0; i < mod.links.stars.len; i++ {
+        i32 dep = dep_of_spec(mod, vec_get(&mod.links.stars, i));
+        if dep < 0 { continue; }
+        i32 rm = -1;
+        str rn = "";
+        i32 r = resolve_export(ld, dep, name, seen, &rm, &rn);
+        if r == RES_AMBIGUOUS { return RES_AMBIGUOUS; }
+        if r != RES_FOUND { continue; }
+        if found_mod >= 0 && (found_mod != rm || !str_equal(found_name, rn)) { return RES_AMBIGUOUS; }
+        found_mod = rm;
+        found_name = rn;
+    }
+    if found_mod >= 0 {
+        *out_mod = found_mod;
+        *out_name = found_name;
+        return RES_FOUND;
+    }
+    return RES_NONE;
+}
+
+private bool path_is_typescript(str path) {
+    return path_ends_with(path, ".ts") || path_ends_with(path, ".mts") || path_ends_with(path, ".tsx");
+}
+
+// The message for a request that did not resolve, or an empty string.
+private string link_message(i32 r, str spec, str name, bool js_importer) {
+    if r == RES_CYCLE { return format("Detected cycle while resolving name '{}' in '{}'", name, spec); }
+    if r == RES_AMBIGUOUS { return format("The requested module '{}' contains conflicting star exports for name '{}'", spec, name); }
+    if r == RES_NONE && js_importer { return format("The requested module '{}' does not provide an export named '{}'", spec, name); }
+    return string("");
+}
+
+// The requests of one module. The first failure is the message.
+private bool link_requests(Loader* ld, Module* mod, Vec<ResKey>* seen, string* msg) {
+    bool js = !path_is_typescript(mod.path);
+    for i32 i = 0; i < mod.links.imports.len; i++ {
+        LinkImport li = vec_get(&mod.links.imports, i);
+        i32 dep = dep_of_spec(mod, li.spec);
+        if dep < 0 { continue; }
+        i32 rm = -1;
+        str rn = "";
+        i32 r = resolve_export(ld, dep, li.name, seen, &rm, &rn);
+        string e = link_message(r, li.spec, li.name, js);
+        if e.len > 0 { *msg = e; return false; }
+        free(e);
+    }
+    for i32 i = 0; i < mod.links.indirect.len; i++ {
+        LinkIndirect ie = vec_get(&mod.links.indirect, i);
+        i32 dep = dep_of_spec(mod, ie.spec);
+        if dep < 0 { continue; }
+        i32 rm = -1;
+        str rn = "";
+        i32 r = resolve_export(ld, dep, ie.name, seen, &rm, &rn);
+        string e = link_message(r, ie.spec, ie.name, js);
+        if e.len > 0 { *msg = e; return false; }
+        free(e);
+    }
+    return true;
+}
+
+// Links the graph under idx: the module's own requests, then its
+// dependencies. A module that failed once fails every later import the
+// same way, and a module whose dependency failed fails with it.
+private bool link_graph(Loader* ld, i32 idx, Vec<ResKey>* seen, string* msg) {
+    Module* mod = vec_get(&ld.mods, idx);
+    if mod.link_state == 1 { return true; }
+    if mod.link_state == 2 {
+        *msg = format("{}", mod.link_error);
+        return false;
+    }
+    // provisionally linked, so a cycle in the graph ends here
+    mod.link_state = 1;
+    if mod.cjs || mod.tmpl == null { return true; }
+    if !link_requests(ld, mod, seen, msg) {
+        mod.link_state = 2;
+        mod.link_error = format("{}", *msg);
+        return false;
+    }
+    for i32 i = 0; i < mod.dep_idx.len; i++ {
+        i32 dep = vec_get(&mod.dep_idx, i);
+        if dep < 0 { continue; }
+        if !link_graph(ld, dep, seen, msg) {
+            mod.link_state = 2;
+            mod.link_error = format("{}", *msg);
+            return false;
+        }
+    }
+    return true;
+}
+
+private bool link_check(Loader* ld, i32 root, string* msg) {
+    Vec<ResKey> seen = vec_new<ResKey>(8);
+    defer vec_free(&seen);
+    return link_graph(ld, root, &seen, msg);
+}
+
+// The names the export * modules of a module provide, for pruning.
+private void star_names(Loader* ld, i32 idx, Vec<str>* out, Vec<i32>* seen_mods) {
+    for i32 i = 0; i < seen_mods.len; i++ {
+        if vec_get(seen_mods, i) == idx { return; }
+    }
+    vec_push(seen_mods, idx);
+    Module* mod = vec_get(&ld.mods, idx);
+    if mod.cjs || mod.tmpl == null { return; }
+    for i32 i = 0; i < mod.links.locals.len; i++ { vec_push(out, vec_get(&mod.links.locals, i)); }
+    for i32 i = 0; i < mod.links.indirect.len; i++ { vec_push(out, vec_get(&mod.links.indirect, i).exported); }
+    for i32 i = 0; i < mod.links.stars.len; i++ {
+        i32 dep = dep_of_spec(mod, vec_get(&mod.links.stars, i));
+        if dep >= 0 { star_names(ld, dep, out, seen_mods); }
+    }
+}
+
+// export * copies whatever its module has once it has run, which is more
+// than the language forwards: never a default, and not a name that two
+// star modules provide differently. Those come off the namespace here.
+private void prune_star_exports(Loader* ld, i32 idx) {
+    Module* mod = vec_get(&ld.mods, idx);
+    if mod.links.stars.len == 0 || mod.ns == null { return; }
+    Vec<str> names = vec_new<str>(16);
+    Vec<i32> seen_mods = vec_new<i32>(8);
+    Vec<ResKey> seen = vec_new<ResKey>(8);
+    defer vec_free(&names);
+    defer vec_free(&seen_mods);
+    defer vec_free(&seen);
+    vec_push(&seen_mods, idx);
+    for i32 i = 0; i < mod.links.stars.len; i++ {
+        i32 dep = dep_of_spec(mod, vec_get(&mod.links.stars, i));
+        if dep >= 0 { star_names(ld, dep, &names, &seen_mods); }
+    }
+    vec_push(&names, "default");
+    for i32 i = 0; i < names.len; i++ {
+        str name = vec_get(&names, i);
+        i32 rm = -1;
+        str rn = "";
+        i32 r = resolve_export(ld, idx, name, &seen, &rm, &rn);
+        if r == RES_AMBIGUOUS || (r == RES_NONE && str_equal(name, "default")) {
+            ignore js_delete_prop(mod.ns, atom_intern(&ld.vm.atoms, name));
+        }
+    }
+}
+
 // Loads and runs an entry module and its graph in the caller-owned loader
 // (shared with dynamic import). Returns the exit code; the caller frees `ld`.
 private i32 module_run(VM* vm, Loader* ld, str entry_path) {
     i32 entry = load_module(ld, entry_path);
     i32 status = 0;
+    string link_msg = string("");
+    if !(ld.failed || ld.diags.n_errors > 0) && !link_check(ld, entry, &link_msg) {
+        eprint("SyntaxError: {}\n", link_msg);
+        free(link_msg);
+        return 1;
+    }
+    free(link_msg);
     if ld.failed || ld.diags.n_errors > 0 {
         // load_module already reported each diagnostic against the source it
         // came from; anything left is from a module whose source is gone.
@@ -1848,6 +2076,7 @@ private bool dyn_eval(Loader* ld, i32 idx, Value* err) {
         *err = take_pending(vm);
         return false;
     }
+    prune_star_exports(ld, idx);
     return true;
 }
 
@@ -1917,6 +2146,15 @@ private Value module_dynamic_import_ns(VM* vm, str spec, str referrer, bool* ok,
         *err = make_reject_error(vm, ERR_SYNTAX, "error loading dynamically imported module");
         return value_undefined();
     }
+    string link_msg = string("");
+    if !link_check(ld, idx, &link_msg) {
+        *ok = false;
+        str lm = link_msg;
+        *err = make_reject_error(vm, ERR_SYNTAX, lm);
+        free(link_msg);
+        return value_undefined();
+    }
+    free(link_msg);
     Value everr = value_undefined();
     if !dyn_eval(ld, idx, &everr) {
         *ok = false;

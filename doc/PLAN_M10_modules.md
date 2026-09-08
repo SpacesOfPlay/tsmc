@@ -63,7 +63,19 @@ script (the existing path), so single-file programs are unaffected.
   node has it (`test/diff/esm_import_cycle.mjs`).
 - Bare specifiers and `node_modules` (M44), `import()` and top-level
   `await` (M41) came later; import attributes stay unsupported.
-- `export *` copies `default` too (minor); named re-export is exact.
+- A graph is linked before it runs. The compiler hands the loader each
+  module's imports, own exports, re-exports by name and `export *`
+  targets, and the loader resolves every named import and re-export the
+  way the language does: own exports, then re-exports by name, then the
+  `export *` modules. A request that comes back to itself is a cycle and
+  a name two star modules provide differently is ambiguous; both are a
+  SyntaxError, from the entry or as the rejection of an `import()`, and
+  a module that failed once fails the same way on every later import. A
+  name that resolves nowhere is an error for a JavaScript importer only,
+  since a TypeScript file may import a type, which has no binding at run
+  time. `export *` still copies at run time; once the module has run,
+  the names the language does not forward come off its namespace: the
+  default, and any ambiguous name. `test/diff/esm_link.mjs`.
 
 ## Implementation note
 
