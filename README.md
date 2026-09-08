@@ -188,11 +188,31 @@ reading before the number below. Failing test paths are written to
 default half the cores). Pin a different revision with the
 `T262_COMMIT` environment variable.
 
-On the default `test/language` run, 18,817 of the 21,037 tests that ran
-pass (about 89%); 2,677 more are skipped as unsupported. The remaining
-failures are mostly early errors the parser does not report, the `with`
-statement, and a long tail of protocol details. This is a current
-snapshot and will change as the interpreter does.
+The default `test/language` run, at the pinned revision:
+
+| | 2026-08-28 | 2026-09-08 |
+|---|---|---|
+| ran | 21,037 | 21,037 |
+| passed | 16,888 (80%) | 18,817 (89%) |
+| failed | 4,149 | 2,220 |
+| skipped as unsupported | 2,677 | 2,677 |
+
+Where the 2,220 remaining failures are, each counted once:
+
+| | tests |
+|---|---|
+| early errors: programs the parser should refuse | 831 |
+| class elements and definitions | 305 |
+| generators and async iteration | 148 |
+| the `with` statement, not implemented | 134 |
+| destructuring, remaining scenarios | 80 |
+| dynamic import and module instantiation | 77 |
+| `eval` and `new Function`, refused by design | 52 |
+| parameter and `arguments` rules | 49 |
+| everything else | 544 |
+
+This is a snapshot and changes as the interpreter does; the failing
+paths of the last run are the list to diff a new run against.
 
 ## Layout
 
