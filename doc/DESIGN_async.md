@@ -46,7 +46,15 @@ the method closes the delegate and raises a TypeError, a `return`
 without it returns the input from the outer generator, and a `return`
 the delegate finishes returns the delegate's value, through the outer
 generator's own finally blocks. An async generator walks the delegate
-with the async protocol, awaiting each result.
+with the async protocol, awaiting each result. The iterator fetch
+reports whether it fell back to `Symbol.iterator`; only then are the
+values awaited too, as the language's async-from-sync iterator does, so
+a promise an async iterator hands over stays a promise. A
+`Symbol.asyncIterator` that is present but not callable is a TypeError.
+The delegation loop and `for await` read the iterator's `next` once, the
+way the language's iterator record keeps it. The async generator driver
+awaits what a plain `yield` produces before settling the consumer's
+request, but hands on a delegate's value as it is.
 
 ## Iterator protocol and symbols
 

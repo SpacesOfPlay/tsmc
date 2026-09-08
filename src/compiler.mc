@@ -1973,9 +1973,21 @@ private void compile_expr(Compiler* co, Node* n) {
             // back to Symbol.iterator and awaiting a plain result is a no-op.
             bool adelegate = co.cur.is_async;
             compile_expr(co, n.a);
-            ch_op(ch, adelegate ? OP_GET_AITER : OP_GET_ITER);
+            // [iter, wrapped]: in an async generator the delegate may be a
+            // sync iterator, whose values are then awaited
+            if adelegate { ch_op(ch, OP_GET_AITER_W); }
+            else { ch_op(ch, OP_GET_ITER); ch_op(ch, OP_FALSE); }
+            i32 t_wrapped = alloc_slot(co.cur);
+            ch_op_u16(ch, OP_SETLOCAL, t_wrapped);
+            ch_op(ch, OP_POP);
             i32 t_it = alloc_slot(co.cur);
             ch_op_u16(ch, OP_SETLOCAL, t_it);
+            ch_op(ch, OP_POP);
+            // the next method is read once, as the language's iterator record has it
+            i32 t_next = alloc_slot(co.cur);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+            ch_op_u16(ch, OP_SETLOCAL, t_next);
             ch_op(ch, OP_POP);
             // What resumed this generator: the input, and the completion's
             // kind (0 next, 1 throw, 2 return), which the loop forwards to
@@ -2003,26 +2015,20 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(2)));
             ch_op(ch, OP_SEQ);
             i32 jret = ch_jump(ch, OP_JUMPT);
-            // next(sent). In an async generator the delegate is walked with
-            // the async protocol: each result is awaited. A sync iterable
-            // still works, since OP_GET_AITER falls back to Symbol.iterator
-            // and awaiting a plain result is a no-op.
-            if adelegate {
-                ch_op_u16(ch, OP_GETLOCAL, t_it);
-                ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
-                ch_op_u16(ch, OP_GETLOCAL, t_sent);
-                ch_op_u16(ch, OP_CALL, 1);
-                ch_op(ch, OP_AWAIT);
-                ch_op(ch, OP_ITER_CHECK);      // [res]
-                ch_op(ch, OP_DUP);
-                ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
-            } else {
-                ch_op_u16(ch, OP_GETLOCAL, t_it);
-                ch_op_u16(ch, OP_GETLOCAL, t_sent);
-                ch_op(ch, OP_ITER_SEND);       // [value, done]
-            }
+            // next.call(it, sent). In an async generator the delegate is
+            // walked with the async protocol: each result is awaited, and a
+            // wrapped sync iterator's values too.
+            ch_op_u16(ch, OP_GETLOCAL, t_next);
+            ch_op_u16(ch, OP_GETLOCAL, t_it);
+            ch_op_u16(ch, OP_GETLOCAL, t_sent);
+            ch_op_u16(ch, OP_CALL, 1);
+            if adelegate { ch_op(ch, OP_AWAIT); }
+            ch_op(ch, OP_ITER_CHECK);          // [res]
+            ch_op(ch, OP_DUP);
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
             i32 jdone = ch_jump(ch, OP_JUMPT);
-            if adelegate { ch_op_u16(ch, OP_GETPROP, name_const(co, "value")); }
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             i32 lyield = ch_pos(ch);           // [value]
             ch_op(ch, OP_YIELD_DELEGATE);      // resumes with [input, kind]
             ch_op_u16(ch, OP_SETLOCAL, t_mode);
@@ -2030,8 +2036,9 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_JUMP, lstart);
-            ch_patch(ch, jdone);               // [value] or [res]: the delegate is done
-            if adelegate { ch_op_u16(ch, OP_GETPROP, name_const(co, "value")); }
+            ch_patch(ch, jdone);               // [res]: the delegate is done
+            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             i32 jend = ch_jump(ch, OP_JUMP);
 
             // throw(sent): forwarded when the delegate has the method; else
@@ -2053,9 +2060,11 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
             i32 jthrowdone = ch_jump(ch, OP_JUMPT);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             ch_op_u16(ch, OP_JUMP, lyield);
             ch_patch(ch, jthrowdone);          // [res]
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             i32 jend2 = ch_jump(ch, OP_JUMP);
             ch_patch(ch, jnothrow);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
@@ -2086,9 +2095,11 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
             i32 jretdone = ch_jump(ch, OP_JUMPT);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             ch_op_u16(ch, OP_JUMP, lyield);
             ch_patch(ch, jretdone);            // [res]
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_await_if_wrapped(co, t_wrapped);
             inline_finallys(co, 0);
             ch_op(ch, OP_RETURN);
             ch_patch(ch, jnoret);
@@ -2098,7 +2109,7 @@ private void compile_expr(Compiler* co, Node* n) {
 
             ch_patch(ch, jend);                // [value]: the yield* result
             ch_patch(ch, jend2);
-            co.cur.cur_slots -= 4;
+            co.cur.cur_slots -= 6;
             return;
         }
         if n.a != null {
@@ -2124,6 +2135,16 @@ private void compile_expr(Compiler* co, Node* n) {
 }
 
 // --- functions ---------------------------------------------------------------------
+
+// [value] -> [value]: awaits it when the iterator it came from wrapped a
+// sync iterator, as the language's async-from-sync iterator does.
+private void emit_await_if_wrapped(Compiler* co, i32 t_wrapped) {
+    Chunk* ch = &co.cur.ch;
+    ch_op_u16(ch, OP_GETLOCAL, t_wrapped);
+    i32 j = ch_jump(ch, OP_JUMPF);
+    ch_op(ch, OP_AWAIT);
+    ch_patch(ch, j);
+}
 
 // A parameter list with a default, a pattern or a rest element binds
 // left to right, the way the language does: a default that reads itself
@@ -2928,9 +2949,18 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     i32 saved_slots = fs.cur_slots;
 
     compile_expr(co, n.b);
-    ch_op(ch, OP_GET_AITER);
+    ch_op(ch, OP_GET_AITER_W);       // [iter, wrapped]
+    i32 t_wrapped = alloc_slot(fs);
+    ch_op_u16(ch, OP_SETLOCAL, t_wrapped);
+    ch_op(ch, OP_POP);
     i32 t_iter = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_iter);
+    ch_op(ch, OP_POP);
+    // the next method is read once, as the language's iterator record has it
+    i32 t_next = alloc_slot(fs);
+    ch_op_u16(ch, OP_GETLOCAL, t_iter);
+    ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+    ch_op_u16(ch, OP_SETLOCAL, t_next);
     ch_op(ch, OP_POP);
     // tracks exhaustion, so a loop left early still releases the iterator
     i32 t_done = alloc_slot(fs);
@@ -2953,9 +2983,9 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     i32 jclose = ch_jump(ch, OP_TRY_PUSH);
     LoopCtx lc = make_loop_ctx(co, true);
     i32 lcond = ch_pos(ch);
-    // result = await iter.next()
+    // result = await next.call(iter)
+    ch_op_u16(ch, OP_GETLOCAL, t_next);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op_u16(ch, OP_GETMETHOD, name_const(co, "next"));
     ch_op_u16(ch, OP_CALL, 0);
     ch_op(ch, OP_AWAIT);
     ch_op(ch, OP_ITER_CHECK);
@@ -2966,9 +2996,9 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_SETLOCAL, t_done);
     ch_op(ch, OP_POP);
     i32 jend = ch_jump(ch, OP_JUMPT);
-    // value = await result.value
+    // value = result.value, awaited when the iterator is a wrapped sync one
     ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
-    ch_op(ch, OP_AWAIT);
+    emit_await_if_wrapped(co, t_wrapped);
 
     for i32 i = bind_start; i < bind_end; i++ {
         CBind b = vec_get(&fs.binds, i);

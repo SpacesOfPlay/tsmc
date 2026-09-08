@@ -4844,6 +4844,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GET_AITER: {
                 do_get_aiter(vm);
             }
+            case OP_GET_AITER_W: {
+                do_get_aiter_w(vm);
+            }
             case OP_CATCH_ENTER: {
                 catch_enter(vm);
             }
@@ -5251,6 +5254,17 @@ private void do_get_aiter(VM* vm) {
     }
 }
 
+// [v] -> [iterator, wrapped]
+private void do_get_aiter_w(VM* vm) {
+    Value it;
+    bool wrapped = false;
+    if vm_get_async_iterator_w(vm, vpeek(vm, 0), &it, &wrapped) {
+        vm.sp--;
+        vpush(vm, it);
+        vpush(vm, value_bool(wrapped));
+    }
+}
+
 // --- iterator protocol --------------------------------------------------
 
 // v stays rooted by the caller; false = threw.
@@ -5375,19 +5389,34 @@ bool vm_get_iterator(VM* vm, Value v, Value* out) {
 
 // `for await` prefers Symbol.asyncIterator and falls back to the sync
 // Symbol.iterator, whose yielded values the loop awaits individually.
-bool vm_get_async_iterator(VM* vm, Value v, Value* out) {
+// The async iterator of v: its Symbol.asyncIterator method, or, when there
+// is none, its sync iterator, which the consumer then treats as wrapped
+// (each value awaited, as the language's async-from-sync iterator does).
+// A Symbol.asyncIterator that is present but not callable is an error.
+bool vm_get_async_iterator_w(VM* vm, Value v, Value* out, bool* wrapped) {
+    *wrapped = false;
     if is_nullish(v) {
         vm_throw_error(vm, ERR_TYPE, "value is not async iterable");
         return false;
     }
     Value m;
     if !vm_get_prop_value(vm, v, vm.sym_async_iterator_id, &m) { return false; }
-    if value_is_callable(m) {
+    if !is_nullish(m) {
+        if !value_is_callable(m) {
+            vm_throw_error(vm, ERR_TYPE, "Symbol.asyncIterator is not a function");
+            return false;
+        }
         Value dummy = value_undefined();
         *out = vm_call_value(vm, m, v, &dummy, 0);
         return !vm.has_pending;
     }
+    *wrapped = true;
     return vm_get_iterator(vm, v, out);
+}
+
+bool vm_get_async_iterator(VM* vm, Value v, Value* out) {
+    bool wrapped = false;
+    return vm_get_async_iterator_w(vm, v, out, &wrapped);
 }
 
 // iter stays rooted by the caller; consume outputs before allocating.
@@ -6048,10 +6077,19 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
         gc_root_reset(&vm.heap, rm);
         return;
     }
-    // Suspended. Both reasons wait on the value first: an await by
-    // definition, a yield because `yield p` hands the consumer what p
-    // resolves to. Settling a fresh promise with it runs the assimilation
-    // path, so a thenable is followed.
+    // Suspended. An await waits on the value by definition, and so does
+    // a yield, since `yield p` hands the consumer what p resolves to.
+    // Settling a fresh promise with it runs the assimilation path, so a
+    // thenable is followed. A yield inside yield* is the exception: the
+    // delegate produced that value, and the language hands it on as it is.
+    if !g.awaiting && g.delegating {
+        gc_root(&vm.heap, genv);
+        gc_root(&vm.heap, res);
+        agen_settle(vm, g, res, false, false);
+        vm_agen_pump(vm, genv);
+        gc_root_reset(&vm.heap, rm);
+        return;
+    }
     Value target = vm_promise_new(vm);
     gc_root(&vm.heap, target);
     vm_promise_settle(vm, target, res, false);
