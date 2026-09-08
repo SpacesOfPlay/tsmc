@@ -1382,8 +1382,10 @@ private void compile_call(Compiler* co, Node* n) {
     if callee.kind == N_IMPORT_EXPR {
         // dynamic import(spec): compile the specifier, then hand it and this
         // module's path to the runtime loader (OP_DYNIMPORT -> a promise).
-        if n.kids.len < 1 {
-            cerror(co, n, "import() requires exactly one argument");
+        // a specifier, and at most an attributes object, which is accepted
+        // and ignored; anything more is a syntax error
+        if n.kids.len < 1 || n.kids.len > 2 {
+            cerror(co, n, "import() takes a specifier and at most an options argument");
             ch_op(ch, OP_UNDEF);
             return;
         }

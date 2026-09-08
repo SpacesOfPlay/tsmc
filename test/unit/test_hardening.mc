@@ -91,6 +91,9 @@ i32 main() {
     check_eq(run("/x/gg;"), 2, "repeated regex flag exits 2");
     check_eq(run("function f() { return /(?<1a>x)/; } probe(1);"), 2, "bad group name exits 2 unreached");
     check_eq(run("/(?<a>x)/u; probe(1);"), 0, "a valid literal runs");
+    // import() takes one or two arguments, even in a function never called
+    check_eq(run("function f() { return import('./x.js', {}, ''); } probe(1);"), 2, "import() with three arguments exits 2");
+    check_eq(run("function f() { return import('./x.js', { with: {} }); } probe(1);"), 0, "import() with options compiles");
 
     return check_done("test_hardening");
 }
