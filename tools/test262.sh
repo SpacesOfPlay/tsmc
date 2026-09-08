@@ -101,7 +101,7 @@ promise-try json-parse-with-source RegExp.escape error-stack-accessor"
 
 # regex features the engine does not accept
 SKIP_FEATURES="$SKIP_FEATURES regexp-modifiers regexp-duplicate-named-groups \
-regexp-match-indices legacy-regexp"
+legacy-regexp"
 
 # protocol hooks that are not consulted: the species constructor, and the
 # well-known methods String defers to

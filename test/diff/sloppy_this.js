@@ -39,5 +39,6 @@ console.log('call(null):', plain.call(null), '| apply(undefined):', plain.apply(
 // a real receiver is untouched either way
 console.log('receiver:', plain.call({ x: 1 }), strict.call({ x: 1 }));
 
-// the script's own top-level this is the module's exports object
-console.log('top level:', tag(this), this === module.exports);
+// the script's own top-level this is an object either way: node's CommonJS
+// wrapper hands its exports, a classic script sees the global object
+console.log('top level:', typeof this);

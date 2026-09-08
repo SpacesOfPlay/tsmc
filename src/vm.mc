@@ -4906,9 +4906,11 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.ret_ip = 0;
     fr.cur_ip = 0;
     fr.base = base;
-    // a script's top-level `this` is its module.exports, as in CommonJS
-    Value* ex = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "exports"));
-    fr.this_val = ex != null ? *ex : value_undefined();
+    // the entry runs as a classic script: its top-level `this` is the
+    // global object, strict or not (a required file is a CommonJS module,
+    // whose wrapper is called with its exports instead)
+    Value* gt = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "globalThis"));
+    fr.this_val = gt != null ? *gt : value_undefined();
     fr.arguments_obj = value_undefined();
     fr.is_ctor = false;
     fr.new_target = value_undefined();
@@ -5125,7 +5127,15 @@ private bool delete_index(VM* vm, Value objv, Value key) {
     if value_is_array(objv) {
         JsObject* a = value_as_object(objv);
         i32 idx = val_to_index(key);
-        if idx >= 0 && idx < a.elen {
+        if idx < 0 {
+            // a string key may still spell an element index; any other key
+            // names an ordinary property of the array
+            u32 atom = key_to_atom(vm, key);
+            if vm.has_pending { return false; }
+            idx = ta_atom_index(vm, atom);
+            if idx < 0 { return delete_key(vm, objv, atom); }
+        }
+        if idx < a.elen {
             if (a.obj_flags & OBJF_SEALED) != 0 {
                 vm_throw_error(vm, ERR_TYPE, "cannot delete from a sealed array");
                 return false;
