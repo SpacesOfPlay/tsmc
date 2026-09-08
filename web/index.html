@@ -107,7 +107,7 @@
   <pre id="out" aria-live="polite"></pre>
 </main>
 
-<script type="text/plain" id="ex-hello" data-title="hello">interface Shape { area(): number; }
+<script type="text/plain" id="ex-hello" data-title="hello" data-expect="fib 0 1 1 2 3 5 8 13 21 34 55 89">interface Shape { area(): number; }
 
 class Circle implements Shape {
   constructor(private r: number) {}
@@ -139,7 +139,7 @@ const m = new Map<string, number>([['a', 1], ['b', 2]]);
 console.log(JSON.stringify({ m: [...m], big: (2n ** 70n).toString() }));
 </script>
 
-<script type="text/plain" id="ex-async" data-title="async">export {};  // a module, so await is allowed at the top level
+<script type="text/plain" id="ex-async" data-title="async" data-expect="tick 3">export {};  // a module, so await is allowed at the top level
 
 const wait = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
@@ -165,7 +165,7 @@ try {
 console.log('done');
 </script>
 
-<script type="text/plain" id="ex-iter" data-title="iterators and sets">const evens = [1, 2, 3, 4, 5, 6, 7, 8].values()
+<script type="text/plain" id="ex-iter" data-title="iterators and sets" data-expect="difference [ 1, 2 ] disjoint true">const evens = [1, 2, 3, 4, 5, 6, 7, 8].values()
   .filter((x) => x % 2 === 0)
   .map((x) => x * x)
   .take(3)
@@ -192,7 +192,7 @@ outer: for (let i = 0; i < 3; i++) {
 console.log([3, 1, 2].toSorted(), 'abc'.at(-1), structuredClone({ d: new Date(0) }));
 </script>
 
-<script type="text/plain" id="ex-text" data-title="strings and regex">const log = 'GET /index.html 200 512\nPOST /api/items 201 48\nGET /missing 404 12';
+<script type="text/plain" id="ex-text" data-title="strings and regex" data-expect="a|b|c 1,2">const log = 'GET /index.html 200 512\nPOST /api/items 201 48\nGET /missing 404 12';
 const re = /^(?<method>\w+) (?<path>\S+) (?<status>\d{3}) (?<bytes>\d+)$/gm;
 for (const m of log.matchAll(re)) {
   const { method, path, status, bytes } = m.groups!;
@@ -210,7 +210,7 @@ const tpl = (s: TemplateStringsArray, ...v: unknown[]) => s.raw.join('|') + ' ' 
 console.log(tpl`a${1}b${2}c`);
 </script>
 
-<script type="text/plain" id="ex-errors" data-title="errors">class ParseError extends Error {
+<script type="text/plain" id="ex-errors" data-title="errors" data-expect="exit handler saw 1" data-exit="1">class ParseError extends Error {
   constructor(message: string, public line: number) {
     super(message);
     this.name = 'ParseError';
@@ -242,7 +242,7 @@ process.on('exit', (code) => console.log('exit handler saw', code));
 parse('4\nx');
 </script>
 
-<script type="text/plain" id="ex-markdown" data-title="npm: markdown-it">// A bare import is resolved against npm: the package and what it depends
+<script type="text/plain" id="ex-markdown" data-title="npm: markdown-it" data-expect="&lt;h1&gt;Hello from &lt;em&gt;tsmc&lt;/em&gt;&lt;/h1&gt;">// A bare import is resolved against npm: the package and what it depends
 // on are fetched on first use, then run by tsmc like any other module.
 import MarkdownIt from 'markdown-it';
 
@@ -259,7 +259,7 @@ A list:
 console.log(md.render(source));
 </script>
 
-<script type="text/plain" id="ex-yaml" data-title="npm: js-yaml">// A version range after the name pins the package: this asks for 4.x.
+<script type="text/plain" id="ex-yaml" data-title="npm: js-yaml" data-expect="tsmc 4 targets">// A version range after the name pins the package: this asks for 4.x.
 import yaml from 'js-yaml@4';
 
 const doc = yaml.load(`
@@ -274,7 +274,7 @@ console.log(doc.name, doc.targets.length, 'targets');
 console.log(yaml.dump({ ...doc, checked: new Date(0) }));
 </script>
 
-<script type="text/plain" id="ex-ramda" data-title="npm: ramda">import * as R from 'ramda';
+<script type="text/plain" id="ex-ramda" data-title="npm: ramda" data-expect="oldest Grace">import * as R from 'ramda';
 
 interface Person { name: string; age: number; }
 const people: Person[] = [
@@ -287,7 +287,7 @@ console.log(R.groupBy((p: Person) => (p.age < 40 ? 'under 40' : '40 and over'), 
 console.log(R.compose(R.join('-'), R.map(R.toUpper), R.split(' '))('functional style'));
 </script>
 
-<script type="text/plain" id="ex-immer" data-title="npm: immer">// Immutable updates through a Proxy draft: the untouched parts are shared.
+<script type="text/plain" id="ex-immer" data-title="npm: immer" data-expect="shared where untouched: true">// Immutable updates through a Proxy draft: the untouched parts are shared.
 import { produce } from 'immer';
 
 const base = { todos: [{ id: 1, text: 'write it', done: false }], filter: 'all' };
@@ -300,7 +300,7 @@ console.log('next', next.todos.length, next.todos[0].done);
 console.log('shared where untouched:', base.filter === next.filter, '| copied where touched:', base.todos !== next.todos);
 </script>
 
-<script type="text/plain" id="ex-decimal" data-title="npm: decimal.js">import Decimal from 'decimal.js';
+<script type="text/plain" id="ex-decimal" data-title="npm: decimal.js" data-expect="decimal: 0.3">import Decimal from 'decimal.js';
 
 console.log('floats:', 0.1 + 0.2, '  decimal:', new Decimal(0.1).plus(0.2).toString());
 console.log('sqrt 2:', new Decimal(2).sqrt().toFixed(40));
@@ -308,7 +308,7 @@ console.log('1/3:', new Decimal(1).div(3).toSignificantDigits(50).toString());
 console.log('2^100:', new Decimal(2).pow(100).toString());
 </script>
 
-<script type="text/plain" id="ex-mustache" data-title="npm: mustache">import Mustache from 'mustache';
+<script type="text/plain" id="ex-mustache" data-title="npm: mustache" data-expect="- sockets: not yet">import Mustache from 'mustache';
 
 const template = `# {{title}}
 {{#items}}
@@ -321,7 +321,7 @@ const view = {
 console.log(Mustache.render(template, view));
 </script>
 
-<script type="text/plain" id="ex-dayjs" data-title="npm: dayjs">import dayjs from 'dayjs';
+<script type="text/plain" id="ex-dayjs" data-title="npm: dayjs" data-expect="leap year: true">import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import isLeapYear from 'dayjs/plugin/isLeapYear';
 dayjs.extend(relativeTime);
@@ -333,7 +333,7 @@ console.log('a year later:', d.add(1, 'year').format('YYYY-MM-DD'), '| end of mo
 console.log(dayjs('2020-01-01').from(d), '|', d.diff('2020-01-01', 'day'), 'days');
 </script>
 
-<script type="text/plain" id="ex-uuid" data-title="npm: uuid">// v4 draws from the page's CSPRNG; v5 hashes a name with SHA-1.
+<script type="text/plain" id="ex-uuid" data-title="npm: uuid" data-expect="valid: true | version: 4">// v4 draws from the page's CSPRNG; v5 hashes a name with SHA-1.
 import { v4 as uuidv4, v5 as uuidv5, validate, version } from 'uuid';
 
 const id = uuidv4();
@@ -342,7 +342,7 @@ console.log('name-based:', uuidv5('tsmc.dev', uuidv5.DNS));
 console.log('not one:', validate('hello'));
 </script>
 
-<script type="text/plain" id="ex-lodash" data-title="npm: lodash-es">// 640 ES modules, loaded one file at a time.
+<script type="text/plain" id="ex-lodash" data-title="npm: lodash-es" data-expect="helloWasmWorld 2">// 640 ES modules, loaded one file at a time.
 import { chunk, groupBy, sortBy, camelCase, uniqBy, mapValues } from 'lodash-es';
 
 console.log(chunk([1, 2, 3, 4, 5, 6, 7], 3));
@@ -352,7 +352,7 @@ console.log(camelCase('hello wasm world'), uniqBy([{ id: 1 }, { id: 1 }, { id: 2
 console.log(mapValues({ a: 1, b: 2 }, (v) => v * 10));
 </script>
 
-<script type="text/plain" id="ex-datefns" data-title="npm: date-fns">import { format, addDays, differenceInDays, formatDistance, isLeapYear } from 'date-fns';
+<script type="text/plain" id="ex-datefns" data-title="npm: date-fns" data-expect="365 days later: 2025-02-28">import { format, addDays, differenceInDays, formatDistance, isLeapYear } from 'date-fns';
 
 const d = new Date(2024, 1, 29, 12, 0, 0);
 console.log(format(d, 'EEEE, MMMM do yyyy'), '| leap year:', isLeapYear(d));
@@ -360,7 +360,7 @@ console.log('365 days later:', format(addDays(d, 365), 'yyyy-MM-dd'));
 console.log('to 2025:', differenceInDays(new Date(2025, 0, 1), d), 'days;', formatDistance(new Date(2020, 0, 1), d), 'before');
 </script>
 
-<script type="text/plain" id="ex-zod" data-title="npm: zod">// A schema is a value: parse returns the data or throws, safeParse lists the issues.
+<script type="text/plain" id="ex-zod" data-title="npm: zod" data-expect="email -&gt; Invalid email address">// A schema is a value: parse returns the data or throws, safeParse lists the issues.
 import { z } from 'zod';
 
 const User = z.object({
@@ -378,7 +378,7 @@ const bad = User.safeParse({ name: 'A', age: -1, email: 'nope' });
 if (!bad.success) for (const issue of bad.error.issues) console.log(issue.path.join('.'), '->', issue.message);
 </script>
 
-<script type="text/plain" id="ex-loop" data-title="runaway loop (use Stop)">let i = 0;
+<script type="text/plain" id="ex-loop" data-title="runaway loop (use Stop)" data-skip="runs until stopped">let i = 0;
 for (;;) {
   if (++i % 1_000_000 === 0) console.log('still going', i);
 }

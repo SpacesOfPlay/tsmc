@@ -154,7 +154,10 @@ most of it was written by sweeping one area at a time against node. All
 201 scripts then run again under `--gc-stress`, which collects on every
 allocation and poisons what it sweeps, and must print what they printed
 without it. The wasm build is cross-compiled on every run, and the golden
-tests run through it under node when node is present.
+tests run through it under node when node is present, followed by the
+playground's examples that need no package. `build/build.exe examples`
+runs every example, fetching its packages from the live registry the way
+the page does.
 
 ## Conformance (test262)
 

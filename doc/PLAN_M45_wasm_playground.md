@@ -210,7 +210,10 @@ that way.
 tarballs it builds, ending with a script run through the wasm build that
 imports an ESM package with an exports map, its CJS dependency, a scoped
 package with a pax-header path, and a package only the fallback can see.
-`minc test` runs it. `tools/wasm_run.js --cdn` gives the same view under
+`minc test` runs it. The examples themselves are checked by
+`tools/examples_check.js`: each block in the page carries a `data-expect`
+line, the test run covers the ones that import no package, and
+`build/build.exe examples` runs all of them against the live registry. `tools/wasm_run.js --cdn` gives the same view under
 node for debugging, with `WASM_TRACE=1` printing every probe.
 
 ## Follow-ups

@@ -16,7 +16,13 @@ Run everything with `minc test`
   `.expected` file. Exit code must be 0.
 - **wasm** — the module is cross-compiled on every run. With node
   present, the golden tests also run through it (`tools/wasm_run.js`),
-  except the two that need an environment or a socket.
+  except the two that need an environment or a socket; then the package
+  view against a registry faked in `tools/cdn_fs_check.js`; then the
+  playground's examples that import no package, through
+  `tools/examples_check.js`. Each example block in `web/index.html`
+  carries `data-expect`, a line its output must contain, so the text and
+  its check sit together. `build/build.exe examples` runs all of them,
+  packages included, against the live registry.
 - **GC stress** — every golden and differential script runs again under
   `--gc-stress`, which collects on every allocation and poisons what it
   sweeps, and its output must match a plain run. A value used after its

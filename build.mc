@@ -510,7 +510,46 @@ void run_wasm_tests(DirList* scripts) {
         fail("cdn_fs", " (see output)");
     }
     proc_result_free(&r);
+    // the page's examples that need no package; the rest run under the
+    // examples verb, against the live registry
+    ProcCmd ex = {
+        .args = { str_from(node.data, node.len), "tools/examples_check.js", str_from(wasm.data, wasm.len) },
+        .capture = true
+    };
+    ProcResult er = proc_run(&ex);
+    if er.exit_code == 0 {
+        pass("examples");
+    } else {
+        out(str_from(er.out.data, er.out.len));
+        fail("examples", " (see output)");
+    }
+    proc_result_free(&er);
     return;
+}
+
+// Every example in the page through the module, packages fetched from
+// the registry as the page fetches them. Needs the network, so it is a
+// verb of its own rather than part of the test run.
+i32 run_examples() {
+    build_wasm();
+    step("examples (node, live registry)");
+    string node = find_node();
+    defer free(node);
+    if node.len == 0 {
+        outln("  node not found (set NODE)");
+        return 1;
+    }
+    string wasm = out_wasm();
+    defer free(wasm);
+    ProcCmd c = {
+        .args = { str_from(node.data, node.len), "tools/examples_check.js", str_from(wasm.data, wasm.len), "--cdn" },
+        .capture = true
+    };
+    ProcResult r = proc_run(&c);
+    out(str_from(r.out.data, r.out.len));
+    i32 rc = r.exit_code;
+    proc_result_free(&r);
+    return rc == 0 ? 0 : 1;
 }
 
 // Re-run every golden and differential script with collect-on-every-
@@ -783,7 +822,7 @@ i32 run_wasm(i32 argc, i32 first_extra) {
 
 void usage() {
     outln("usage: minc <build|test|bench|wasm|clean>");
-    outln("  or:  build/build.exe <plugins|diff|t262>   (no minc verb for these)");
+    outln("  or:  build/build.exe <plugins|diff|examples|t262>   (no minc verb for these)");
     outln("  build   compile build/tsmc");
     outln("  plugins compile build/tsmc-plugins (loads minc plugins)");
     outln("  test    build, then run unit + cli + golden + wasm + gc-stress tests");
@@ -791,6 +830,8 @@ void usage() {
     outln("  wasm    build tsmc.wasm and the page into build/web, then serve it");
     outln("          (--no-serve: stop after assembling)");
     outln("  diff    build, then diff test/diff/*.js vs node");
+    outln("  examples build tsmc.wasm, then run every playground example through it");
+    outln("          (the package ones fetch from the live registry)");
     outln("  t262    build, then run test262 (fetched to vendor/ on first use)");
     outln("  clean   remove build/");
     return;
@@ -819,6 +860,7 @@ i32 main() {
     if str_equal(verb, "bench") { return run_bench(); }
     if str_equal(verb, "wasm") { return run_wasm(argc, 2); }
     if str_equal(verb, "diff") { return run_diff(); }
+    if str_equal(verb, "examples") { return run_examples(); }
     if str_equal(verb, "t262") { return run_t262(argc, 2); }
 
     usage();
