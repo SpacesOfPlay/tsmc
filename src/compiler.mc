@@ -17,6 +17,7 @@ import value;
 import gc;
 import atom;
 import bytecode;
+import regex;
 import bump;
 import object;
 import bigint;
@@ -1493,6 +1494,15 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_NULL { ch_op(ch, OP_NULL); return; }
     if k == N_REGEX {
+        // an invalid literal is a syntax error of the program, not of the
+        // statement that first evaluates it
+        if !regex_flags_valid(n.aux) {
+            cerror(co, n, "invalid regular expression flags");
+        } else {
+            RegexProg* probe = regex_compile(n.name, n.aux);
+            if probe == null { cerror(co, n, "invalid regular expression"); }
+            else { regex_free(probe); }
+        }
         i32 src = str_const(co, n.name);
         i32 flags = str_const(co, n.aux);
         ch_op(ch, OP_REGEX);

@@ -86,6 +86,11 @@ i32 main() {
     check_eq(run("throw new Error('x');"), 1, "uncaught exits 1");
     // compile error exits 2
     check_eq(run("@dec class C {}"), 2, "unsupported exits 2");
+    // an invalid regex literal is a compile error, even one never reached
+    check_eq(run("/(?<a>x)(?<a>y)/;"), 2, "duplicate group names exit 2");
+    check_eq(run("/x/gg;"), 2, "repeated regex flag exits 2");
+    check_eq(run("function f() { return /(?<1a>x)/; } probe(1);"), 2, "bad group name exits 2 unreached");
+    check_eq(run("/(?<a>x)/u; probe(1);"), 0, "a valid literal runs");
 
     return check_done("test_hardening");
 }
