@@ -55,3 +55,29 @@ class Base { constructor() { this.tag = 'base'; } }
 class Derived extends Base { constructor() { super(); const name = () => super.constructor.name; this.after = name(); } }
 function mk() { return class { [arguments[0]] = 'from a computed key'; }; }
 console.log(new Derived().tag, new Derived().after, new (mk('key'))().key);
+
+// an escaped contextual keyword is an ordinary identifier, and an escaped
+// reserved word is fine as a property name
+var async = 'escaped async as a name';
+var get = 'escaped get as a name';
+console.log(async, get, ({ for: 'for' }).for, ({ get: 'get key' }).get);
+
+// parentheses settle the operators that may not mix
+console.log((-2) ** 2, (null ?? 'a') || 'b', null ?? ('a' && 'c'), (2 ** 3) ** 2, 2 ** -1);
+
+// an optional chain may be read and called, and a template may follow a
+// parenthesised chain
+const oc = { b: 1, t: (s) => s.raw[0] };
+console.log(oc?.b, (oc?.t)`paren`, oc?.missing?.(), typeof oc?.["b"]);
+
+// arrows and yield with the newline on the other side
+const ar1 = (a) =>
+  a + 1;
+const ar2 = a =>
+  a + 2;
+function* gen() { yield 1; yield* [2]; const v = yield
+  3; return v; }
+console.log(ar1(1), ar2(1), [...gen()]);
+
+// numeric separators, one __proto__, get and set as plain keys
+console.log(1_000, 0x1_0, 1_0.0_1, ({ __proto__: null, ['__proto__']: 1 }).__proto__, ({ get: 1, set: 2, async: 3 }).async);

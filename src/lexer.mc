@@ -72,6 +72,7 @@ struct Token {
     i32 start;
     i32 end;
     bool newline_before;   // line terminator crossed before this token
+    bool escaped;          // an identifier spelled with a Unicode escape
     f64 num;               // TOK_NUMBER value
     str text;              // ident/keyword name, cooked string/template, regex pattern
     str aux;               // regex flags
@@ -459,6 +460,34 @@ private i32 scan_ident_escape(Lexer* lx) {
     return v;
 }
 
+// The words that are never identifiers. An escape may spell one only
+// where any IdentifierName is accepted, such as a property name.
+bool reserved_word_text(str t) {
+    return str_equal(t, "break") || str_equal(t, "case") || str_equal(t, "catch")
+        || str_equal(t, "class") || str_equal(t, "const") || str_equal(t, "continue")
+        || str_equal(t, "debugger") || str_equal(t, "default") || str_equal(t, "delete")
+        || str_equal(t, "do") || str_equal(t, "else") || str_equal(t, "enum")
+        || str_equal(t, "export") || str_equal(t, "extends") || str_equal(t, "false")
+        || str_equal(t, "finally") || str_equal(t, "for") || str_equal(t, "function")
+        || str_equal(t, "if") || str_equal(t, "import") || str_equal(t, "in")
+        || str_equal(t, "instanceof") || str_equal(t, "new") || str_equal(t, "null")
+        || str_equal(t, "return") || str_equal(t, "super") || str_equal(t, "switch")
+        || str_equal(t, "this") || str_equal(t, "throw") || str_equal(t, "true")
+        || str_equal(t, "try") || str_equal(t, "typeof") || str_equal(t, "var")
+        || str_equal(t, "void") || str_equal(t, "while") || str_equal(t, "with");
+}
+
+// Whether an escaped code point may start, or continue, an identifier.
+private bool cp_is_id_start(i32 v) {
+    if v < 0x80 { return is_id_start(cast(u8, v)); }
+    return uni_is_id_start(cast(u32, v));
+}
+
+private bool cp_is_id_part(i32 v) {
+    if v < 0x80 { return is_id_part(cast(u8, v)); }
+    return uni_is_id_cont(cast(u32, v));
+}
+
 // Decodes an identifier span containing \u escapes (already validated by
 // the scan) into an owned UTF-8 buffer.
 private str decode_ident(Lexer* lx, i32 a, i32 b) {
@@ -504,13 +533,15 @@ private void scan_ident(Lexer* lx, Token* t) {
     i32 a = lx.pos;
     bool esc = false;
     if lx_cur(lx) == '\\' {
-        if scan_ident_escape(lx) < 0 {
+        i32 v = scan_ident_escape(lx);
+        if v < 0 {
             lex_error(lx, a, lx.pos + 1, "invalid Unicode escape in identifier");
             t.kind = TOK_ERROR;
             lx.pos++;
             t.text = lx_view(lx, a, lx.pos);
             return;
         }
+        if !cp_is_id_start(v) { lex_error(lx, a, lx.pos, "invalid Unicode escape sequence: not an identifier character"); }
         esc = true;
     } else {
         i32 n;
@@ -520,7 +551,10 @@ private void scan_ident(Lexer* lx, Token* t) {
     while lx.pos < lx.src.len {
         u8 c = lx_cur(lx);
         if c == '\\' {
-            if scan_ident_escape(lx) < 0 { break; }
+            i32 at = lx.pos;
+            i32 v = scan_ident_escape(lx);
+            if v < 0 { break; }
+            if !cp_is_id_part(v) { lex_error(lx, at, lx.pos, "invalid Unicode escape sequence: not an identifier character"); }
             esc = true;
         } else {
             i32 n;
@@ -530,11 +564,14 @@ private void scan_ident(Lexer* lx, Token* t) {
     }
     if esc { t.text = decode_ident(lx, a, lx.pos); }
     else { t.text = lx_view(lx, a, lx.pos); }
+    // a keyword spelled with an escape is an identifier, which the parser
+    // refuses wherever the word could not have been one
     i32* k = strmap_get<i32>(&lx.keywords, t.text);
-    if k != null {
+    if k != null && !esc {
         t.kind = *k;
     } else {
         t.kind = TOK_IDENT;
+        t.escaped = esc;
     }
 }
 
@@ -545,12 +582,14 @@ private void scan_private_name(Lexer* lx, Token* t) {
     bool esc = false;
     // the name after '#' follows identifier rules, Unicode escapes included
     if lx.pos < lx.src.len && lx_cur(lx) == '\\' {
-        if scan_ident_escape(lx) < 0 {
+        i32 v = scan_ident_escape(lx);
+        if v < 0 {
             lex_error(lx, a - 1, lx.pos + 1, "invalid Unicode escape in identifier");
             t.kind = TOK_ERROR;
             lx.pos++;
             return;
         }
+        if !cp_is_id_start(v) { lex_error(lx, a, lx.pos, "invalid Unicode escape sequence: not an identifier character"); }
         esc = true;
     } else if lx.pos >= lx.src.len || !id_start_at(lx, lx.pos, &n) {
         lex_error(lx, a - 1, lx.pos, "expected identifier after '#'");
@@ -561,7 +600,10 @@ private void scan_private_name(Lexer* lx, Token* t) {
     }
     while lx.pos < lx.src.len {
         if lx_cur(lx) == '\\' {
-            if scan_ident_escape(lx) < 0 { break; }
+            i32 at = lx.pos;
+            i32 v = scan_ident_escape(lx);
+            if v < 0 { break; }
+            if !cp_is_id_part(v) { lex_error(lx, at, lx.pos, "invalid Unicode escape sequence: not an identifier character"); }
             esc = true;
         } else if id_part_at(lx, lx.pos, &n) {
             lx.pos += n;
@@ -767,6 +809,9 @@ private void scan_number(Lexer* lx, Token* t) {
     t.kind = TOK_NUMBER;
     if lx_cur(lx) == '0' {
         u8 n = lx_at(lx, lx.pos + 1);
+        if n == '_' {
+            lex_error(lx, start, lx.pos + 2, "numeric separator cannot follow a leading zero");
+        }
         if n == 'x' || n == 'X' { scan_radix(lx, t, start, 16); return; }
         if n == 'o' || n == 'O' { scan_radix(lx, t, start, 8); return; }
         if n == 'b' || n == 'B' { scan_radix(lx, t, start, 2); return; }
@@ -1021,6 +1066,7 @@ Token lexer_next(Lexer* lx) {
     bool nl = skip_trivia(lx);
     Token t;
     t.newline_before = nl;
+    t.escaped = false;
     t.start = lx.pos;
     if lx.pos >= lx.src.len {
         t.kind = TOK_EOF;

@@ -171,6 +171,42 @@ private bool is_reserved_word(i32 k) {
         && k != TOK_KW_YIELD && k != TOK_KW_AWAIT;
 }
 
+// An escape may not spell a reserved word where an identifier is needed.
+private void refuse_escaped_keyword(Parser* p, Token t) {
+    if t.escaped && reserved_word_text(t.text) {
+        perror(p, "Keyword must not contain escaped characters");
+    }
+}
+
+// Whether an expression is, or ends, an optional chain: nothing may be
+// assigned through one, updated through one, or tag a template with one.
+private bool has_opt_chain(Node* n) {
+    while n != null && (n.kind == N_MEMBER || n.kind == N_INDEX || n.kind == N_CALL) {
+        if (n.flags & NF_PARENED) != 0 { return false; }
+        if (n.flags & NF_OPT_CHAIN) != 0 { return true; }
+        n = n.a;
+    }
+    return false;
+}
+
+// An unparenthesised binary node with one of two operators.
+private bool bare_bin(Node* n, i32 op1, i32 op2) {
+    return n != null && n.kind == N_BIN && (n.flags & NF_PARENED) == 0
+        && (n.op == op1 || n.op == op2);
+}
+
+// A getter takes no parameters; a setter takes exactly one, not a rest.
+private void check_accessor_params(Parser* p, i32 flags, Node* fun) {
+    if fun == null { return; }
+    if (flags & NF_GETTER) != 0 && fun.kids.len != 0 {
+        perror(p, "Getter must not have any formal parameters.");
+    }
+    if (flags & NF_SETTER) != 0 {
+        bool one = fun.kids.len == 1 && ((*(fun.kids.items)).flags & NF_REST) == 0;
+        if !one { perror(p, "Setter must have exactly one formal parameter."); }
+    }
+}
+
 private bool is_assign_op(i32 k) {
     return k == TOK_EQ || k == TOK_PLUS_EQ || k == TOK_MINUS_EQ
         || k == TOK_STAR_EQ || k == TOK_SLASH_EQ || k == TOK_PERCENT_EQ
@@ -472,6 +508,7 @@ private Node* prop_name(Parser* p) {
 private Node* parse_binding(Parser* p) {
     i32 k = p.cur.kind;
     if is_binding_ident(k) {
+        refuse_escaped_keyword(p, p.cur);
         Node* n = nnew(p, N_IDENT);
         n.name = p.cur.text;
         advance(p);
@@ -718,8 +755,10 @@ private Node* parse_object(Parser* p) {
         }
         Node* pr = nnew(p, N_PROP);
         i32 fnflags = 0;
+        // `async` and its method must share a line
         if (p.cur.kind == TOK_KW_GET || p.cur.kind == TOK_KW_SET
-                || p.cur.kind == TOK_KW_ASYNC) && starts_member_name(peek(p)) {
+                || p.cur.kind == TOK_KW_ASYNC) && starts_member_name(peek(p))
+                && !(p.cur.kind == TOK_KW_ASYNC && peek(p).newline_before) {
             if p.cur.kind == TOK_KW_GET { pr.flags |= NF_GETTER; }
             if p.cur.kind == TOK_KW_SET { pr.flags |= NF_SETTER; }
             if p.cur.kind == TOK_KW_ASYNC { fnflags |= NF_ASYNC; }
@@ -727,6 +766,7 @@ private Node* parse_object(Parser* p) {
         }
         if eat(p, TOK_STAR) { fnflags |= NF_GENERATOR; }
         i32 keyk = TOK_IDENT;
+        Token keytok = p.cur;
         if at(p, TOK_LBRACK) {
             advance(p);
             pr.a = parse_assign(p);
@@ -736,21 +776,31 @@ private Node* parse_object(Parser* p) {
             keyk = p.cur.kind;
             pr.a = prop_name(p);
         }
+        bool shorthand_ok = (pr.flags & NF_COMPUTED) == 0 && keyk != TOK_NUMBER
+            && keyk != TOK_STRING && keyk != TOK_BIGINT && keyk != TOK_PRIVATE_NAME;
         if at(p, TOK_LPAREN) || at(p, TOK_LT) {
             // a method definition, unlike `key: function (...)`, requires
             // its parameter names to be unique
             pr.b = parse_callable(p, fnflags | NF_METHOD, pr.span.start);
-        } else if eat(p, TOK_COLON) {
-            pr.b = parse_assign(p);
-        } else if eat(p, TOK_EQ) {
-            // destructuring cover grammar: shorthand with default
-            pr.flags |= NF_SHORTHAND;
-            // shorthand key is an IdentifierReference — not a reserved word
-            if is_reserved_word(keyk) { perror(p, "unexpected reserved word"); }
-            pr.b = parse_assign(p);
+            check_accessor_params(p, pr.flags, pr.b);
         } else {
-            pr.flags |= NF_SHORTHAND;
-            if is_reserved_word(keyk) { perror(p, "unexpected reserved word"); }
+            if fnflags != 0 || (pr.flags & (NF_GETTER | NF_SETTER)) != 0 {
+                perror(p, "expected a method after get, set, async or *");
+            }
+            if eat(p, TOK_COLON) {
+                pr.b = parse_assign(p);
+            } else if eat(p, TOK_EQ) {
+                // destructuring cover grammar: shorthand with default
+                pr.flags |= NF_SHORTHAND;
+                // shorthand key is an IdentifierReference — not a reserved word
+                if is_reserved_word(keyk) || !shorthand_ok { perror(p, "unexpected token in shorthand property"); }
+                refuse_escaped_keyword(p, keytok);
+                pr.b = parse_assign(p);
+            } else {
+                pr.flags |= NF_SHORTHAND;
+                if is_reserved_word(keyk) || !shorthand_ok { perror(p, "unexpected token in shorthand property"); }
+                refuse_escaped_keyword(p, keytok);
+            }
         }
         vec_push(&p.scratch, nfin(p, pr));
         if !eat(p, TOK_COMMA) { break; }
@@ -838,6 +888,7 @@ private Node* parse_primary(Parser* p) {
         return parse_function_rest(p, NF_ASYNC, false, fstart);
     }
     if k == TOK_IDENT || is_ctx_ident(k) {
+        refuse_escaped_keyword(p, p.cur);
         Node* n = nnew(p, N_IDENT);
         n.name = p.cur.text;
         advance(p);
@@ -1056,6 +1107,7 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
             continue;
         }
         if (k == TOK_TEMPLATE_FULL || k == TOK_TEMPLATE_HEAD) && allow_call {
+            if has_opt_chain(e) { perror(p, "Invalid tagged template on optional chain"); }
             Node* tt = nnew(p, N_TAGGED_TEMPLATE);
             tt.span.start = e.span.start;
             tt.a = e;
@@ -1084,6 +1136,7 @@ private Node* parse_postfix(Parser* p) {
     Node* e = parse_member_or_call(p, true);
     if (p.cur.kind == TOK_PLUSPLUS || p.cur.kind == TOK_MINUSMINUS)
         && !p.cur.newline_before {
+        if has_opt_chain(e) { perror(p, "Invalid left-hand side expression in postfix operation"); }
         Node* u = nnew(p, N_UPDATE);
         u.span.start = e.span.start;
         u.op = p.cur.kind;
@@ -1110,6 +1163,7 @@ private Node* parse_unary(Parser* p) {
         u.flags = NF_PREFIX;
         advance(p);
         u.a = parse_unary(p);
+        if has_opt_chain(u.a) { perror(p, "Invalid left-hand side expression in prefix operation"); }
         return nfin(p, u);
     }
     if k == TOK_KW_AWAIT {
@@ -1149,7 +1203,21 @@ private Node* parse_bin(Parser* p, i32 min_prec) {
         advance(p);
         i32 next_min = pr + 1;
         if k == TOK_STARSTAR { next_min = pr; }
+        // a unary operator may not sit bare before **
+        if k == TOK_STARSTAR && left.kind == N_UNARY && (left.flags & NF_PARENED) == 0 {
+            perror(p, "Unary operator used immediately before exponentiation expression. Parenthesis must be used to disambiguate operator precedence");
+        }
         Node* right = parse_bin(p, next_min);
+        // ?? does not mix with || or && without parentheses
+        if k == TOK_QUESTION_QUESTION
+            && (bare_bin(left, TOK_PIPEPIPE, TOK_AMPAMP) || bare_bin(right, TOK_PIPEPIPE, TOK_AMPAMP)) {
+            perror(p, "Cannot mix ?? with || or && without parentheses");
+        }
+        if (k == TOK_PIPEPIPE || k == TOK_AMPAMP)
+            && (bare_bin(left, TOK_QUESTION_QUESTION, TOK_QUESTION_QUESTION)
+                || bare_bin(right, TOK_QUESTION_QUESTION, TOK_QUESTION_QUESTION)) {
+            perror(p, "Cannot mix ?? with || or && without parentheses");
+        }
         Node* b = nnew(p, N_BIN);
         b.span.start = left.span.start;
         b.op = k;
@@ -1178,7 +1246,7 @@ private Node* parse_cond(Parser* p) {
 private Node* parse_yield(Parser* p) {
     Node* y = nnew(p, N_YIELD);
     advance(p);
-    if at(p, TOK_STAR) {
+    if at(p, TOK_STAR) && !p.cur.newline_before {
         y.flags |= NF_DELEGATE;
         advance(p);
         y.a = parse_assign(p);
@@ -1208,7 +1276,7 @@ private Node* try_arrow(Parser* p, i32 flags) {
             advance(p);
             ts_return_type(p);
         }
-        ok = p.diags.n_suppressed == base && p.cur.kind == TOK_ARROW;
+        ok = p.diags.n_suppressed == base && p.cur.kind == TOK_ARROW && !p.cur.newline_before;
     }
     diags_unmute(p.diags);
     if !ok {
@@ -1251,7 +1319,7 @@ private Node* ident_arrow(Parser* p, i32 flags) {
 Node* parse_assign(Parser* p) {
     i32 k = p.cur.kind;
     if k == TOK_KW_YIELD { return parse_yield(p); }
-    if (k == TOK_IDENT || is_ctx_ident(k)) && peek(p).kind == TOK_ARROW {
+    if (k == TOK_IDENT || is_ctx_ident(k)) && peek(p).kind == TOK_ARROW && !peek(p).newline_before {
         return ident_arrow(p, 0);
     }
     if k == TOK_KW_ASYNC && !peek(p).newline_before {
@@ -1261,7 +1329,7 @@ Node* parse_assign(Parser* p) {
         if (pk.kind == TOK_IDENT || is_ctx_ident(pk.kind)) && pk.kind != TOK_KW_ASYNC {
             PState st = psave(p);
             advance(p);
-            if peek(p).kind == TOK_ARROW {
+            if peek(p).kind == TOK_ARROW && !peek(p).newline_before {
                 Node* ar = ident_arrow(p, NF_ASYNC);
                 ar.span.start = astart;
                 return ar;
@@ -1284,6 +1352,7 @@ Node* parse_assign(Parser* p) {
     }
     Node* left = parse_cond(p);
     if is_assign_op(p.cur.kind) {
+        if has_opt_chain(left) { perror(p, "Invalid left-hand side in assignment"); }
         Node* a = nnew(p, N_ASSIGN);
         a.span.start = left.span.start;
         a.op = p.cur.kind;
@@ -1532,6 +1601,7 @@ private Node* parse_class_member(Parser* p) {
             || k == TOK_KW_PROTECTED || k == TOK_KW_OVERRIDE { add = 0; }
         if add < 0 { break; }
         if !starts_member_name(peek(p)) { break; }
+        if add == NF_ASYNC && peek(p).newline_before { break; }
         if fstart < 0 && (add == NF_ASYNC || add == NF_GETTER || add == NF_SETTER) {
             fstart = p.cur.start;
         }
@@ -1576,6 +1646,7 @@ private Node* parse_class_member(Parser* p) {
         // NF_METHOD goes to the function, not the member: class and object
         // methods need unique parameter names
         m.b = parse_callable(p, fnflags | NF_METHOD, fstart);
+        check_accessor_params(p, m.flags, m.b);
         if fnflags != 0 { m.flags |= fnflags; }
         return nfin(p, m);
     }
@@ -2124,6 +2195,7 @@ Node* parse_statement(Parser* p) {
     // A label may be a plain identifier or a contextual keyword (e.g. the
     // `out` variance modifier, valid as an identifier outside type positions).
     if is_binding_ident(k) && peek(p).kind == TOK_COLON {
+        refuse_escaped_keyword(p, p.cur);
         Node* n = nnew(p, N_LABELED);
         n.name = p.cur.text;
         advance(p);

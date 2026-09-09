@@ -1817,6 +1817,7 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_OBJECT {
         ch_op(ch, OP_NEWOBJ);
+        bool proto_seen = false;
         for i32 i = 0; i < n.kids.len; i++ {
             Node* p = *(n.kids.items + i);
             if p.kind == N_SPREAD {
@@ -1864,6 +1865,8 @@ private void compile_expr(Compiler* co, Node* n) {
                 && (p.a.kind == N_IDENT || p.a.kind == N_STRING)
                 && str_equal(p.a.name, "__proto__")
                 && (p.b.kind != N_FUNCTION || (p.b.flags & NF_METHOD) == 0) {
+                if proto_seen { cerror(co, p, "Duplicate __proto__ fields are not allowed in object literals"); }
+                proto_seen = true;
                 ch_op(ch, OP_DUP);
                 compile_expr(co, p.b);
                 ch_op(ch, OP_SETPROTO);

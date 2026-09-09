@@ -150,7 +150,7 @@ build/build.exe t262               # ECMAScript conformance (test262), see below
 scripts are checked against golden output. 178 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
-most of it was written by sweeping one area at a time against node. 49
+most of it was written by sweeping one area at a time against node. 77
 negative tests are programs the compiler must refuse with a named
 message. All 210 scripts then run again under `--gc-stress`, which collects on every
 allocation and poisons what it sweeps, and must print what they printed

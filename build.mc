@@ -100,7 +100,13 @@ void die(str msg) {
 // is one folder with the binary at its root and lib/ beside it.
 string find_minc_dir() {
     string env = env_get("MINC");
-    if env.len > 0 { return env; }
+    if env.len > 0 {
+        // the folder, or the binary inside it
+        if path_is_dir(str_from(env.data, env.len)) { return env; }
+        string dir = str_concat(path_dirname(str_from(env.data, env.len)), "");
+        free(env);
+        return dir;
+    }
     free(env);
 
     string binname = str_concat("minc", EXE_SUFFIX);
