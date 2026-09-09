@@ -14,6 +14,10 @@ Run everything with `minc test`
 - **`run/<name>.ts` + `run/<name>.expected`** — golden end-to-end tests.
   The runner executes the script with tsmc and diffs stdout against the
   `.expected` file. Exit code must be 0.
+- **`neg/<name>.js`** — programs the compiler must refuse. The first
+  line is `// expect: <fragment>`; the runner requires exit code 2 and
+  that fragment in the output. The valid programs that sit next to each
+  rule live in `diff/early_valid.js`.
 - **wasm** — the module is cross-compiled on every run. With node
   present, the golden tests also run through it (`tools/wasm_run.js`),
   except the two that need an environment or a socket; then the package

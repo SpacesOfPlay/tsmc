@@ -19,6 +19,9 @@ struct Parser {
     Token cur;
     i32 prev_end;
     i32 no_in;         // > 0 while parsing for-statement init
+    i32 strict;        // > 0 inside strict-mode code (a "use strict" prologue)
+    i32 single;        // the next statement is the body of an if (1), a loop (2)
+                       // or a label (3), where a declaration may not appear
     DiagList* diags;
     Bump* arena;
     Vec<NodePtr> scratch;
@@ -37,6 +40,8 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.arena = arena;
     p.prev_end = 0;
     p.no_in = 0;
+    p.strict = 0;
+    p.single = 0;
     vec_init<NodePtr>(&p.scratch, 64);
     p.cur = lexer_next(&p.lx);
 }
@@ -597,6 +602,9 @@ private void parse_params_into(Parser* p) {
                 prm.b = parse_assign(p);
             }
             vec_push(&p.scratch, nfin(p, prm));
+            if (prm.flags & NF_REST) != 0 && at(p, TOK_COMMA) {
+                perror(p, "Rest parameter must be last formal parameter");
+            }
         }
         if !eat(p, TOK_COMMA) { break; }
     }
@@ -617,7 +625,10 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     fun.kids = finish_kids(p, mark);
     if eat(p, TOK_COLON) { ts_return_type(p); }
     if at(p, TOK_LBRACE) {
+        bool strict_body = peek(p).kind == TOK_STRING && str_equal(peek(p).text, "use strict");
+        if strict_body { p.strict++; }
         fun.a = parse_block(p);
+        if strict_body { p.strict--; }
     } else {
         fun.flags |= NF_SIGNATURE;
         expect_semi(p);
@@ -763,6 +774,9 @@ private Node* parse_array(Parser* p) {
             Node* s = nnew(p, N_SPREAD);
             s.a = parse_assign(p);
             vec_push(&p.scratch, nfin(p, s));
+            // a comma after the spread is fine in a literal; a pattern
+            // rejects it as a rest element that is not last
+            if at(p, TOK_COMMA) && peek(p).kind == TOK_RBRACK { a.flags |= NF_REST; }
         } else {
             vec_push(&p.scratch, parse_assign(p));
         }
@@ -1340,8 +1354,8 @@ private Node* parse_if(Parser* p) {
     expect(p, TOK_LPAREN, "expected '('");
     n.a = parse_expression(p);
     expect(p, TOK_RPAREN, "expected ')'");
-    n.b = parse_statement(p);
-    if eat(p, TOK_KW_ELSE) { n.c = parse_statement(p); }
+    n.b = parse_body(p, 1);
+    if eat(p, TOK_KW_ELSE) { n.c = parse_body(p, 1); }
     return nfin(p, n);
 }
 
@@ -1377,7 +1391,7 @@ private Node* parse_for(Parser* p) {
             n.a = v;
             n.b = is_of ? parse_assign(p) : parse_expression(p);
             expect(p, TOK_RPAREN, "expected ')'");
-            n.c = parse_statement(p);
+            n.c = parse_body(p, 2);
             return nfin(p, n);
         }
         if eat(p, TOK_EQ) {
@@ -1414,7 +1428,7 @@ private Node* parse_for(Parser* p) {
             n.a = e;
             n.b = is_of ? parse_assign(p) : parse_expression(p);
             expect(p, TOK_RPAREN, "expected ')'");
-            n.c = parse_statement(p);
+            n.c = parse_body(p, 2);
             return nfin(p, n);
         }
         init = e;
@@ -1429,7 +1443,7 @@ private Node* parse_for(Parser* p) {
     expect(p, TOK_SEMI, "expected ';'");
     if !at(p, TOK_RPAREN) { n.c = parse_expression(p); }
     expect(p, TOK_RPAREN, "expected ')'");
-    n.d = parse_statement(p);
+    n.d = parse_body(p, 2);
     return nfin(p, n);
 }
 
@@ -1596,6 +1610,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     }
     expect(p, TOK_LBRACE, "expected '{'");
     i32 mark = p.scratch.len;
+    p.strict++;   // a class body is strict-mode code
     while !at(p, TOK_RBRACE) && !at(p, TOK_EOF) {
         if eat(p, TOK_SEMI) { continue; }
         i32 before = p.cur.start;
@@ -1605,6 +1620,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
             advance(p);
         }
     }
+    p.strict--;
     expect(p, TOK_RBRACE, "expected '}'");
     c.kids = finish_kids(p, mark);
     return nfin(p, c);
@@ -1939,7 +1955,31 @@ private Node* parse_export_decl(Parser* p) {
 
 // --- statement dispatch ---------------------------------------------------
 
+// The body of an if, a loop or a label: one statement, where a declaration
+// may not appear. A plain function is the one exception, as the body of an
+// if or a label in sloppy code, which Annex B allows.
+private Node* parse_body(Parser* p, i32 kind) {
+    p.single = kind;
+    Node* s = parse_statement(p);
+    p.single = 0;
+    return s;
+}
+
+private void refuse_lexical_in_single(Parser* p, i32 single) {
+    if single != 0 { perror(p, "Lexical declaration cannot appear in a single-statement context"); }
+}
+
+private void refuse_function_in_single(Parser* p, i32 single, bool gen, bool async) {
+    if single == 0 { return; }
+    if gen { perror(p, "Generators can only be declared at the top level or inside a block."); }
+    else if async { perror(p, "Async functions can only be declared at the top level or inside a block."); }
+    else if p.strict > 0 { perror(p, "In strict mode code, functions can only be declared at top level or inside a block."); }
+    else if single == 2 { perror(p, "In non-strict mode code, functions can only be declared at top level, inside a block, or as the body of an if statement."); }
+}
+
 Node* parse_statement(Parser* p) {
+    i32 single = p.single;
+    p.single = 0;
     i32 k = p.cur.kind;
     if k == TOK_LBRACE { return parse_block(p); }
     if k == TOK_SEMI {
@@ -1947,8 +1987,10 @@ Node* parse_statement(Parser* p) {
         advance(p);
         return nfin(p, n);
     }
+    if k == TOK_KW_LET && single != 0 && starts_binding(peek(p)) { refuse_lexical_in_single(p, single); }
     if k == TOK_KW_VAR || k == TOK_KW_LET { return parse_var_stmt(p); }
     if k == TOK_KW_CONST {
+        refuse_lexical_in_single(p, single);
         if peek(p).kind == TOK_KW_ENUM {
             advance(p);
             return parse_enum(p, NF_CONST);
@@ -1956,17 +1998,22 @@ Node* parse_statement(Parser* p) {
         return parse_var_stmt(p);
     }
     if k == TOK_KW_FUNCTION {
+        refuse_function_in_single(p, single, peek(p).kind == TOK_STAR, false);
         i32 fstart = p.cur.start;
         advance(p);
         return parse_function_rest(p, 0, true, fstart);
     }
     if k == TOK_KW_ASYNC && peek(p).kind == TOK_KW_FUNCTION && !peek(p).newline_before {
+        refuse_function_in_single(p, single, false, true);
         i32 fstart = p.cur.start;
         advance(p);
         advance(p);
         return parse_function_rest(p, NF_ASYNC, true, fstart);
     }
-    if k == TOK_KW_CLASS { return parse_class(p, 0, true); }
+    if k == TOK_KW_CLASS {
+        refuse_lexical_in_single(p, single);
+        return parse_class(p, 0, true);
+    }
     if k == TOK_KW_ABSTRACT && peek(p).kind == TOK_KW_CLASS {
         advance(p);
         return parse_class(p, NF_ABSTRACT, true);
@@ -1979,13 +2026,13 @@ Node* parse_statement(Parser* p) {
         expect(p, TOK_LPAREN, "expected '('");
         n.a = parse_expression(p);
         expect(p, TOK_RPAREN, "expected ')'");
-        n.b = parse_statement(p);
+        n.b = parse_body(p, 2);
         return nfin(p, n);
     }
     if k == TOK_KW_DO {
         Node* n = nnew(p, N_DO_WHILE);
         advance(p);
-        n.a = parse_statement(p);
+        n.a = parse_body(p, 2);
         expect(p, TOK_KW_WHILE, "expected 'while'");
         expect(p, TOK_LPAREN, "expected '('");
         n.b = parse_expression(p);
@@ -2072,7 +2119,7 @@ Node* parse_statement(Parser* p) {
         n.name = p.cur.text;
         advance(p);
         advance(p);
-        n.a = parse_statement(p);
+        n.a = parse_body(p, 3);
         return nfin(p, n);
     }
     Node* n = nnew(p, N_EXPR_STMT);
@@ -2084,6 +2131,7 @@ Node* parse_statement(Parser* p) {
 Node* parse_program(Parser* p) {
     Node* n = nnew(p, N_PROGRAM);
     i32 mark = p.scratch.len;
+    if p.cur.kind == TOK_STRING && str_equal(p.cur.text, "use strict") { p.strict++; }
     while !at(p, TOK_EOF) {
         i32 before = p.cur.start;
         Node* s = parse_statement(p);

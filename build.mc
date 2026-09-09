@@ -443,6 +443,65 @@ void golden_check(str stem, str src, ProcCmd* c) {
     return;
 }
 
+// True when `needle` occurs in `hay`.
+private bool text_contains(str hay, str needle) {
+    if needle.len == 0 { return true; }
+    for i32 i = 0; i + needle.len <= hay.len; i++ {
+        bool same = true;
+        for i32 j = 0; j < needle.len; j++ {
+            if *(hay.data + i + j) != *(needle.data + j) { same = false; break; }
+        }
+        if same { return true; }
+    }
+    return false;
+}
+
+// The fragment after "// expect:" on a test's first line, else empty.
+private str neg_expectation(str text) {
+    str none = str_from(text.data, 0);
+    str tag = "// expect:";
+    if text.len < tag.len { return none; }
+    for i32 j = 0; j < tag.len; j++ {
+        if *(text.data + j) != *(tag.data + j) { return none; }
+    }
+    i32 s = tag.len;
+    while s < text.len && *(text.data + s) == ' ' { s++; }
+    i32 e = s;
+    while e < text.len && *(text.data + e) != '\n' && *(text.data + e) != '\r' { e++; }
+    return str_from(text.data + s, e - s);
+}
+
+// Each test/neg/*.js is a program the compiler must refuse: exit code 2,
+// and the message named on its first line, `// expect: <fragment>`.
+void run_neg_tests(str exe) {
+    step("negative tests");
+    DirList tests = dir_list_ext("test/neg", ".js");
+    if tests.count == 0 { outln("  (none)"); }
+    for i32 i = 0; i < tests.count; i++ {
+        str name = tests.items[i];
+        str stem = path_stem(name);
+        string src = path_join("test/neg", name);
+        defer free(src);
+        string text = file_read_str(str_from(src.data, src.len));
+        defer free(text);
+        str want = neg_expectation(str_from(text.data, text.len));
+        ProcCmd c = { .args = { exe, str_from(src.data, src.len) }, .capture = true };
+        ProcResult r = proc_run(&c);
+        if r.exit_code != 2 {
+            fail(stem, " (compiled, or failed at run time)");
+        } else if !text_contains(str_from(r.out.data, r.out.len), want) {
+            fail(stem, " (message)");
+            out("      ");
+            outln(str_from(r.out.data, r.out.len));
+        } else {
+            pass(stem);
+        }
+        proc_result_free(&r);
+    }
+    dir_list_free(&tests);
+    return;
+}
+
 void run_golden_tests(str exe, DirList* scripts) {
     step("run tests");
     if scripts.count == 0 {
@@ -653,6 +712,7 @@ i32 run_tests() {
     DirList diff_scripts = list_diff_scripts();
 
     run_golden_tests(e, &run_scripts);
+    run_neg_tests(e);
     run_wasm_tests(&run_scripts);
     run_gc_stress(e, &run_scripts, &diff_scripts);
 

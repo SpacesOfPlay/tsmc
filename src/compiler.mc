@@ -94,6 +94,9 @@ struct FScope {
 struct PrivName {
     str name;
     i32 kind;
+    i32 acc;         // NF_GETTER or NF_SETTER for an accessor, else 0
+    bool is_static;
+    bool paired;     // an accessor whose other half was seen
 }
 
 // The private names one class declares, the number that makes them its
@@ -1002,9 +1005,13 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             }
             if e.kind == N_REST || e.kind == N_SPREAD {
                 // in the assignment form the pattern arrived as an array
-                // literal, so the "rest comes last" rule is checked here
-                if i != pat.kids.len - 1 {
-                    cerror(co, e, "a rest element must be last");
+                // literal, so the rest rules are checked here: last, with
+                // no trailing comma, and with no default
+                if i != pat.kids.len - 1 || (pat.flags & NF_REST) != 0 {
+                    cerror(co, e, "Rest element must be last element");
+                }
+                if !declare_mode && e.a != null && e.a.kind == N_ASSIGN && e.a.op == TOK_EQ {
+                    cerror(co, e, "Rest element may not have a default initializer");
                 }
                 if !declare_mode && target_is_ref(e.a) {
                     i32 r_obj = 0;
@@ -2360,6 +2367,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     if !co.strict && f.a != null && f.a.kind == N_BLOCK && has_use_strict(&f.a.kids) {
         co.strict = true;
     }
+    // the directive is refused when the parameters are anything but names
+    if !simple_params && f.a != null && f.a.kind == N_BLOCK && has_use_strict(&f.a.kids) {
+        cerror(co, f, "Illegal 'use strict' directive in function with non-simple parameter list");
+    }
     if !simple_params || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
         Vec<str> pnames = vec_new<str>(4);
         for i32 i = 0; i < f.kids.len; i++ {
@@ -2567,6 +2578,35 @@ private bool member_is_field(Node* m) {
     return true;
 }
 
+// The names a class element may not have. A key that is a name or a
+// string counts; a computed key is only known at run time.
+private bool member_named(Node* m, str name) {
+    if (m.flags & NF_COMPUTED) != 0 || m.a == null { return false; }
+    return (m.a.kind == N_IDENT || m.a.kind == N_STRING) && str_equal(m.a.name, name);
+}
+
+private void class_member_rules(Compiler* co, Node* m) {
+    bool is_static = (m.flags & NF_STATIC) != 0;
+    bool is_method = m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0;
+    bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
+    if m.a != null && m.a.kind == N_PRIVATE_IDENT && str_equal(m.a.name, "constructor") {
+        cerror(co, m, "Classes may not have a private field named '#constructor'");
+        return;
+    }
+    if !is_static && member_named(m, "constructor") {
+        if !is_method { cerror(co, m, "Classes may not have a field named 'constructor'"); }
+        else if is_acc { cerror(co, m, "Class constructor may not be an accessor"); }
+        else if (m.b.flags & NF_GENERATOR) != 0 { cerror(co, m, "Class constructor may not be a generator"); }
+        else if (m.b.flags & NF_ASYNC) != 0 { cerror(co, m, "Class constructor may not be an async method"); }
+    }
+    if is_static && member_named(m, "prototype") {
+        cerror(co, m, "Classes may not have a static property named 'prototype'");
+    }
+    if is_static && !is_method && member_named(m, "constructor") {
+        cerror(co, m, "Classes may not have a static property named 'constructor'");
+    }
+}
+
 // Leaves the class constructor function on the stack.
 private void compile_class_expr(Compiler* co, Node* c) {
     FScope* fs = co.cur;
@@ -2601,9 +2641,29 @@ private void compile_class_expr(Compiler* co, Node* c) {
         Node* m = *(c.kids.items + i);
         if m.kind == N_CLASS_MEMBER && m.a != null && m.a.kind == N_PRIVATE_IDENT {
             bool is_fn = m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0;
+            // a private name is declared once, except a getter with its setter
+            for i32 j = 0; j < ps.names.len; j++ {
+                PrivName seen = vec_get(&ps.names, j);
+                if !str_equal(seen.name, m.a.name) { continue; }
+                i32 acc = m.flags & (NF_GETTER | NF_SETTER);
+                bool pair = acc != 0 && seen.acc != 0 && acc != seen.acc
+                    && seen.is_static == ((m.flags & NF_STATIC) != 0);
+                if !pair || seen.paired {
+                    string msg = format("Identifier '#{}' has already been declared", m.a.name);
+                    str mv = msg;
+                    cerror(co, m, mv);
+                    free(msg);
+                } else {
+                    PrivName* sp = ps.names.data + j;
+                    sp.paired = true;
+                }
+            }
             PrivName pn;
             pn.name = m.a.name;
             pn.kind = !is_fn ? 0 : ((m.flags & NF_STATIC) != 0 ? 2 : 1);
+            pn.acc = m.flags & (NF_GETTER | NF_SETTER);
+            pn.is_static = (m.flags & NF_STATIC) != 0;
+            pn.paired = false;
             vec_push(&ps.names, pn);
         }
     }
@@ -2629,9 +2689,10 @@ private void compile_class_expr(Compiler* co, Node* c) {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK { has_static = true; continue; }
         if m.kind != N_CLASS_MEMBER { continue; }
+        class_member_rules(co, m);
         if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
-            && (m.flags & (NF_GETTER | NF_SETTER)) == 0
-            && m.a != null && m.a.kind == N_IDENT && str_equal(m.a.name, "constructor") {
+            && (m.flags & (NF_GETTER | NF_SETTER)) == 0 && member_named(m, "constructor") {
+            if ctor_member != null { cerror(co, m, "A class may only have one constructor"); }
             ctor_member = m;
             continue;
         }
@@ -2874,13 +2935,19 @@ private void hoist_lexical_decls(Compiler* co, NodeList* list, Vec<str>* vnames)
     }
 }
 
+// The function declaration a statement is, if it is one: labels on a
+// declaration mean nothing to it.
+private Node* function_decl_of(Node* s) {
+    while s != null && s.kind == N_LABELED { s = s.a; }
+    if s != null && s.kind == N_FUNCTION && s.name.len > 0 { return s; }
+    return null;
+}
+
 // Function declarations bind before any statement runs.
 private void hoist_function_decls(Compiler* co, NodeList* list) {
     for i32 i = 0; i < list.len; i++ {
-        Node* s = *(list.items + i);
-        if s.kind == N_FUNCTION && s.name.len > 0 {
-            declare_plain(co, s, s.name);
-        }
+        Node* f = function_decl_of(*(list.items + i));
+        if f != null { declare_plain(co, f, f.name); }
     }
 }
 
@@ -2901,10 +2968,10 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     vec_free(&vnames);
     hoist_function_decls(co, list);
     for i32 i = 0; i < list.len; i++ {
-        Node* s = *(list.items + i);
-        if s.kind == N_FUNCTION && s.name.len > 0 {
-            i32 li = find_local(fs, s.name);
-            compile_function(co, s, false);
+        Node* f = function_decl_of(*(list.items + i));
+        if f != null {
+            i32 li = find_local(fs, f.name);
+            compile_function(co, f, false);
             emit_init_binding(co, li);
         }
     }
@@ -2912,7 +2979,7 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     bool injected = n_fields == 0;
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
-        if s.kind == N_FUNCTION && s.name.len > 0 { continue; }
+        if function_decl_of(s) != null { continue; }
         if !injected {
             bool first_is_super = i == 0 && s.kind == N_EXPR_STMT && s.a != null
                 && s.a.kind == N_CALL && s.a.a != null && s.a.a.kind == N_SUPER;
@@ -3515,8 +3582,8 @@ private void compile_stmt(Compiler* co, Node* n) {
         for i32 i = 0; i < n.kids.len; i++ {
             NodeList* cl = &(*(n.kids.items + i)).kids;
             for i32 s = 0; s < cl.len; s++ {
-                Node* st = *(cl.items + s);
-                if st.kind == N_FUNCTION && st.name.len > 0 {
+                Node* st = function_decl_of(*(cl.items + s));
+                if st != null {
                     i32 li = find_local(fs, st.name);
                     compile_function(co, st, false);
                     emit_init_binding(co, li);
@@ -3551,7 +3618,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             for i32 s = 0; s < c.kids.len; s++ {
                 Node* st = *(c.kids.items + s);
                 // already bound and initialized above
-                if st.kind == N_FUNCTION && st.name.len > 0 { continue; }
+                if function_decl_of(st) != null { continue; }
                 compile_stmt(co, st);
             }
         }
@@ -4006,15 +4073,13 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     //    exported one writes it to the namespace
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
-        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
-        if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
-            declare_plain(co, d, d.name);
-        }
+        Node* d = function_decl_of(s.kind == N_EXPORT && s.a != null ? s.a : s);
+        if d != null { declare_plain(co, d, d.name); }
     }
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
-        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
-        if d != null && d.kind == N_FUNCTION && d.name.len > 0 {
+        Node* d = function_decl_of(s.kind == N_EXPORT && s.a != null ? s.a : s);
+        if d != null {
             i32 li = find_local(&fs, d.name);
             compile_function(co, d, false);
             emit_init_binding(co, li);
@@ -4025,7 +4090,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
         if s.kind == N_IMPORT { continue; }
-        if s.kind == N_FUNCTION && s.name.len > 0 { continue; }
+        if function_decl_of(s) != null { continue; }
         if s.kind == N_EXPORT && s.a != null && s.a.kind == N_FUNCTION
             && s.a.name.len > 0 { continue; }
         if s.kind == N_EXPORT {
