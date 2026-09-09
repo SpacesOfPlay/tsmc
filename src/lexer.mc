@@ -1097,6 +1097,12 @@ Token lexer_next(Lexer* lx) {
     return t;
 }
 
+// U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR at `pos`.
+private bool is_line_sep_at(Lexer* lx, i32 pos) {
+    return lx_at(lx, pos) == 0xE2 && lx_at(lx, pos + 1) == 0x80
+        && (lx_at(lx, pos + 2) == 0xA8 || lx_at(lx, pos + 2) == 0xA9);
+}
+
 // Re-lex a '/' or '/=' token as a regex literal. The parser calls
 // this where it expects an expression.
 Token lexer_rescan_regex(Lexer* lx, Token slash) {
@@ -1114,7 +1120,8 @@ Token lexer_rescan_regex(Lexer* lx, Token slash) {
             return t;
         }
         u8 c = lx_cur(lx);
-        if c == '\n' || c == '\r' {
+        // a line or paragraph separator ends the line here as well
+        if c == '\n' || c == '\r' || is_line_sep_at(lx, lx.pos) {
             lex_error(lx, t.start, lx.pos, "unterminated regular expression");
             t.kind = TOK_ERROR;
             t.end = lx.pos;
@@ -1122,7 +1129,7 @@ Token lexer_rescan_regex(Lexer* lx, Token slash) {
         }
         if c == '\\' {
             u8 e = lx_at(lx, lx.pos + 1);
-            if e == '\n' || e == '\r' || e == 0 {
+            if e == '\n' || e == '\r' || e == 0 || is_line_sep_at(lx, lx.pos + 1) {
                 lex_error(lx, t.start, lx.pos, "unterminated regular expression");
                 t.kind = TOK_ERROR;
                 t.end = lx.pos;

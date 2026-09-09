@@ -93,3 +93,8 @@ for ((async) of [[8]]) ;
 console.log(async);
 async function fa() { var async = 0; for await (async of [9]) ; return async; }
 fa().then((v) => console.log('for await async:', v));
+
+// regular expressions next to the early errors: a braced quantifier with
+// something to repeat, a lone brace and \k without named groups outside u
+// mode, a quantified lookahead outside u mode, and identifier group names
+console.log(/a{2}/.test('aa'), /{/.test('{'), /\k/.test('k'), /(?=a)?b/.test('b'), /(?<a_1>.)\k<a_1>/.test('xx'), /(?<$>.)/.exec('q').groups.$, /(?<ünïcode>.)/.exec('z').groups.ünïcode);

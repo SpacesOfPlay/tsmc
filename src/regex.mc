@@ -829,17 +829,51 @@ private i32 parse_int(RxParser* p) {
     return v;
 }
 
-// A group name is an identifier: no leading digit, and none of the punctuation
-// that would make the pattern ambiguous.
+// Whether a code point is in a sorted table of inclusive ranges.
+private bool bin_has(u32* table, i32 n, u32 cp) {
+    i32 lo = 0;
+    i32 hi = n - 1;
+    while lo <= hi {
+        i32 mid = (lo + hi) / 2;
+        u32 a = *(table + mid * 2);
+        u32 b = *(table + mid * 2 + 1);
+        if cp < a { hi = mid - 1; }
+        else if cp > b { lo = mid + 1; }
+        else { return true; }
+    }
+    return false;
+}
+
+// One character of a group name: an identifier start, or after the first
+// an identifier continuation.
+private bool group_name_char(u32 cp, bool first) {
+    if cp == '$' || cp == '_' { return true; }
+    if !first && (cp == 0x200C || cp == 0x200D) { return true; }
+    if bin_has(&UNI_BIN_ID_START[0], UNI_BIN_ID_START_N, cp) { return true; }
+    return !first && bin_has(&UNI_BIN_ID_CONTINUE[0], UNI_BIN_ID_CONTINUE_N, cp);
+}
+
+// A group name is an identifier. A name spelled with an escape is left to
+// the group itself.
 private bool valid_group_name(str nm) {
     if nm.len == 0 { return false; }
-    u8 c0 = *(nm.data);
-    if c0 >= '0' && c0 <= '9' { return false; }
-    for i32 i = 0; i < nm.len; i++ {
+    i32 i = 0;
+    bool first = true;
+    while i < nm.len {
         u8 c = *(nm.data + i);
-        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-            || c == '_' || c == '$' || c >= 0x80 { continue; }
-        return false;
+        if c == '\\' { return true; }
+        u32 cp = cast(u32, c);
+        i32 n = 1;
+        if c >= 0xF0 { n = 4; cp = cast(u32, c & 0x07); }
+        else if c >= 0xE0 { n = 3; cp = cast(u32, c & 0x0F); }
+        else if c >= 0xC0 { n = 2; cp = cast(u32, c & 0x1F); }
+        if i + n > nm.len { return false; }
+        for i32 k = 1; k < n; k++ {
+            cp = (cp << 6) | cast(u32, *(nm.data + i + k) & 0x3F);
+        }
+        if !group_name_char(cp, first) { return false; }
+        first = false;
+        i += n;
     }
     return true;
 }
@@ -847,7 +881,7 @@ private bool valid_group_name(str nm) {
 private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
     u8 c = px_cur(p);
     // A quantifier here has nothing in front of it to repeat.
-    if c == '*' || c == '+' {
+    if c == '*' || c == '+' || c == '?' {
         p.failed = true;
         p.pos++;
         return rx_node(RN_CHAR);
@@ -858,7 +892,9 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
         p.pos++;
         return rx_node(RN_CHAR);
     }
-    if p.unicode && c == '{' {
+    if c == '{' {
+        // a brace that forms a quantifier has nothing to repeat either; a
+        // lone brace is a literal outside u mode
         i32 save = p.pos;
         p.pos++;
         i32 lo = parse_int(p);
@@ -867,7 +903,8 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             p.pos++;
             if px_cur(p) != '}' { ok = parse_int(p) >= 0; }
         }
-        if !ok || px_cur(p) != '}' { p.failed = true; }
+        ok = ok && px_cur(p) == '}';
+        if ok || p.unicode { p.failed = true; }
         p.pos = save;
     }
     if c == '(' {
@@ -953,15 +990,20 @@ private RxNode* parse_atom(RxParser* p, Vec<RxNodePtr>* stack) {
             n.a = g;
             return n;
         }
+        // Under /u, and in any pattern that declares a named group, \k is a
+        // backreference: it needs a complete <name>, and an unknown name is a
+        // SyntaxError. Only a non-unicode pattern with no named group at all
+        // keeps the Annex B reading, where \k is an identity escape and the
+        // rest is literal.
+        if e == 'k' && (p.unicode || p.declared.len > 0) && px_at(p, p.pos + 1) != '<' {
+            p.failed = true;
+        }
         if e == 'k' && px_at(p, p.pos + 1) == '<' {
             i32 nstart = p.pos + 2;
             i32 nend = nstart;
             while nend < p.src.len && *(p.src.data + nend) != cast(u8, '>') { nend++; }
-            // Under /u, and in any pattern that declares a named group, this is
-            // a backreference and an unknown name is a SyntaxError. Only a
-            // non-unicode pattern with no named group at all keeps the Annex B
-            // reading, where `\k` is an identity escape and the rest is literal.
             bool is_ref = p.unicode || p.declared.len > 0;
+            if is_ref && nend >= p.src.len { p.failed = true; }
             if is_ref && nend < p.src.len {
                 p.pos = nend + 1;
                 RxNode* n = rx_node(RN_BACKREF);
@@ -1025,8 +1067,10 @@ private RxNode* parse_quant(RxParser* p, Vec<RxNodePtr>* stack) {
         kind = RN_REPEAT;
     }
     if kind < 0 { return atom; }
-    // a lookbehind has nothing to repeat: node refuses (?<=a)* outright
+    // a lookbehind has nothing to repeat: node refuses (?<=a)* outright;
+    // in u mode the same goes for a lookahead
     if atom != null && atom.kind == RN_LOOKBEHIND { p.failed = true; }
+    if atom != null && atom.kind == RN_LOOK && p.unicode { p.failed = true; }
     bool greedy = true;
     if px_cur(p) == '?' { greedy = false; p.pos++; }
     RxNode* q = rx_node(kind);
