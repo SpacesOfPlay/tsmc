@@ -156,11 +156,13 @@ private bool uni_is_id_start(u32 cp) {
     // Other_ID_Start
     if cp == 0x1885 || cp == 0x1886 || cp == 0x2118
         || cp == 0x212E || cp == 0x309B || cp == 0x309C { return true; }
+    if cp == 0x2E2F { return false; }   // VERTICAL TILDE: Pattern_Syntax
     return (uni_gc_bit(cp) & UNI_ID_START_CATS) != 0;
 }
 
 private bool uni_is_id_cont(u32 cp) {
     if cp == 0x200C || cp == 0x200D { return true; }   // ZWNJ, ZWJ
+    if cp == 0x2E2F { return false; }                  // VERTICAL TILDE
     // Other_ID_Continue
     if cp == 0xB7 || cp == 0x387 || cp == 0x19DA
         || (cp >= 0x1369 && cp <= 0x1371) { return true; }

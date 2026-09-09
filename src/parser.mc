@@ -22,6 +22,8 @@ struct Parser {
     i32 strict;        // > 0 inside strict-mode code (a "use strict" prologue)
     i32 single;        // the next statement is the body of an if (1), a loop (2)
                        // or a label (3), where a declaration may not appear
+    Vec<str> labels;   // the labels enclosing the statement being parsed
+    i32 label_floor;   // where the current function's labels begin
     DiagList* diags;
     Bump* arena;
     Vec<NodePtr> scratch;
@@ -43,11 +45,14 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.strict = 0;
     p.single = 0;
     vec_init<NodePtr>(&p.scratch, 64);
+    vec_init<str>(&p.labels, 4);
+    p.label_floor = 0;
     p.cur = lexer_next(&p.lx);
 }
 
 void parser_destroy(Parser* p) {
     vec_free(&p.scratch);
+    vec_free(&p.labels);
     lexer_destroy(&p.lx);
 }
 
@@ -664,7 +669,10 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     if at(p, TOK_LBRACE) {
         bool strict_body = peek(p).kind == TOK_STRING && str_equal(peek(p).text, "use strict");
         if strict_body { p.strict++; }
+        i32 saved_floor = p.label_floor;
+        p.label_floor = p.labels.len;
         fun.a = parse_block(p);
+        p.label_floor = saved_floor;
         if strict_body { p.strict--; }
     } else {
         fun.flags |= NF_SIGNATURE;
@@ -1490,6 +1498,10 @@ private Node* parse_for(Parser* p) {
         p.no_in--;
         if at(p, TOK_KW_OF) || at(p, TOK_KW_IN) {
             bool is_of = at(p, TOK_KW_OF);
+            if is_of && (flags & NF_AWAIT) == 0 && e.kind == N_IDENT
+                && (e.flags & NF_PARENED) == 0 && str_equal(e.name, "async") {
+                perror(p, "The left-hand side of a for-of loop may not be 'async'");
+            }
             advance(p);
             Node* n = nnew(p, is_of ? N_FOR_OF : N_FOR_IN);
             n.span.start = start;
@@ -1579,7 +1591,10 @@ private Node* parse_class_member(Parser* p) {
     if at(p, TOK_KW_STATIC) && peek(p).kind == TOK_LBRACE {
         Node* sb = nnew(p, N_STATIC_BLOCK);
         advance(p);
+        i32 saved_floor = p.label_floor;
+        p.label_floor = p.labels.len;
         sb.a = parse_block(p);
+        p.label_floor = saved_floor;
         return nfin(p, sb);
     }
     Node* m = nnew(p, N_CLASS_MEMBER);
@@ -2198,9 +2213,17 @@ Node* parse_statement(Parser* p) {
         refuse_escaped_keyword(p, p.cur);
         Node* n = nnew(p, N_LABELED);
         n.name = p.cur.text;
+        for i32 i = p.label_floor; i < p.labels.len; i++ {
+            if str_equal(vec_get(&p.labels, i), n.name) {
+                perror(p, "Label has already been declared");
+                break;
+            }
+        }
         advance(p);
         advance(p);
+        vec_push(&p.labels, n.name);
         n.a = parse_body(p, 3);
+        ignore vec_pop(&p.labels);
         return nfin(p, n);
     }
     Node* n = nnew(p, N_EXPR_STMT);

@@ -1,0 +1,2 @@
+// expect: async
+var async; for (async of [1]) ;

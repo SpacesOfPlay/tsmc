@@ -80,6 +80,8 @@ struct FScope {
     bool is_async;
     bool needs_arguments;   // references `arguments`; build it at call time
     bool super_call_ok;     // a derived class constructor: super() is allowed
+    i32 loop_floor;         // loops below this index belong to an enclosing
+                            // scope a break or continue may not reach
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
@@ -174,6 +176,8 @@ struct Compiler {
     bool outer_is_body;         // the next block is a function body
     bool next_is_derived_ctor;  // the next function compiled is a derived
                                 // class constructor
+    bool in_static_block;       // directly inside a class static block
+    bool in_params;             // compiling parameter defaults
     StrMap<ModImport> mod_imports;   // valid while in_module
     str ns_name;                     // the module namespace binding
     StrMap<i32> export_heads;        // local name -> first ExportName
@@ -199,6 +203,8 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     vec_init<str>(&co.outer_names, 4);
     co.outer_is_body = false;
     co.next_is_derived_ctor = false;
+    co.in_static_block = false;
+    co.in_params = false;
     strmap_init<ModImport>(&co.mod_imports);
     co.ns_name = "";
     strmap_init<i32>(&co.export_heads);
@@ -278,6 +284,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.is_async = false;
     fs.needs_arguments = false;
     fs.super_call_ok = false;
+    fs.loop_floor = 0;
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -769,6 +776,9 @@ private void emit_load_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
     if co.strict && strict_reserved(n.name) {
         cerror(co, n, "Unexpected strict mode reserved word");
+    }
+    if co.in_static_block && str_equal(n.name, "await") {
+        cerror(co, n, "Unexpected reserved word");
     }
     // `arguments` in an ordinary function is that function's OWN arguments
     // object, never a capture of an enclosing function's — so resolve it
@@ -2140,8 +2150,13 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_YIELD {
-        if !co.cur.is_gen {
+        if !co.cur.is_gen || co.in_static_block {
             cerror(co, n, "yield outside a generator");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        if co.in_params {
+            cerror(co, n, "Yield expression not allowed in formal parameter");
             ch_op(ch, OP_UNDEF);
             return;
         }
@@ -2303,8 +2318,13 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_AWAIT {
-        if !co.cur.is_async {
+        if !co.cur.is_async || co.in_static_block {
             cerror(co, n, "await outside an async function");
+            ch_op(ch, OP_UNDEF);
+            return;
+        }
+        if co.in_params {
+            cerror(co, n, "Illegal await-expression in formal parameters of async function");
             ch_op(ch, OP_UNDEF);
             return;
         }
@@ -2399,6 +2419,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     fs.is_async = (f.flags & NF_ASYNC) != 0;
     fs.super_call_ok = co.next_is_derived_ctor;
     co.next_is_derived_ctor = false;
+    bool saved_static_block = co.in_static_block;
+    bool saved_in_params = co.in_params;
+    co.in_static_block = false;
+    co.in_params = false;
     co.cur = &fs;
     scan_inner(&fs.inner, f, true);
     for i32 i = 0; i < n_fields; i++ {
@@ -2474,7 +2498,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             }
         }
     } else {
+        // a default may not yield or await: those belong to the body
+        co.in_params = true;
         bind_params_in_order(co, &fs, f, n_params);
+        co.in_params = false;
     }
     // a named function EXPRESSION binds its own name inside its body (for
     // recursion), referring to the function itself; the name does not leak to
@@ -2574,6 +2601,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         arity++;
     }
     t.arity = arity;
+    co.in_static_block = saved_static_block;
+    co.in_params = saved_in_params;
     co.cur = fs.parent;
     fscope_free(&fs);
     return t;
@@ -2961,8 +2990,14 @@ private void compile_class_expr(Compiler* co, Node* c) {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK {
             bool saved_st = co.static_this;
+            bool saved_sb = co.in_static_block;
+            i32 saved_floor = fs.loop_floor;
             co.static_this = true;
+            co.in_static_block = true;
+            fs.loop_floor = fs.loops.len;   // no break or continue leaves the block
             compile_stmt(co, m.a);
+            fs.loop_floor = saved_floor;
+            co.in_static_block = saved_sb;
             co.static_this = saved_st;
         }
     }
@@ -3587,7 +3622,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_BREAK || k == N_CONTINUE {
         i32 li = -1;
         if n.name.len > 0 {
-            for i32 i = fs.loops.len - 1; i >= 0; i-- {
+            for i32 i = fs.loops.len - 1; i >= fs.loop_floor; i-- {
                 LoopCtx c = vec_get(&fs.loops, i);
                 if c.label.len > 0 && str_equal(c.label, n.name) {
                     li = i;
@@ -3606,18 +3641,18 @@ private void compile_stmt(Compiler* co, Node* n) {
                 }
             }
         } else {
-            if fs.loops.len == 0 {
+            if fs.loops.len <= fs.loop_floor {
                 cerror(co, n, "break/continue outside a loop");
                 return;
             }
             li = fs.loops.len - 1;
             if k == N_CONTINUE {
-                while li >= 0 {
+                while li >= fs.loop_floor {
                     LoopCtx c = vec_get(&fs.loops, li);
                     if c.is_loop { break; }
                     li--;
                 }
-                if li < 0 {
+                if li < fs.loop_floor {
                     cerror(co, n, "continue outside a loop");
                     return;
                 }
@@ -3637,7 +3672,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         return;
     }
     if k == N_RETURN {
-        if fs.parent == null {
+        if fs.parent == null || co.in_static_block {
             cerror(co, n, "return outside a function");
             return;
         }

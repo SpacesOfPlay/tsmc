@@ -81,3 +81,15 @@ console.log(ar1(1), ar2(1), [...gen()]);
 
 // numeric separators, one __proto__, get and set as plain keys
 console.log(1_000, 0x1_0, 1_0.0_1, ({ __proto__: null, ['__proto__']: 1 }).__proto__, ({ get: 1, set: 2, async: 3 }).async);
+
+// labels may repeat across functions and static blocks, and break may
+// leave a loop inside a static block; a for-of may iterate a parenthesised
+// async, and a for-await one plainly
+a: { function labelled() { a: { return 'inner a'; } } console.log(labelled()); }
+class S { static { a: for (const x of [1, 2]) { if (x === 2) break a; S.seen = x; } } }
+console.log(S.seen);
+var async = [7];
+for ((async) of [[8]]) ;
+console.log(async);
+async function fa() { var async = 0; for await (async of [9]) ; return async; }
+fa().then((v) => console.log('for await async:', v));
