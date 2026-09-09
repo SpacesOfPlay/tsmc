@@ -7,4 +7,4 @@
 //
 // Between releases it carries a -dev suffix, which no tag can match.
 
-str TSMC_VERSION = "0.1.0-dev";
+str TSMC_VERSION = "0.1.0";
