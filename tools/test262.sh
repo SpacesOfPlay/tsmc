@@ -7,6 +7,12 @@
 # reproduce the exact same tests. Set T262_COMMIT to pin a different one.
 #
 #   tools/test262.sh [subpath] [--limit N] [--jobs N] [--verbose]
+#   tools/test262.sh --list FILE [--jobs N] [--verbose]
+#
+# --list runs exactly the test files named in FILE, one absolute path per
+# line, instead of walking a subpath. Useful to re-check a saved failure
+# list, or to run the suite in resumable chunks on a machine that cannot
+# hold a whole run.
 #
 # subpath defaults to test/language (core semantics — closest to what the
 # interpreter implements). Examples:
@@ -40,13 +46,16 @@ SUBPATH="test/language"
 LIMIT=0
 JOBS=0
 VERBOSE=0
+LIST=""
 pending=""
 for arg in "$@"; do
     case "$arg" in
         --limit=*) LIMIT="${arg#--limit=}" ;;
         --jobs=*)  JOBS="${arg#--jobs=}" ;;
+        --list=*)  LIST="${arg#--list=}" ;;
         --limit)   pending=limit ;;          # next positional is the number
         --jobs)    pending=jobs ;;
+        --list)    pending=list ;;           # next positional is the file
         --verbose) VERBOSE=1 ;;
         [0-9]*)
             case "$pending" in
@@ -55,7 +64,12 @@ for arg in "$@"; do
                 *)     SUBPATH="$arg" ;;
             esac
             pending="" ;;
-        *)         SUBPATH="$arg" ;;
+        *)
+            case "$pending" in
+                list) LIST="$arg" ;;
+                *)    SUBPATH="$arg" ;;
+            esac
+            pending="" ;;
     esac
 done
 
@@ -135,7 +149,10 @@ if [ ! -f "$VENDOR/harness/sta.js" ]; then
 fi
 
 ROOT="$VENDOR/$SUBPATH"
-if [ ! -d "$ROOT" ] && [ ! -f "$ROOT" ]; then
+if [ -n "$LIST" ]; then
+    ROOT="$VENDOR"
+    SUBPATH="$(basename "$LIST")"
+elif [ ! -d "$ROOT" ] && [ ! -f "$ROOT" ]; then
     fail "no such path in test262: $SUBPATH"
     exit 1
 fi
@@ -162,7 +179,7 @@ find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
 TMP=""
 TMPDIR_SEEN=""
 SHARD=0
-WORK="$PROJECT_DIR/build/t262-work"
+WORK="$PROJECT_DIR/build/t262-work.$$"
 FAILS="$WORK/fails.0"
 FAILS_OUT="$PROJECT_DIR/build/test262-fails.txt"
 trap 'rm -f "$TMP"' EXIT
@@ -305,7 +322,12 @@ publish() {
 }
 
 rm -rf "$WORK"; mkdir -p "$WORK"
-find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*.js' | sort > "$WORK/all.txt"
+if [ -n "$LIST" ]; then
+    [ -f "$LIST" ] || { fail "no such list file: $LIST"; exit 1; }
+    sort "$LIST" > "$WORK/all.txt"
+else
+    find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*.js' | sort > "$WORK/all.txt"
+fi
 total="$(wc -l < "$WORK/all.txt")"
 if [ "$total" -eq 0 ]; then
     fail "no tests under $SUBPATH"
@@ -336,12 +358,17 @@ done
 wait
 
 pass=0; failc=0; skip=0
-for c in "$WORK"/counts.*; do
-    read -r p f s < "$c"
-    pass=$((pass + p)); failc=$((failc + f)); skip=$((skip + s))
+i=0
+while [ "$i" -lt "$JOBS" ]; do
+    if [ -f "$WORK/counts.$i" ]; then
+        read -r p f s < "$WORK/counts.$i"
+        pass=$((pass + p)); failc=$((failc + f)); skip=$((skip + s))
+    fi
+    i=$((i + 1))
 done
-cat "$WORK"/fails.* | sort > "$FAILS_OUT"
+cat "$WORK"/fails.* 2>/dev/null | sort > "$FAILS_OUT"
 find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
+rm -rf "$WORK"
 
 ran=$((pass + failc))
 printf '\n'
@@ -352,3 +379,9 @@ printf '  passed  %d' "$pass"
 printf '\n'
 printf '  failed  %d   (see build/test262-fails.txt)\n' "$failc"
 printf '  skipped %d   (unsupported features/modes)\n' "$skip"
+missing=$((total - ran - skip))
+if [ "$missing" -gt 0 ]; then
+    fail "$missing of $total tests produced no result — the run is INCOMPLETE"
+    fail "a shard died, usually a fork failure under memory pressure; rerun"
+    exit 1
+fi

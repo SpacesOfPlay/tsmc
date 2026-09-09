@@ -218,6 +218,7 @@ same tests:
 build/build.exe t262                            # default: test/language
 build/build.exe t262 test/built-ins/Array
 build/build.exe t262 test/language --limit 500   # sample the first N
+tools/test262.sh --list fails.txt                # exactly these files
 ```
 
 On Windows the runner is a portable bash script (`tools/test262.sh`)
@@ -232,31 +233,40 @@ reading before the number below. Failing test paths are written to
 default half the cores). Pin a different revision with the
 `T262_COMMIT` environment variable.
 
-The default `test/language` run, at the pinned revision:
-
-| | 2026-08-28 | 2026-09-08 |
-|---|---|---|
-| ran | 21,037 | 21,037 |
-| passed | 16,888 (80%) | 18,817 (89%) |
-| failed | 4,149 | 2,220 |
-| skipped as unsupported | 2,677 | 2,677 |
-
-Where the 2,220 remaining failures are, each counted once:
+The default `test/language` run, at the pinned revision, measured
+2026-09-10:
 
 | | tests |
 |---|---|
-| early errors: programs the parser should refuse | 831 |
-| class elements and definitions | 305 |
-| generators and async iteration | 148 |
+| ran | 21,037 |
+| passed | 19,457 (92%) |
+| failed | 1,580 |
+| skipped as unsupported | 2,677 |
+
+Where the failures are, each counted once. Early errors are counted by
+the suite's own `phase: parse` frontmatter, the rest by area:
+
+| | tests |
+|---|---|
+| class elements and definitions | 288 |
+| early errors: programs the parser should refuse | 215 |
 | the `with` statement, not implemented | 134 |
-| destructuring, remaining scenarios | 80 |
+| generators and async iteration | 114 |
+| destructuring, remaining scenarios | 105 |
 | dynamic import and module instantiation | 77 |
 | `eval` and `new Function`, refused by design | 52 |
-| parameter and `arguments` rules | 49 |
-| everything else | 544 |
+| parameter and `arguments` rules | 47 |
+| everything else | 548 |
 
-This is a snapshot and changes as the interpreter does; the failing
-paths of the last run are the list to diff a new run against.
+Most of the early-error group is now one rule: `await` and `yield` are
+not reserved inside async functions and generators, so both the plain and
+the escaped spelling are accepted there as ordinary identifiers. A
+handful of identifier tests fail on the other side of the same coin, from
+Unicode property tables a version behind the suite.
+
+This is a snapshot and changes as the interpreter does; the failing paths
+of the last run are the list to diff a new run against, which is what
+`--list` is for.
 
 ## Layout
 

@@ -1,8 +1,8 @@
 # M46 — early errors
 
-Status: landed on main in five commits (2026-09-09). test262 has not been
-re-measured since; the 2026-09-08 snapshot in the README predates this
-milestone.
+Status: landed on main (2026-09-09), measured 2026-09-10. The suite's
+language tests went from 18,817 passing to 19,457 of 21,037, and the
+early-error group of the remaining failures from 831 to 215.
 
 ## Why
 
@@ -99,6 +99,35 @@ quantified under `u`; `\k` in a pattern with named groups, or under `u`,
 carries a complete name; a group name is an identifier by the Unicode
 tables.
 
+## What the measurement found
+
+Three of the new rules were refusing valid programs, 59 tests' worth, all
+fixed the next day:
+
+- A script's top level binds function declarations the way a function body
+  does, not the way a block does. `function f() {} var f;` is legal there,
+  and the block rule was firing on it. This was most of the 59, and it
+  would have refused ordinary code.
+- `let` alone at the end of a line, where a declaration cannot appear, is
+  an identifier reference: semicolon insertion ends the statement. The
+  error was wrong, and worse, the parse still swallowed the next line into
+  a declaration, so a loop body that never runs assigned anyway.
+- Only the literal spelling of `async` is barred from a for-of head. The
+  check compared decoded names, so it caught `\u0061sync` too.
+
+The lesson is that a negative test suite cannot tell you when a rule is
+too eager. What caught these was diffing the new failure list against the
+old one and reading every test that had started failing, positive ones
+first.
+
+A second group, about 180 tests, regressed for a different reason: they
+were passing by accident. The lexer used to decode an escaped keyword into
+the keyword itself, so `var \u0061wait` inside an async function failed as
+a keyword misuse. Now that the lexer is right, those programs are accepted
+because tsmc does not reserve `await` and `yield` in async functions and
+generators, which it never did for the plain spellings either. Closing
+that is the next piece of work, and it is worth about 180 tests.
+
 ## Not covered
 
 - Annex B block-level function hoisting: `{ function f() {} }` does not
@@ -108,8 +137,12 @@ tables.
   the wrong `this` at run time; the early error side is right.
 - A `var` that repeats a destructured catch parameter, and `for (var e
   of ...)` inside `catch (e)`, are still accepted.
-- Escaped `yield` and `await` in the contexts where the plain word is a
-  keyword are accepted as names.
+- `await` and `yield` are not reserved inside async functions and
+  generators, in either spelling. The largest remaining early-error group.
+- The Unicode property tables are a version behind the suite, so a few
+  identifier tests fail in both the plain and the escaped spelling. Two of
+  them only need U+30FB and U+FF65 added to Other_ID_Continue, which
+  Unicode 15.1 did; the rest need the tables regenerated.
 - Escapes inside a regular expression group name are not validated.
 - Object-literal methods have no `super` binding, so `super.x` there is
   refused instead of working.
