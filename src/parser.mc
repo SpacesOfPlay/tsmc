@@ -176,6 +176,17 @@ private bool is_reserved_word(i32 k) {
         && k != TOK_KW_YIELD && k != TOK_KW_AWAIT;
 }
 
+// Whether an identifier was written out, rather than spelled with a
+// Unicode escape: its source span is the name itself. `for (async of x)`
+// is refused, `for (\u0061sync of x)` is not.
+private bool ident_written_plainly(Parser* p, Node* n) {
+    if n.span.end - n.span.start != n.name.len { return false; }
+    for i32 i = 0; i < n.name.len; i++ {
+        if *(p.lx.src.data + n.span.start + i) != *(n.name.data + i) { return false; }
+    }
+    return true;
+}
+
 // An escape may not spell a reserved word where an identifier is needed.
 private void refuse_escaped_keyword(Parser* p, Token t) {
     if t.escaped && reserved_word_text(t.text) {
@@ -1499,7 +1510,8 @@ private Node* parse_for(Parser* p) {
         if at(p, TOK_KW_OF) || at(p, TOK_KW_IN) {
             bool is_of = at(p, TOK_KW_OF);
             if is_of && (flags & NF_AWAIT) == 0 && e.kind == N_IDENT
-                && (e.flags & NF_PARENED) == 0 && str_equal(e.name, "async") {
+                && (e.flags & NF_PARENED) == 0 && str_equal(e.name, "async")
+                && ident_written_plainly(p, e) {
                 perror(p, "The left-hand side of a for-of loop may not be 'async'");
             }
             advance(p);
@@ -2082,7 +2094,21 @@ Node* parse_statement(Parser* p) {
         advance(p);
         return nfin(p, n);
     }
-    if k == TOK_KW_LET && single != 0 && starts_binding(peek(p)) { refuse_lexical_in_single(p, single); }
+    if k == TOK_KW_LET && single != 0 {
+        if peek(p).newline_before {
+            // `let` alone on a line, in a position where a declaration
+            // cannot appear: it is an identifier reference, and the
+            // semicolon ASI inserts ends the statement here
+            Node* n = nnew(p, N_EXPR_STMT);
+            Node* id = nnew(p, N_IDENT);
+            id.name = p.cur.text;
+            advance(p);
+            n.a = nfin(p, id);
+            expect_semi(p);
+            return nfin(p, n);
+        }
+        if starts_binding(peek(p)) { refuse_lexical_in_single(p, single); }
+    }
     if k == TOK_KW_VAR || k == TOK_KW_LET { return parse_var_stmt(p); }
     if k == TOK_KW_CONST {
         refuse_lexical_in_single(p, single);

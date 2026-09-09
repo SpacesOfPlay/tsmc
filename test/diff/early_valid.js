@@ -98,3 +98,20 @@ fa().then((v) => console.log('for await async:', v));
 // something to repeat, a lone brace and \k without named groups outside u
 // mode, a quantified lookahead outside u mode, and identifier group names
 console.log(/a{2}/.test('aa'), /{/.test('{'), /\k/.test('k'), /(?=a)?b/.test('b'), /(?<a_1>.)\k<a_1>/.test('xx'), /(?<$>.)/.exec('q').groups.$, /(?<ünïcode>.)/.exec('z').groups.ünïcode);
+
+// a script's top level is not a block: a function declaration there is
+// var-like, so it may repeat a var and repeat itself
+function topLevel() { return 'first'; }
+var topLevel;
+function topLevel() { return 'second'; }
+console.log('function and var at the top level:', topLevel());
+
+// `let` at the end of a line is an identifier reference, by ASI, so the
+// loop body is an expression statement rather than a declaration
+for (var asi of []) let
+asi = 1;
+console.log('let as a loop body, by ASI:', asi);
+
+// only the literal spelling of async is refused as a for-of head
+for (\u0061sync of ['escaped async as a for-of head']) ;
+console.log(async);

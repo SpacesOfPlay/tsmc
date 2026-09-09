@@ -3895,6 +3895,9 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     scan_inner(&fs.inner, prog, true);
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
+    // a script's top level binds function declarations the way a function
+    // body does, so one may repeat a `var` or another function
+    co.outer_is_body = true;
     compile_block_stmts(co, &prog.kids);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
@@ -3931,6 +3934,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     vec_free(&pslots);
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
+    co.outer_is_body = true;   // as in a script, not a block
     compile_block_stmts(co, &prog.kids);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
