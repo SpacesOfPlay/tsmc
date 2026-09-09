@@ -1962,6 +1962,15 @@ private Node* parse_body(Parser* p, i32 kind) {
     p.single = kind;
     Node* s = parse_statement(p);
     p.single = 0;
+    // labels do not turn a function declaration into a statement
+    if kind != 3 && s != null && s.kind == N_LABELED {
+        Node* inner = s.a;
+        while inner != null && inner.kind == N_LABELED { inner = inner.a; }
+        if inner != null && inner.kind == N_FUNCTION {
+            if p.strict > 0 { perror(p, "In strict mode code, functions can only be declared at top level or inside a block."); }
+            else { perror(p, "In non-strict mode code, functions can only be declared at top level, inside a block, or as the body of an if statement."); }
+        }
+    }
     return s;
 }
 

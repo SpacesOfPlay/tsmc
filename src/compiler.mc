@@ -79,6 +79,7 @@ struct FScope {
     bool is_gen;
     bool is_async;
     bool needs_arguments;   // references `arguments`; build it at call time
+    bool super_call_ok;     // a derived class constructor: super() is allowed
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
@@ -167,6 +168,12 @@ struct Compiler {
     bool in_module;
     bool strict;        // strict-mode code: modules, classes, after "use strict"
     bool static_this;   // inside a static block / field: `this` is the class ctor
+    Vec<str> outer_names;       // names the next block's lexical declarations may
+                                // not repeat: the parameters of its function, or
+                                // the catch parameter
+    bool outer_is_body;         // the next block is a function body
+    bool next_is_derived_ctor;  // the next function compiled is a derived
+                                // class constructor
     StrMap<ModImport> mod_imports;   // valid while in_module
     str ns_name;                     // the module namespace binding
     StrMap<i32> export_heads;        // local name -> first ExportName
@@ -189,6 +196,9 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.in_module = false;
     co.strict = false;
     co.static_this = false;
+    vec_init<str>(&co.outer_names, 4);
+    co.outer_is_body = false;
+    co.next_is_derived_ctor = false;
     strmap_init<ModImport>(&co.mod_imports);
     co.ns_name = "";
     strmap_init<i32>(&co.export_heads);
@@ -267,6 +277,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.is_gen = false;
     fs.is_async = false;
     fs.needs_arguments = false;
+    fs.super_call_ok = false;
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -559,12 +570,12 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
     }
     // An instance field initializer is hoisted into the constructor, so its
     // identifiers are captured by that (possibly synthesized) function just
-    // like a method body. Its computed key is likewise compiled in the
-    // constructor. Treat both as inner-function code so the enclosing scope
-    // cellifies anything they close over.
+    // like a method body. Treat it as inner-function code so the enclosing
+    // scope cellifies anything it closes over. Its computed key is evaluated
+    // where the class is, so that is scanned as ordinary code.
     if n.kind == N_CLASS_MEMBER && member_is_field(n) {
         scan_all_names(set, n.b);
-        if (n.flags & NF_COMPUTED) != 0 { scan_all_names(set, n.a); }
+        if (n.flags & NF_COMPUTED) != 0 { scan_inner(set, n.a, false); }
         return;
     }
     scan_inner(set, n.a, false);
@@ -596,10 +607,30 @@ private void redeclared(Compiler* co, Node* at, str name) {
     free(m);
 }
 
+// The words strict-mode code keeps for itself.
+private bool strict_reserved(str name) {
+    return str_equal(name, "implements") || str_equal(name, "interface")
+        || str_equal(name, "package") || str_equal(name, "private")
+        || str_equal(name, "protected") || str_equal(name, "public")
+        || str_equal(name, "static") || str_equal(name, "let") || str_equal(name, "yield");
+}
+
+// In strict-mode code nothing may be named eval or arguments, and the
+// reserved words may not name anything.
+private void check_strict_binding(Compiler* co, Node* at, str name) {
+    if !co.strict { return; }
+    if str_equal(name, "eval") || str_equal(name, "arguments") {
+        cerror(co, at, "Unexpected eval or arguments in strict mode");
+    } else if strict_reserved(name) {
+        cerror(co, at, "Unexpected strict mode reserved word");
+    }
+}
+
 private void declare_lexical(Compiler* co, Node* at, str name, bool is_const) {
     FScope* fs = co.cur;
     // a lexical name may not share its scope with any other declaration
     if at != null && bound_here(fs, name, false) { redeclared(co, at, name); }
+    if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, is_const, true);
     CBind b = vec_get(&fs.binds, bi);
     if b.is_cell {
@@ -613,6 +644,7 @@ private void declare_plain(Compiler* co, Node* at, str name) {
     FScope* fs = co.cur;
     // a function declaration may repeat, but not over a lexical name
     if at != null && bound_here(fs, name, true) { redeclared(co, at, name); }
+    if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, false, false);
     CBind b = vec_get(&fs.binds, bi);
     if b.is_cell {
@@ -662,6 +694,7 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
 
 private void hoist_declare_var(Compiler* co, Node* id) {
     FScope* fs = co.cur;
+    check_strict_binding(co, id, id.name);
     i32 li = find_local(fs, id.name);
     if li >= 0 { return; }   // var redeclaration shares the binding
     i32 bi = declare(co, id.name, false, false);
@@ -734,6 +767,9 @@ private void hoist_vars(Compiler* co, Node* n) {
 
 private void emit_load_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
+    if co.strict && strict_reserved(n.name) {
+        cerror(co, n, "Unexpected strict mode reserved word");
+    }
     // `arguments` in an ordinary function is that function's OWN arguments
     // object, never a capture of an enclosing function's — so resolve it
     // before the local/upvalue walk, unless a real local/param shadows it.
@@ -805,6 +841,9 @@ private void emit_export_writes(Compiler* co, str name, Node* at) {
 // Emits a store that keeps the value on the stack.
 private void emit_store_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
+    if co.strict && (str_equal(n.name, "eval") || str_equal(n.name, "arguments")) {
+        cerror(co, n, "Unexpected eval or arguments in strict mode");
+    }
     i32 li = find_local(fs, n.name);
     if li >= 0 {
         CBind b = vec_get(&fs.binds, li);
@@ -845,6 +884,14 @@ private bool super_available(Compiler* co) {
     str nm = "%super";
     if find_local(co.cur, nm) >= 0 { return true; }
     return resolve_upval(co.cur, nm) >= 0;
+}
+
+// super() belongs to the constructor of a derived class, and to the arrows
+// inside it.
+private bool super_call_ok(Compiler* co) {
+    FScope* fs = co.cur;
+    while fs != null && fs.is_arrow { fs = fs.parent; }
+    return fs != null && fs.super_call_ok;
 }
 
 // --- destructuring ---------------------------------------------------------------
@@ -1560,8 +1607,8 @@ private void compile_call(Compiler* co, Node* n) {
         return;
     }
     if callee.kind == N_SUPER {
-        if !super_available(co) {
-            cerror(co, n, "super outside a derived class constructor");
+        if !super_available(co) || !super_call_ok(co) {
+            cerror(co, n, "'super' keyword unexpected here");
             ch_op(ch, OP_UNDEF);
             return;
         }
@@ -2018,6 +2065,7 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_UPDATE { compile_update(co, n); return; }
     if k == N_MEMBER {
         if n.a.kind == N_SUPER {
+            if (n.flags & NF_PRIVATE) != 0 { cerror(co, n, "Unexpected private field"); }
             if !super_available(co) {
                 cerror(co, n, "super outside a class method");
                 ch_op(ch, OP_UNDEF);
@@ -2346,6 +2394,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
     fs.is_gen = (f.flags & NF_GENERATOR) != 0;
     fs.is_async = (f.flags & NF_ASYNC) != 0;
+    fs.super_call_ok = co.next_is_derived_ctor;
+    co.next_is_derived_ctor = false;
     co.cur = &fs;
     scan_inner(&fs.inner, f, true);
     for i32 i = 0; i < n_fields; i++ {
@@ -2371,7 +2421,11 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     if !simple_params && f.a != null && f.a.kind == N_BLOCK && has_use_strict(&f.a.kids) {
         cerror(co, f, "Illegal 'use strict' directive in function with non-simple parameter list");
     }
-    if !simple_params || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
+    // a strict function may not be named eval or arguments
+    if f.name.len > 0 && (f.flags & (NF_METHOD | NF_ARROW | NF_NAME_INFERRED)) == 0 {
+        check_strict_binding(co, f, f.name);
+    }
+    if !simple_params || co.strict || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
         Vec<str> pnames = vec_new<str>(4);
         for i32 i = 0; i < f.kids.len; i++ {
             collect_pattern_names((*(f.kids.items + i)).a, &pnames);
@@ -2401,6 +2455,7 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             }
         }
         if prm.a.kind == N_IDENT {
+            check_strict_binding(co, prm.a, prm.a.name);
             ignore declare(co, prm.a.name, false, !simple_params);
         } else {
             ignore declare(co, hidden_name(co, "%p", i), false, false);
@@ -2477,6 +2532,11 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         // a generator binds its parameters at the call and waits here for
         // the first next(); an error above belongs to the caller
         if fs.is_gen { ch_op(&fs.ch, OP_GEN_START); }
+        co.outer_names.len = 0;
+        for i32 i = 0; i < f.kids.len; i++ {
+            collect_pattern_names((*(f.kids.items + i)).a, &co.outer_names);
+        }
+        co.outer_is_body = true;
         compile_block_stmts_ex(co, &f.a.kids, fields, n_fields);
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_RETURN);
@@ -2585,10 +2645,55 @@ private bool member_named(Node* m, str name) {
     return (m.a.kind == N_IDENT || m.a.kind == N_STRING) && str_equal(m.a.name, name);
 }
 
+// Whether `n` refers to `arguments`, looking through arrows but not into
+// other functions, which have their own.
+private bool contains_arguments(Node* n) {
+    if n == null { return false; }
+    if n.kind == N_FUNCTION && (n.flags & NF_ARROW) == 0 { return false; }
+    if n.kind == N_IDENT { return str_equal(n.name, "arguments"); }
+    if (n.kind == N_PROP || n.kind == N_CLASS_MEMBER || n.kind == N_PATTERN_PROP)
+        && (n.flags & NF_COMPUTED) == 0 {
+        // a literal key is a name, not a reference, unless it is shorthand
+        // for the value
+        if n.kind == N_PROP && n.b == null { return contains_arguments(n.a); }
+        return contains_arguments(n.b);
+    }
+    if contains_arguments(n.a) || contains_arguments(n.b)
+        || contains_arguments(n.c) || contains_arguments(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if contains_arguments(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+// Whether `n` calls super(), looking through arrows but not into other
+// functions.
+private bool contains_super_call(Node* n) {
+    if n == null { return false; }
+    if n.kind == N_FUNCTION && (n.flags & NF_ARROW) == 0 { return false; }
+    if n.kind == N_CALL && n.a != null && n.a.kind == N_SUPER { return true; }
+    if contains_super_call(n.a) || contains_super_call(n.b)
+        || contains_super_call(n.c) || contains_super_call(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if contains_super_call(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+// A field initializer or static block is not a function of its own: it may
+// not mention `arguments`, and may not call super().
+private void class_init_rules(Compiler* co, Node* at, Node* body) {
+    if contains_arguments(body) {
+        cerror(co, at, "'arguments' is not allowed in class field initializer or static initialization block");
+    }
+    if contains_super_call(body) { cerror(co, at, "'super' keyword unexpected here"); }
+}
+
 private void class_member_rules(Compiler* co, Node* m) {
     bool is_static = (m.flags & NF_STATIC) != 0;
     bool is_method = m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0;
     bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
+    if !is_method && m.b != null { class_init_rules(co, m, m.b); }
     if m.a != null && m.a.kind == N_PRIVATE_IDENT && str_equal(m.a.name, "constructor") {
         cerror(co, m, "Classes may not have a private field named '#constructor'");
         return;
@@ -2687,7 +2792,11 @@ private void compile_class_expr(Compiler* co, Node* c) {
     bool has_static = false;
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
-        if m.kind == N_STATIC_BLOCK { has_static = true; continue; }
+        if m.kind == N_STATIC_BLOCK {
+            class_init_rules(co, m, m.a);
+            has_static = true;
+            continue;
+        }
         if m.kind != N_CLASS_MEMBER { continue; }
         class_member_rules(co, m);
         if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
@@ -2714,6 +2823,21 @@ private void compile_class_expr(Compiler* co, Node* c) {
     } else {
         ctor_fn = build_default_ctor(co, derived);
     }
+    // A computed field key is evaluated once, when the class is defined,
+    // in the scope around the class; the constructor reads the result from
+    // a hidden binding each time it defines the field.
+    for i32 i = 0; i < fields.len; i++ {
+        Node* m = vec_get(&fields, i);
+        if (m.flags & NF_COMPUTED) == 0 { continue; }
+        compile_expr(co, m.a);
+        i32 bi = declare(co, hidden_name(co, "%fk", i), true, false);
+        CBind* bp = fs.binds.data + bi;
+        bp.is_cell = true;
+        ch_op_u16(ch, OP_NEWCELL_UNDEF, bp.slot);
+        ch_op_u16(ch, OP_SETCELL, bp.slot);
+        ch_op(ch, OP_POP);
+    }
+    co.next_is_derived_ctor = derived;
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
     ct.is_class = true;
     // a class prints as the whole class, not as its constructor
@@ -2943,11 +3067,27 @@ private Node* function_decl_of(Node* s) {
     return null;
 }
 
-// Function declarations bind before any statement runs.
-private void hoist_function_decls(Compiler* co, NodeList* list) {
+// Function declarations bind before any statement runs. At the top of a
+// function body they are var-like and may repeat; in a block they are
+// lexical: no `var` of the same name in the block, and no second
+// declaration, except that sloppy code may repeat a plain function.
+// `seen` carries the declarations across the clauses of a switch.
+private void hoist_function_decls(Compiler* co, NodeList* list, Vec<str>* vnames, bool body, Vec<NodePtr>* seen) {
     for i32 i = 0; i < list.len; i++ {
         Node* f = function_decl_of(*(list.items + i));
-        if f != null { declare_plain(co, f, f.name); }
+        if f == null { continue; }
+        if !body {
+            if names_has(vnames, f.name) { redeclared(co, f, f.name); }
+            for i32 j = 0; j < seen.len; j++ {
+                Node* g = vec_get(seen, j);
+                if !str_equal(g.name, f.name) { continue; }
+                bool plain = ((f.flags | g.flags) & (NF_GENERATOR | NF_ASYNC)) == 0;
+                if co.strict || !plain { redeclared(co, f, f.name); }
+                break;
+            }
+            vec_push(seen, f);
+        }
+        declare_plain(co, f, f.name);
     }
 }
 
@@ -2959,14 +3099,22 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     i32 saved_binds = fs.binds.len;
     i32 saved_slots = fs.cur_slots;
 
-    // the `var` names this scope binds, which no lexical name here may repeat
+    // the `var` names this scope binds, which no lexical name here may
+    // repeat, along with the parameters of the function whose body this is
+    // or the catch parameter the block belongs to
+    bool body = co.outer_is_body;
     Vec<str> vnames = vec_new<str>(4);
+    for i32 i = 0; i < co.outer_names.len; i++ { vec_push(&vnames, vec_get(&co.outer_names, i)); }
+    co.outer_names.len = 0;
+    co.outer_is_body = false;
     for i32 i = 0; i < list.len; i++ {
         collect_var_names(*(list.items + i), &vnames);
     }
     hoist_lexical_decls(co, list, &vnames);
+    Vec<NodePtr> seen = vec_new<NodePtr>(4);
+    hoist_function_decls(co, list, &vnames, body, &seen);
+    vec_free(&seen);
     vec_free(&vnames);
-    hoist_function_decls(co, list);
     for i32 i = 0; i < list.len; i++ {
         Node* f = function_decl_of(*(list.items + i));
         if f != null {
@@ -3013,7 +3161,8 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
         Node* m = *(fields + i);
         ch_op(ch, OP_THIS);
         if (m.flags & NF_COMPUTED) != 0 {
-            compile_expr(co, m.a);
+            // the key was evaluated when the class was defined
+            emit_load_name(co, hidden_name(co, "%fk", i), m);
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op(ch, OP_SETINDEX);
         } else {
@@ -3532,6 +3681,9 @@ private void compile_stmt(Compiler* co, Node* n) {
             if cat.a != null {
                 declare_pattern(co, cat.a, 2);
                 compile_destructure(co, cat.a, true);
+                co.outer_names.len = 0;
+                collect_pattern_names(cat.a, &co.outer_names);
+                co.outer_is_body = false;
             } else {
                 ch_op(ch, OP_POP);
             }
@@ -3575,10 +3727,12 @@ private void compile_stmt(Compiler* co, Node* n) {
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_lexical_decls(co, &(*(n.kids.items + i)).kids, &svars);
         }
-        vec_free(&svars);
+        Vec<NodePtr> seen = vec_new<NodePtr>(4);
         for i32 i = 0; i < n.kids.len; i++ {
-            hoist_function_decls(co, &(*(n.kids.items + i)).kids);
+            hoist_function_decls(co, &(*(n.kids.items + i)).kids, &svars, false, &seen);
         }
+        vec_free(&seen);
+        vec_free(&svars);
         for i32 i = 0; i < n.kids.len; i++ {
             NodeList* cl = &(*(n.kids.items + i)).kids;
             for i32 s = 0; s < cl.len; s++ {
