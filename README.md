@@ -113,30 +113,36 @@ host side is `web/tsmc_host.js`, which also runs under node
 
 ## Download
 
-Each release publishes one binary per platform on the
-[releases page](https://github.com/SpacesOfPlay/tsmc/releases). A binary
-is self-contained: no runtime to install, nothing else to fetch.
+Each release publishes an archive per platform on the
+[releases page](https://github.com/SpacesOfPlay/tsmc/releases). Inside is
+a directory holding the binary, the licence, the third-party notices and
+a short readme.
 
-| file | platform |
+| archive | platform |
 |---|---|
-| `tsmc-<version>-windows-x64.exe` | Windows, x86-64 |
-| `tsmc-<version>-linux-x64` | Linux, x86-64 |
-| `tsmc-<version>-linux-arm64` | Linux, ARM64 |
-| `tsmc-<version>-macos-arm64` | macOS, Apple silicon |
-| `tsmc-<version>.wasm` | the browser module, see In the browser |
+| `tsmc-<version>-windows-x64.zip` | Windows, x86-64 |
+| `tsmc-<version>-linux-x64.zip` | Linux, x86-64 |
+| `tsmc-<version>-linux-arm64.zip` | Linux, ARM64 |
+| `tsmc-<version>-macos-arm64.zip` | macOS, Apple silicon |
+| `tsmc-<version>-wasm.zip` | the wasm module, its host glue and a node runner |
 
-macOS on Intel is not published: the compiler's macOS target is ARM64,
-so build from source there. On macOS and Linux the download needs its
-execute bit, and macOS quarantines a binary it did not see installed:
+The binary needs nothing else: it links only the platform's own C library
+(`libc.so.6`, `libSystem`, or Windows' own DLLs), and the Unicode tables,
+the regex engine, the TLS stack and its 119 trusted roots are compiled
+in. macOS on Intel is not published, since the compiler's macOS target is
+ARM64, and a musl system such as Alpine needs a build from source.
+
+A zip carries no Unix permission bit, so on macOS and Linux:
 
 ```
-curl -fLo tsmc <url from the releases page>
+unzip tsmc-<version>-linux-x64.zip
+cd tsmc-<version>-linux-x64
 chmod +x tsmc
-xattr -d com.apple.quarantine tsmc   # macOS only
+xattr -d com.apple.quarantine tsmc   # macOS: it arrived from a browser
 ./tsmc script.ts
 ```
 
-`SHA256SUMS` is published beside the binaries, so `sha256sum -c
+`SHA256SUMS` is published beside the archives, so `sha256sum -c
 SHA256SUMS` checks a download.
 
 ## Install minc
@@ -174,7 +180,8 @@ build/build.exe release            # -> build/release: a binary per platform
 ```
 
 `release` cross-compiles every published platform from whatever machine
-runs it, names each file with the version in `src/version.mc`, writes
+runs it, packs each with the licence, the notices and `dist/README.md`,
+names the archives with the version in `src/version.mc`, writes
 `SHA256SUMS`, and runs the binary it built for that host to confirm it
 reports that version. Tagging `v<version>` and pushing runs the same verb
 on CI and publishes what it produced; `doc/PLAN_M47_release.md` has the

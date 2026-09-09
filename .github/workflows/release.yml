@@ -1,4 +1,4 @@
-# Publishes the downloadable tsmc binaries for a version tag.
+# Publishes the downloadable tsmc archives for a version tag.
 #
 # To cut a release: set TSMC_VERSION in src/version.mc to the version,
 # commit it, then
@@ -7,7 +7,7 @@
 #
 # The run refuses to publish when the tag and src/version.mc disagree, so
 # a downloaded binary always reports the version it was published under.
-# A manual run builds and checks everything, attaches the binaries to the
+# A manual run builds and checks everything, attaches the archives to the
 # run itself, and publishes nothing.
 name: release
 
@@ -60,8 +60,8 @@ jobs:
       - name: Test
         run: minc test
 
-      # One cross-compile per platform, plus SHA256SUMS. The verb runs the
-      # binary it built for this host to confirm it reports the version.
+      # One archive per platform, plus SHA256SUMS. The verb runs the binary
+      # it built for this host to confirm it reports the version.
       - name: Build every platform
         run: |
           mkdir -p build
@@ -70,11 +70,11 @@ jobs:
           ls -l build/release
           cat build/release/SHA256SUMS
 
-      - name: Attach the binaries to this run
+      - name: Attach the archives to this run
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4
         with:
-          name: tsmc-binaries
+          name: tsmc-archives
           path: build/release/
 
       - name: Publish the release

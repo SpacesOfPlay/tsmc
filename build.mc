@@ -11,7 +11,7 @@
 // once and call it directly:
 //   minc build.mc -o build/build.exe
 //   build/build.exe plugins
-//   build/build.exe release   the downloadable binaries, all platforms
+//   build/build.exe release   the downloadable archives, all platforms
 //
 // Requires the minc compiler: its install dir on PATH, or MINC naming
 // that dir (the folder holding the binary and its lib/). A deploy at
@@ -22,6 +22,7 @@ import process;
 import file;
 import str;
 import sha256;
+import zip;
 import "src/version.mc";
 
 when os(windows) { str EXE_SUFFIX = ".exe"; }
@@ -375,25 +376,28 @@ void build_plugins() {
 
 // --- release ----------------------------------------------------------
 
-// One downloadable binary per platform, named with the version, plus the
-// wasm module and a SHA256SUMS file to check a download against. Every
-// target is cross-compiled, so whichever machine runs this produces the
-// whole set; the one built for this host is run to confirm it reports the
-// version the tree claims.
+// One archive per platform: the binary under a plain name, the licence,
+// the third-party notices and a short readme, in a directory named after
+// the archive. Every target is cross-compiled, so whichever machine runs
+// this produces the whole set, and the one built for this host is run to
+// confirm it reports the version the tree claims.
 //
-// macOS on Intel is not here: the compiler's macOS target is ARM64.
+// macOS on Intel is not here: the compiler's macOS target is ARM64. A zip
+// carries no Unix permission bit, so the readme says to set it.
 
 str REL_DIR = "build/release";
+str STAGE_DIR = "build/stage";
 str SUMS_NAME = "SHA256SUMS";
+const i32 SUMS_CAP = 4096;
 
-// The artifact name ending for this host, or empty when the host is not
-// one of the platforms below.
-private str host_suffix() {
+// The platform name for this host, or empty when the host is not one of
+// the platforms below.
+private str host_platform() {
     str s = "";
-    when os(windows) { s = "-windows-x64.exe"; }
-    when os(macos) { s = "-macos-arm64"; }
-    when os(linux) && arch(x64) { s = "-linux-x64"; }
-    when os(linux) && arch(arm64) { s = "-linux-arm64"; }
+    when os(windows) { s = "windows-x64"; }
+    when os(macos) { s = "macos-arm64"; }
+    when os(linux) && arch(x64) { s = "linux-x64"; }
+    when os(linux) && arch(arm64) { s = "linux-arm64"; }
     return s;
 }
 
@@ -420,72 +424,131 @@ private string hex_digest(u8* digest) {
     return str_concat(str_from(&text[0], 64), "");
 }
 
+// Adds `path` to the archive as "<dir>/<name>".
+private void zip_put(ZipWriter* z, str dir, str name, str path) {
+    string entry = format("{}/{}", dir, name);
+    ignore zip_add_file(z, str_from(entry.data, entry.len), path, true);
+    free(entry);
+}
+
+// Writes the archive as REL_DIR/<base>.zip, hashes it into `sums` and
+// reports it. Returns the new sums length, or -1 if anything failed.
+private i32 close_archive(ZipWriter* z, str base, u8* sums, i32 sn) {
+    string arc = format("{}.zip", base);
+    str av = str_from(arc.data, arc.len);
+    string path = path_join(REL_DIR, av);
+    str pv = str_from(path.data, path.len);
+    i32 out = -1;
+    bool written = zip_end(z, pv);
+    if !written {
+        fail(av, " (archive failed)");
+    } else {
+        FileData d = file_read(pv);
+        if d.data == null {
+            fail(av, " (cannot read back)");
+        } else {
+            u8[32] digest;
+            sha256_oneshot(d.data, cast(u64, d.len), &digest[0]);
+            string hex = hex_digest(&digest[0]);
+            i32 n = buf_add(sums, sn, SUMS_CAP, str_from(hex.data, hex.len));
+            n = buf_add(sums, n, SUMS_CAP, "  ");
+            n = buf_add(sums, n, SUMS_CAP, av);
+            n = buf_add(sums, n, SUMS_CAP, "\n");
+            free(hex);
+            string shown = format("{}  {} KB", av, d.len / 1024);
+            pass(str_from(shown.data, shown.len));
+            free(shown);
+            free(d.data);
+            out = n;
+        }
+    }
+    free(path);
+    free(arc);
+    return out;
+}
+
 i32 run_release() {
     step("release");
     assert_toolchain();
     ignore dir_create("build");
-    // start empty, so the directory holds this version and nothing else
+    // start empty, so the directories hold this version and nothing else
     ignore dir_remove(REL_DIR);
+    ignore dir_remove(STAGE_DIR);
     ignore dir_create(REL_DIR);
+    ignore dir_create(STAGE_DIR);
 
-    // one row per artifact: the compiler target, and what the file is
-    // called after the version
-    str[5] targets = { "windows", "linux", "linux-arm64", "macos", "wasm" };
-    str[5] endings = { "-windows-x64.exe", "-linux-x64", "-linux-arm64",
-                       "-macos-arm64", ".wasm" };
+    // one row per platform: the compiler target, the name in the archive
+    // name, and what the binary is called inside it
+    str[4] targets = { "windows", "linux", "linux-arm64", "macos" };
+    str[4] platforms = { "windows-x64", "linux-x64", "linux-arm64", "macos-arm64" };
+    str[4] binaries = { "tsmc.exe", "tsmc", "tsmc", "tsmc" };
 
-    // the SHA256SUMS text as it grows: a hash, two spaces and a name per
-    // artifact
-    u8[4096] sums;
+    u8[SUMS_CAP] sums;
     i32 sn = 0;
     i32 bad = 0;
-    for i32 i = 0; i < 5; i++ {
-        string name = format("tsmc-{}{}", TSMC_VERSION, endings[i]);
-        str nv = str_from(name.data, name.len);
-        string dst = path_join(REL_DIR, nv);
-        str dv = str_from(dst.data, dst.len);
 
-        if compile_for("src/main.mc", dv, targets[i]) != 0 {
-            fail(nv, " (cross-compile failed)");
+    for i32 i = 0; i < 4; i++ {
+        string base = format("tsmc-{}-{}", TSMC_VERSION, platforms[i]);
+        str bv = str_from(base.data, base.len);
+        string staged = path_join(STAGE_DIR, binaries[i]);
+        str sv = str_from(staged.data, staged.len);
+
+        if compile_for("src/main.mc", sv, targets[i]) != 0 {
+            fail(bv, " (cross-compile failed)");
             bad++;
-            free(dst);
-            free(name);
+            free(staged);
+            free(base);
             continue;
         }
-
-        // hash what was written, so the sums cover the shipped bytes
-        FileData d = file_read(dv);
-        if d.data == null {
-            fail(nv, " (cannot read back)");
-            bad++;
-            free(dst);
-            free(name);
-            continue;
-        }
-        u8[32] digest;
-        sha256_oneshot(d.data, cast(u64, d.len), &digest[0]);
-        free(d.data);
-        string hex = hex_digest(&digest[0]);
-        sn = buf_add(&sums[0], sn, 4096, str_from(hex.data, hex.len));
-        sn = buf_add(&sums[0], sn, 4096, "  ");
-        sn = buf_add(&sums[0], sn, 4096, nv);
-        sn = buf_add(&sums[0], sn, 4096, "\n");
-        free(hex);
-
-        string shown = format("{}  {} KB", nv, d.len / 1024);
-        pass(str_from(shown.data, shown.len));
-        free(shown);
-
-        if str_equal(endings[i], host_suffix()) && !check_version(dv) {
-            fail(nv, " (does not report this version)");
+        // the binary built for this host has to answer with this version
+        if str_equal(platforms[i], host_platform()) && !check_version(sv) {
+            fail(bv, " (does not report this version)");
             bad++;
         }
-        free(dst);
-        free(name);
+
+        ZipWriter z;
+        zip_put(&z, bv, binaries[i], sv);
+        zip_put(&z, bv, "README.md", "dist/README.md");
+        zip_put(&z, bv, "LICENSE.md", "LICENSE.md");
+        zip_put(&z, bv, "NOTICE.md", "NOTICE.md");
+        i32 n = close_archive(&z, bv, &sums[0], sn);
+        if n < 0 { bad++; } else { sn = n; }
+
+        ignore file_remove(sv);
+        free(staged);
+        free(base);
     }
 
+    // The wasm module is not an executable: it ships with the host that
+    // gives it a file view, a clock, output and randomness, and with the
+    // node runner the test suite uses. wasm_run.js reads the host from
+    // web/ beside it, so both keep their paths.
+    string wbase = format("tsmc-{}-wasm", TSMC_VERSION);
+    str wv = str_from(wbase.data, wbase.len);
+    string wstage = path_join(STAGE_DIR, "tsmc.wasm");
+    str wsv = str_from(wstage.data, wstage.len);
+    if compile_for("src/main.mc", wsv, "wasm") != 0 {
+        fail(wv, " (cross-compile failed)");
+        bad++;
+    } else {
+        ZipWriter z;
+        zip_put(&z, wv, "tsmc.wasm", wsv);
+        zip_put(&z, wv, "tools/wasm_run.js", "tools/wasm_run.js");
+        zip_put(&z, wv, "web/tsmc_host.js", "web/tsmc_host.js");
+        zip_put(&z, wv, "web/cdn_fs.js", "web/cdn_fs.js");
+        zip_put(&z, wv, "README.md", "dist/README.md");
+        zip_put(&z, wv, "LICENSE.md", "LICENSE.md");
+        zip_put(&z, wv, "NOTICE.md", "NOTICE.md");
+        i32 n = close_archive(&z, wv, &sums[0], sn);
+        if n < 0 { bad++; } else { sn = n; }
+        ignore file_remove(wsv);
+    }
+    free(wstage);
+    free(wbase);
+    ignore dir_remove(STAGE_DIR);
+
     string sums_path = path_join(REL_DIR, SUMS_NAME);
-    if sn >= 4096 {
+    if sn >= SUMS_CAP {
         fail(SUMS_NAME, " (too long for its buffer)");
         bad++;
     } else if !file_write_str(str_from(sums_path.data, sums_path.len), str_from(&sums[0], sn)) {
@@ -1056,8 +1119,8 @@ void usage() {
     outln("  examples build tsmc.wasm, then run every playground example through it");
     outln("          (the package ones fetch from the live registry)");
     outln("  t262    build, then run test262 (fetched to vendor/ on first use)");
-    outln("  release cross-compile a binary per platform into build/release,");
-    outln("          named with the version, with a SHA256SUMS beside them");
+    outln("  release build/release: a zip per platform holding the binary,");
+    outln("          the licence and a readme, with a SHA256SUMS beside them");
     outln("  clean   remove build/");
     return;
 }
