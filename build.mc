@@ -7,10 +7,11 @@
 //   minc wasm       build tsmc.wasm and the page into build/web, serve it
 //   minc clean      remove build/
 //
-// plugins, diff and t262 have no minc verb. Compile this script once
-// and call it directly:
+// plugins, diff, t262 and release have no minc verb. Compile this script
+// once and call it directly:
 //   minc build.mc -o build/build.exe
 //   build/build.exe plugins
+//   build/build.exe release   the downloadable binaries, all platforms
 //
 // Requires the minc compiler: its install dir on PATH, or MINC naming
 // that dir (the folder holding the binary and its lib/). A deploy at
@@ -20,11 +21,16 @@
 import process;
 import file;
 import str;
+import sha256;
+import "src/version.mc";
 
 when os(windows) { str EXE_SUFFIX = ".exe"; }
 when os(linux) || os(macos) { str EXE_SUFFIX = ""; }
 
-str VERSION_LINE = "tsmc 0.1.0-dev";
+// What `tsmc --version` prints. Owned: free it.
+string version_line() {
+    return format("tsmc {}", TSMC_VERSION);
+}
 
 i32 g_pass = 0;
 i32 g_fail = 0;
@@ -185,6 +191,37 @@ bool same_text(str a, str b) {
 }
 
 // Compile one .mc into `exe`. Returns the compiler's exit code.
+// Cross-compile for one target; an empty target means the host default.
+// Release binaries are built with the same flags as every other build,
+// bounds checks included.
+i32 compile_for(str src, str dst, str target) {
+    ProcCmd c = { .args = { cc(), src }, .capture = true };
+    if target.len > 0 {
+        proc_arg(&c, "--target");
+        proc_arg(&c, target);
+    }
+    proc_arg(&c, "-o");
+    proc_arg(&c, dst);
+    ProcResult r = proc_run(&c);
+    i32 rc = r.exit_code;
+    if rc != 0 { out(str_from(r.out.data, r.out.len)); }
+    proc_result_free(&r);
+    return rc;
+}
+
+// Whether `exe` reports the version this tree says it has. A mismatch
+// means a stale binary, or a build that did not pick up version.mc.
+bool check_version(str exe) {
+    ProcCmd c = { .args = { exe, "--version" }, .capture = true };
+    ProcResult r = proc_run(&c);
+    string want = version_line();
+    bool ok = r.exit_code == 0
+        && same_text(str_from(r.out.data, r.out.len), str_from(want.data, want.len));
+    free(want);
+    proc_result_free(&r);
+    return ok;
+}
+
 i32 compile(str src, str exe, str define) {
     ProcCmd c = { .args = { cc(), src }, .capture = true };
     if define.len > 0 { proc_arg(&c, define); }
@@ -252,12 +289,7 @@ string out_wasm() {
 }
 
 i32 compile_wasm(str src, str dst) {
-    ProcCmd c = { .args = { cc(), src, "--target", "wasm", "-o", dst }, .capture = true };
-    ProcResult r = proc_run(&c);
-    i32 rc = r.exit_code;
-    if rc != 0 { out(str_from(r.out.data, r.out.len)); }
-    proc_result_free(&r);
-    return rc;
+    return compile_for(src, dst, "wasm");
 }
 
 void build_wasm() {
@@ -341,6 +373,138 @@ void build_plugins() {
     return;
 }
 
+// --- release ----------------------------------------------------------
+
+// One downloadable binary per platform, named with the version, plus the
+// wasm module and a SHA256SUMS file to check a download against. Every
+// target is cross-compiled, so whichever machine runs this produces the
+// whole set; the one built for this host is run to confirm it reports the
+// version the tree claims.
+//
+// macOS on Intel is not here: the compiler's macOS target is ARM64.
+
+str REL_DIR = "build/release";
+str SUMS_NAME = "SHA256SUMS";
+
+// The artifact name ending for this host, or empty when the host is not
+// one of the platforms below.
+private str host_suffix() {
+    str s = "";
+    when os(windows) { s = "-windows-x64.exe"; }
+    when os(macos) { s = "-macos-arm64"; }
+    when os(linux) && arch(x64) { s = "-linux-x64"; }
+    when os(linux) && arch(arm64) { s = "-linux-arm64"; }
+    return s;
+}
+
+// Appends `s` at `n` and returns the new length, stopping at `cap` so an
+// overflow shows up as a length the caller can refuse.
+private i32 buf_add(u8* buf, i32 n, i32 cap, str s) {
+    for i32 i = 0; i < s.len; i++ {
+        if n >= cap { return cap; }
+        *(buf + n) = *(s.data + i);
+        n++;
+    }
+    return n;
+}
+
+// 64 lowercase hex digits for a 32-byte digest. Owned: free it.
+private string hex_digest(u8* digest) {
+    u8[64] text;
+    str digits = "0123456789abcdef";
+    for i32 i = 0; i < 32; i++ {
+        i32 v = cast(i32, *(digest + i));
+        text[i * 2] = *(digits.data + (v >> 4));
+        text[i * 2 + 1] = *(digits.data + (v & 15));
+    }
+    return str_concat(str_from(&text[0], 64), "");
+}
+
+i32 run_release() {
+    step("release");
+    assert_toolchain();
+    ignore dir_create("build");
+    // start empty, so the directory holds this version and nothing else
+    ignore dir_remove(REL_DIR);
+    ignore dir_create(REL_DIR);
+
+    // one row per artifact: the compiler target, and what the file is
+    // called after the version
+    str[5] targets = { "windows", "linux", "linux-arm64", "macos", "wasm" };
+    str[5] endings = { "-windows-x64.exe", "-linux-x64", "-linux-arm64",
+                       "-macos-arm64", ".wasm" };
+
+    // the SHA256SUMS text as it grows: a hash, two spaces and a name per
+    // artifact
+    u8[4096] sums;
+    i32 sn = 0;
+    i32 bad = 0;
+    for i32 i = 0; i < 5; i++ {
+        string name = format("tsmc-{}{}", TSMC_VERSION, endings[i]);
+        str nv = str_from(name.data, name.len);
+        string dst = path_join(REL_DIR, nv);
+        str dv = str_from(dst.data, dst.len);
+
+        if compile_for("src/main.mc", dv, targets[i]) != 0 {
+            fail(nv, " (cross-compile failed)");
+            bad++;
+            free(dst);
+            free(name);
+            continue;
+        }
+
+        // hash what was written, so the sums cover the shipped bytes
+        FileData d = file_read(dv);
+        if d.data == null {
+            fail(nv, " (cannot read back)");
+            bad++;
+            free(dst);
+            free(name);
+            continue;
+        }
+        u8[32] digest;
+        sha256_oneshot(d.data, cast(u64, d.len), &digest[0]);
+        free(d.data);
+        string hex = hex_digest(&digest[0]);
+        sn = buf_add(&sums[0], sn, 4096, str_from(hex.data, hex.len));
+        sn = buf_add(&sums[0], sn, 4096, "  ");
+        sn = buf_add(&sums[0], sn, 4096, nv);
+        sn = buf_add(&sums[0], sn, 4096, "\n");
+        free(hex);
+
+        string shown = format("{}  {} KB", nv, d.len / 1024);
+        pass(str_from(shown.data, shown.len));
+        free(shown);
+
+        if str_equal(endings[i], host_suffix()) && !check_version(dv) {
+            fail(nv, " (does not report this version)");
+            bad++;
+        }
+        free(dst);
+        free(name);
+    }
+
+    string sums_path = path_join(REL_DIR, SUMS_NAME);
+    if sn >= 4096 {
+        fail(SUMS_NAME, " (too long for its buffer)");
+        bad++;
+    } else if !file_write_str(str_from(sums_path.data, sums_path.len), str_from(&sums[0], sn)) {
+        fail(SUMS_NAME, " (write failed)");
+        bad++;
+    } else {
+        pass(SUMS_NAME);
+    }
+    free(sums_path);
+
+    if bad != 0 {
+        outln("release failed");
+        return 1;
+    }
+    out("  ready in ");
+    outln(REL_DIR);
+    return 0;
+}
+
 // --- tests ------------------------------------------------------------
 
 // Each test/unit/*.mc is a standalone program; exit 0 means pass.
@@ -381,14 +545,7 @@ void run_unit_tests() {
 void run_cli_smoke(str exe) {
     step("cli smoke");
 
-    ProcCmd v = { .args = { exe, "--version" }, .capture = true };
-    ProcResult rv = proc_run(&v);
-    if rv.exit_code == 0 && same_text(str_from(rv.out.data, rv.out.len), VERSION_LINE) {
-        pass("--version");
-    } else {
-        fail("--version", "");
-    }
-    proc_result_free(&rv);
+    if check_version(exe) { pass("--version"); } else { fail("--version", ""); }
 
     ProcCmd n = { .args = { exe }, .capture = true };
     ProcResult rn = proc_run(&n);
@@ -888,7 +1045,7 @@ i32 run_wasm(i32 argc, i32 first_extra) {
 
 void usage() {
     outln("usage: minc <build|test|bench|wasm|clean>");
-    outln("  or:  build/build.exe <plugins|diff|examples|t262>   (no minc verb for these)");
+    outln("  or:  build/build.exe <plugins|diff|examples|t262|release>   (no minc verb)");
     outln("  build   compile build/tsmc");
     outln("  plugins compile build/tsmc-plugins (loads minc plugins)");
     outln("  test    build, then run unit + cli + golden + wasm + gc-stress tests");
@@ -899,6 +1056,8 @@ void usage() {
     outln("  examples build tsmc.wasm, then run every playground example through it");
     outln("          (the package ones fetch from the live registry)");
     outln("  t262    build, then run test262 (fetched to vendor/ on first use)");
+    outln("  release cross-compile a binary per platform into build/release,");
+    outln("          named with the version, with a SHA256SUMS beside them");
     outln("  clean   remove build/");
     return;
 }
@@ -928,6 +1087,7 @@ i32 main() {
     if str_equal(verb, "diff") { return run_diff(); }
     if str_equal(verb, "examples") { return run_examples(); }
     if str_equal(verb, "t262") { return run_t262(argc, 2); }
+    if str_equal(verb, "release") { return run_release(); }
 
     usage();
     return 0;

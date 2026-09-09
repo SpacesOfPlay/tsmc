@@ -1,0 +1,87 @@
+# Publishes the downloadable tsmc binaries for a version tag.
+#
+# To cut a release: set TSMC_VERSION in src/version.mc to the version,
+# commit it, then
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The run refuses to publish when the tag and src/version.mc disagree, so
+# a downloaded binary always reports the version it was published under.
+# A manual run builds and checks everything, attaches the binaries to the
+# run itself, and publishes nothing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install minc
+        env:
+          MINC_NO_PATH: "1"
+          MINC_VSCODE: "0"
+        run: |
+          curl -fsSL https://minc.dev/install | bash
+          echo "$HOME/.minc" >> "$GITHUB_PATH"
+
+      # Before anything is built, so a mistyped tag costs seconds.
+      - name: Check the tag against src/version.mc
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          src="$(sed -n 's/^str TSMC_VERSION = "\(.*\)";.*/\1/p' src/version.mc)"
+          case "$src" in
+            *-dev*)
+              echo "src/version.mc still says $src, which is not a release" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$tag" != "$src" ]; then
+            echo "tag ${GITHUB_REF_NAME} means $tag, src/version.mc says $src" >&2
+            echo "set TSMC_VERSION to $tag, commit, then tag again" >&2
+            exit 1
+          fi
+          echo "releasing $src"
+
+      # The whole suite, on the binary this runner builds for itself.
+      - name: Test
+        run: minc test
+
+      # One cross-compile per platform, plus SHA256SUMS. The verb runs the
+      # binary it built for this host to confirm it reports the version.
+      - name: Build every platform
+        run: |
+          mkdir -p build
+          minc build.mc -o build/build.exe
+          build/build.exe release
+          ls -l build/release
+          cat build/release/SHA256SUMS
+
+      - name: Attach the binaries to this run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsmc-binaries
+          path: build/release/
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/release/* \
+            --title "tsmc ${GITHUB_REF_NAME#v}" \
+            --generate-notes

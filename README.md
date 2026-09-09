@@ -111,6 +111,34 @@ host side is `web/tsmc_host.js`, which also runs under node
 (`tools/wasm_run.js`) so the golden tests can run through the module.
 `doc/PLAN_M45_wasm_playground.md` has the host contract and the numbers.
 
+## Download
+
+Each release publishes one binary per platform on the
+[releases page](https://github.com/SpacesOfPlay/tsmc/releases). A binary
+is self-contained: no runtime to install, nothing else to fetch.
+
+| file | platform |
+|---|---|
+| `tsmc-<version>-windows-x64.exe` | Windows, x86-64 |
+| `tsmc-<version>-linux-x64` | Linux, x86-64 |
+| `tsmc-<version>-linux-arm64` | Linux, ARM64 |
+| `tsmc-<version>-macos-arm64` | macOS, Apple silicon |
+| `tsmc-<version>.wasm` | the browser module, see In the browser |
+
+macOS on Intel is not published: the compiler's macOS target is ARM64,
+so build from source there. On macOS and Linux the download needs its
+execute bit, and macOS quarantines a binary it did not see installed:
+
+```
+curl -fLo tsmc <url from the releases page>
+chmod +x tsmc
+xattr -d com.apple.quarantine tsmc   # macOS only
+./tsmc script.ts
+```
+
+`SHA256SUMS` is published beside the binaries, so `sha256sum -c
+SHA256SUMS` checks a download.
+
 ## Install minc
 
 ```
@@ -142,7 +170,15 @@ minc build.mc -o build/build.exe   # once
 build/build.exe plugins            # -> build/tsmc-plugins[.exe]
 build/build.exe diff               # differential test vs a reference node
 build/build.exe t262               # ECMAScript conformance (test262), see below
+build/build.exe release            # -> build/release: a binary per platform
 ```
+
+`release` cross-compiles every published platform from whatever machine
+runs it, names each file with the version in `src/version.mc`, writes
+`SHA256SUMS`, and runs the binary it built for that host to confirm it
+reports that version. Tagging `v<version>` and pushing runs the same verb
+on CI and publishes what it produced; `doc/PLAN_M47_release.md` has the
+procedure.
 
 ## Tests
 

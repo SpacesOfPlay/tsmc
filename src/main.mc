@@ -8,6 +8,7 @@ import file;
 import vm;
 import builtins;
 import module;
+import version;
 
 const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
@@ -24,7 +25,7 @@ i32 main() {
     while i < get_argc() {
         str a = str_from_cstr(get_arg(i));
         if str_equal(a, "--version") {
-            print("tsmc 0.1.0-dev\n");
+            print("tsmc {}\n", TSMC_VERSION);
             return EXIT_OK;
         }
         if str_equal(a, "--help") || str_equal(a, "-h") {
