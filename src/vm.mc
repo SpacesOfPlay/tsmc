@@ -47,6 +47,7 @@ struct Frame {
     Value new_target;   // new.target: the constructor, or undefined; super() propagates it
     bool is_ctor;
     bool super_pending;  // a derived constructor that has not called super()
+    i32 super_for;
     JsGenerator* gen;   // non-null while running a generator/async body
 }
 
@@ -116,6 +117,7 @@ struct VM {
     Frame* frames;
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
+    i32 pending_super_for;     // super_for for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
@@ -1272,6 +1274,28 @@ private void op_bigint_bitop(VM* vm, i32 op) {
     vm.sp -= 2;
     vpush(vm, b);
     return;
+}
+
+// Where the derived constructor a super() belongs to sits, or -1.
+private i32 derived_ctor_index(VM* vm) {
+    for i32 i = vm.fp - 1; i >= 0; i-- {
+        if (vm.frames + i).tmpl != null && (vm.frames + i).tmpl.derived_ctor { return i; }
+    }
+    return 0 - 1;
+}
+
+// What a returning frame hands back: a constructor, and a base reached
+// through super(), gives the object it built unless it named another, and
+// a super() result settles the derived constructor's `this`. Kept out of
+// the interpreter loop for its frame's sake.
+private Value ctor_result(VM* vm, Frame* fr, Value res) {
+    if (fr.is_ctor || fr.super_for >= 0) && !value_is_reference(res) {
+        res = fr.this_val;
+    }
+    if fr.super_for >= 0 && value_is_reference(res) {
+        (vm.frames + fr.super_for).this_val = res;
+    }
+    return res;
 }
 
 // A derived constructor calls super() exactly once. False means this was a
@@ -3447,6 +3471,7 @@ void vm_init(VM* vm) {
     vm.frames = alloc<Frame>(VM_FRAMES_MAX);
     vm.fp = 0;
     vm.pending_new_target = value_undefined();
+    vm.pending_super_for = 0 - 1;
     vm.handlers = alloc<Handler>(VM_HANDLERS_MAX);
     vm.hp = 0;
     intmap_init<Value>(&vm.globals);
@@ -4516,7 +4541,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.this_val = thisv;
                             nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
-                nf.super_pending = ft.derived_ctor;
+                            nf.super_pending = ft.derived_ctor;
+                            nf.super_for = op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1;
                             if op == OP_NEW { nf.new_target = fnv; }
                             else if op == OP_SUPERCALL { nf.new_target = inherited_target; }
                             else { nf.new_target = value_undefined(); }
@@ -4554,7 +4580,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.super_pending && !value_is_reference(res) {
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
                 } else {
-                    if fr.is_ctor && !value_is_reference(res) { res = fr.this_val; }
+                    res = ctor_result(vm, fr, res);
                     vm.sp = fr.base - 2;
                     vpush(vm, res);
                     // A return inside a try leaves that try's handler open;
@@ -5007,6 +5033,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if op == OP_NEW_ARRAY { vm.pending_new_target = vpeek(vm, 1); }
                 else if op == OP_SUPERCALL_ARRAY {
                     vm.pending_new_target = fr.new_target;
+                    vm.pending_super_for = derived_ctor_index(vm);
                     ignore super_call_begin(vm);
                 }
                 if op == OP_NEW_ARRAY {
@@ -5243,6 +5270,7 @@ i32 vm_run_template(VM* vm, FnTemplate* t) {
     fr.arguments_obj = value_undefined();
     fr.is_ctor = false;
     fr.super_pending = false;
+    fr.super_for = 0 - 1;
     fr.new_target = value_undefined();
     fr.gen = null;
     vm.fp++;
@@ -5933,6 +5961,7 @@ Value vm_gen_resume_mode(VM* vm, JsGenerator* g, Value input, bool is_throw, boo
     nf.arguments_obj = g.arguments_obj;
     nf.is_ctor = false;
     nf.super_pending = false;
+    nf.super_for = 0 - 1;
     nf.new_target = value_undefined();
     nf.gen = g;
     vm.fp++;
@@ -6829,21 +6858,26 @@ Value vm_call_stack(VM* vm, i32 argc) {
     Value fnv = vpeek(vm, argc + 1);
     Value thisv = vpeek(vm, argc);
     if value_is_native(fnv) {
+        // a native base cannot settle a derived constructor's `this`
+        vm.pending_super_for = 0 - 1;
         JsNative* na = value_as_native(fnv);
         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
         vm.sp = entry_sp;
         return res;
     }
     if !value_is_function(fnv) {
+        vm.pending_super_for = 0 - 1;
         vm.sp = entry_sp;
         vm_throw_error(vm, ERR_TYPE, "not a function");
         return value_undefined();
     }
     JsFunction* f = value_as_function(fnv);
     FnTemplate* ft = f.tmpl;
+    vm.pending_super_for = ft.is_gen || ft.is_async ? 0 - 1 : vm.pending_super_for;
     if ft.is_gen { return make_generator_from_call(vm, f, argc); }
     if ft.is_async { return make_async_from_call(vm, f, argc); }
     if vm.fp >= VM_FRAMES_MAX || vm.sp + ft.n_slots + 8 >= VM_STACK_MAX {
+        vm.pending_super_for = 0 - 1;
         vm.sp = entry_sp;
         vm_throw_error(vm, ERR_RANGE, "maximum call stack size exceeded");
         return value_undefined();
@@ -6869,6 +6903,8 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.arguments_obj = argobj;
     nf.is_ctor = false;
     nf.super_pending = ft.derived_ctor;
+    nf.super_for = vm.pending_super_for;
+    vm.pending_super_for = 0 - 1;
     // a super()/new spread call stashes the new.target here; consume it once
     nf.new_target = vm.pending_new_target;
     vm.pending_new_target = value_undefined();
