@@ -80,6 +80,7 @@ struct FScope {
     bool is_async;
     bool needs_arguments;   // references `arguments`; build it at call time
     bool super_call_ok;     // a derived class constructor: super() is allowed
+    bool static_home;       // a static member: `super.x` is the parent class
     i32 loop_floor;         // loops below this index belong to an enclosing
                             // scope a break or continue may not reach
     Vec<BrkJump> break_jumps;
@@ -170,6 +171,7 @@ struct Compiler {
     bool in_module;
     bool strict;        // strict-mode code: modules, classes, after "use strict"
     bool static_this;   // inside a static block / field: `this` is the class ctor
+    bool next_static_home;  // the next function compiled is a static member
     Vec<str> outer_names;       // names the next block's lexical declarations may
                                 // not repeat: the parameters of its function, or
                                 // the catch parameter
@@ -200,6 +202,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.in_module = false;
     co.strict = false;
     co.static_this = false;
+    co.next_static_home = false;
     vec_init<str>(&co.outer_names, 4);
     co.outer_is_body = false;
     co.next_is_derived_ctor = false;
@@ -284,6 +287,8 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.is_async = false;
     fs.needs_arguments = false;
     fs.super_call_ok = false;
+    // an arrow has no home object of its own; it uses the one around it
+    fs.static_home = is_arrow && parent != null ? parent.static_home : false;
     fs.loop_floor = 0;
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
@@ -918,6 +923,39 @@ private void emit_init_binding(Compiler* co, i32 bind_idx) {
     ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
     if b.exported { emit_export_writes(co, b.name, null); }
     ch_op(&fs.ch, OP_POP);
+}
+
+// In a static member, and in an arrow inside one, `super.x` reads the parent
+// class itself; everywhere else it reads the parent's prototype.
+private bool super_home_is_static(Compiler* co) {
+    if co.cur.static_home { return true; }
+    return !co.cur.is_arrow && co.static_this;
+}
+
+// Loads the parent object a `super.x` reads from.
+private void emit_super_home(Compiler* co, Node* at) {
+    emit_load_name(co, "%super", at);
+    if !super_home_is_static(co) {
+        ch_op_u16(&co.cur.ch, OP_GETPROP, name_const(co, "prototype"));
+    }
+}
+
+// `this`: the class-scoped binding inside a static block or field
+// initializer, and in an arrow that closed over one; the frame's own
+// otherwise.
+private void emit_this(Compiler* co, Node* at) {
+    FScope* fs = co.cur;
+    str nm = "this";
+    if fs.is_arrow {
+        if find_local(fs, nm) >= 0 || resolve_upval(fs, nm) >= 0 {
+            emit_load_name(co, nm, at);
+            return;
+        }
+    } else if co.static_this && find_local(fs, nm) >= 0 {
+        emit_load_name(co, nm, at);
+        return;
+    }
+    ch_op(&fs.ch, OP_THIS);
 }
 
 private bool super_available(Compiler* co) {
@@ -1665,8 +1703,7 @@ private void compile_call(Compiler* co, Node* n) {
             ch_op(ch, OP_UNDEF);
             return;
         }
-        emit_load_name(co, "%super", n);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+        emit_super_home(co, n);
         if callee.kind == N_INDEX {
             compile_expr(co, callee.b);
             ch_op(ch, OP_GETINDEX);
@@ -1674,7 +1711,7 @@ private void compile_call(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
         }
         // the receiver stays `this`, as for super.name(...)
-        ch_op(ch, OP_THIS);
+        emit_this(co, n);
         i32 c = compile_args(co, &n.kids);
         if c >= 0 { ch_op_u16(ch, OP_CALL, c); } else { ch_op(ch, OP_CALL_ARRAY); }
         return;
@@ -1794,19 +1831,7 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_THIS {
-        FScope* fs = co.cur;
-        str nm = "this";
-        if fs.is_arrow {
-            if find_local(fs, nm) >= 0 || resolve_upval(fs, nm) >= 0 {
-                emit_load_name(co, nm, n);
-                return;
-            }
-        } else if co.static_this && find_local(fs, nm) >= 0 {
-            // inline static block / field: `this` is the class-scoped binding
-            emit_load_name(co, nm, n);
-            return;
-        }
-        ch_op(ch, OP_THIS);
+        emit_this(co, n);
         return;
     }
     if k == N_NEW_TARGET {
@@ -2114,8 +2139,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_UNDEF);
                 return;
             }
-            emit_load_name(co, "%super", n);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+            emit_super_home(co, n);
             ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
             return;
         }
@@ -2142,8 +2166,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_UNDEF);
                 return;
             }
-            emit_load_name(co, "%super", n);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+            emit_super_home(co, n);
             compile_expr(co, n.b);
             ch_op(ch, OP_GETINDEX);
             return;
@@ -2469,6 +2492,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     fs.is_async = (f.flags & NF_ASYNC) != 0;
     fs.super_call_ok = co.next_is_derived_ctor;
     co.next_is_derived_ctor = false;
+    if (f.flags & NF_ARROW) == 0 { fs.static_home = co.next_static_home; }
+    co.next_static_home = false;
     bool saved_static_block = co.in_static_block;
     bool saved_in_params = co.in_params;
     co.in_static_block = false;
@@ -2739,6 +2764,16 @@ private void emit_def_private(Compiler* co, Node* m) {
     ch_u16(ch, cast(u16, private_def_kind(m)));
 }
 
+// A static data member: a static field, as opposed to a static method or
+// accessor. A field whose initializer happens to be a function or an arrow
+// is still a field.
+private bool member_is_static_field(Node* m) {
+    if m == null || m.kind != N_CLASS_MEMBER { return false; }
+    if (m.flags & NF_STATIC) == 0 { return false; }
+    if (m.flags & (NF_GETTER | NF_SETTER)) != 0 { return false; }
+    return m.b == null || m.b.kind != N_FUNCTION || (m.b.flags & NF_METHOD) == 0;
+}
+
 private bool member_is_field(Node* m) {
     if m.kind != N_CLASS_MEMBER { return false; }
     if (m.flags & NF_STATIC) != 0 { return false; }
@@ -2931,10 +2966,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             continue;
         }
         // a static data member (static field) also runs with `this` = the class
-        if (m.flags & NF_STATIC) != 0 && (m.b == null || m.b.kind != N_FUNCTION)
-            && (m.flags & (NF_GETTER | NF_SETTER)) == 0 {
-            has_static = true;
-        }
+        if member_is_static_field(m) { has_static = true; }
     }
 
     // constructor template
@@ -3023,7 +3055,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
         if m.kind == N_STATIC_BLOCK { continue; }
         if m.kind != N_CLASS_MEMBER || m == ctor_member { continue; }
         bool is_static = (m.flags & NF_STATIC) != 0;
-        bool is_method = m.b != null && m.b.kind == N_FUNCTION;
+        bool is_method = m.b != null && m.b.kind == N_FUNCTION
+            && (m.b.flags & NF_METHOD) != 0;
         bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
         bool computed = (m.flags & NF_COMPUTED) != 0;
         bool is_priv = m.a != null && m.a.kind == N_PRIVATE_IDENT;
@@ -3055,6 +3088,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             ch_op_u16(ch, OP_GETLOCAL, t_ctor);
             infer_name(m.b, is_acc ? accessor_name(co, (m.flags & NF_GETTER) != 0 ? "get" : "set", m.a)
                                    : key_name_text(co, m.a));
+            co.next_static_home = true;
             compile_function(co, m.b, false);
             emit_def_private(co, m);
             ch_op(ch, OP_POP);
@@ -3065,6 +3099,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             if computed {
                 compile_expr(co, m.a);
                 ch_op(ch, OP_TOPROPKEY);
+                co.next_static_home = is_static;
                 compile_function(co, m.b, false);
                 if is_acc {
                     i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
@@ -3076,6 +3111,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             } else if is_acc {
                 str an = accessor_name(co, (m.flags & NF_GETTER) != 0 ? "get" : "set", m.a);
                 if an.len > 0 { infer_name(m.b, an); }
+                co.next_static_home = is_static;
                 compile_function(co, m.b, false);
                 i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER : OP_DEFSETTER;
                 ch_op_u16(ch, aop, prop_key_const(co, m.a));
@@ -3084,6 +3120,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             } else {
                 // the key names the method, as in an object literal
                 infer_name(m.b, key_name_text(co, m.a));
+                co.next_static_home = is_static;
                 compile_function(co, m.b, false);
                 ch_op_u16(ch, OP_DEFMETHOD, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
@@ -3117,30 +3154,33 @@ private void compile_class_expr(Compiler* co, Node* c) {
             bool saved_bt = co.static_this;
             co.static_this = true;
             co.in_static_block = true;
+            bool saved_sh = fs.static_home;
+            fs.static_home = true;
             fs.loop_floor = fs.loops.len;   // no break or continue leaves the block
             compile_stmt(co, m.a);
             fs.loop_floor = saved_floor;
+            fs.static_home = saved_sh;
             co.in_static_block = saved_sb;
             co.static_this = saved_bt;
             continue;
         }
-        if m.kind != N_CLASS_MEMBER || m == ctor_member { continue; }
-        if (m.flags & NF_STATIC) == 0 { continue; }
-        if m.b != null && m.b.kind == N_FUNCTION { continue; }
-        if (m.flags & (NF_GETTER | NF_SETTER)) != 0 { continue; }
+        if m == ctor_member || !member_is_static_field(m) { continue; }
         ch_op_u16(ch, OP_GETLOCAL, t_ctor);
-        infer_name(m.b, key_name_text(co, m.a));
         bool saved_st = co.static_this;
+        bool saved_sh2 = fs.static_home;
+        co.static_this = true;
+        fs.static_home = true;   // an arrow here takes the class as its home
         if (m.flags & NF_COMPUTED) != 0 {
             ch_op_u16(ch, OP_GETLOCAL, vec_get(&key_slots, i));
-            co.static_this = true;
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             co.static_this = saved_st;
+            fs.static_home = saved_sh2;
             ch_op_u16(ch, OP_DEFPROP_DYN, 1);   // an anonymous value takes the key as its name
         } else {
-            co.static_this = true;
+            infer_name(m.b, key_name_text(co, m.a));
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             co.static_this = saved_st;
+            fs.static_home = saved_sh2;
             if m.a != null && m.a.kind == N_PRIVATE_IDENT { emit_def_private(co, m); }
             else { ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a)); }
         }
@@ -3352,16 +3392,17 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
             ch_op(ch, OP_POP);
             continue;
         }
-        infer_name(m.b, key_name_text(co, m.a));
         if (m.flags & NF_COMPUTED) != 0 {
             // the key was evaluated when the class was defined
             emit_load_name(co, hidden_name(co, "%fk", i), m);
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op_u16(ch, OP_DEFPROP_DYN, 1);   // defined, so no setter runs
         } else if m.a != null && m.a.kind == N_PRIVATE_IDENT {
+            infer_name(m.b, key_name_text(co, m.a));
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             emit_def_private(co, m);
         } else {
+            infer_name(m.b, key_name_text(co, m.a));
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
         }
