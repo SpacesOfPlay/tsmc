@@ -3932,6 +3932,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_SUB: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
+            case OP_SETCONST_ERR: {
+                // the value was computed first, as the assignment says
+                vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
+            }
                     if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);

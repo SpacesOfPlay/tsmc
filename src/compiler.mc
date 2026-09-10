@@ -647,12 +647,12 @@ private void declare_lexical(Compiler* co, Node* at, str name, bool is_const) {
     }
 }
 
-private void declare_plain(Compiler* co, Node* at, str name) {
+private void declare_plain_const(Compiler* co, Node* at, str name, bool is_const) {
     FScope* fs = co.cur;
     // a function declaration may repeat, but not over a lexical name
     if at != null && bound_here(fs, name, true) { redeclared(co, at, name); }
     if at != null { check_strict_binding(co, at, name); }
-    i32 bi = declare(co, name, false, false);
+    i32 bi = declare(co, name, is_const, false);
     CBind b = vec_get(&fs.binds, bi);
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
@@ -660,7 +660,8 @@ private void declare_plain(Compiler* co, Node* at, str name) {
 }
 
 // Walks a binding pattern applying `mode` per name:
-// 0 lexical let, 1 lexical const, 2 plain, 3 hoisted var.
+// 0 lexical let, 1 lexical const, 2 plain, 3 hoisted var,
+// 4 plain and immutable (a `for (const x of ...)` head).
 private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
     if pat == null { return; }
     i32 k = pat.kind;
@@ -679,6 +680,10 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* e = *(pat.kids.items + i);
             if e.kind == N_HOLE { continue; }
+private void declare_plain(Compiler* co, Node* at, str name) {
+    declare_plain_const(co, at, name, false);
+}
+
             declare_pattern(co, e, mode);
         }
         return;
@@ -689,6 +694,7 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
             if pp.kind == N_REST {
                 declare_pattern(co, pp.a, mode);
             } else {
+        if mode == 4 { declare_plain_const(co, pat, pat.name, true); }
                 declare_pattern(co, pp.b, mode);
             }
         }
@@ -848,7 +854,9 @@ private void emit_export_writes(Compiler* co, str name, Node* at) {
     }
 }
 
-// Emits a store that keeps the value on the stack.
+// Emits a store that keeps the value on the stack. A store to a const, to
+// a class's own name or to an import is not an early error: the value is
+// computed and the store throws, so the opcode stands in for the write.
 private void emit_store_ident(Compiler* co, Node* n) {
     FScope* fs = co.cur;
     if co.strict && (str_equal(n.name, "eval") || str_equal(n.name, "arguments")) {
@@ -858,7 +866,8 @@ private void emit_store_ident(Compiler* co, Node* n) {
     if li >= 0 {
         CBind b = vec_get(&fs.binds, li);
         if b.is_const {
-            cerror(co, n, "assignment to constant");
+            ch_op(&fs.ch, OP_SETCONST_ERR);
+            return;
         }
         ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
         if b.exported { emit_export_writes(co, n.name, n); }
@@ -868,14 +877,16 @@ private void emit_store_ident(Compiler* co, Node* n) {
     if ui >= 0 {
         CUp u = vec_get(&fs.ups, ui);
         if u.is_const {
-            cerror(co, n, "assignment to constant");
+            ch_op(&fs.ch, OP_SETCONST_ERR);
+            return;
         }
         ch_op_u16(&fs.ch, OP_SETUPVAL, ui);
         if u.exported { emit_export_writes(co, n.name, n); }
         return;
     }
     if co.in_module && strmap_get<ModImport>(&co.mod_imports, n.name) != null {
-        cerror(co, n, "cannot assign to an imported binding");
+        // an import is an immutable binding, refused when the store runs
+        ch_op(&fs.ch, OP_SETCONST_ERR);
         return;
     }
     ch_op_u16(&fs.ch, OP_SETGLOBAL, name_const(co, n.name));
@@ -3288,7 +3299,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     Node* pattern = null;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, 2);
+        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
     }
     i32 bind_end = fs.binds.len;
 
@@ -3371,7 +3382,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     Node* pattern = null;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, 2);
+        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
     }
     i32 bind_end = fs.binds.len;
 
@@ -3456,7 +3467,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     Node* pattern = null;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, 2);
+        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
     }
     i32 bind_end = fs.binds.len;
 
