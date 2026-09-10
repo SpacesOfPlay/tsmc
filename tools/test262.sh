@@ -23,10 +23,14 @@
 # is half the cores, so the machine stays usable. --limit samples the first
 # N tests and runs on one shard, so the sample is the same every time.
 #
-# A test is skipped (not failed) when it needs a feature the interpreter
-# does not implement (see SKIP_FEATURES) or a harness mode we do not run
-# (modules, raw multi-realm). The honest metric is the pass rate over the
-# tests that actually ran.
+# A test is skipped when it needs a feature the interpreter does not
+# implement (see SKIP_FEATURES) or a mode this runner cannot drive. A skip
+# is not a pass: the percentage is over every test found, so a family that
+# lands in the skip list costs the same as failing it.
+#
+# A `flags: [module]` test is written beside the original as .mjs and run
+# once, since module code is strict and its relative imports have to
+# resolve against the real directory.
 #
 # `flags: [async]` tests report through print(): doneprintHandle.js turns
 # $DONE into one of two markers on stdout, and a test passes only if the
@@ -175,25 +179,28 @@ if command -v timeout >/dev/null 2>&1; then T262_RUN="timeout 10"; else T262_RUN
 # A shard keeps one such file at a time and drops it when the directory
 # changes. A killed run can leave one behind, so they are swept first and
 # never picked up as tests.
-find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
+find "$ROOT" -name '.t262-tmp-*' -delete 2>/dev/null
 TMP=""
+TMPM=""
 TMPDIR_SEEN=""
+TARGET=""
 SHARD=0
 WORK="$PROJECT_DIR/build/t262-work.$$"
 FAILS="$WORK/fails.0"
 FAILS_OUT="$PROJECT_DIR/build/test262-fails.txt"
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP" "$TMPM"' EXIT
 
 pass=0; failc=0; skip=0
 
 # Extracts field VALUE from a test's YAML frontmatter block.
 frontmatter() { sed -n '/\/\*---/,/---\*\//p' "$1"; }
 
+# TARGET is the file the variant is written to: the .mjs one for a module.
 run_variant() {   # <body-with-harness> <negative-phase> <negative-type> <async>
     local src="$1" nphase="$2" ntype="$3" isasync="${4:-0}"
-    printf '%s' "$src" > "$TMP"
+    printf '%s' "$src" > "$TARGET"
     local out rc
-    out="$($T262_RUN "$TSMC" "$TMP" 2>&1)"; rc=$?
+    out="$($T262_RUN "$TSMC" "$TARGET" 2>&1)"; rc=$?
     if [ -z "$nphase" ] && [ "$isasync" = "1" ]; then
         # the markers decide, not the exit code
         case "$out" in
@@ -208,8 +215,16 @@ run_variant() {   # <body-with-harness> <negative-phase> <negative-type> <async>
         return 1
     fi
     # negative test
-    if [ "$nphase" = "parse" ] || [ "$nphase" = "resolution" ] || [ "$nphase" = "early" ]; then
+    if [ "$nphase" = "parse" ] || [ "$nphase" = "early" ]; then
         [ "$rc" -eq 2 ] && return 0    # compile/parse error
+        return 1
+    fi
+    # a link error is found while loading, before any of the module runs,
+    # and is reported as a thrown SyntaxError rather than a compile error
+    if [ "$nphase" = "resolution" ]; then
+        [ "$rc" -eq 2 ] && return 0
+        [ "$rc" -ne 0 ] || return 1
+        case "$out" in *"$ntype"*) return 0 ;; esac
         return 1
     fi
     # runtime negative: must throw, and the thrown type should match
@@ -222,9 +237,10 @@ run_one() {
     local f="$1"
     local d="${f%/*}"
     if [ "$d" != "$TMPDIR_SEEN" ]; then
-        [ -n "$TMP" ] && rm -f "$TMP"
+        [ -n "$TMP" ] && rm -f "$TMP" "$TMPM"
         TMPDIR_SEEN="$d"
         TMP="$d/.t262-tmp-$SHARD.js"
+        TMPM="$d/.t262-tmp-$SHARD.mjs"
     fi
     local fm; fm="$(frontmatter "$f")"
 
@@ -233,13 +249,14 @@ run_one() {
     feats="$(printf '%s\n' "$fm" | sed -n 's/.*features:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr ',' ' ')"
     incs="$(printf '%s\n'  "$fm" | sed -n 's/.*includes:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr ',' ' ')"
 
-    # skip: modes we do not run
+    # skip: modes we cannot drive
     case ",$flags," in
-        *,module,*|*,CanBlockIsFalse,*|*,CanBlockIsTrue,*)
+        *,CanBlockIsFalse,*|*,CanBlockIsTrue,*)
             skip=$((skip + 1)); return ;;
     esac
-    local isasync=0
+    local isasync=0 ismodule=0
     case ",$flags," in *,async,*) isasync=1 ;; esac
+    case ",$flags," in *,module,*) ismodule=1 ;; esac
     # skip: unsupported feature families (entries may be globs)
     for ft in $feats; do
         for s in $SKIP_FEATURES; do
@@ -278,9 +295,16 @@ run_one() {
     esac
 
     local ok=1
-    if [ "$raw" = "1" ]; then
+    if [ "$ismodule" = "1" ]; then
+        # module code is strict on its own, so there is one variant, and
+        # the harness rides along inside the module
+        TARGET="$TMPM"
+        run_variant "$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" "$isasync" || ok=0
+    elif [ "$raw" = "1" ]; then
+        TARGET="$TMP"
         run_variant "$body" "$nphase" "$ntype" "$isasync" || ok=0
     else
+        TARGET="$TMP"
         if [ "$do_sloppy" = "1" ]; then
             run_variant "$BASE_HARNESS"$'\n'"$inc_src$body" "$nphase" "$ntype" "$isasync" || ok=0
         fi
@@ -305,7 +329,7 @@ run_shard() {
     FAILS="$WORK/fails.$SHARD"
     : > "$FAILS"
     pass=0; failc=0; skip=0
-    TMP=""; TMPDIR_SEEN=""
+    TMP=""; TMPM=""; TMPDIR_SEEN=""
     local n=0
     while IFS= read -r f; do
         n=$((n + 1))
@@ -326,7 +350,7 @@ if [ -n "$LIST" ]; then
     [ -f "$LIST" ] || { fail "no such list file: $LIST"; exit 1; }
     sort "$LIST" > "$WORK/all.txt"
 else
-    find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*.js' | sort > "$WORK/all.txt"
+    find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*' | sort > "$WORK/all.txt"
 fi
 total="$(wc -l < "$WORK/all.txt")"
 if [ "$total" -eq 0 ]; then
@@ -367,20 +391,22 @@ while [ "$i" -lt "$JOBS" ]; do
     i=$((i + 1))
 done
 cat "$WORK"/fails.* 2>/dev/null | sort > "$FAILS_OUT"
-find "$ROOT" -name '.t262-tmp-*.js' -delete 2>/dev/null
+find "$ROOT" -name '.t262-tmp-*' -delete 2>/dev/null
 rm -rf "$WORK"
 
 ran=$((pass + failc))
 printf '\n'
 step "test262 result"
+printf '  tests   %d\n' "$total"
 printf '  ran     %d\n' "$ran"
 printf '  passed  %d' "$pass"
-[ "$ran" -gt 0 ] && printf '  (%d%%)' "$((pass * 100 / ran))"
+[ "$total" -gt 0 ] && printf '  (%d%% of all tests)' "$((pass * 100 / total))"
 printf '\n'
 printf '  failed  %d   (see build/test262-fails.txt)\n' "$failc"
-printf '  skipped %d   (unsupported features/modes)\n' "$skip"
+printf '  skipped %d   (unsupported features or modes; not a pass)\n' "$skip"
+# --limit stops early on purpose; otherwise every test owes a result
 missing=$((total - ran - skip))
-if [ "$missing" -gt 0 ]; then
+if [ "$LIMIT" -eq 0 ] && [ "$missing" -gt 0 ]; then
     fail "$missing of $total tests produced no result — the run is INCOMPLETE"
     fail "a shard died, usually a fork failure under memory pressure; rerun"
     exit 1

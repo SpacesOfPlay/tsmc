@@ -224,24 +224,37 @@ tools/test262.sh --list fails.txt                # exactly these files
 On Windows the runner is a portable bash script (`tools/test262.sh`)
 run through Git Bash. It assembles each test with its harness includes,
 runs the strict and sloppy variants, and honours the `negative`
-frontmatter. Tests that need a feature the interpreter doesn't implement
-(Temporal, Intl, SharedArrayBuffer and Atomics, WeakRef, `eval`, …) are
-**skipped**, not failed — the honest metric is the pass rate over the
-tests that ran, so the skip list at the top of the script is worth
-reading before the number below. Failing test paths are written to
-`build/test262-fails.txt`. The run is split into shards (`--jobs`,
-default half the cores). Pin a different revision with the
-`T262_COMMIT` environment variable.
+frontmatter. A `module` test is written beside the original as `.mjs`
+and run once, so its relative imports resolve and module code is strict
+where it should be.
+
+A test that needs a feature the interpreter doesn't implement (Temporal,
+Intl, SharedArrayBuffer and Atomics, WeakRef, `eval`, …) is **skipped**,
+and a skip is **not** a pass: the percentage below is over every test
+found, so a family in the skip list costs exactly what failing it would.
+The list at the top of the script is the thing to read before the number.
+Failing test paths are written to `build/test262-fails.txt`. The run is
+split into shards (`--jobs`, default half the cores). Pin a different
+revision with the `T262_COMMIT` environment variable.
 
 The default `test/language` run, at the pinned revision, measured
 2026-09-10:
 
 | | tests |
 |---|---|
-| ran | 21,037 |
-| passed | 19,457 (92%) |
+| in the tree | 23,714 |
+| passed | 19,457 (82%) |
 | failed | 1,580 |
 | skipped as unsupported | 2,677 |
+
+The pass rate is over everything in the tree. Of the tests that actually
+ran it is 92%, which is the flattering way to say it and the reason the
+skip list is printed above the number.
+
+That snapshot skipped the 810 `module` tests, which the runner now runs.
+A skip already counted against the total, so measuring them can only help
+the figure: `module-code` on its own passes 418 of its 599. What it costs
+is the flattering number, not the honest one.
 
 Where the failures are, each counted once. Early errors are counted by
 the suite's own `phase: parse` frontmatter, the rest by area:
