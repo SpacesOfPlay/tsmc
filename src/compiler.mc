@@ -2197,6 +2197,10 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_CONST, ch_add_const(ch, value_int(0)));
             ch_op_u16(ch, OP_SETLOCAL, t_mode);
             ch_op(ch, OP_POP);
+            // the delegate's throw/return, read once each time one is
+            // needed: the language reads the property once and calls what
+            // it found, and a test with a getter on it can tell
+            i32 t_meth = alloc_slot(co.cur);
             // never set: the close on a missing throw method always runs
             i32 t_done = alloc_slot(co.cur);
             ch_op(ch, OP_FALSE);
@@ -2243,12 +2247,21 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_patch(ch, jthrow);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "throw"));
+            ch_op_u16(ch, OP_SETLOCAL, t_meth);
+            // undefined or null means the delegate has no throw; anything
+            // else has to be callable, and is an error on its own if not
+            i32 jnothrow = ch_jump(ch, OP_JUMP_NULLISH);
             ch_op(ch, OP_TYPEOF);
             ch_op_u16(ch, OP_CONST, str_const(co, "function"));
             ch_op(ch, OP_SEQ);
-            i32 jnothrow = ch_jump(ch, OP_JUMPF);
+            i32 jthrowok = ch_jump(ch, OP_JUMPT);
+            ch_op_u16(ch, OP_GETGLOBAL, name_const(co, "TypeError"));
+            ch_op_u16(ch, OP_CONST, str_const(co, "The iterator's 'throw' property is not a function."));
+            ch_op_u16(ch, OP_NEW, 1);
+            ch_op(ch, OP_THROW);
+            ch_patch(ch, jthrowok);
+            ch_op_u16(ch, OP_GETLOCAL, t_meth);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, "throw"));
             ch_op_u16(ch, OP_GETLOCAL, t_sent);
             ch_op_u16(ch, OP_CALL, 1);
             if adelegate { ch_op(ch, OP_AWAIT); }
@@ -2278,12 +2291,19 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_patch(ch, jret);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "return"));
+            ch_op_u16(ch, OP_SETLOCAL, t_meth);
+            i32 jnoret = ch_jump(ch, OP_JUMP_NULLISH);
             ch_op(ch, OP_TYPEOF);
             ch_op_u16(ch, OP_CONST, str_const(co, "function"));
             ch_op(ch, OP_SEQ);
-            i32 jnoret = ch_jump(ch, OP_JUMPF);
+            i32 jretok = ch_jump(ch, OP_JUMPT);
+            ch_op_u16(ch, OP_GETGLOBAL, name_const(co, "TypeError"));
+            ch_op_u16(ch, OP_CONST, str_const(co, "The iterator's 'return' property is not a function."));
+            ch_op_u16(ch, OP_NEW, 1);
+            ch_op(ch, OP_THROW);
+            ch_patch(ch, jretok);
+            ch_op_u16(ch, OP_GETLOCAL, t_meth);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, "return"));
             ch_op_u16(ch, OP_GETLOCAL, t_sent);
             ch_op_u16(ch, OP_CALL, 1);
             if adelegate { ch_op(ch, OP_AWAIT); }

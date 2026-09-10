@@ -111,3 +111,22 @@ Two are left, and both belong elsewhere because sync generators share them:
   own cell kind rather than objects, so there is no prototype chain to walk,
   and the `%IteratorPrototype%` / `%AsyncIteratorPrototype%` layer does not
   exist either.
+
+## `yield*` delegation, 2026-09-10
+
+The delegate's `throw` and `return` are read once each time one is needed,
+as GetMethod does, rather than once to test and once to call: a test that
+puts a getter on either can count the reads, and test262 does. A value
+that is neither undefined nor callable is a TypeError of its own now,
+instead of being treated as an absence and closing the iterator.
+
+Two differences from node remain here, both deliberate:
+
+- An async generator delegating to a sync iterator that has no `throw`
+  closes it and reports a TypeError. Node propagates the original error
+  and does not close, which is the older text; the pinned test262 asserts
+  the close and the TypeError.
+- A sync generator does not pass the delegate's result object through to
+  its consumer, where the language says the same object comes back out.
+  Visible when the result carries getters. The async form is right, and
+  does build a fresh object.
