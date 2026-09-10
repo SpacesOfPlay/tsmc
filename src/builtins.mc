@@ -124,12 +124,35 @@ private i32 bi_utf8_encode(u8* dst, u32 cp) {
 
 // --- Object ---------------------------------------------------------------
 
+// ToObject: an object is itself, a primitive is a fresh wrapper carrying
+// it, and nothing else can be converted. The wrapper inherits from the
+// prototype the primitive already reports, so its methods find the value
+// through %prim.
+private Value js_to_object(VM* vm, Value v) {
+    if value_is_object(v) || value_is_function(v) || value_is_native(v) { return v; }
+    if value_is_undefined(v) || value_is_null(v) {
+        vm_throw_error(vm, ERR_TYPE, "cannot convert undefined or null to an object");
+        return value_undefined();
+    }
+    Value protov = proto_of_value(vm, v);
+    JsObject* proto = value_is_object(protov) ? value_as_object(protov) : null;
+    vm_push(vm, v);
+    JsObject* o = js_new_object(&vm.heap, proto);
+    vm_push(vm, value_cell(&o.head));
+    set_wrapped_prim(vm, o, v);
+    vm_pop(vm);
+    vm_pop(vm);
+    return value_cell(&o.head);
+}
+
 private Value nat_object_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value v = arg_at(args, argc, 0);
-    if value_is_object(v) { return v; }
-    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
-    return value_cell(&o.head);
+    if value_is_undefined(v) || value_is_null(v) {
+        JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+        return value_cell(&o.head);
+    }
+    return js_to_object(vm, v);
 }
 
 private Value nat_object_keys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5557,8 +5580,16 @@ private Value nat_bigint_ctor(void* vmp, Value callee, Value thisv, Value* args,
 
 private Value nat_bigint_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    if !value_is_bigint(thisv) { return new_str(vm, "0"); }
-    BigNum v = bigint_view(value_as_bigint(thisv));
+    Value self = thisv;
+    if !value_is_bigint(self) {
+        Value p;
+        if wrapped_prim(vm, self, &p) && value_is_bigint(p) { self = p; }
+    }
+    if !value_is_bigint(self) {
+        vm_throw_error(vm, ERR_TYPE, "BigInt.prototype.toString requires that 'this' be a BigInt");
+        return value_undefined();
+    }
+    BigNum v = bigint_view(value_as_bigint(self));
     Value radv = arg_at(args, argc, 0);
     i32 radix = 10;
     if !value_is_undefined(radv) { radix = to_int_arg(radv); }
@@ -5611,7 +5642,12 @@ private Value nat_bigint_tostring(void* vmp, Value callee, Value thisv, Value* a
 }
 
 private Value nat_bigint_valueof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    return thisv;
+    VM* vm = as_vm(vmp);
+    if value_is_bigint(thisv) { return thisv; }
+    Value p;
+    if wrapped_prim(vm, thisv, &p) && value_is_bigint(p) { return p; }
+    vm_throw_error(vm, ERR_TYPE, "BigInt.prototype.valueOf requires that 'this' be a BigInt");
+    return value_undefined();
 }
 
 private Value nat_symbol_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {

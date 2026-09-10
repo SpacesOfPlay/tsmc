@@ -33,7 +33,8 @@ enum Op {
     OP_SETGLOBAL,    // u16 const idx; keeps value
 
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
-    OP_NEG, OP_TONUM,
+    OP_NEG, OP_TONUM,   // ToNumeric: a BigInt stays one (++ and --)
+    OP_TONUMBER,        // ToNumber: unary plus, which a BigInt refuses
     OP_TOSTR,         // ToString (string hint) — template substitutions
     OP_INC, OP_DEC,   // ++/-- step, type-appropriate (Number or BigInt)
     OP_NOT, OP_BITNOT, OP_TYPEOF,

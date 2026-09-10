@@ -2069,7 +2069,7 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         compile_expr(co, n.a);
         if n.op == TOK_MINUS { ch_op(ch, OP_NEG); return; }
-        if n.op == TOK_PLUS { ch_op(ch, OP_TONUM); return; }
+        if n.op == TOK_PLUS { ch_op(ch, OP_TONUMBER); return; }
         if n.op == TOK_BANG { ch_op(ch, OP_NOT); return; }
         if n.op == TOK_TILDE { ch_op(ch, OP_BITNOT); return; }
         cerror(co, n, "unsupported unary operator");

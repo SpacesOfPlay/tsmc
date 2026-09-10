@@ -254,6 +254,172 @@ BigNum bn_divmod(BigNum a, BigNum b, BigNum* rem, bool* ok) {
     return q;
 }
 
+// --- bitwise ---------------------------------------------------------
+//
+// The limbs are base 1e9, which says nothing about bits, so these convert
+// to base 2^32, work there, and convert back. A negative value is read as
+// its infinite two's complement, which is how the language defines the
+// bitwise operators over integers of any size.
+
+const u64 BN_WORD = 4294967296;   // 2^32
+
+// The magnitude in base 2^32, little-endian. Owned; free it.
+private u32* bn_to_words(BigNum a, i32* out_n) {
+    i32 cn = a.n;
+    u32* cur = bn_alloc(cn > 0 ? cn : 1);
+    for i32 i = 0; i < cn; i++ { *(cur + i) = *(a.limbs + i); }
+    i32 cap = cn + 2;
+    u32* w = bn_alloc(cap);
+    i32 wn = 0;
+    // local copies: `%` by a const of this size miscompiles, see
+    // ../lang/doc/BUG_u64_mod_const_over_32_bits.md
+    u64 word = BN_WORD;
+    u64 base = BN_BASE;
+    while cn > 0 {
+        // divide the whole number by 2^32; the remainder is the next word
+        u64 rem = 0;
+        for i32 i = cn - 1; i >= 0; i-- {
+            u64 v = rem * base + cast(u64, *(cur + i));
+            *(cur + i) = cast(u32, v / word);
+            rem = v % word;
+        }
+        if wn < cap { *(w + wn) = cast(u32, rem); }
+        wn++;
+        while cn > 0 && *(cur + cn - 1) == 0 { cn--; }
+    }
+    free(cur);
+    *out_n = wn;
+    return w;
+}
+
+// A base-2^32 magnitude back into base 1e9.
+private BigNum bn_from_words(u32* w, i32 wn, bool neg) {
+    BigNum r = bn_zero();
+    i32 cap = wn * 2 + 2;
+    r.limbs = bn_alloc(cap);
+    r.n = 0;
+    u64 word = BN_WORD;
+    u64 base = BN_BASE;
+    for i32 i = wn - 1; i >= 0; i-- {
+        // r = r * 2^32 + w[i]
+        u64 carry = cast(u64, *(w + i));
+        for i32 j = 0; j < r.n; j++ {
+            u64 v = cast(u64, *(r.limbs + j)) * word + carry;
+            *(r.limbs + j) = cast(u32, v % base);
+            carry = v / base;
+        }
+        while carry > 0 && r.n < cap {
+            *(r.limbs + r.n) = cast(u32, carry % base);
+            carry = carry / base;
+            r.n++;
+        }
+    }
+    r.neg = neg;
+    bn_trim(&r);
+    return r;
+}
+
+// Turns a magnitude into its two's complement over `n` words, in place.
+private void words_negate(u32* w, i32 n) {
+    u64 word = BN_WORD;
+    u64 carry = 1;
+    for i32 i = 0; i < n; i++ {
+        u64 v = cast(u64, ~(*(w + i))) + carry;
+        *(w + i) = cast(u32, v % word);
+        carry = v / word;
+    }
+}
+
+// The magnitude of `a` widened to `n` words, as two's complement when it
+// is negative. Owned; free it.
+private u32* bn_words_signed(BigNum a, i32 n) {
+    i32 an = 0;
+    u32* aw = bn_to_words(a, &an);
+    u32* out = bn_alloc(n);
+    for i32 i = 0; i < n; i++ { *(out + i) = i < an ? *(aw + i) : 0; }
+    free(aw);
+    if a.neg { words_negate(out, n); }
+    return out;
+}
+
+// kind: 0 and, 1 or, 2 xor
+private BigNum bn_bitop(BigNum a, BigNum b, i32 kind) {
+    i32 an = 0;
+    i32 bn2 = 0;
+    u32* aw0 = bn_to_words(a, &an);
+    u32* bw0 = bn_to_words(b, &bn2);
+    free(aw0);
+    free(bw0);
+    // one word of headroom, so the sign bit of the result is its own
+    i32 n = (an > bn2 ? an : bn2) + 1;
+    u32* x = bn_words_signed(a, n);
+    u32* y = bn_words_signed(b, n);
+    for i32 i = 0; i < n; i++ {
+        if kind == 0 { *(x + i) = *(x + i) & *(y + i); }
+        else if kind == 1 { *(x + i) = *(x + i) | *(y + i); }
+        else { *(x + i) = *(x + i) ^ *(y + i); }
+    }
+    free(y);
+    bool neg = (*(x + n - 1) >> 31) != 0;
+    if neg { words_negate(x, n); }
+    BigNum r = bn_from_words(x, n, neg);
+    free(x);
+    return r;
+}
+
+BigNum bn_and(BigNum a, BigNum b) { return bn_bitop(a, b, 0); }
+BigNum bn_or(BigNum a, BigNum b) { return bn_bitop(a, b, 1); }
+BigNum bn_xor(BigNum a, BigNum b) { return bn_bitop(a, b, 2); }
+
+// ~a is -(a + 1), which needs no bits at all.
+BigNum bn_not(BigNum a) {
+    BigNum one = bn_from_i64(1);
+    BigNum plus = bn_add(a, one);
+    BigNum r = bn_neg(plus);
+    bn_free(&plus);
+    bn_free(&one);
+    return r;
+}
+
+// 2^n, for the shifts.
+private BigNum bn_pow2(i64 n) {
+    BigNum two = bn_from_i64(2);
+    BigNum e = bn_from_i64(n);
+    bool ok = true;
+    BigNum r = bn_pow(two, e, &ok);
+    bn_free(&e);
+    bn_free(&two);
+    return r;
+}
+
+// a << n, n >= 0.
+BigNum bn_shl(BigNum a, i64 n) {
+    if a.n == 0 || n == 0 { return bn_copy(a); }
+    BigNum p = bn_pow2(n);
+    BigNum r = bn_mul(a, p);
+    bn_free(&p);
+    return r;
+}
+
+// a >> n, n >= 0. The shift floors, so a negative value rounds away from
+// zero rather than toward it: -9n >> 2n is -3n, not -2n.
+BigNum bn_shr(BigNum a, i64 n) {
+    if a.n == 0 || n == 0 { return bn_copy(a); }
+    BigNum p = bn_pow2(n);
+    BigNum rem;
+    bool ok = true;
+    BigNum q = bn_divmod(a, p, &rem, &ok);
+    bool round_down = a.neg && rem.n > 0;
+    bn_free(&rem);
+    bn_free(&p);
+    if !round_down { return q; }
+    BigNum one = bn_from_i64(1);
+    BigNum r = bn_sub(q, one);
+    bn_free(&one);
+    bn_free(&q);
+    return r;
+}
+
 // a ** e, e >= 0. *ok is false for a negative exponent.
 BigNum bn_pow(BigNum a, BigNum e, bool* ok) {
     if e.neg { *ok = false; return bn_zero(); }

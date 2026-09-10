@@ -1245,6 +1245,35 @@ private Frame* derived_ctor_frame(VM* vm) {
     return null;
 }
 
+// Unary plus: ToNumber, the one conversion a BigInt refuses.
+private void op_to_number(VM* vm) {
+    if value_is_bigint(vpeek(vm, 0)) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot convert a BigInt value to a number");
+        return;
+    }
+    f64 r = vm_to_number(vm, vpeek(vm, 0));
+    vm.sp--;
+    vpush(vm, num_norm(r));
+    return;
+}
+
+// ~x on a BigInt, replacing the operand.
+private void op_bitnot_bigint(VM* vm) {
+    Value b = bigint_complement(vm, vpeek(vm, 0));
+    vm.sp--;
+    vpush(vm, b);
+    return;
+}
+
+// A bitwise or shift op on two BigInts, replacing both operands.
+private void op_bigint_bitop(VM* vm, i32 op) {
+    Value b = bigint_arith(vm, vpeek(vm, 1), vpeek(vm, 0), op);
+    if vm.has_pending { return; }
+    vm.sp -= 2;
+    vpush(vm, b);
+    return;
+}
+
 // A derived constructor calls super() exactly once. False means this was a
 // second call, which is an error and stops the call from happening.
 private bool super_call_begin(VM* vm) {
@@ -3567,7 +3596,24 @@ private bool coerce_top2_prim(VM* vm, i32 hint) {
     return true;
 }
 
-// Arithmetic on two BigInts; throws RangeError on /0 or negative **.
+// A shift count as a machine integer. Beyond this the result would need
+// more memory than any program has, so the caller reports it rather than
+// trying: 2^30 bits is already 128 MB.
+const i64 BIGINT_SHIFT_MAX = 1073741824;
+
+// The shift count of a BigInt, and whether it is small enough to act on.
+// `too_big` says the magnitude is past the cap, which the two shifts
+// answer differently.
+private i64 bigint_shift_count(BigNum y, bool* too_big) {
+    f64 d = bn_to_f64(y);
+    if d < 0.0 { d = -d; }
+    *too_big = d > cast(f64, BIGINT_SHIFT_MAX);
+    if *too_big { return BIGINT_SHIFT_MAX; }
+    return cast(i64, d);
+}
+
+// Arithmetic and bitwise on two BigInts; throws RangeError on /0, a
+// negative **, or a shift too large to hold.
 private Value bigint_arith(VM* vm, Value av, Value bv, i32 op) {
     BigNum x = bigint_view(value_as_bigint(av));
     BigNum y = bigint_view(value_as_bigint(bv));
@@ -3579,6 +3625,28 @@ private Value bigint_arith(VM* vm, Value av, Value bv, i32 op) {
     else if op == OP_DIV { BigNum rem; r = bn_divmod(x, y, &rem, &ok); bn_free(&rem); }
     else if op == OP_MOD { BigNum q = bn_divmod(x, y, &r, &ok); bn_free(&q); }
     else if op == OP_POW { r = bn_pow(x, y, &ok); }
+    else if op == OP_BAND { r = bn_and(x, y); }
+    else if op == OP_BOR { r = bn_or(x, y); }
+    else if op == OP_BXOR { r = bn_xor(x, y); }
+    else if op == OP_SHL || op == OP_SHR {
+        // a negative count shifts the other way
+        bool left = op == OP_SHL;
+        if y.neg { left = !left; }
+        bool too_big = false;
+        i64 n = bigint_shift_count(y, &too_big);
+        if too_big && left {
+            vm_throw_error(vm, ERR_RANGE, "Maximum BigInt size exceeded");
+            return value_undefined();
+        }
+        if too_big {
+            // everything shifted out: 0, or -1 for a negative value
+            r = bn_from_i64(x.neg ? -1 : 0);
+        } else if left {
+            r = bn_shl(x, n);
+        } else {
+            r = bn_shr(x, n);
+        }
+    }
     else { ok = false; r = bn_from_i64(0); }
     if !ok {
         bn_free(&r);
@@ -3586,6 +3654,13 @@ private Value bigint_arith(VM* vm, Value av, Value bv, i32 op) {
             op == OP_POW ? "Exponent must be non-negative" : "Division by zero");
         return value_undefined();
     }
+    GcBigInt* g = js_new_bigint(&vm.heap, r);
+    bn_free(&r);
+    return value_cell(&g.head);
+}
+
+private Value bigint_complement(VM* vm, Value v) {
+    BigNum r = bn_not(bigint_view(value_as_bigint(v)));
     GcBigInt* g = js_new_bigint(&vm.heap, r);
     bn_free(&r);
     return value_cell(&g.head);
@@ -3960,6 +4035,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
+            case OP_TONUMBER: { op_to_number(vm); }
             case OP_TOSTR: {
                 // ToString with the string hint (template substitutions)
                 Value s = js_to_string_value(vm, vpeek(vm, 0));
@@ -3989,7 +4065,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_BITNOT: {
                 if value_is_bigint(vpeek(vm, 0)) {
-                    vm_throw_error(vm, ERR_TYPE, "BigInt bitwise operators are not supported yet");
+                    op_bitnot_bigint(vm);
                     break case;
                 }
                 i32 r = ~f64_to_i32(vm_to_number(vm, vpeek(vm, 0)));
@@ -4091,8 +4167,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+                // an object operand becomes a primitive first, which is how
+                // a wrapped BigInt reaches the BigInt path
+                if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 if value_is_bigint(vpeek(vm, 0)) || value_is_bigint(vpeek(vm, 1)) {
-                    vm_throw_error(vm, ERR_TYPE, "BigInt bitwise operators are not supported yet");
+                    if !value_is_bigint(vpeek(vm, 0)) || !value_is_bigint(vpeek(vm, 1)) {
+                        vm_throw_error(vm, ERR_TYPE, "Cannot mix BigInt and other types, use explicit conversions");
+                        break case;
+                    }
+                    op_bigint_bitop(vm, op);
                     break case;
                 }
                 i32 x = f64_to_i32(vm_to_number(vm, vpeek(vm, 1)));
