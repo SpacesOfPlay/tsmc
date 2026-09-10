@@ -3040,8 +3040,9 @@ private void compile_class_expr(Compiler* co, Node* c) {
     ch_op(ch, OP_POP);
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     ch_op_u16(ch, OP_GETLOCAL, t_proto);
-    // .prototype is a non-enumerable own property of the constructor
-    ch_op_u16(ch, OP_DEFMETHOD, name_const(co, "prototype"));
+    // a class's .prototype is fixed: not writable, not enumerable, not
+    // configurable
+    ch_op_u16(ch, OP_DEFPROP_FIXED, name_const(co, "prototype"));
     ch_op(ch, OP_POP);
 
     // The elements, in source order: every computed key is evaluated here,

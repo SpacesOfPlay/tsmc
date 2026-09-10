@@ -70,6 +70,8 @@ enum Op {
                      // module import read: the name must be present
     OP_SETPROP,      // u16 const idx; pops obj, keeps value
     OP_DEFMETHOD,    // u16 const idx; like SETPROP but non-enumerable
+    OP_DEFPROP_FIXED,// u16 const idx; neither writable, enumerable nor
+                     // configurable — a class's `prototype`
     OP_DEFMETHOD_DYN,// [obj, key, fn] pops key+fn, keeps obj
     OP_GETINDEX, OP_SETINDEX,
     OP_GETMETHOD,    // u16 const idx; pops obj, pushes fn then obj

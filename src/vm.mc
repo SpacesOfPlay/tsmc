@@ -1731,6 +1731,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             vm_throw_error(vm, ERR_TYPE, "cannot assign to read only property of a function");
             return false;
         }
+        // a read-only own property refuses the write, as it does on an object
+        Prop* fe = props_entry(fprops, a);
+        if fe != null && (fe.flags & PROP_WRITABLE) == 0 {
+            vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
+            return false;
+        }
         props_set(fprops, a, v);
         return true;
     }
@@ -1970,6 +1976,16 @@ private void name_by_key(VM* vm, Value fnv, u32 key, str prefix) {
 // as well as a plain object. A frozen object takes no definition, and a
 // non-extensible one takes none it does not already have.
 private void def_prop_atom(VM* vm, Value objv, u32 a, Value v) {
+    // one that is neither writable nor configurable cannot be redefined
+    Prop* ex = null;
+    if value_props(objv) != null { ex = props_entry(value_props(objv), a); }
+    if ex != null && (ex.flags & (PROP_WRITABLE | PROP_CONFIGURABLE)) == 0 {
+        string msg = format("Cannot redefine property: {}", atom_name(&vm.atoms, a));
+        str mv = msg;
+        vm_throw_error(vm, ERR_TYPE, mv);
+        free(msg);
+        return;
+    }
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
         bool fresh = props_get(&o.props, a) == null;
@@ -2167,11 +2183,15 @@ private void require_object(VM* vm) {
 }
 
 private void def_method(Value objv, u32 a, Value v) {
-    PropList* props = null;
-    if value_is_object(objv) { props = &value_as_object(objv).props; }
-    else if value_is_function(objv) { props = &value_as_function(objv).props; }
-    else if value_is_native(objv) { props = &value_as_native(objv).props; }
+    PropList* props = value_props(objv);
     if props != null { props_set_desc(props, a, v, PROP_WRITABLE | PROP_CONFIGURABLE); }
+}
+
+// A property that cannot be written, enumerated or redefined: a class's
+// `prototype`, which the specification fixes on the constructor.
+private void def_prop_fixed(Value objv, u32 a, Value v) {
+    PropList* props = value_props(objv);
+    if props != null { props_set_desc(props, a, v, 0); }
 }
 
 // Installs `fnv` as the getter or setter of `a` on `objv`, reusing an existing
@@ -4634,6 +4654,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm.sp -= 2;
                     vpush(vm, v);
                 }
+            }
+            case OP_DEFPROP_FIXED: {
+                ip += 2;
+                def_prop_fixed(vpeek(vm, 1), cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), vpeek(vm, 0));
+                vm.sp--;
             }
             case OP_DEFMETHOD: {
                 // like SETPROP but installs a non-enumerable property
