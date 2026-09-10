@@ -531,6 +531,26 @@ private i32 prop_key_const(Compiler* co, Node* key) {
     return name_const(co, key.name);
 }
 
+// The name an anonymous method or field initializer takes from its key.
+// A private name keeps its '#'; a computed key has none at compile time.
+private str key_name_text(Compiler* co, Node* key) {
+    if key == null { return ""; }
+    if key.kind == N_NUMBER { return num_key_text(co, key.num); }
+    if key.kind == N_PRIVATE_IDENT {
+        string s = format("#{}", key.name);
+        str view = s;
+        u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
+        memcpy(copy, view.data, view.len);
+        free(s);
+        str r;
+        r.data = copy;
+        r.len = view.len;
+        return r;
+    }
+    if key.kind == N_IDENT || key.kind == N_STRING { return key.name; }
+    return "";
+}
+
 private str hidden_name(Compiler* co, str prefix, i32 n) {
     string s = format("{}{}", prefix, n);
     str view = s;
@@ -659,6 +679,10 @@ private void declare_plain_const(Compiler* co, Node* at, str name, bool is_const
     }
 }
 
+private void declare_plain(Compiler* co, Node* at, str name) {
+    declare_plain_const(co, at, name, false);
+}
+
 // Walks a binding pattern applying `mode` per name:
 // 0 lexical let, 1 lexical const, 2 plain, 3 hoisted var,
 // 4 plain and immutable (a `for (const x of ...)` head).
@@ -670,6 +694,7 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
         if mode == 1 { declare_lexical(co, pat, pat.name, true); }
         if mode == 2 { declare_plain(co, pat, pat.name); }
         if mode == 3 { hoist_declare_var(co, pat); }
+        if mode == 4 { declare_plain_const(co, pat, pat.name, true); }
         return;
     }
     if k == N_ASSIGN_PATTERN || k == N_REST {
@@ -680,10 +705,6 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* e = *(pat.kids.items + i);
             if e.kind == N_HOLE { continue; }
-private void declare_plain(Compiler* co, Node* at, str name) {
-    declare_plain_const(co, at, name, false);
-}
-
             declare_pattern(co, e, mode);
         }
         return;
@@ -694,7 +715,6 @@ private void declare_plain(Compiler* co, Node* at, str name) {
             if pp.kind == N_REST {
                 declare_pattern(co, pp.a, mode);
             } else {
-        if mode == 4 { declare_plain_const(co, pat, pat.name, true); }
                 declare_pattern(co, pp.b, mode);
             }
         }
@@ -2837,16 +2857,17 @@ private void compile_class_expr(Compiler* co, Node* c) {
     }
     vec_push(&co.priv_scopes, ps);
 
-    // Inner class-name binding: inside the class body the class name refers to
-    // the class itself, initialized before static blocks and static field
-    // initializers run — unlike the outer binding a class *statement* adds,
-    // which is still in TDZ during class creation. `declare` cellifies it
-    // automatically when a method or field initializer closes over it.
+    // Inner class-name binding: inside the class body the class name refers
+    // to the class itself. It stays in TDZ while the elements are defined —
+    // a computed key may not read it — and is initialized before the static
+    // initializers run. `declare` cellifies it automatically when a method
+    // or field initializer closes over it.
     i32 name_bind = 0 - 1;
     if c.name.len > 0 {
-        name_bind = declare(co, c.name, true, false);
+        name_bind = declare(co, c.name, true, true);
         CBind* nb = fs.binds.data + name_bind;
-        if nb.is_cell { ch_op_u16(ch, OP_NEWCELL_UNDEF, nb.slot); }
+        if nb.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, nb.slot); }
+        else { ch_op_u16(ch, OP_SETHOLE, nb.slot); }
     }
 
     // partition members
@@ -2886,19 +2907,17 @@ private void compile_class_expr(Compiler* co, Node* c) {
     } else {
         ctor_fn = build_default_ctor(co, derived);
     }
-    // A computed field key is evaluated once, when the class is defined,
-    // in the scope around the class; the constructor reads the result from
-    // a hidden binding each time it defines the field.
+    // A computed field key is evaluated once, when the class is defined, and
+    // the constructor reads the result from a hidden binding each time it
+    // defines the field. The bindings are declared here so the constructor
+    // can capture them; the element pass below fills them in source order.
     for i32 i = 0; i < fields.len; i++ {
         Node* m = vec_get(&fields, i);
         if (m.flags & NF_COMPUTED) == 0 { continue; }
-        compile_expr(co, m.a);
         i32 bi = declare(co, hidden_name(co, "%fk", i), true, false);
         CBind* bp = fs.binds.data + bi;
         bp.is_cell = true;
         ch_op_u16(ch, OP_NEWCELL_UNDEF, bp.slot);
-        ch_op_u16(ch, OP_SETCELL, bp.slot);
-        ch_op(ch, OP_POP);
     }
     co.next_is_derived_ctor = derived;
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
@@ -2915,13 +2934,6 @@ private void compile_class_expr(Compiler* co, Node* c) {
     i32 t_ctor = alloc_slot(fs);
     ch_op_u16(ch, OP_SETLOCAL, t_ctor);
     ch_op(ch, OP_POP);
-
-    // Bind the inner class name to the freshly built constructor, so static
-    // blocks / fields and any closure over it see the class value.
-    if name_bind >= 0 {
-        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
-        emit_init_binding(co, name_bind);
-    }
 
     // Static blocks and static field initializers run with `this` bound to the
     // constructor; expose it as a class-scoped `this` (cellified when a nested
@@ -2960,7 +2972,13 @@ private void compile_class_expr(Compiler* co, Node* c) {
     ch_op_u16(ch, OP_DEFMETHOD, name_const(co, "prototype"));
     ch_op(ch, OP_POP);
 
-    // members
+    // The elements, in source order: every computed key is evaluated here,
+    // once, and a method is defined as it is met. A field keeps its key for
+    // the pass below, which runs the initializers once the methods are in
+    // place.
+    Vec<i32> key_slots = vec_new<i32>(4);
+    for i32 i = 0; i < c.kids.len; i++ { vec_push(&key_slots, 0 - 1); }
+    i32 field_ix = 0;
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK { continue; }
@@ -2968,10 +2986,25 @@ private void compile_class_expr(Compiler* co, Node* c) {
         bool is_static = (m.flags & NF_STATIC) != 0;
         bool is_method = m.b != null && m.b.kind == N_FUNCTION;
         bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
+        bool computed = (m.flags & NF_COMPUTED) != 0;
+        if member_is_field(m) {
+            // an instance field: the key now, the value in the constructor
+            if computed {
+                compile_expr(co, m.a);
+                ch_op(ch, OP_TOPROPKEY);
+                i32 bi = find_local(fs, hidden_name(co, "%fk", field_ix));
+                CBind kb = vec_get(&fs.binds, bi);
+                ch_op_u16(ch, OP_SETCELL, kb.slot);
+                ch_op(ch, OP_POP);
+            }
+            field_ix++;
+            continue;
+        }
         if is_method {
             ch_op_u16(ch, OP_GETLOCAL, is_static ? t_ctor : t_proto);
-            if (m.flags & NF_COMPUTED) != 0 {
+            if computed {
                 compile_expr(co, m.a);
+                ch_op(ch, OP_TOPROPKEY);
                 compile_function(co, m.b, false);
                 if is_acc {
                     i32 aop = (m.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
@@ -2990,49 +3023,69 @@ private void compile_class_expr(Compiler* co, Node* c) {
                 ch_op(ch, OP_POP);
             } else {
                 // the key names the method, as in an object literal
-                if m.a.kind == N_IDENT || m.a.kind == N_STRING { infer_name(m.b, m.a.name); }
-                else if m.a.kind == N_NUMBER { infer_name(m.b, num_key_text(co, m.a.num)); }
+                infer_name(m.b, key_name_text(co, m.a));
                 compile_function(co, m.b, false);
                 ch_op_u16(ch, OP_DEFMETHOD, prop_key_const(co, m.a));
                 ch_op(ch, OP_POP);
             }
             continue;
         }
-        if is_static {
-            ch_op_u16(ch, OP_GETLOCAL, t_ctor);
-            bool saved_st = co.static_this;
-            if (m.flags & NF_COMPUTED) != 0 {
-                compile_expr(co, m.a);   // computed key keeps the outer `this`
-                co.static_this = true;
-                if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
-                co.static_this = saved_st;
-                ch_op(ch, OP_SETINDEX);
-            } else {
-                co.static_this = true;
-                if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
-                co.static_this = saved_st;
-                ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
-            }
+        if is_static && computed {
+            // a static field: the key now, the initializer below
+            compile_expr(co, m.a);   // a computed key keeps the outer `this`
+            ch_op(ch, OP_TOPROPKEY);
+            i32 slot = alloc_slot(fs);
+            ch_op_u16(ch, OP_SETLOCAL, slot);
             ch_op(ch, OP_POP);
+            vec_set(&key_slots, i, slot);
         }
-        // instance fields run inside the constructor
     }
-    // static blocks execute at class creation, in order
+    // Bind the inner class name to the freshly built constructor, so the
+    // static initializers and any closure over it see the class value.
+    if name_bind >= 0 {
+        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+        emit_init_binding(co, name_bind);
+    }
+
+    // Static field initializers and static blocks run after every method is
+    // defined, in source order with each other.
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK {
-            bool saved_st = co.static_this;
             bool saved_sb = co.in_static_block;
             i32 saved_floor = fs.loop_floor;
+            bool saved_bt = co.static_this;
             co.static_this = true;
             co.in_static_block = true;
             fs.loop_floor = fs.loops.len;   // no break or continue leaves the block
             compile_stmt(co, m.a);
             fs.loop_floor = saved_floor;
             co.in_static_block = saved_sb;
-            co.static_this = saved_st;
+            co.static_this = saved_bt;
+            continue;
         }
+        if m.kind != N_CLASS_MEMBER || m == ctor_member { continue; }
+        if (m.flags & NF_STATIC) == 0 { continue; }
+        if m.b != null && m.b.kind == N_FUNCTION { continue; }
+        if (m.flags & (NF_GETTER | NF_SETTER)) != 0 { continue; }
+        ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+        infer_name(m.b, key_name_text(co, m.a));
+        bool saved_st = co.static_this;
+        if (m.flags & NF_COMPUTED) != 0 {
+            ch_op_u16(ch, OP_GETLOCAL, vec_get(&key_slots, i));
+            co.static_this = true;
+            if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+            co.static_this = saved_st;
+            ch_op_u16(ch, OP_DEFPROP_DYN, 1);   // an anonymous value takes the key as its name
+        } else {
+            co.static_this = true;
+            if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+            co.static_this = saved_st;
+            ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
+        }
+        ch_op(ch, OP_POP);
     }
+    vec_free(&key_slots);
 
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     vec_free(&fields);
@@ -3230,11 +3283,12 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
     for i32 i = 0; i < n_fields; i++ {
         Node* m = *(fields + i);
         ch_op(ch, OP_THIS);
+        infer_name(m.b, key_name_text(co, m.a));
         if (m.flags & NF_COMPUTED) != 0 {
             // the key was evaluated when the class was defined
             emit_load_name(co, hidden_name(co, "%fk", i), m);
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
-            ch_op(ch, OP_SETINDEX);
+            ch_op_u16(ch, OP_DEFPROP_DYN, 1);   // defined, so no setter runs
         } else {
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));

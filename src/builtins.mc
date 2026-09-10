@@ -705,14 +705,22 @@ private Value nat_object_defineproperties(void* vmp, Value callee, Value thisv, 
 }
 
 // Property-key value → atom for reflection APIs: Symbols map to their
-// reserved id, everything else is ToString'd. `sk` receives the string
-// form (for the array index/length checks); it is left empty for symbols.
+// reserved id, everything else is ToString'd. An object is asked for a
+// primitive first, since that primitive may itself be a Symbol. `sk`
+// receives the string form (for the array index/length checks); it is
+// left empty for symbols.
 private u32 reflect_key(VM* vm, Value kv, str* sk) {
+    if !value_is_primitive(kv) {
+        Value prim;
+        if vm_to_primitive(vm, kv, HINT_STRING, &prim) { kv = prim; }
+    }
     if value_is_symbol(kv) {
         *sk = "";
         return value_as_symbol(kv).id;
     }
+    vm_push(vm, kv);
     Value ks = js_to_string_value(vm, kv);
+    vm_pop(vm);
     vm_push(vm, ks);
     u32 a = atom_intern(&vm.atoms, sview(ks));
     *sk = atom_name(&vm.atoms, a);

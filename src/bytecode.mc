@@ -37,6 +37,7 @@ enum Op {
     OP_NEG, OP_TONUM,   // ToNumeric: a BigInt stays one (++ and --)
     OP_TONUMBER,        // ToNumber: unary plus, which a BigInt refuses
     OP_TOSTR,         // ToString (string hint) — template substitutions
+    OP_TOPROPKEY,     // ToPropertyKey: a Symbol stays, anything else a string
     OP_INC, OP_DEC,   // ++/-- step, type-appropriate (Number or BigInt)
     OP_NOT, OP_BITNOT, OP_TYPEOF,
     OP_EQ, OP_NEQ, OP_SEQ, OP_SNEQ,

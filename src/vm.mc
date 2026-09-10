@@ -1855,9 +1855,39 @@ void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
 
 // Key value → property atom; key must stay rooted by the caller.
 // Symbols map to their reserved id.
+// ToPropertyKey on the top of the stack, leaving the key there: a Symbol
+// stays as it is, anything else becomes its string form. The candidate
+// always occupies the stack slot, so it is rooted across the conversions.
+private void op_to_prop_key(VM* vm) {
+    if value_is_symbol(vpeek(vm, 0)) { return; }
+    if !value_is_primitive(vpeek(vm, 0)) {
+        Value prim;
+        if !vm_to_primitive(vm, vpeek(vm, 0), HINT_STRING, &prim) { return; }
+        vm.sp--;
+        vpush(vm, prim);
+        if value_is_symbol(prim) { return; }
+    }
+    Value s = js_to_string_value(vm, vpeek(vm, 0));
+    if vm.has_pending { return; }
+    vm.sp--;
+    vpush(vm, s);
+}
+
+// ToPropertyKey: a Symbol is already a key, and an object's own primitive
+// may be one too, so the conversion asks for a primitive before it asks
+// for a string.
 private u32 key_to_atom(VM* vm, Value key) {
     if value_is_symbol(key) { return value_as_symbol(key).id; }
-    Value s = js_to_string_value(vm, key);
+    Value k = key;
+    if !value_is_primitive(k) {
+        Value prim;
+        if !vm_to_primitive(vm, k, HINT_STRING, &prim) { return atom_intern(&vm.atoms, ""); }
+        if value_is_symbol(prim) { return value_as_symbol(prim).id; }
+        k = prim;
+    }
+    vpush(vm, k);
+    Value s = js_to_string_value(vm, k);
+    vm.sp--;
     vpush(vm, s);
     u32 a = atom_intern(&vm.atoms, gc_string_view(value_as_string(s)));
     vm.sp--;
@@ -1912,11 +1942,10 @@ private void name_by_key(VM* vm, Value fnv, u32 key, str prefix) {
     props_set_desc(&f.props, vm.atom_name, value_cell(&g.head), PROP_CONFIGURABLE);
 }
 
-// [obj, val] -> [obj]: defines a data property. A frozen object takes no
-// definition, and a non-extensible one takes none it does not have.
-private void def_prop(VM* vm, u32 a) {
-    Value v = vpop(vm);
-    Value objv = vpeek(vm, 0);
+// Defines a data property on anything that carries properties, a function
+// as well as a plain object. A frozen object takes no definition, and a
+// non-extensible one takes none it does not already have.
+private void def_prop_atom(VM* vm, Value objv, u32 a, Value v) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
         bool fresh = props_get(&o.props, a) == null;
@@ -1930,6 +1959,12 @@ private void def_prop(VM* vm, u32 a) {
     }
 }
 
+// [obj, val] -> [obj]: defines a data property.
+private void def_prop(VM* vm, u32 a) {
+    Value v = vpop(vm);
+    def_prop_atom(vm, vpeek(vm, 0), a, v);
+}
+
 // [obj, key, val] -> [obj]: a computed-key property of an object literal.
 // With name_it, an anonymous function or class value takes the key as its
 // name.
@@ -1938,8 +1973,7 @@ private void def_prop_dyn(VM* vm, bool name_it) {
     u32 a = key_to_atom(vm, vpeek(vm, 1));
     if vm.has_pending { return; }
     if name_it { name_by_key(vm, v, a, ""); }
-    Value objv = vpeek(vm, 2);
-    if value_is_object(objv) { js_set_prop(value_as_object(objv), a, v); }
+    def_prop_atom(vm, vpeek(vm, 2), a, v);
     vm.sp -= 2;
 }
 
@@ -2340,7 +2374,7 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
 }
 
 // A primitive value is anything that is not an object-like reference.
-private bool value_is_primitive(Value v) {
+bool value_is_primitive(Value v) {
     if !value_is_cell(v) { return true; }
     return value_is_string(v) || value_is_symbol(v) || value_is_bigint(v);
 }
@@ -2372,6 +2406,11 @@ bool vm_to_primitive(VM* vm, Value v, i32 hint, Value* out) {
             return true;
         }
         vm_throw_error(vm, ERR_TYPE, "Cannot convert object to a primitive value");
+        return false;
+    }
+    // GetMethod: present but not callable is an error, not a fallback
+    if !value_is_undefined(exotic) && !value_is_null(exotic) {
+        vm_throw_error(vm, ERR_TYPE, "Symbol.toPrimitive is not a function");
         return false;
     }
     bool prefer_string = hint == HINT_STRING;
@@ -3893,6 +3932,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 intmap_set<Value>(&vm.globals, a, vpeek(vm, 0));
             }
+            case OP_SETCONST_ERR: {
+                // the value was computed first, as the assignment says
+                vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
+            }
             case OP_ADD: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
                     if !coerce_top2_prim(vm, HINT_DEFAULT) { break case; }
@@ -3932,10 +3975,6 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_SUB: {
                 if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-            case OP_SETCONST_ERR: {
-                // the value was computed first, as the assignment says
-                vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
-            }
                     if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
                 }
                 Value b = vpeek(vm, 0);
@@ -4040,6 +4079,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, num_norm(r));
             }
             case OP_TONUMBER: { op_to_number(vm); }
+            case OP_TOPROPKEY: {
+                op_to_prop_key(vm);
+            }
             case OP_TOSTR: {
                 // ToString with the string hint (template substitutions)
                 Value s = js_to_string_value(vm, vpeek(vm, 0));
