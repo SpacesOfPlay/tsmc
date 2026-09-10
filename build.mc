@@ -702,9 +702,10 @@ private str neg_expectation(str text) {
 void run_neg_tests(str exe) {
     step("negative tests");
     DirList tests = dir_list_ext("test/neg", ".js");
-    if tests.count == 0 { outln("  (none)"); }
-    for i32 i = 0; i < tests.count; i++ {
-        str name = tests.items[i];
+    DirList mods = dir_list_ext("test/neg", ".mjs");   // module-only rules
+    if tests.count + mods.count == 0 { outln("  (none)"); }
+    for i32 i = 0; i < tests.count + mods.count; i++ {
+        str name = i < tests.count ? tests.items[i] : mods.items[i - tests.count];
         str stem = path_stem(name);
         string src = path_join("test/neg", name);
         defer free(src);
@@ -724,6 +725,7 @@ void run_neg_tests(str exe) {
         }
         proc_result_free(&r);
     }
+    dir_list_free(&mods);
     dir_list_free(&tests);
     return;
 }

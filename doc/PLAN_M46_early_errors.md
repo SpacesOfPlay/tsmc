@@ -133,12 +133,15 @@ that is the next piece of work, and it is worth about 180 tests.
 - Annex B block-level function hoisting: `{ function f() {} }` does not
   make `f` visible outside the block, so the sloppy allowances above are
   accepted but the binding stays inside. Independent of this milestone.
-- `super()` called from an arrow inside a derived constructor runs with
-  the wrong `this` at run time; the early error side is right.
+- `super()` called from an arrow inside a derived constructor throws a
+  TypeError at run time; the early error side is right. Predates the
+  constructor rules below.
+- `this` before `super()` in a derived constructor is read rather than
+  refused. The other half of the same rule, and it needs the constructor's
+  `this` binding to start empty, which is a change to how a derived
+  constructor is called.
 - A `var` that repeats a destructured catch parameter, and `for (var e
   of ...)` inside `catch (e)`, are still accepted.
-- `await` and `yield` are not reserved inside async functions and
-  generators, in either spelling. The largest remaining early-error group.
 - The Unicode property tables are a version behind the suite, so a few
   identifier tests fail in both the plain and the escaped spelling. Two of
   them only need U+30FB and U+FF65 added to Other_ID_Continue, which

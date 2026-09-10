@@ -2872,6 +2872,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     co.next_is_derived_ctor = derived;
     FnTemplate* ct = compile_function_tmpl(co, ctor_fn, fields.data, fields.len, false);
     ct.is_class = true;
+    ct.derived_ctor = derived;   // owes a super() call before it returns
     // a class prints as the whole class, not as its constructor
     ct.src_start = c.span.start;
     ct.src_end = c.span.end;
@@ -3994,7 +3995,17 @@ private bool has_use_strict(NodeList* list) {
     return false;
 }
 
-private void add_export_name(Compiler* co, str local, str exported) {
+// `at` is where the export was written, for the duplicate report.
+private void add_export_name(Compiler* co, str local, str exported, Node* at) {
+    for i32 i = 0; i < co.export_names.len; i++ {
+        if str_equal(vec_get(&co.export_names, i).exported, exported) {
+            string m = format("Duplicate export of '{}'", exported);
+            str mv = m;
+            cerror(co, at, mv);
+            free(m);
+            break;
+        }
+    }
     ExportName e;
     e.exported = exported;
     i32* head = strmap_get<i32>(&co.export_heads, local);
@@ -4095,7 +4106,7 @@ private void collect_exports(Compiler* co, Node* prog) {
         if s.a == null {
             for i32 j = 0; j < s.kids.len; j++ {
                 Node* sp = *(s.kids.items + j);
-                add_export_name(co, sp.name, sp.a != null ? sp.a.name : sp.name);
+                add_export_name(co, sp.name, sp.a != null ? sp.a.name : sp.name, sp);
             }
             continue;
         }
@@ -4108,11 +4119,17 @@ private void collect_exports(Compiler* co, Node* prog) {
             }
             for i32 j = 0; j < names.len; j++ {
                 str nm = vec_get(&names, j);
-                add_export_name(co, nm, nm);
+                add_export_name(co, nm, nm, d);
             }
             vec_free(&names);
         } else if (d.kind == N_FUNCTION || d.kind == N_CLASS) && d.name.len > 0 {
-            add_export_name(co, d.name, is_default ? "default" : d.name);
+            str exported = d.name;
+            if is_default { exported = "default"; }
+            add_export_name(co, d.name, exported, d);
+        } else if is_default {
+            // `export default <expression>`: the name is taken even though
+            // no binding carries it
+            add_export_name(co, "%default", "default", s);
         }
     }
 }
@@ -4266,12 +4283,32 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     }
 
     // 6. top-level function declarations (hoisted); initializing an
-    //    exported one writes it to the namespace
+    //    exported one writes it to the namespace.
+    //
+    //    A module's top level is lexical, unlike a script's: a function
+    //    declared there may not repeat another declaration, nor a `var`.
+    Vec<str> mod_vars = vec_new<str>(4);
+    for i32 i = 0; i < prog.kids.len; i++ {
+        Node* s = *(prog.kids.items + i);
+        collect_var_names(s.kind == N_EXPORT && s.a != null ? s.a : s, &mod_vars);
+    }
+    Vec<NodePtr> mod_fns = vec_new<NodePtr>(4);
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
         Node* d = function_decl_of(s.kind == N_EXPORT && s.a != null ? s.a : s);
-        if d != null { declare_plain(co, d, d.name); }
+        if d == null { continue; }
+        if names_has(&mod_vars, d.name) { redeclared(co, d, d.name); }
+        for i32 j = 0; j < mod_fns.len; j++ {
+            if str_equal(vec_get(&mod_fns, j).name, d.name) {
+                redeclared(co, d, d.name);
+                break;
+            }
+        }
+        vec_push(&mod_fns, d);
+        declare_plain(co, d, d.name);
     }
+    vec_free(&mod_fns);
+    vec_free(&mod_vars);
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
         Node* d = function_decl_of(s.kind == N_EXPORT && s.a != null ? s.a : s);

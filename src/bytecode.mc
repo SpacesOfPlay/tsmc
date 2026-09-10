@@ -148,6 +148,7 @@ struct FnTemplate {
     bool is_gen;         // calls build a generator object
     bool is_async;       // calls build generator state + promise
     bool is_class;       // a class constructor: reachable only via `new`/super()
+    bool derived_ctor;   // a derived class constructor: owes a super() call
     bool not_ctor;       // arrow/method/generator/async: `new` is a TypeError
     bool needs_arguments; // references `arguments`; build it at call time
     bool sloppy;         // not strict-mode code: a plain call's `this` is
@@ -282,6 +283,7 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
     t.is_gen = is_gen;
     t.is_async = is_async;
     t.is_class = false;
+    t.derived_ctor = false;
     t.not_ctor = is_gen || is_async;
     t.sloppy = false;
     if name.len > 0 {
