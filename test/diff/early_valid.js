@@ -115,3 +115,30 @@ console.log('let as a loop body, by ASI:', asi);
 // only the literal spelling of async is refused as a for-of head
 for (\u0061sync of ['escaped async as a for-of head']) ;
 console.log(async);
+
+// `await` and `yield` are keywords only where the grammar says so. In a
+// script, in a plain function, and in an arrow or function nested inside
+// async or generator code, they are ordinary names.
+function awaitAsParam(await) { return await; }
+var yield = 'yield is a name in sloppy script code';
+yieldLabel: ;
+console.log(awaitAsParam('await is a name here'), yield);
+
+async function asyncOuter() {
+  const inner = () => { var await = 'a plain arrow resets the context'; return await; };
+  return inner();
+}
+function* genOuter() {
+  function inner() { var yield = 'a nested function resets it too'; return yield; }
+  return inner();
+}
+asyncOuter().then((v) => console.log(v));
+console.log(genOuter().next().value === undefined, [...genOuter()].length);
+
+// the name of a generator is read in the context around it
+function* yield_() { }
+console.log('generator named in the outer context:', typeof yield_);
+
+// an escaped spelling is a name wherever the plain word is
+function escapedNames() { var \u0061wait = 1, yi\u0065ld = 2; return \u0061wait + yi\u0065ld; }
+console.log('escaped await and yield as names:', escapedNames());

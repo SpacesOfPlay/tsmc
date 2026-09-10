@@ -24,6 +24,11 @@ struct Parser {
                        // or a label (3), where a declaration may not appear
     Vec<str> labels;   // the labels enclosing the statement being parsed
     i32 label_floor;   // where the current function's labels begin
+    i32 in_async;      // > 0 where `await` is a keyword
+    i32 in_gen;        // > 0 where `yield` is a keyword
+    i32 fn_depth;      // functions entered; 0 is the top level
+    bool module_top;   // the top level is a module's, where `await` is a
+                       // keyword; in a script it is an ordinary name
     DiagList* diags;
     Bump* arena;
     Vec<NodePtr> scratch;
@@ -47,7 +52,11 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     vec_init<NodePtr>(&p.scratch, 64);
     vec_init<str>(&p.labels, 4);
     p.label_floor = 0;
-    p.cur = lexer_next(&p.lx);
+    p.in_async = 0;
+    p.in_gen = 0;
+    p.fn_depth = 0;
+    p.module_top = false;
+    p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
 void parser_destroy(Parser* p) {
@@ -60,12 +69,46 @@ void parser_destroy(Parser* p) {
 
 private void advance(Parser* p) {
     p.prev_end = p.cur.end;
-    p.cur = lexer_next(&p.lx);
+    p.cur = contextualize(p, lexer_next(&p.lx));
+}
+
+// `await` and `yield` are keywords only where the grammar says so: inside
+// async code and generator code. Everywhere else they are ordinary names,
+// which is what the token becomes, so every binding, reference and label
+// site accepts them without knowing the rule.
+//
+// An escaped spelling goes the other way. Inside those contexts
+// `\u0061wait` is the keyword too, so it is refused where the plain word
+// would be instead of slipping through as a name.
+private bool await_is_keyword(Parser* p) {
+    return p.in_async > 0 || (p.fn_depth == 0 && p.module_top);
+}
+
+private Token contextualize(Parser* p, Token t) {
+    if t.kind == TOK_KW_AWAIT {
+        if !await_is_keyword(p) { t.kind = TOK_IDENT; }
+    } else if t.kind == TOK_KW_YIELD {
+        if p.in_gen == 0 { t.kind = TOK_IDENT; }
+    } else if t.kind == TOK_IDENT && t.escaped {
+        if await_is_keyword(p) && str_equal(t.text, "await") { t.kind = TOK_KW_AWAIT; }
+        else if p.in_gen > 0 && str_equal(t.text, "yield") { t.kind = TOK_KW_YIELD; }
+    }
+    return t;
+}
+
+// Module code makes `await` a keyword at its top level. The first token is
+// already classified by the time a caller can say so, so it is reclassified
+// here.
+void parser_set_module_top(Parser* p, bool on) {
+    p.module_top = on;
+    if on && p.cur.kind == TOK_IDENT && !p.cur.escaped && str_equal(p.cur.text, "await") {
+        p.cur.kind = TOK_KW_AWAIT;
+    }
 }
 
 private Token peek(Parser* p) {
     i32 save = lexer_tell(&p.lx);
-    Token t = lexer_next(&p.lx);
+    Token t = contextualize(p, lexer_next(&p.lx));
     lexer_seek(&p.lx, save);
     return t;
 }
@@ -523,6 +566,19 @@ private Node* prop_name(Parser* p) {
 
 private Node* parse_binding(Parser* p) {
     i32 k = p.cur.kind;
+    // where these are keywords, a name is a mistake worth naming: the
+    // generic "expected binding" would not say why
+    if k == TOK_KW_AWAIT || k == TOK_KW_YIELD {
+        if k == TOK_KW_AWAIT {
+            perror(p, "'await' is a keyword in async code and cannot be a name");
+        } else {
+            perror(p, "'yield' is a keyword in a generator and cannot be a name");
+        }
+        Node* n = nnew(p, N_IDENT);
+        n.name = p.cur.text;
+        advance(p);
+        return n;
+    }
     if is_binding_ident(k) {
         refuse_escaped_keyword(p, p.cur);
         Node* n = nnew(p, N_IDENT);
@@ -673,6 +729,14 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     if start >= 0 { fun.span.start = start; }
     fun.flags = flags;
     if p.cur.kind == TOK_LT { ts_type_params(p); }
+    // the parameters and the body are this function's own context: a
+    // generator's parameters are yield-context, an async function's are
+    // await-context, and neither leaks in from outside
+    i32 saved_async = p.in_async;
+    i32 saved_gen = p.in_gen;
+    p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
+    p.in_gen = (flags & NF_GENERATOR) != 0 ? 1 : 0;
+    p.fn_depth++;
     i32 mark = p.scratch.len;
     parse_params_into(p);
     fun.kids = finish_kids(p, mark);
@@ -689,6 +753,9 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
         fun.flags |= NF_SIGNATURE;
         expect_semi(p);
     }
+    p.fn_depth--;
+    p.in_async = saved_async;
+    p.in_gen = saved_gen;
     return nfin(p, fun);
 }
 
@@ -1186,6 +1253,7 @@ private Node* parse_unary(Parser* p) {
         return nfin(p, u);
     }
     if k == TOK_KW_AWAIT {
+        if p.cur.escaped { perror(p, "Keyword must not contain escaped characters"); }
         Node* u = nnew(p, N_AWAIT);
         advance(p);
         u.a = parse_unary(p);
@@ -1289,6 +1357,10 @@ private Node* try_arrow(Parser* p, i32 flags) {
     i32 start = p.cur.start;
     if p.cur.kind == TOK_LT { ts_type_params(p); }
     bool ok = p.diags.n_suppressed == base && p.cur.kind == TOK_LPAREN;
+    // an async arrow's parameters are await-context; a plain arrow's
+    // inherit from where the arrow sits
+    i32 head_async = p.in_async;
+    if (flags & NF_ASYNC) != 0 { p.in_async = 1; }
     if ok {
         parse_params_into(p);
         if p.cur.kind == TOK_COLON && p.diags.n_suppressed == base {
@@ -1297,6 +1369,7 @@ private Node* try_arrow(Parser* p, i32 flags) {
         }
         ok = p.diags.n_suppressed == base && p.cur.kind == TOK_ARROW && !p.cur.newline_before;
     }
+    p.in_async = head_async;
     diags_unmute(p.diags);
     if !ok {
         prestore(p, st);
@@ -1307,11 +1380,19 @@ private Node* try_arrow(Parser* p, i32 flags) {
     fun.flags = NF_ARROW | flags;
     fun.kids = finish_kids(p, mark);
     advance(p);   // =>
+    i32 saved_async = p.in_async;
+    i32 saved_gen = p.in_gen;
+    p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
+    p.in_gen = 0;
+    p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
     } else {
         fun.a = parse_assign(p);
     }
+    p.fn_depth--;
+    p.in_async = saved_async;
+    p.in_gen = saved_gen;
     return nfin(p, fun);
 }
 
@@ -1327,17 +1408,30 @@ private Node* ident_arrow(Parser* p, i32 flags) {
     vec_push(&p.scratch, prm);
     fun.kids = finish_kids(p, mark);
     advance(p);   // =>
+    // the body of an arrow is its own: a plain one is neither await nor
+    // yield context, however it is nested
+    i32 saved_async = p.in_async;
+    i32 saved_gen = p.in_gen;
+    p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
+    p.in_gen = 0;
+    p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
     } else {
         fun.a = parse_assign(p);
     }
+    p.fn_depth--;
+    p.in_async = saved_async;
+    p.in_gen = saved_gen;
     return nfin(p, fun);
 }
 
 Node* parse_assign(Parser* p) {
     i32 k = p.cur.kind;
-    if k == TOK_KW_YIELD { return parse_yield(p); }
+    if k == TOK_KW_YIELD {
+        if p.cur.escaped { perror(p, "Keyword must not contain escaped characters"); }
+        return parse_yield(p);
+    }
     if (k == TOK_IDENT || is_ctx_ident(k)) && peek(p).kind == TOK_ARROW && !peek(p).newline_before {
         return ident_arrow(p, 0);
     }
@@ -1604,8 +1698,14 @@ private Node* parse_class_member(Parser* p) {
         Node* sb = nnew(p, N_STATIC_BLOCK);
         advance(p);
         i32 saved_floor = p.label_floor;
+        i32 saved_async = p.in_async;
+        i32 saved_gen = p.in_gen;
         p.label_floor = p.labels.len;
+        p.in_async = 1;   // `await` is a keyword here, and not an operator
+        p.in_gen = 0;
         sb.a = parse_block(p);
+        p.in_gen = saved_gen;
+        p.in_async = saved_async;
         p.label_floor = saved_floor;
         return nfin(p, sb);
     }

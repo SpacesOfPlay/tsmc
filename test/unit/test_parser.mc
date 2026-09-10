@@ -212,7 +212,9 @@ i32 main() {
     check_parses("let x: Array<Array<number>> = [];", "nested type args split >>");
     check_parses("type C<T> = T extends string ? 1 : 2;", "conditional type");
     check_parses("const m = new Map<string, number[]>();", "new with type args");
-    check_parses("for await (const c of chunks) process(c);", "for await");
+    // `for await` belongs to async code: at the top level of a script it is
+    // a syntax error, as it is in node
+    check_parses("async function f() { for await (const c of chunks) process(c); }", "for await");
     check_parses("class Q<T> implements I<T>, J { readonly k?: T; static s = 0; async *gen(): AsyncGenerator<T> { yield* this.items; } }", "generic class");
     check_parses("const o = { a, b: 2, [k]: 3, m() { return 1; }, get g() { return 2; }, ...rest };", "object literal forms");
     check_parses("label: for (;;) { break label; }", "labels");

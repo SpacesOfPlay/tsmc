@@ -570,6 +570,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
 
     Parser p;
     parser_init(&p, src, &ld.diags, &mod.arena);
+    parser_set_module_top(&p, true);   // top-level await belongs to a module
     Node* prog = parse_program(&p);
     Lower lw;
     lower_init(&lw, &mod.arena, &ld.diags);
@@ -977,6 +978,8 @@ private bool has_module_syntax(str src) {
     bump_init(&arena);
     Parser p;
     parser_init(&p, src, &d, &arena);
+    // parse as module code, so a top-level await does not derail the scan
+    parser_set_module_top(&p, true);
     Node* prog = parse_program(&p);
     bool found = false;
     for i32 i = 0; i < prog.kids.len; i++ {
