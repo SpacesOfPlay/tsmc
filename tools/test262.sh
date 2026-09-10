@@ -9,10 +9,11 @@
 #   tools/test262.sh [subpath] [--limit N] [--jobs N] [--verbose]
 #   tools/test262.sh --list FILE [--jobs N] [--verbose]
 #
-# --list runs exactly the test files named in FILE, one absolute path per
-# line, instead of walking a subpath. Useful to re-check a saved failure
-# list, or to run the suite in resumable chunks on a machine that cannot
-# hold a whole run.
+# --list runs exactly the test files named in FILE, one path per line,
+# instead of walking a subpath; a relative path is read against the
+# checkout, so build/test262-fails.txt can be fed straight back in. Useful
+# to re-check a saved failure list, or to run the suite in resumable
+# chunks on a machine that cannot hold a whole run.
 #
 # subpath defaults to test/language (core semantics — closest to what the
 # interpreter implements). Examples:
@@ -348,7 +349,17 @@ publish() {
 rm -rf "$WORK"; mkdir -p "$WORK"
 if [ -n "$LIST" ]; then
     [ -f "$LIST" ] || { fail "no such list file: $LIST"; exit 1; }
-    sort "$LIST" > "$WORK/all.txt"
+    # a relative path is read against the checkout, so the saved failure
+    # list (build/test262-fails.txt) can be fed straight back in
+    while IFS= read -r t262_line; do
+        [ -n "$t262_line" ] || continue
+        case "$t262_line" in
+            /*|[A-Za-z]:*) printf '%s
+' "$t262_line" ;;
+            *) printf '%s/%s
+' "$VENDOR" "$t262_line" ;;
+        esac
+    done < "$LIST" | sort > "$WORK/all.txt"
 else
     find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*' | sort > "$WORK/all.txt"
 fi

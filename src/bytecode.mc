@@ -93,6 +93,10 @@ enum Op {
     OP_DEFGETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj
     OP_DEFSETTER,    // u16 name, u16 enum; [obj, fn] pops fn, keeps obj
     OP_DEFGETTER_DYN,// u16 enum; [obj, key, fn] pops key+fn, keeps obj
+    // u16 name, u16 kind; [obj, val] pops val, keeps obj. Installs a private
+    // element on the object it belongs to, once: 0 a method, 1 a getter,
+    // 2 a setter, 3 a field (the only writable one).
+    OP_DEFPRIVATE,
     OP_DEFSETTER_DYN,// u16 enum; [obj, key, fn] pops key+fn, keeps obj
     OP_ARR_APPEND,   // [arr, v] pops v, keeps arr
     OP_ARR_SPREAD,   // [arr, src] pops src; appends elements/chars

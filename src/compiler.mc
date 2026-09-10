@@ -453,11 +453,30 @@ private str num_key_text(Compiler* co, f64 num) {
 
 // An accessor's function is named "get x" / "set x". Built in the arena so it
 // outlives this call as the function's inferred name.
+// The name an anonymous method or field initializer takes from its key.
+// A private name keeps its '#'; a computed key has none at compile time.
+private str key_name_text(Compiler* co, Node* key) {
+    if key == null { return ""; }
+    if key.kind == N_NUMBER { return num_key_text(co, key.num); }
+    if key.kind == N_PRIVATE_IDENT {
+        string s = format("#{}", key.name);
+        str view = s;
+        u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
+        memcpy(copy, view.data, view.len);
+        free(s);
+        str r;
+        r.data = copy;
+        r.len = view.len;
+        return r;
+    }
+    if key.kind == N_IDENT || key.kind == N_STRING { return key.name; }
+    return "";
+}
+
 private str accessor_name(Compiler* co, str prefix, Node* key) {
-    str none = "";
-    if key == null { return none; }
-    if key.kind != N_IDENT && key.kind != N_STRING { return none; }
-    string s = format("{} {}", prefix, key.name);
+    str base = key_name_text(co, key);
+    if base.len == 0 { return base; }
+    string s = format("{} {}", prefix, base);
     str view = s;
     u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
     memcpy(copy, view.data, view.len);
@@ -529,26 +548,6 @@ private i32 prop_key_const(Compiler* co, Node* key) {
     if key.kind == N_NUMBER { return num_key_const(co, key.num); }
     if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key, key.name); }
     return name_const(co, key.name);
-}
-
-// The name an anonymous method or field initializer takes from its key.
-// A private name keeps its '#'; a computed key has none at compile time.
-private str key_name_text(Compiler* co, Node* key) {
-    if key == null { return ""; }
-    if key.kind == N_NUMBER { return num_key_text(co, key.num); }
-    if key.kind == N_PRIVATE_IDENT {
-        string s = format("#{}", key.name);
-        str view = s;
-        u8* copy = cast(u8*, bump_alloc(co.arena, view.len));
-        memcpy(copy, view.data, view.len);
-        free(s);
-        str r;
-        r.data = copy;
-        r.len = view.len;
-        return r;
-    }
-    if key.kind == N_IDENT || key.kind == N_STRING { return key.name; }
-    return "";
 }
 
 private str hidden_name(Compiler* co, str prefix, i32 n) {
@@ -2477,6 +2476,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     co.cur = &fs;
     scan_inner(&fs.inner, f, true);
     for i32 i = 0; i < n_fields; i++ {
+        // a private method's body was compiled with the class, not here
+        if member_is_private_method(*(fields + i)) { continue; }
         scan_inner(&fs.inner, *(fields + i), true);
     }
 
@@ -2714,6 +2715,30 @@ private Node* build_default_ctor(Compiler* co, bool derived) {
 // while `m = function () {}` and `m = () => {}` are fields that happen to hold a
 // function — own properties on the instance, and an arrow there closes over the
 // constructor's `this`. The parser marks the method form with NF_METHOD.
+// A private method or accessor declared on instances belongs to each
+// object rather than to the prototype, so the constructor installs it.
+private bool member_is_private_method(Node* m) {
+    if m == null || m.kind != N_CLASS_MEMBER { return false; }
+    if (m.flags & NF_STATIC) != 0 { return false; }
+    if m.a == null || m.a.kind != N_PRIVATE_IDENT { return false; }
+    return m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0;
+}
+
+// The OP_DEFPRIVATE kind of a class member: a getter, a setter, a method,
+// or a field.
+private i32 private_def_kind(Node* m) {
+    if (m.flags & NF_GETTER) != 0 { return 1; }
+    if (m.flags & NF_SETTER) != 0 { return 2; }
+    if m.b != null && m.b.kind == N_FUNCTION && (m.b.flags & NF_METHOD) != 0 { return 0; }
+    return 3;
+}
+
+private void emit_def_private(Compiler* co, Node* m) {
+    Chunk* ch = &co.cur.ch;
+    ch_op_u16(ch, OP_DEFPRIVATE, prop_key_const(co, m.a));
+    ch_u16(ch, cast(u16, private_def_kind(m)));
+}
+
 private bool member_is_field(Node* m) {
     if m.kind != N_CLASS_MEMBER { return false; }
     if (m.flags & NF_STATIC) != 0 { return false; }
@@ -2870,10 +2895,21 @@ private void compile_class_expr(Compiler* co, Node* c) {
         else { ch_op_u16(ch, OP_SETHOLE, nb.slot); }
     }
 
-    // partition members
+    // The instance elements, in the order the constructor installs them:
+    // every private method first, then the fields. `elem_ix` gives a member
+    // its place in that list, which names its hidden bindings.
     Vec<NodePtr> fields = vec_new<NodePtr>(4);
+    Vec<i32> elem_ix = vec_new<i32>(4);
+    for i32 i = 0; i < c.kids.len; i++ { vec_push(&elem_ix, 0 - 1); }
     Node* ctor_member = null;
     bool has_static = false;
+    for i32 i = 0; i < c.kids.len; i++ {
+        Node* m = *(c.kids.items + i);
+        if !member_is_private_method(m) { continue; }
+        class_member_rules(co, m);
+        vec_set(&elem_ix, i, fields.len);
+        vec_push(&fields, m);
+    }
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK {
@@ -2881,7 +2917,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             has_static = true;
             continue;
         }
-        if m.kind != N_CLASS_MEMBER { continue; }
+        if m.kind != N_CLASS_MEMBER || member_is_private_method(m) { continue; }
         class_member_rules(co, m);
         if (m.flags & NF_STATIC) == 0 && m.b != null && m.b.kind == N_FUNCTION
             && (m.flags & (NF_GETTER | NF_SETTER)) == 0 && member_named(m, "constructor") {
@@ -2890,6 +2926,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
             continue;
         }
         if member_is_field(m) {
+            vec_set(&elem_ix, i, fields.len);
             vec_push(&fields, m);
             continue;
         }
@@ -2913,8 +2950,11 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // can capture them; the element pass below fills them in source order.
     for i32 i = 0; i < fields.len; i++ {
         Node* m = vec_get(&fields, i);
-        if (m.flags & NF_COMPUTED) == 0 { continue; }
-        i32 bi = declare(co, hidden_name(co, "%fk", i), true, false);
+        str hn = "";
+        if member_is_private_method(m) { hn = hidden_name(co, "%pm", i); }
+        else if (m.flags & NF_COMPUTED) != 0 { hn = hidden_name(co, "%fk", i); }
+        if hn.len == 0 { continue; }
+        i32 bi = declare(co, hn, true, false);
         CBind* bp = fs.binds.data + bi;
         bp.is_cell = true;
         ch_op_u16(ch, OP_NEWCELL_UNDEF, bp.slot);
@@ -2978,7 +3018,6 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // place.
     Vec<i32> key_slots = vec_new<i32>(4);
     for i32 i = 0; i < c.kids.len; i++ { vec_push(&key_slots, 0 - 1); }
-    i32 field_ix = 0;
     for i32 i = 0; i < c.kids.len; i++ {
         Node* m = *(c.kids.items + i);
         if m.kind == N_STATIC_BLOCK { continue; }
@@ -2987,17 +3026,38 @@ private void compile_class_expr(Compiler* co, Node* c) {
         bool is_method = m.b != null && m.b.kind == N_FUNCTION;
         bool is_acc = (m.flags & (NF_GETTER | NF_SETTER)) != 0;
         bool computed = (m.flags & NF_COMPUTED) != 0;
+        bool is_priv = m.a != null && m.a.kind == N_PRIVATE_IDENT;
+        if member_is_private_method(m) {
+            // the closure is made once and kept for the constructor to install
+            infer_name(m.b, is_acc ? accessor_name(co, (m.flags & NF_GETTER) != 0 ? "get" : "set", m.a)
+                                   : key_name_text(co, m.a));
+            compile_function(co, m.b, false);
+            i32 pi = find_local(fs, hidden_name(co, "%pm", vec_get(&elem_ix, i)));
+            CBind pb = vec_get(&fs.binds, pi);
+            ch_op_u16(ch, OP_SETCELL, pb.slot);
+            ch_op(ch, OP_POP);
+            continue;
+        }
         if member_is_field(m) {
             // an instance field: the key now, the value in the constructor
             if computed {
                 compile_expr(co, m.a);
                 ch_op(ch, OP_TOPROPKEY);
-                i32 bi = find_local(fs, hidden_name(co, "%fk", field_ix));
+                i32 bi = find_local(fs, hidden_name(co, "%fk", vec_get(&elem_ix, i)));
                 CBind kb = vec_get(&fs.binds, bi);
                 ch_op_u16(ch, OP_SETCELL, kb.slot);
                 ch_op(ch, OP_POP);
             }
-            field_ix++;
+            continue;
+        }
+        if is_method && is_priv {
+            // a static private method: the class is the only object with it
+            ch_op_u16(ch, OP_GETLOCAL, t_ctor);
+            infer_name(m.b, is_acc ? accessor_name(co, (m.flags & NF_GETTER) != 0 ? "get" : "set", m.a)
+                                   : key_name_text(co, m.a));
+            compile_function(co, m.b, false);
+            emit_def_private(co, m);
+            ch_op(ch, OP_POP);
             continue;
         }
         if is_method {
@@ -3081,11 +3141,13 @@ private void compile_class_expr(Compiler* co, Node* c) {
             co.static_this = true;
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             co.static_this = saved_st;
-            ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));
+            if m.a != null && m.a.kind == N_PRIVATE_IDENT { emit_def_private(co, m); }
+            else { ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a)); }
         }
         ch_op(ch, OP_POP);
     }
     vec_free(&key_slots);
+    vec_free(&elem_ix);
 
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     vec_free(&fields);
@@ -3283,12 +3345,22 @@ private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
     for i32 i = 0; i < n_fields; i++ {
         Node* m = *(fields + i);
         ch_op(ch, OP_THIS);
+        if member_is_private_method(m) {
+            // the closure the class made, installed on this object alone
+            emit_load_name(co, hidden_name(co, "%pm", i), m);
+            emit_def_private(co, m);
+            ch_op(ch, OP_POP);
+            continue;
+        }
         infer_name(m.b, key_name_text(co, m.a));
         if (m.flags & NF_COMPUTED) != 0 {
             // the key was evaluated when the class was defined
             emit_load_name(co, hidden_name(co, "%fk", i), m);
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op_u16(ch, OP_DEFPROP_DYN, 1);   // defined, so no setter runs
+        } else if m.a != null && m.a.kind == N_PRIVATE_IDENT {
+            if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
+            emit_def_private(co, m);
         } else {
             if m.b != null { compile_expr(co, m.b); } else { ch_op(ch, OP_UNDEF); }
             ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, m.a));

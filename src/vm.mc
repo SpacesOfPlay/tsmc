@@ -2037,10 +2037,32 @@ private string private_missing_message(VM* vm, u32 a, bool write) {
     return format("Cannot read private member {} from an object whose class did not declare it", shown);
 }
 
+// A private element belongs to the object it was installed on and to no
+// other, so the brand check never walks the prototype chain.
 private bool has_private(VM* vm, Value objv, u32 a) {
-    if value_is_function(objv) || value_is_native(objv) { return fn_has_prop(vm, objv, a); }
-    if value_is_object(objv) { return js_has_prop(value_as_object(objv), a); }
-    return false;
+    PropList* p = value_props(objv);
+    if p == null { return false; }
+    return props_get(p, a) != null;
+}
+
+// A private accessor with no getter cannot be read, and one with no setter
+// cannot be written; both are TypeErrors rather than undefined.
+private bool private_half_missing(VM* vm, Value objv, u32 a, bool want_get) {
+    PropList* p = value_props(objv);
+    if p == null { return false; }
+    Value* ex = props_get(p, a);
+    if ex == null || !value_is_accessor(*ex) { return false; }
+    JsAccessor* ac = value_as_accessor(*ex);
+    Value half = want_get ? ac.get : ac.set;
+    return value_is_undefined(half);
+}
+
+private void private_half_error(VM* vm, u32 a, bool want_get) {
+    string msg = format("'{}' was defined without a {}",
+        atom_name(&vm.atoms, a), want_get ? "getter" : "setter");
+    str mv = msg;
+    vm_throw_error(vm, ERR_TYPE, mv);
+    free(msg);
 }
 
 private void private_missing(VM* vm, u32 a, bool write) {
@@ -2055,6 +2077,7 @@ private void private_get(VM* vm, FnTemplate* t, i32 ci) {
     u32 a = cast(u32, value_as_int(*(t.consts + ci)));
     Value objv = vpeek(vm, 0);
     if !has_private(vm, objv, a) { private_missing(vm, a, false); return; }
+    if private_half_missing(vm, objv, a, true) { private_half_error(vm, a, true); return; }
     Value out;
     if vm_get_prop_value(vm, objv, a, &out) {
         vm.sp--;
@@ -2079,6 +2102,7 @@ private void private_method(VM* vm, FnTemplate* t, i32 ci) {
     u32 a = cast(u32, value_as_int(*(t.consts + ci)));
     Value objv = vpeek(vm, 0);
     if !has_private(vm, objv, a) { private_missing(vm, a, false); return; }
+    if private_half_missing(vm, objv, a, true) { private_half_error(vm, a, true); return; }
     Value out;
     if vm_get_prop_value(vm, objv, a, &out) {
         vm.sp--;
@@ -2146,6 +2170,47 @@ private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, 
         props_set_desc(props, a, value_cell(&ac.head), attrs);
     }
     if is_getter { ac.get = fnv; } else { ac.set = fnv; }
+}
+
+// [obj, val] -> [obj]: installs a private element on the object it belongs
+// to. Nothing is writable but a field, so a store to a private method is a
+// TypeError, and nothing may be installed twice on the same object, which
+// is what a constructor re-entered with an object it already built hits.
+private void def_private(VM* vm, u32 a, i32 kind) {
+    Value v = vpeek(vm, 0);
+    Value objv = vpeek(vm, 1);
+    PropList* props = value_props(objv);
+    if props == null { vm.sp--; return; }
+    Value* ex = props_get(props, a);
+    if kind != 1 && kind != 2 {
+        if ex != null {
+            vm_throw_error(vm, ERR_TYPE, "Cannot initialize the same private element twice");
+            return;
+        }
+        u8 attrs = 0;
+        if kind == 3 { attrs = PROP_WRITABLE; }
+        props_set_desc(props, a, v, attrs);
+        vm.sp--;
+        return;
+    }
+    JsAccessor* ac = null;
+    if ex != null {
+        if !value_is_accessor(*ex) {
+            vm_throw_error(vm, ERR_TYPE, "Cannot initialize the same private element twice");
+            return;
+        }
+        ac = value_as_accessor(*ex);
+        Value half = kind == 1 ? ac.get : ac.set;
+        if !value_is_undefined(half) {
+            vm_throw_error(vm, ERR_TYPE, "Cannot initialize the same private element twice");
+            return;
+        }
+    } else {
+        ac = js_new_accessor(&vm.heap);
+        props_set_desc(value_props(vpeek(vm, 1)), a, value_cell(&ac.head), 0);
+    }
+    if kind == 1 { ac.get = vpeek(vm, 0); } else { ac.set = vpeek(vm, 0); }
+    vm.sp--;
 }
 
 // True when the atom spells a canonical array index ("0", "1", ...
@@ -4340,20 +4405,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_HASPRIVATE: {
-                // #name in obj: an own/inherited check for the private field's
-                // hidden atom, never routed through a proxy trap. Non-object
-                // right-hand sides throw, like the ordinary `in` operator.
+                // #name in obj: an own check for the private element's hidden
+                // atom, never routed through a proxy trap. Non-object right-hand
+                // sides throw, like the ordinary `in` operator.
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
                 Value objv = vpeek(vm, 0);
-                if value_is_function(objv) || value_is_native(objv) {
-                    bool r = fn_has_prop(vm, objv, a);
-                    if !vm.has_pending {
-                        vm.sp--;
-                        vpush(vm, value_bool(r));
-                    }
-                } else if value_is_object(objv) {
-                    bool r = js_has_prop(value_as_object(objv), a);
+                if value_props(objv) != null {
+                    bool r = has_private(vm, objv, a);
                     vm.sp--;
                     vpush(vm, value_bool(r));
                 } else {
@@ -4663,6 +4722,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, out);
                     vpush(vm, objv);
                 }
+            }
+            case OP_DEFPRIVATE: {
+                ip += 4;
+                def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 4)))),
+                    cast(i32, rd_u16(code, ip - 2)));
             }
             case OP_GETPRIVATE: { private_get(vm, t, rd_u16(code, ip)); ip += 2; }
             case OP_SETPRIVATE: { private_set(vm, t, rd_u16(code, ip)); ip += 2; }
