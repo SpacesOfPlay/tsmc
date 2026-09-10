@@ -271,8 +271,8 @@ private u32* bn_to_words(BigNum a, i32* out_n) {
     i32 cap = cn + 2;
     u32* w = bn_alloc(cap);
     i32 wn = 0;
-    // local copies: `%` by a const of this size miscompiles, see
-    // ../lang/doc/BUG_u64_mod_const_over_32_bits.md
+    // the divisors in locals throughout this section: a file-level const
+    // of this width is not dependable on the right of `%`
     u64 word = BN_WORD;
     u64 base = BN_BASE;
     while cn > 0 {

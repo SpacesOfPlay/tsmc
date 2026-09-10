@@ -116,11 +116,9 @@ without cutting a release.
 
 ## Not covered
 
-- A zip stores no Unix permission bit, so `chmod +x` is still the first
-  step on macOS and Linux. The compiler's zip writer fills the external
-  attributes with zero and calls itself MS-DOS; reported as
-  `BUG_zip_no_unix_mode` against minc. A tar.gz would carry the mode,
-  at the cost of a second archive format.
+- The archives carry no Unix permission bit, so `chmod +x` is still the
+  first step on macOS and Linux; `dist/README.md` says so. A tar.gz
+  would carry the mode, at the cost of a second archive format.
 - No code signing on Windows, and only an ad-hoc signature on macOS, so
   both warn about an unknown developer. Real signing needs certificates
   the project does not have.
@@ -134,3 +132,6 @@ without cutting a release.
   produced but never executed on their platforms.
 - Nothing runs `minc test` on an ordinary push. The release gate is the
   only place CI runs the suite.
+- CI installs the current minc release and does not pin it, so the tree
+  has to build with what is published. Checked on 0.9.14: build, the
+  full suite and the release verb all pass.
