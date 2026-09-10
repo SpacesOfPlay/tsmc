@@ -221,65 +221,41 @@ build/build.exe t262 test/language --limit 500   # sample the first N
 tools/test262.sh --list fails.txt                # exactly these files
 ```
 
-On Windows the runner is a portable bash script (`tools/test262.sh`)
-run through Git Bash. It assembles each test with its harness includes,
-runs the strict and sloppy variants, and honours the `negative`
-frontmatter. A `module` test is written beside the original as `.mjs`
-and run once, so its relative imports resolve and module code is strict
-where it should be.
+On Windows the runner is a portable bash script (`tools/test262.sh`) run
+through Git Bash. It assembles each test with its harness includes, runs
+the strict and sloppy variants, and honours the `negative` frontmatter. A
+`module` test is written beside the original as `.mjs` and run once. A
+test needing a feature the interpreter doesn't implement (Temporal, Intl,
+SharedArrayBuffer, WeakRef, `eval`, …) is skipped, and a skip counts as
+not passing; the list is at the top of the script. Failing paths go to
+`build/test262-fails.txt`. The run is split into shards (`--jobs`). Pin a
+revision with `T262_COMMIT`.
 
-A test that needs a feature the interpreter doesn't implement (Temporal,
-Intl, SharedArrayBuffer and Atomics, WeakRef, `eval`, …) is **skipped**,
-and a skip is **not** a pass: the percentage below is over every test
-found, so a family in the skip list costs exactly what failing it would.
-The list at the top of the script is the thing to read before the number.
-Failing test paths are written to `build/test262-fails.txt`. The run is
-split into shards (`--jobs`, default half the cores). Pin a different
-revision with the `T262_COMMIT` environment variable.
-
-The default `test/language` run, at the pinned revision, measured
-2026-09-10:
+`test/language`, at the pinned revision, measured 2026-09-10:
 
 | | tests |
 |---|---|
 | in the tree | 23,714 |
-| passed | 19,457 (82%) |
+| passed | 19,457 (82%; 92% of those that ran) |
 | failed | 1,580 |
-| skipped as unsupported | 2,677 |
+| skipped | 2,677 |
 
-The pass rate is over everything in the tree. Of the tests that actually
-ran it is 92%, which is the flattering way to say it and the reason the
-skip list is printed above the number.
-
-That snapshot skipped the 810 `module` tests, which the runner now runs.
-A skip already counted against the total, so measuring them can only help
-the figure: `module-code` on its own passes 418 of its 599. What it costs
-is the flattering number, not the honest one.
-
-Where the failures are, each counted once. Early errors are counted by
-the suite's own `phase: parse` frontmatter, the rest by area:
+Where the failures are, each counted once:
 
 | | tests |
 |---|---|
 | class elements and definitions | 288 |
-| early errors: programs the parser should refuse | 215 |
-| the `with` statement, not implemented | 134 |
+| early errors | 215 |
+| `with`, not implemented | 134 |
 | generators and async iteration | 114 |
-| destructuring, remaining scenarios | 105 |
+| destructuring | 105 |
 | dynamic import and module instantiation | 77 |
 | `eval` and `new Function`, refused by design | 52 |
 | parameter and `arguments` rules | 47 |
 | everything else | 548 |
 
-Most of the early-error group is now one rule: `await` and `yield` are
-not reserved inside async functions and generators, so both the plain and
-the escaped spelling are accepted there as ordinary identifiers. A
-handful of identifier tests fail on the other side of the same coin, from
-Unicode property tables a version behind the suite.
-
-This is a snapshot and changes as the interpreter does; the failing paths
-of the last run are the list to diff a new run against, which is what
-`--list` is for.
+The snapshot predates the module tests, which the runner now runs:
+`module-code` passes 418 of 599.
 
 ## Layout
 
