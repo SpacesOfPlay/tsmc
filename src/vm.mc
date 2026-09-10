@@ -59,7 +59,7 @@ struct Handler {
 
 const i32 JOB_REACTION = 0;    // a=handler, b=arg, c=promise2
 const i32 JOB_ASYNC_STEP = 1;  // a=generator, b=result promise, c=input
-const i32 JOB_THENABLE = 2;    // a=thenable, b=promise it resolves
+const i32 JOB_THENABLE = 2;    // a=thenable, b=promise it resolves, c=its `then`
 
 struct VmJob {
     i32 kind;
@@ -6096,7 +6096,11 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
             return;
         }
         if value_is_callable(thenf) {
-            vm_enqueue(vm, JOB_THENABLE, false, v, pv, value_undefined());
+            // this is the only read of `then`: the job is handed the function
+            // it is to call, rather than looking it up again
+            vpush(vm, thenf);
+            vm_enqueue(vm, JOB_THENABLE, false, v, pv, thenf);
+            vm.sp--;
             return;
         }
     }
@@ -6127,14 +6131,15 @@ void vm_promise_settle(VM* vm, Value pv, Value v, bool rejected) {
     }
 }
 
-// Calls `thenable.then(resolve, reject)` on behalf of the promise `pv`. A throw
-// from the call, or from reading `then` again, rejects `pv` instead.
-private void run_thenable_job(VM* vm, Value thenv, Value pv) {
+// Calls `thenable.then(resolve, reject)` on behalf of the promise `pv`, with
+// the function read when the thenable was seen. A throw from the call rejects
+// `pv` instead.
+private void run_thenable_job(VM* vm, Value thenv, Value pv, Value thenf) {
+    // the queue stopped rooting these when the job was taken off it
     vpush(vm, thenv);
     vpush(vm, pv);
-    Value thenf;
-    bool got = vm_get_prop_value(vm, thenv, atom_intern(&vm.atoms, "then"), &thenf);
-    if got && value_is_callable(thenf) {
+    vpush(vm, thenf);
+    if value_is_callable(thenf) {
         JsNative* onf = js_new_native(&vm.heap, &nat_adopt_ful, "resolve");
         onf.env0 = pv;
         vpush(vm, value_cell(&onf.head));
@@ -6142,10 +6147,10 @@ private void run_thenable_job(VM* vm, Value thenv, Value pv) {
         onr.env0 = pv;
         vpush(vm, value_cell(&onr.head));
         Value[2] a = { vpeek(vm, 1), vpeek(vm, 0) };
-        ignore vm_call_value(vm, thenf, thenv, &a[0], 2);
+        ignore vm_call_value(vm, vpeek(vm, 2), thenv, &a[0], 2);
         vm.sp -= 2;
-    } else if got {
-        // no longer thenable: fulfil with the object itself
+    } else {
+        // not a function after all: fulfil with the object itself
         vm_promise_settle(vm, pv, thenv, false);
     }
     if vm.has_pending {
@@ -6156,7 +6161,7 @@ private void run_thenable_job(VM* vm, Value thenv, Value pv) {
         vm_promise_settle(vm, pv, e, true);
         vm.sp--;
     }
-    vm.sp -= 2;
+    vm.sp -= 3;
 }
 
 // Registers reactions and returns the derived promise.
@@ -6230,30 +6235,17 @@ void vm_async_step(VM* vm, Value genv, Value rpv, Value input, bool is_throw) {
         vm.sp -= 4;
         return;
     }
-    // `await` on a thenable resolves it: route the value through a promise so
-    // the assimilation path runs, rather than resuming with the object itself.
+    // `await` hands the value to a promise and waits on that, which is where
+    // the thenable check and its one read of `then` belong. A `then` getter
+    // that throws rejects the promise, so the awaiting function's own catch
+    // still gets a chance at it.
     Value target = res;
     i32 extra = 0;
     if !vm_is_promise(vm, res) && value_is_object(res) {
-        Value thenf;
-        bool got = vm_get_prop_value(vm, res, atom_intern(&vm.atoms, "then"), &thenf);
-        if !got {
-            // reading `then` threw: the await observes a rejected value, so the
-            // awaiting function's own catch handler still gets a chance at it
-            Value e = vm.pending;
-            vm.has_pending = false;
-            vm.pending = value_undefined();
-            vpush(vm, e);
-            target = vm_promise_new(vm);
-            vpush(vm, target);
-            extra = 2;
-            vm_promise_settle(vm, target, vpeek(vm, 1), true);
-        } else if value_is_callable(thenf) {
-            target = vm_promise_new(vm);
-            vpush(vm, target);
-            extra = 1;
-            vm_promise_settle(vm, target, res, false);
-        }
+        target = vm_promise_new(vm);
+        vpush(vm, target);
+        extra = 1;
+        vm_promise_settle(vm, target, res, false);
     }
     if vm_is_promise(vm, target) {
         JsNative* onf = js_new_native(&vm.heap, &nat_async_ful, "step");
@@ -6722,7 +6714,7 @@ i32 vm_run_event_loop(VM* vm) {
                 }
                 vm.sp--;
             } else if j.kind == JOB_THENABLE {
-                run_thenable_job(vm, j.a, j.b);
+                run_thenable_job(vm, j.a, j.b, j.c);
             } else {
                 vm_async_step(vm, j.a, j.b, j.c, j.flag);
             }
