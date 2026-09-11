@@ -369,7 +369,16 @@ private Value proto_cell(JsObject* p) {
 // which is what boxing it would give; a Set, Map or generator has one too,
 // even though none of them is a plain object.
 private Value proto_of_value(VM* vm, Value v) {
-    if value_is_object(v) { return proto_cell(value_as_object(v).proto); }
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        // a proxy keeps no prototype of its own; its target's is the answer
+        // (a getPrototypeOf trap is consulted by Object.getPrototypeOf, which
+        // has somewhere to report a throw)
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            return proto_of_value(vm, cast(JsProxy*, o).target);
+        }
+        return proto_cell(o.proto);
+    }
     if value_is_map(v) { return proto_cell(value_as_map(v).proto); }
     if value_is_generator(v) {
         return proto_cell(value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto);

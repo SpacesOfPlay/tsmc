@@ -1065,6 +1065,10 @@ void vm_throw_error(VM* vm, i32 kind, str msg) {
 // --- property helpers -----------------------------------------------------------
 
 private Value ensure_prototype(VM* vm, Value fnv) {
+    // a proxy has no .prototype of its own; its target's is the answer
+    if value_is_object(fnv) && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
+        return ensure_prototype(vm, cast(JsProxy*, value_as_object(fnv)).target);
+    }
     PropList* props = null;
     if value_is_function(fnv) { props = &value_as_function(fnv).props; }
     if value_is_native(fnv) { props = &value_as_native(fnv).props; }
@@ -4506,30 +4510,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     Value protov = ensure_prototype(vm, ctor);
                     bool r = false;
-                    JsObject* start = null;
-                    if value_is_object(v) {
-                        start = value_as_object(v).proto;
-                    } else if value_is_map(v) {
-                        start = value_as_map(v).proto;
-                    } else if value_is_generator(v) {
-                        start = value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto;
-                    } else if value_is_bigint(v) {
-                        start = vm.bigint_proto;
-                    } else if value_is_function(v) || value_is_native(v) {
-                        // a function has a chain too: its [[Prototype]], which
-                        // defaults to Function.prototype. Constructors linked
-                        // by static inheritance are stepped over, since the
-                        // right-hand side is always a .prototype object.
-                        Value cur = value_undefined();
-                        if value_is_function(v) { cur = value_as_function(v).fproto; }
-                        while value_is_function(cur) || value_is_native(cur) {
-                            Value nxt = value_undefined();
-                            if value_is_function(cur) { nxt = value_as_function(cur).fproto; }
-                            cur = nxt;
-                        }
-                        if value_is_object(cur) { start = value_as_object(cur); }
-                        else if !value_is_null(cur) { start = vm.function_proto; }
-                    }
+                    JsObject* start = proto_chain_start(vm, v);
                     if value_is_object(protov) {
                         JsObject* proto = value_as_object(protov);
                         while start != null {
@@ -7058,6 +7039,48 @@ i32 vm_report_unhandled(VM* vm) {
 
 // Stack already holds fn, this, args. Pops them; returns the result.
 // On throw, pending stays set and undefined comes back.
+// Where an `instanceof` walk starts for a value: its [[Prototype]], as an
+// object. A proxy has none of its own, so its target answers. A constructor
+// linked to a parent by static inheritance is stepped over, since the
+// right-hand side of instanceof is always a .prototype object. Out of the
+// dispatch loop for its frame's sake.
+private JsObject* proto_chain_start(VM* vm, Value v) {
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        if (o.obj_flags & OBJF_PROXY) != 0 {
+            return proto_chain_start(vm, cast(JsProxy*, o).target);
+        }
+        return o.proto;
+    }
+    if value_is_map(v) { return value_as_map(v).proto; }
+    if value_is_generator(v) {
+        return value_as_generator(v).is_async ? vm.async_generator_proto : vm.generator_proto;
+    }
+    if value_is_bigint(v) { return vm.bigint_proto; }
+    if value_is_function(v) || value_is_native(v) {
+        Value cur = value_undefined();
+        if value_is_function(v) { cur = value_as_function(v).fproto; }
+        while value_is_function(cur) || value_is_native(cur) {
+            Value nxt = value_undefined();
+            if value_is_function(cur) { nxt = value_as_function(cur).fproto; }
+            cur = nxt;
+        }
+        if value_is_object(cur) { return value_as_object(cur); }
+        if !value_is_null(cur) { return vm.function_proto; }
+    }
+    return null;
+}
+
+// A callable-target proxy reached through a helper rather than the call
+// opcode: the apply trap, or the target when there is none. Kept out of
+// vm_call_stack, whose frame is on the deep re-entry path.
+private Value call_proxy_stack(VM* vm, Value fnv, Value thisv, i32 argc, i32 entry_sp) {
+    Value r = proxy_apply(vm, cast(JsProxy*, value_as_object(fnv)), thisv,
+        vm.stack + vm.sp - argc, argc);
+    vm.sp = entry_sp;
+    return r;
+}
+
 Value vm_call_stack(VM* vm, i32 argc) {
     i32 entry_sp = vm.sp - argc - 2;
     Value fnv = vpeek(vm, argc + 1);
@@ -7069,6 +7092,10 @@ Value vm_call_stack(VM* vm, i32 argc) {
         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
         vm.sp = entry_sp;
         return res;
+    }
+    if value_is_object(fnv) && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
+        vm.pending_super_for = 0 - 1;
+        return call_proxy_stack(vm, fnv, thisv, argc, entry_sp);
     }
     if !value_is_function(fnv) {
         vm.pending_super_for = 0 - 1;
