@@ -1862,6 +1862,9 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
         if fe != null && (fe.flags & PROP_WRITABLE) == 0 {
             return write_refused(vm, mode, "cannot assign to read-only property");
         }
+        if fe == null && *(value_fn_nonext(objv)) != 0 {
+            return write_refused(vm, mode, "cannot add property to a non-extensible function");
+        }
         props_set(fprops, a, v);
         return true;
     }

@@ -261,6 +261,7 @@ struct JsFunction {
     Value fproto;          // [[Prototype]]: parent ctor for derived classes
     u8 synth_off;          // SYNTH_NAME / SYNTH_LENGTH: the synthesized
                            // property was deleted
+    u8 fn_nonext;          // 1 once preventExtensions has closed it
 }
 
 const u8 SYNTH_NAME = 1;
@@ -278,6 +279,7 @@ struct JsNative {
     Value env1;
     Value env2;
     u8 synth_off;          // as on JsFunction
+    u8 fn_nonext;          // as on JsFunction
 }
 
 struct JsBox {
@@ -654,6 +656,14 @@ bool value_is_array(Value v) {
 // functions, and natives (constructors keep their statics here). Returns
 // null for primitives. Lets reflection reach a constructor's own
 // properties, which a value_is_object check alone would miss.
+// The extensibility bit of a function or a native, or null for anything
+// else. Objects keep theirs in obj_flags.
+u8* value_fn_nonext(Value v) {
+    if value_is_function(v) { return &value_as_function(v).fn_nonext; }
+    if value_is_native(v)   { return &value_as_native(v).fn_nonext; }
+    return null;
+}
+
 PropList* value_props(Value v) {
     if value_is_object(v)   { return &value_as_object(v).props; }
     if value_is_function(v) { return &value_as_function(v).props; }

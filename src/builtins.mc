@@ -450,6 +450,11 @@ private Value nat_is_prototype_of(void* vmp, Value callee, Value thisv, Value* a
 // their indices and "length").
 private Value nat_object_getownnames(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    // a proxy answers through its ownKeys trap, which vm_own_keys drives
+    if as_proxy(arg_at(args, argc, 0)) != null {
+        JsObject* keys = vm_own_keys(vm, arg_at(args, argc, 0));
+        return value_cell(&keys.head);
+    }
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&arr.head));
@@ -517,8 +522,32 @@ private Value nat_object_getownsymbols(void* vmp, Value callee, Value thisv, Val
 
 // `report` says a refusal is the caller's answer rather than an error.
 private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
+    VM* vmp2 = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
     Value pv = arg_at(args, argc, 1);
+    JsProxy* px = as_proxy(ov);
+    if px != null {
+        Value trap = proxy_trap_fn(vmp2, px, "setPrototypeOf");
+        if vmp2.has_pending { return false; }
+        if value_is_callable(trap) {
+            i32 rmx = gc_root_mark(&vmp2.heap);
+            noinit Value[2] ca;
+            ca[0] = px.target;
+            ca[1] = pv;
+            Value r = vm_call_value(vmp2, trap, px.handler, &ca[0], 2);
+            gc_root_reset(&vmp2.heap, rmx);
+            if vmp2.has_pending { return false; }
+            if js_truthy(r) { return true; }
+            if !report {
+                vm_throw_error(vmp2, ERR_TYPE, "proxy refused to set the prototype");
+            }
+            return false;
+        }
+        noinit Value[2] ta;
+        ta[0] = px.target;
+        ta[1] = pv;
+        return set_proto_core(vmp, &ta[0], 2, report);
+    }
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
         // setting the prototype it already has changes nothing, so it is
@@ -1032,12 +1061,8 @@ private Value nat_object_seal(void* vmp, Value callee, Value thisv, Value* args,
 }
 
 private Value nat_object_preventext(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    Value ov = arg_at(args, argc, 0);
-    if value_is_object(ov) {
-        JsObject* o = value_as_object(ov);
-        o.obj_flags = o.obj_flags | OBJF_NONEXT;
-    }
-    return ov;
+    ignore prevent_extensions_of(as_vm(vmp), arg_at(args, argc, 0));
+    return arg_at(args, argc, 0);
 }
 
 // All own data properties satisfy a predicate over cleared bits.
@@ -1067,10 +1092,66 @@ private Value nat_object_issealed(void* vmp, Value callee, Value thisv, Value* a
     return value_bool(object_all_locked(o, PROP_CONFIGURABLE));
 }
 
+// A proxy trap that takes the target alone. `had` says the handler has one;
+// without it the caller acts on the target instead.
+private Value proxy_trap_target(VM* vm, JsProxy* p, str name, bool* had) {
+    *had = false;
+    Value trap = proxy_trap_fn(vm, p, name);
+    if vm.has_pending || !value_is_callable(trap) { return value_undefined(); }
+    *had = true;
+    i32 rm = gc_root_mark(&vm.heap);
+    noinit Value[1] ca;
+    ca[0] = p.target;
+    Value r = vm_call_value(vm, trap, p.handler, &ca[0], 1);
+    gc_root_reset(&vm.heap, rm);
+    return r;
+}
+
+// The proxy a value is, or null. Only objects can be proxies.
+private JsProxy* as_proxy(Value v) {
+    if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0 {
+        return cast(JsProxy*, value_as_object(v));
+    }
+    return null;
+}
+
+// [[IsExtensible]]: the trap when the handler has one, the target otherwise.
+private bool is_extensible_of(VM* vm, Value ov) {
+    JsProxy* p = as_proxy(ov);
+    if p != null {
+        bool had = false;
+        Value r = proxy_trap_target(vm, p, "isExtensible", &had);
+        if vm.has_pending { return false; }
+        if had { return js_truthy(r); }
+        return is_extensible_of(vm, p.target);
+    }
+    u8* fx = value_fn_nonext(ov);
+    if fx != null { return *fx == 0; }
+    if !value_is_object(ov) { return false; }
+    return (value_as_object(ov).obj_flags & OBJF_NONEXT) == 0;
+}
+
+// [[PreventExtensions]]: the trap decides, or the target is closed.
+private bool prevent_extensions_of(VM* vm, Value ov) {
+    JsProxy* p = as_proxy(ov);
+    if p != null {
+        bool had = false;
+        Value r = proxy_trap_target(vm, p, "preventExtensions", &had);
+        if vm.has_pending { return false; }
+        if had { return js_truthy(r); }
+        return prevent_extensions_of(vm, p.target);
+    }
+    u8* fx = value_fn_nonext(ov);
+    if fx != null { *fx = 1; }
+    if value_is_object(ov) {
+        JsObject* o = value_as_object(ov);
+        o.obj_flags = o.obj_flags | OBJF_NONEXT;
+    }
+    return true;
+}
+
 private Value nat_object_isextensible(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) { return value_bool(false); }
-    return value_bool((value_as_object(ov).obj_flags & OBJF_NONEXT) == 0);
+    return value_bool(is_extensible_of(as_vm(vmp), arg_at(args, argc, 0)));
 }
 
 // Own-property existence, shared by Object.prototype.hasOwnProperty and
@@ -18353,23 +18434,21 @@ private Value nat_reflect_apply(void* vmp, Value callee, Value thisv, Value* arg
 private Value nat_reflect_isextensible(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) {
+    if !value_is_object(ov) && value_fn_nonext(ov) == null {
         vm_throw_error(vm, ERR_TYPE, "Reflect.isExtensible called on non-object");
         return value_undefined();
     }
-    return value_bool((value_as_object(ov).obj_flags & OBJF_NONEXT) == 0);
+    return value_bool(is_extensible_of(vm, ov));
 }
 
 private Value nat_reflect_preventext(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
-    if !value_is_object(ov) {
+    if !value_is_object(ov) && value_fn_nonext(ov) == null {
         vm_throw_error(vm, ERR_TYPE, "Reflect.preventExtensions called on non-object");
         return value_undefined();
     }
-    JsObject* o = value_as_object(ov);
-    o.obj_flags = o.obj_flags | OBJF_NONEXT;
-    return value_bool(true);
+    return value_bool(prevent_extensions_of(vm, ov));
 }
 
 private Value nat_reflect_construct(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
