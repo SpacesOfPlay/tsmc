@@ -1233,6 +1233,37 @@ private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver, bool 
     return !vm.has_pending;
 }
 
+// [[DefineOwnProperty]] on a proxy: the trap is handed the data descriptor a
+// definition means, which is what a class field's define has to look like
+// from the outside.
+private bool proxy_define(VM* vm, JsProxy* p, u32 a, Value v) {
+    Value trap;
+    i32 tr = proxy_trap(vm, p, "defineProperty", &trap);
+    if tr < 0 { return false; }
+    if tr == 0 {
+        def_prop_atom(vm, p.target, a, v);
+        return !vm.has_pending;
+    }
+    vpush(vm, v);                 // rooted across the allocations below
+    JsObject* d = js_new_object(&vm.heap, vm.object_proto);
+    vpush(vm, value_cell(&d.head));
+    js_set_prop(d, atom_intern(&vm.atoms, "value"), vpeek(vm, 1));
+    js_set_prop(d, atom_intern(&vm.atoms, "writable"), value_bool(true));
+    js_set_prop(d, atom_intern(&vm.atoms, "enumerable"), value_bool(true));
+    js_set_prop(d, atom_intern(&vm.atoms, "configurable"), value_bool(true));
+    vpush(vm, atom_to_key(vm, a));
+    Value[3] ca = { p.target, vpeek(vm, 0), vpeek(vm, 1) };
+    Value r = vm_call_value(vm, trap, p.handler, &ca[0], 3);
+    vm.sp -= 3;
+    if vm.has_pending { return false; }
+    // a trap that says no makes the definition itself fail
+    if !js_truthy(r) {
+        vm_throw_error(vm, ERR_TYPE, "proxy refused to define the property");
+        return false;
+    }
+    return true;
+}
+
 bool proxy_has(VM* vm, JsProxy* p, u32 a) {
     Value trap;
     i32 tr = proxy_trap(vm, p, "has", &trap);
@@ -2019,6 +2050,10 @@ private void name_by_key(VM* vm, Value fnv, u32 key, str prefix) {
 // as well as a plain object. A frozen object takes no definition, and a
 // non-extensible one takes none it does not already have.
 private void def_prop_atom(VM* vm, Value objv, u32 a, Value v) {
+    if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_PROXY) != 0 {
+        ignore proxy_define(vm, cast(JsProxy*, value_as_object(objv)), a, v);
+        return;
+    }
     // one that is neither writable nor configurable cannot be redefined
     Prop* ex = null;
     if value_props(objv) != null { ex = props_entry(value_props(objv), a); }
