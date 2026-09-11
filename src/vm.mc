@@ -1293,14 +1293,24 @@ private bool proxy_define(VM* vm, JsProxy* p, u32 a, Value v) {
     return true;
 }
 
+// [[HasProperty]] on anything: a proxy asks its trap, an object walks its
+// chain (which may have a proxy on it), a function has its own table.
+bool has_prop_of(VM* vm, Value objv, u32 a) {
+    if value_is_object(objv) {
+        JsObject* o = value_as_object(objv);
+        if (o.obj_flags & OBJF_PROXY) != 0 { return proxy_has(vm, cast(JsProxy*, o), a); }
+        return chain_has(vm, o, a);
+    }
+    if value_is_function(objv) || value_is_native(objv) { return fn_has_prop(vm, objv, a); }
+    return false;
+}
+
 bool proxy_has(VM* vm, JsProxy* p, u32 a) {
     Value trap;
     i32 tr = proxy_trap(vm, p, "has", &trap);
     if tr < 0 { return false; }
-    if tr == 0 {
-        if value_is_object(p.target) { return js_has_prop(value_as_object(p.target), a); }
-        return false;
-    }
+    // no trap: the target answers, whatever kind of thing it is
+    if tr == 0 { return has_prop_of(vm, p.target, a); }
     i32 rm = gc_root_mark(&vm.heap);
     Value key = atom_to_key(vm, a);
     gc_root(&vm.heap, key);
@@ -1317,6 +1327,9 @@ bool proxy_delete(VM* vm, JsProxy* p, u32 a) {
     i32 tr = proxy_trap(vm, p, "deleteProperty", &trap);
     if tr < 0 { return false; }
     if tr == 0 {
+        if value_is_object(p.target) && (value_as_object(p.target).obj_flags & OBJF_PROXY) != 0 {
+            return proxy_delete(vm, cast(JsProxy*, value_as_object(p.target)), a);
+        }
         if value_is_object(p.target) { return js_delete_prop(value_as_object(p.target), a); }
         return true;
     }
@@ -1501,6 +1514,37 @@ JsObject* proxy_own_keys(VM* vm, JsProxy* p) {
     return js_new_array(&vm.heap, vm.array_proto);
 }
 
+// The prototype chain, with a proxy on it answering for everything past
+// itself: an inherited read is the proxy's get trap, and an inherited `in` is
+// its has trap. Otherwise the same walk js_get_prop does.
+private bool chain_get(VM* vm, JsObject* o, u32 a, Value receiver, Value* out) {
+    JsObject* cur = o;
+    while cur != null {
+        if (cur.obj_flags & OBJF_PROXY) != 0 {
+            return proxy_get(vm, cast(JsProxy*, cur), a, receiver, out);
+        }
+        Value* v = props_get(&cur.props, a);
+        if v != null {
+            *out = *v;
+            return true;
+        }
+        cur = cur.proto;
+    }
+    return false;
+}
+
+private bool chain_has(VM* vm, JsObject* o, u32 a) {
+    JsObject* cur = o;
+    while cur != null {
+        if (cur.obj_flags & OBJF_PROXY) != 0 {
+            return proxy_has(vm, cast(JsProxy*, cur), a);
+        }
+        if props_get(&cur.props, a) != null { return true; }
+        cur = cur.proto;
+    }
+    return false;
+}
+
 private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
     *out = value_undefined();
     if value_is_object(objv) {
@@ -1526,9 +1570,10 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
                 *out = value_int(o.elen);
                 return true;
             }
-            // a string-numeric key (e.g. arr["1"]) reads the element part
+            // a string-numeric key (e.g. arr["1"]) reads the element part; a
+            // hole is not an element, so the prototype chain answers for it
             i32 idx = ta_atom_index(vm, a);
-            if idx >= 0 && idx < o.elen {
+            if idx >= 0 && idx < o.elen && js_array_has(o, idx) {
                 *out = js_array_get(o, idx);
                 return true;
             }
@@ -1540,7 +1585,7 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
                 return true;
             }
         }
-        ignore js_get_prop(o, a, out);
+        ignore chain_get(vm, o, a, objv, out);
         return true;
     }
     if value_is_function(objv) || value_is_native(objv) {
@@ -4557,11 +4602,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             // a view's elements are bytes, not properties
                             r = idx < ta_prop_int(vm, o, vm.atom_ta_len);
                         } else if idx >= 0 {
-                            r = js_array_has(o, idx);
+                            r = js_array_has(o, idx) || chain_has(vm, o, a);
                         } else if (o.obj_flags & OBJF_GLOBAL) != 0 {
-                            r = vm_global_exists(vm, a) || js_has_prop(o, a);
+                            r = vm_global_exists(vm, a) || chain_has(vm, o, a);
                         } else {
-                            r = js_has_prop(o, a);
+                            r = chain_has(vm, o, a);
                         }
                     }
                     if vm.has_pending { break case; }
@@ -4804,7 +4849,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value objv = vpeek(vm, 1);
                 if value_is_array(objv) {
                     i32 idx = val_to_index(key);
-                    if idx >= 0 {
+                    // an absent element, in range or past the end, is the
+                    // prototype chain's to answer
+                    if idx >= 0 && js_array_has(value_as_object(objv), idx) {
                         Value r = js_array_get(value_as_object(objv), idx);
                         vm.sp -= 2;
                         vpush(vm, r);
