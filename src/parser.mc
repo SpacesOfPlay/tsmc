@@ -100,6 +100,8 @@ private Token contextualize(Parser* p, Token t) {
 // already classified by the time a caller can say so, so it is reclassified
 // here.
 void parser_set_module_top(Parser* p, bool on) {
+    // module code is strict-mode code, with no directive to say so
+    if on && p.module_top == false { p.strict++; }
     p.module_top = on;
     if on && p.cur.kind == TOK_IDENT && !p.cur.escaped && str_equal(p.cur.text, "await") {
         p.cur.kind = TOK_KW_AWAIT;
@@ -233,6 +235,23 @@ private bool ident_written_plainly(Parser* p, Node* n) {
 // An escape may not spell a reserved word where an identifier is needed.
 private void refuse_escaped_keyword(Parser* p, Token t) {
     if t.escaped && reserved_word_text(t.text) {
+        perror(p, "Keyword must not contain escaped characters");
+    }
+}
+
+// The words reserved only in strict-mode code. Spelled with an escape they
+// are still those words, so they cannot stand as an identifier there either.
+private bool strict_reserved_text(str name) {
+    return str_equal(name, "implements") || str_equal(name, "interface")
+        || str_equal(name, "package") || str_equal(name, "private")
+        || str_equal(name, "protected") || str_equal(name, "public")
+        || str_equal(name, "static") || str_equal(name, "let")
+        || str_equal(name, "yield");
+}
+
+private void refuse_escaped_ident(Parser* p, Token t) {
+    refuse_escaped_keyword(p, t);
+    if t.escaped && p.strict > 0 && strict_reserved_text(t.text) {
         perror(p, "Keyword must not contain escaped characters");
     }
 }
@@ -880,12 +899,12 @@ private Node* parse_object(Parser* p) {
                 pr.flags |= NF_SHORTHAND;
                 // shorthand key is an IdentifierReference — not a reserved word
                 if is_reserved_word(keyk) || !shorthand_ok { perror(p, "unexpected token in shorthand property"); }
-                refuse_escaped_keyword(p, keytok);
+                refuse_escaped_ident(p, keytok);
                 pr.b = parse_assign(p);
             } else {
                 pr.flags |= NF_SHORTHAND;
                 if is_reserved_word(keyk) || !shorthand_ok { perror(p, "unexpected token in shorthand property"); }
-                refuse_escaped_keyword(p, keytok);
+                refuse_escaped_ident(p, keytok);
             }
         }
         vec_push(&p.scratch, nfin(p, pr));
@@ -974,7 +993,7 @@ private Node* parse_primary(Parser* p) {
         return parse_function_rest(p, NF_ASYNC, false, fstart);
     }
     if k == TOK_IDENT || is_ctx_ident(k) {
-        refuse_escaped_keyword(p, p.cur);
+        refuse_escaped_ident(p, p.cur);
         Node* n = nnew(p, N_IDENT);
         n.name = p.cur.text;
         advance(p);
