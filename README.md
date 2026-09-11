@@ -163,6 +163,7 @@ overrides the install dir.
 ```
 minc build      # -> build/tsmc[.exe]
 minc test       # build + run the full test suite (incl. GC stress)
+minc test neg   # one stage: unit, cli, run, neg, wasm or gc
 minc bench      # time bench/*.ts
 minc wasm       # -> build/web: the wasm build and the playground, served locally
 minc clean      # remove build/

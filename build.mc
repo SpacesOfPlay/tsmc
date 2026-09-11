@@ -2,7 +2,8 @@
 //
 // Usage, from this folder:
 //   minc build      compile build/tsmc
-//   minc test       build, then unit + cli + golden + gc-stress
+//   minc test       build, then unit + cli + golden + neg + wasm + gc-stress
+//   minc test <scope>  one stage: unit, cli, run, neg, wasm or gc
 //   minc bench      build, then time bench/*.ts
 //   minc wasm       build tsmc.wasm and the page into build/web, serve it
 //   minc clean      remove build/
@@ -928,21 +929,39 @@ DirList list_diff_scripts() {
     return all;
 }
 
-i32 run_tests() {
+// `minc test [scope]` runs one stage instead of all of them. The
+// differential suite is not among them: it needs node, and has its own verb.
+private bool want_stage(str scope, str name) {
+    return scope.len == 0 || str_equal(scope, name);
+}
+
+private bool known_scope(str scope) {
+    return scope.len == 0 || str_equal(scope, "unit") || str_equal(scope, "cli")
+        || str_equal(scope, "run") || str_equal(scope, "neg")
+        || str_equal(scope, "wasm") || str_equal(scope, "gc");
+}
+
+i32 run_tests(str scope) {
+    if !known_scope(scope) {
+        out("  FAIL  unknown test scope: ");
+        outln(scope);
+        outln("  scopes: unit, cli, run, neg, wasm, gc");
+        return 1;
+    }
     build_tsmc();
     string exe = out_exe();
     str e = str_from(exe.data, exe.len);
 
-    run_unit_tests();
-    run_cli_smoke(e);
+    if want_stage(scope, "unit") { run_unit_tests(); }
+    if want_stage(scope, "cli") { run_cli_smoke(e); }
 
     DirList run_scripts = dir_list_ext("test/run", ".ts");
     DirList diff_scripts = list_diff_scripts();
 
-    run_golden_tests(e, &run_scripts);
-    run_neg_tests(e);
-    run_wasm_tests(&run_scripts);
-    run_gc_stress(e, &run_scripts, &diff_scripts);
+    if want_stage(scope, "run") { run_golden_tests(e, &run_scripts); }
+    if want_stage(scope, "neg") { run_neg_tests(e); }
+    if want_stage(scope, "wasm") { run_wasm_tests(&run_scripts); }
+    if want_stage(scope, "gc") { run_gc_stress(e, &run_scripts, &diff_scripts); }
 
     dir_list_free(&run_scripts);
     dir_list_free(&diff_scripts);
@@ -1113,7 +1132,8 @@ void usage() {
     outln("  or:  build/build.exe <plugins|diff|examples|t262|release>   (no minc verb)");
     outln("  build   compile build/tsmc");
     outln("  plugins compile build/tsmc-plugins (loads minc plugins)");
-    outln("  test    build, then run unit + cli + golden + wasm + gc-stress tests");
+    outln("  test    build, then run unit + cli + golden + neg + wasm + gc-stress");
+    outln("          (test <scope>: one of unit, cli, run, neg, wasm, gc)");
     outln("  bench   build, then time bench/*.ts");
     outln("  wasm    build tsmc.wasm and the page into build/web, then serve it");
     outln("          (--no-serve: stop after assembling)");
@@ -1146,7 +1166,11 @@ i32 main() {
         build_plugins();
         return 0;
     }
-    if str_equal(verb, "test") { return run_tests(); }
+    if str_equal(verb, "test") {
+        str scope = "";
+        if argc > 2 { scope = str_from_cstr(get_arg(2)); }
+        return run_tests(scope);
+    }
     if str_equal(verb, "bench") { return run_bench(); }
     if str_equal(verb, "wasm") { return run_wasm(argc, 2); }
     if str_equal(verb, "diff") { return run_diff(); }
