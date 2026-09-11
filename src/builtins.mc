@@ -398,6 +398,23 @@ private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* a
         vm_throw_error(vm, ERR_TYPE, "Object.getPrototypeOf called on null or undefined");
         return value_undefined();
     }
+    // a proxy answers through its getPrototypeOf trap, target's chain otherwise
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_PROXY) != 0 {
+        JsProxy* p = cast(JsProxy*, value_as_object(ov));
+        Value trap = proxy_trap_fn(vm, p, "getPrototypeOf");
+        if vm.has_pending { return value_undefined(); }
+        if value_is_callable(trap) {
+            i32 rmp = gc_root_mark(&vm.heap);
+            noinit Value[1] ca;
+            ca[0] = p.target;
+            Value r = vm_call_value(vm, trap, p.handler, &ca[0], 1);
+            gc_root_reset(&vm.heap, rmp);
+            return r;
+        }
+        noinit Value[1] ta;
+        ta[0] = p.target;
+        return nat_object_getproto(vmp, callee, thisv, &ta[0], 1);
+    }
     return proto_of_value(vm, ov);
 }
 
@@ -528,6 +545,88 @@ private Value nat_proto_set(void* vmp, Value callee, Value thisv, Value* args, i
     return value_undefined();
 }
 
+// Annex B accessors. __defineGetter__ and __defineSetter__ build the
+// descriptor the specification names — enumerable and configurable, unlike
+// defineProperty's defaults — and hand it to defineProperty, so the proxy
+// trap and the attribute rules are the ones already written.
+private Value annexb_define(void* vmp, Value thisv, Value* args, i32 argc, bool is_get) {
+    VM* vm = as_vm(vmp);
+    Value ov = js_to_object(vm, thisv);
+    if vm.has_pending { return value_undefined(); }
+    Value accessor = arg_at(args, argc, 1);
+    if !value_is_callable(accessor) {
+        vm_throw_error(vm, ERR_TYPE, is_get
+            ? "Object.prototype.__defineGetter__: Expecting function"
+            : "Object.prototype.__defineSetter__: Expecting function");
+        return value_undefined();
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, ov);
+    JsObject* d = js_new_object(&vm.heap, vm.object_proto);
+    Value dv = value_cell(&d.head);
+    gc_root(&vm.heap, dv);
+    js_set_prop(d, bi_atom(vm, is_get ? "get" : "set"), accessor);
+    js_set_prop(d, bi_atom(vm, "enumerable"), value_bool(true));
+    js_set_prop(d, bi_atom(vm, "configurable"), value_bool(true));
+    noinit Value[3] a;
+    a[0] = ov;
+    a[1] = arg_at(args, argc, 0);
+    a[2] = dv;
+    ignore nat_object_defineproperty(vmp, value_undefined(), value_undefined(), &a[0], 3);
+    gc_root_reset(&vm.heap, rm);
+    return value_undefined();
+}
+
+// __lookupGetter__ and __lookupSetter__ walk the prototype chain for the
+// first own property of that name; an accessor answers with its half, a data
+// property answers undefined and stops the walk.
+private Value annexb_lookup(void* vmp, Value thisv, Value* args, i32 argc, bool want_get) {
+    VM* vm = as_vm(vmp);
+    Value ov = js_to_object(vm, thisv);
+    if vm.has_pending { return value_undefined(); }
+    i32 rm = gc_root_mark(&vm.heap);
+    gc_root(&vm.heap, ov);
+    Value key = arg_at(args, argc, 0);
+    gc_root(&vm.heap, key);
+    Value out = value_undefined();
+    while !value_is_undefined(ov) && !value_is_null(ov) {
+        noinit Value[2] a;
+        a[0] = ov;
+        a[1] = key;
+        Value desc = nat_object_getownpropdesc(vmp, value_undefined(), value_undefined(), &a[0], 2);
+        if vm.has_pending { break; }
+        if !value_is_undefined(desc) {
+            gc_root(&vm.heap, desc);
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, want_get ? "get" : "set"), &out);
+            break;
+        }
+        noinit Value[1] pa;
+        pa[0] = ov;
+        ov = nat_object_getproto(vmp, value_undefined(), value_undefined(), &pa[0], 1);
+        if vm.has_pending { break; }
+        gc_root(&vm.heap, ov);
+    }
+    gc_root_reset(&vm.heap, rm);
+    if vm.has_pending { return value_undefined(); }
+    return out;
+}
+
+private Value nat_define_getter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return annexb_define(vmp, thisv, args, argc, true);
+}
+
+private Value nat_define_setter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return annexb_define(vmp, thisv, args, argc, false);
+}
+
+private Value nat_lookup_getter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return annexb_lookup(vmp, thisv, args, argc, true);
+}
+
+private Value nat_lookup_setter(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return annexb_lookup(vmp, thisv, args, argc, false);
+}
+
 // True if ov has an own or inherited property named `name`.
 private bool desc_has(VM* vm, Value ov, str name) {
     if !value_is_object(ov) { return false; }
@@ -652,13 +751,26 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
 
     Value stored;
     if desc_has(vm, desc, "get") || desc_has(vm, desc, "set") {
+        // a half the descriptor leaves out keeps what the property had, so
+        // defining the getter and the setter in two steps lands one accessor
         Value g = value_undefined();
         Value s = value_undefined();
-        if desc_has(vm, desc, "get") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "get"), &g); }
-        if desc_has(vm, desc, "set") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "set"), &s); }
+        if existing != null && value_is_accessor(existing.val) {
+            JsAccessor* was = value_as_accessor(existing.val);
+            g = was.get;
+            s = was.set;
+        }
+        if desc_has(vm, desc, "get") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "get"), &tmp);
+            g = value_is_callable(tmp) ? tmp : value_undefined();
+        }
+        if desc_has(vm, desc, "set") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "set"), &tmp);
+            s = value_is_callable(tmp) ? tmp : value_undefined();
+        }
         JsAccessor* ac = js_new_accessor(&vm.heap);
-        ac.get = value_is_callable(g) ? g : value_undefined();
-        ac.set = value_is_callable(s) ? s : value_undefined();
+        ac.get = g;
+        ac.set = s;
         stored = value_cell(&ac.head);
         flags = flags & cast(u8, ~PROP_WRITABLE);
     } else {
@@ -18320,6 +18432,11 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.object_proto, "isPrototypeOf", &nat_is_prototype_of);
     def_method(vm, vm.object_proto, "toString", &nat_object_tostring);
     def_method(vm, vm.object_proto, "valueOf", &nat_object_valueof);
+    // Annex B, still relied on by shipped code
+    def_method(vm, vm.object_proto, "__defineGetter__", &nat_define_getter);
+    def_method(vm, vm.object_proto, "__defineSetter__", &nat_define_setter);
+    def_method(vm, vm.object_proto, "__lookupGetter__", &nat_lookup_getter);
+    def_method(vm, vm.object_proto, "__lookupSetter__", &nat_lookup_setter);
     {
         // __proto__: a get/set accessor, so it follows the prototype chain
         JsNative* pg = js_new_native(&vm.heap, &nat_proto_get, "__proto__");

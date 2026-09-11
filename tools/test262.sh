@@ -129,7 +129,7 @@ Symbol.isConcatSpreadable Symbol.replace Symbol.match Symbol.split \
 Symbol.search"
 
 # Annex B leftovers we do not define
-SKIP_FEATURES="$SKIP_FEATURES __getter__ __setter__ caller"
+SKIP_FEATURES="$SKIP_FEATURES caller"
 
 # Harness includes that pull in a skipped family, or that do not load at all
 # (fnGlobalObject.js reaches the global through the Function constructor).
