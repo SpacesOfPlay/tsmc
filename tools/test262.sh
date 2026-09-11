@@ -30,6 +30,8 @@
 # lands in the skip list costs the same as failing it.
 #
 # A `flags: [module]` test is written beside the original as .mjs and run
+# once; a test that imports itself by name has that reference repointed at the
+# copy, since the copy is the module being run.
 # once, since module code is strict and its relative imports have to
 # resolve against the real directory.
 #
@@ -297,6 +299,13 @@ run_one() {
 
     local ok=1
     if [ "$ismodule" = "1" ]; then
+        # A test that imports itself names the file it was written as, and the
+        # assembled copy sits under another name, so the self-reference is
+        # repointed at the copy — the copy is the module being run.
+        local selfbase tmpbase
+        selfbase="$(basename "$f")"
+        tmpbase="$(basename "$TMPM")"
+        body="$(printf '%s' "$body" | sed -e "s|'\./$selfbase'|'./$tmpbase'|g" -e "s|\"\./$selfbase\"|\"./$tmpbase\"|g")"
         # module code is strict on its own, so there is one variant, and
         # the harness rides along inside the module
         TARGET="$TMPM"
