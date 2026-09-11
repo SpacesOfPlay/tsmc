@@ -1169,11 +1169,27 @@ private bool proxy_get(VM* vm, JsProxy* p, u32 a, Value receiver, Value* out) {
     return !vm.has_pending;
 }
 
-private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver) {
+// A write the object refuses. Strict-mode code makes that a TypeError;
+// sloppy code drops the write and carries on, which is what the assignment
+// expression's value being `v` already reflects.
+private bool write_refused(VM* vm, bool strict, str msg) {
+    if !strict { return true; }
+    vm_throw_error(vm, ERR_TYPE, msg);
+    return false;
+}
+
+// A delete the object refuses: 0 for `false`, -1 for a thrown TypeError.
+private i32 delete_refused(VM* vm, bool strict, str msg) {
+    if !strict { return 0; }
+    vm_throw_error(vm, ERR_TYPE, msg);
+    return 0 - 1;
+}
+
+private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver, bool strict) {
     Value trap;
     i32 tr = proxy_trap(vm, p, "set", &trap);
     if tr < 0 { return false; }
-    if tr == 0 { return set_prop_atom(vm, p.target, a, v); }
+    if tr == 0 { return set_prop_atom(vm, p.target, a, v, strict); }
     i32 rm = gc_root_mark(&vm.heap);
     Value key = atom_to_key(vm, a);
     gc_root(&vm.heap, key);
@@ -1605,7 +1621,8 @@ bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
 // Public property set through the full path (proxy set trap, array length,
 // typed arrays, accessors). Used by Reflect.set and similar.
 bool vm_set_prop_value(VM* vm, Value objv, u32 a, Value v) {
-    return set_prop_atom(vm, objv, a, v);
+    // the reflective entry reports a refusal as an error, as Reflect.set does
+    return set_prop_atom(vm, objv, a, v, true);
 }
 
 // Public delete through the full path, so a proxy's deleteProperty trap
@@ -1621,19 +1638,21 @@ bool vm_delete_prop_value(VM* vm, Value objv, u32 a) {
     return true;
 }
 
-private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
+// `strict` is the strictness of the code performing the write, which is what
+// decides whether a refusal throws or is dropped.
+private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
         if (o.obj_flags & OBJF_PROXY) != 0 {
-            return proxy_set(vm, cast(JsProxy*, o), a, v, objv);
+            return proxy_set(vm, cast(JsProxy*, o), a, v, objv, strict);
         }
         if (o.obj_flags & OBJF_GLOBAL) != 0 {
             // writing a property of the global object creates or updates the
             // binding a bare name resolves to; the three value properties
             // of the global object are read-only
             if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
-                vm_throw_error(vm, ERR_TYPE, "cannot assign to read only property of the global object");
-                return false;
+                return write_refused(vm, strict,
+                    "cannot assign to read only property of the global object");
             }
             intmap_set<Value>(&vm.globals, a, v);
             return true;
@@ -1653,12 +1672,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             i32 idx = ta_atom_index(vm, a);
             if idx >= 0 {
                 if (o.obj_flags & OBJF_FROZEN) != 0 {
-                    vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property of a frozen array");
-                    return false;
+                    return write_refused(vm, strict,
+                        "cannot assign to read-only property of a frozen array");
                 }
                 if idx >= o.elen && (o.obj_flags & OBJF_NONEXT) != 0 {
-                    vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible array");
-                    return false;
+                    return write_refused(vm, strict,
+                        "cannot add property to a non-extensible array");
                 }
                 js_array_set(o, idx, v);
                 return true;
@@ -1683,23 +1702,19 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
                         ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                         return !vm.has_pending;
                     }
-                    // strict mode throughout, so a failed write is an error
-                    // rather than the sloppy-mode silent no-op
-                    vm_throw_error(vm, ERR_TYPE, "cannot set property which has only a getter");
-                    return false;
+                    return write_refused(vm, strict,
+                        "cannot set property which has only a getter");
                 }
                 if cur == o {
                     if (pe.flags & PROP_WRITABLE) == 0 {
-                        vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
-                        return false;
+                        return write_refused(vm, strict, "cannot assign to read-only property");
                     }
                     pe.val = v;
                     return true;
                 }
                 // an inherited non-writable data property blocks the write
                 if (pe.flags & PROP_WRITABLE) == 0 {
-                    vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
-                    return false;
+                    return write_refused(vm, strict, "cannot assign to read-only property");
                 }
                 break;
             }
@@ -1707,8 +1722,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
         }
         // a fresh property cannot be added to a non-extensible object
         if (o.obj_flags & OBJF_NONEXT) != 0 {
-            vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible object");
-            return false;
+            return write_refused(vm, strict, "cannot add property to a non-extensible object");
         }
         js_set_prop(o, a, v);
         return true;
@@ -1723,19 +1737,17 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
                 ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                 return !vm.has_pending;
             }
-            vm_throw_error(vm, ERR_TYPE, "cannot set property which has only a getter");
-            return false;
+            return write_refused(vm, strict, "cannot set property which has only a getter");
         }
         PropList* fprops = value_props(objv);
         if fn_synth_bit(vm, a) != 0 && props_get(fprops, a) == null && !vm_fn_synth_hidden(vm, objv, a) {
-            vm_throw_error(vm, ERR_TYPE, "cannot assign to read only property of a function");
-            return false;
+            return write_refused(vm, strict,
+                "cannot assign to read only property of a function");
         }
         // a read-only own property refuses the write, as it does on an object
         Prop* fe = props_entry(fprops, a);
         if fe != null && (fe.flags & PROP_WRITABLE) == 0 {
-            vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property");
-            return false;
+            return write_refused(vm, strict, "cannot assign to read-only property");
         }
         props_set(fprops, a, v);
         return true;
@@ -1744,7 +1756,8 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v) {
         vm_throw_error(vm, ERR_TYPE, "cannot set properties of null or undefined");
         return false;
     }
-    return true;
+    // a primitive keeps no properties of its own, so the write goes nowhere
+    return write_refused(vm, strict, "cannot create a property on a primitive value");
 }
 
 private i32 val_to_index(Value v) {
@@ -2131,7 +2144,7 @@ private void private_set(VM* vm, FnTemplate* t, i32 ci) {
     Value v = vpeek(vm, 0);
     Value objv = vpeek(vm, 1);
     if !has_private(vm, objv, a) { private_missing(vm, a, true); return; }
-    if set_prop_atom(vm, objv, a, v) {
+    if set_prop_atom(vm, objv, a, v, true) {   // a class body is strict
         vm.sp -= 2;
         vpush(vm, v);
     }
@@ -4650,7 +4663,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 Value v = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
-                if set_prop_atom(vm, objv, a, v) {
+                if set_prop_atom(vm, objv, a, v, !t.sloppy) {
                     vm.sp -= 2;
                     vpush(vm, v);
                 }
@@ -4742,7 +4755,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_array(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
-                        if !array_index_writable(vm, value_as_object(objv), idx) { break case; }
+                        if !array_index_writable(vm, value_as_object(objv), idx, !t.sloppy) {
+                            // sloppy code drops the write; the value stays the
+                            // assignment expression's own
+                            if !vm.has_pending { vm.sp -= 3; vpush(vm, v); }
+                            break case;
+                        }
                         js_array_set(value_as_object(objv), idx, v);
                         vm.sp -= 3;
                         vpush(vm, v);
@@ -4759,7 +4777,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
                 u32 a = key_to_atom(vm, key);
-                if set_prop_atom(vm, objv, a, v) {
+                if set_prop_atom(vm, objv, a, v, !t.sloppy) {
                     vm.sp -= 3;
                     vpush(vm, v);
                 }
@@ -4805,18 +4823,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DELPROP: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                if delete_key(vm, vpeek(vm, 0), a) {
-                    vm.sp--;
-                    vpush(vm, value_bool(true));
-                }
+                op_delete_prop(vm, t, rd_u16(code, ip - 2));
             }
             case OP_DELINDEX: {
-                if delete_index(vm, vpeek(vm, 1), vpeek(vm, 0)) {
-                    vm.sp -= 2;
-                    vpush(vm, value_bool(true));
-                }
+                op_delete_index(vm, !t.sloppy);
             }
             case OP_TRY_PUSH: {
                 i32 target = rd_u16(code, ip);
@@ -5468,30 +5479,33 @@ private bool instanceof_hook(VM* vm) {
 
 // An element store blocked by the array's integrity level. Throws and returns
 // false when it is; kept out of the interpreter loop for frame size.
-private bool array_index_writable(VM* vm, JsObject* a, i32 idx) {
+// False means the element must not be written: either it threw (strict) or
+// the write is simply dropped (sloppy), which the caller cannot tell apart
+// and does not need to.
+private bool array_index_writable(VM* vm, JsObject* a, i32 idx, bool strict) {
     if (a.obj_flags & OBJF_FROZEN) != 0 {
-        vm_throw_error(vm, ERR_TYPE, "cannot assign to read-only property of a frozen array");
+        ignore write_refused(vm, strict, "cannot assign to read-only property of a frozen array");
         return false;
     }
     if idx >= a.elen && (a.obj_flags & OBJF_NONEXT) != 0 {
-        vm_throw_error(vm, ERR_TYPE, "cannot add property to a non-extensible array");
+        ignore write_refused(vm, strict, "cannot add property to a non-extensible array");
         return false;
     }
     return true;
 }
 
 // `delete`, shared by the named and computed forms. Removing an absent
-// property succeeds; a non-configurable one is a TypeError under strict mode,
-// which is the only mode here. Returns false when it threw.
-private bool delete_key(VM* vm, Value objv, u32 a) {
+// property succeeds.
+// 1 deleted, 0 refused, -1 threw. A refusal is the delete expression's
+// `false` in sloppy code and a TypeError in strict code.
+private i32 delete_key(VM* vm, Value objv, u32 a, bool strict) {
     if !value_is_object(objv) {
         // a function or a native carries properties of its own
         PropList* fprops = value_props(objv);
         if fprops != null {
             Prop* fe = props_entry(fprops, a);
             if fe != null && (fe.flags & PROP_CONFIGURABLE) == 0 {
-                vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
-                return false;
+                return delete_refused(vm, strict, "cannot delete non-configurable property");
             }
             if fe == null && fn_synth_bit(vm, a) != 0 {
                 // the synthesized name or length: configurable, so it goes
@@ -5500,31 +5514,31 @@ private bool delete_key(VM* vm, Value objv, u32 a) {
             }
             ignore props_remove(fprops, a);
         }
-        return true;
+        return 1;
     }
     JsObject* o = value_as_object(objv);
     if (o.obj_flags & OBJF_PROXY) != 0 {
-        ignore proxy_delete(vm, cast(JsProxy*, o), a);
-        return !vm.has_pending;
+        bool got = proxy_delete(vm, cast(JsProxy*, o), a);
+        if vm.has_pending { return 0 - 1; }
+        return got ? 1 : 0;
     }
     if (o.obj_flags & OBJF_GLOBAL) != 0 {
         // removing the binding, not a copy of it: the bare name stops
         // resolving too
         intmap_remove<Value>(&vm.globals, a);
-        return true;
+        return 1;
     }
     Prop* pe = props_entry(&o.props, a);
     if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
-        vm_throw_error(vm, ERR_TYPE, "cannot delete non-configurable property");
-        return false;
+        return delete_refused(vm, strict, "cannot delete non-configurable property");
     }
     ignore js_delete_prop(o, a);
-    return true;
+    return 1;
 }
 
 // The computed form. An array index clears the slot to a hole rather than
 // removing a property, so `1 in a` goes false and the iteration methods skip it.
-private bool delete_index(VM* vm, Value objv, Value key) {
+private i32 delete_index(VM* vm, Value objv, Value key, bool strict) {
     if value_is_array(objv) {
         JsObject* a = value_as_object(objv);
         i32 idx = val_to_index(key);
@@ -5532,21 +5546,39 @@ private bool delete_index(VM* vm, Value objv, Value key) {
             // a string key may still spell an element index; any other key
             // names an ordinary property of the array
             u32 atom = key_to_atom(vm, key);
-            if vm.has_pending { return false; }
+            if vm.has_pending { return 0 - 1; }
             idx = ta_atom_index(vm, atom);
-            if idx < 0 { return delete_key(vm, objv, atom); }
+            if idx < 0 { return delete_key(vm, objv, atom, strict); }
         }
         if idx < a.elen {
             if (a.obj_flags & OBJF_SEALED) != 0 {
-                vm_throw_error(vm, ERR_TYPE, "cannot delete from a sealed array");
-                return false;
+                return delete_refused(vm, strict, "cannot delete from a sealed array");
             }
             js_array_set(a, idx, value_hole());
         }
-        return true;
+        return 1;
     }
-    if !value_is_object(objv) && value_props(objv) == null { return true; }
-    return delete_key(vm, objv, key_to_atom(vm, key));
+    if !value_is_object(objv) && value_props(objv) == null { return 1; }
+    u32 ka = key_to_atom(vm, key);
+    if vm.has_pending { return 0 - 1; }
+    return delete_key(vm, objv, ka, strict);
+}
+
+// [obj] -> [bool]: `delete obj.name`.
+private void op_delete_prop(VM* vm, FnTemplate* t, i32 ci) {
+    i32 r = delete_key(vm, vpeek(vm, 0),
+        cast(u32, value_as_int(*(t.consts + ci))), !t.sloppy);
+    if r < 0 { return; }
+    vm.sp--;
+    vpush(vm, value_bool(r == 1));
+}
+
+// [obj, key] -> [bool]: `delete obj[expr]`.
+private void op_delete_index(VM* vm, bool strict) {
+    i32 r = delete_index(vm, vpeek(vm, 1), vpeek(vm, 0), strict);
+    if r < 0 { return; }
+    vm.sp -= 2;
+    vpush(vm, value_bool(r == 1));
 }
 
 // A return completion is not catchable: hand it straight back to the unwinder,
