@@ -2084,9 +2084,24 @@ private void compile_expr(Compiler* co, Node* n) {
                 compile_expr(co, t.a);
                 compile_expr(co, t.b);
                 ch_op(ch, OP_DELINDEX);
+            } else if t.kind == N_IDENT {
+                // a bare name is a binding, not a property: strict-mode code
+                // may not ask, and a binding refuses. Only a global that some
+                // assignment created can go.
+                if co.strict {
+                    cerror(co, n, "Delete of an unqualified identifier in strict mode");
+                    ch_op(ch, OP_FALSE);
+                    return;
+                }
+                FScope* fs = co.cur;
+                if find_local(fs, t.name) >= 0 || resolve_upval(fs, t.name) >= 0 {
+                    ch_op(ch, OP_FALSE);
+                } else {
+                    ch_op_u16(ch, OP_DELGLOBAL, name_const(co, t.name));
+                }
             } else {
-                // deleting anything that is not a property reference is
-                // vacuously successful, but the operand is still evaluated
+                // deleting anything that is not a reference is vacuously
+                // successful, but the operand is still evaluated
                 compile_expr(co, t);
                 ch_op(ch, OP_POP);
                 ch_op(ch, OP_TRUE);

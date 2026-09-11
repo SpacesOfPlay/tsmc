@@ -1169,6 +1169,36 @@ private bool proxy_get(VM* vm, JsProxy* p, u32 a, Value receiver, Value* out) {
     return !vm.has_pending;
 }
 
+// `name = v` where the name is no binding at all. In strict-mode code that
+// is a ReferenceError instead of a fresh global, and the three value
+// properties of the global object are read-only whatever the mode.
+private bool set_global(VM* vm, u32 a, Value v, bool strict) {
+    if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
+        return write_refused(vm, strict,
+            "cannot assign to read only property of the global object");
+    }
+    if strict && intmap_get<Value>(&vm.globals, a) == null {
+        string msg = format("{} is not defined", atom_name(&vm.atoms, a));
+        str mv = msg;
+        vm_throw_error(vm, ERR_REF, mv);
+        free(msg);
+        return false;
+    }
+    intmap_set<Value>(&vm.globals, a, v);
+    return true;
+}
+
+// `delete name` in sloppy code, where the name is not a binding: the global
+// goes, unless it is one of the three the specification fixes.
+private void del_global(VM* vm, u32 a) {
+    if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
+        vpush(vm, value_bool(false));
+        return;
+    }
+    intmap_remove<Value>(&vm.globals, a);
+    vpush(vm, value_bool(true));
+}
+
 // A write the object refuses. Strict-mode code makes that a TypeError;
 // sloppy code drops the write and carries on, which is what the assignment
 // expression's value being `v` already reflects.
@@ -4051,9 +4081,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SETGLOBAL: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                intmap_set<Value>(&vm.globals, a, vpeek(vm, 0));
+                ignore set_global(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    vpeek(vm, 0), !t.sloppy);
+            }
+            case OP_DELGLOBAL: {
+                ip += 2;
+                del_global(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
             }
             case OP_SETCONST_ERR: {
                 // the value was computed first, as the assignment says

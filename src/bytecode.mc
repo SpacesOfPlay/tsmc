@@ -31,6 +31,7 @@ enum Op {
     OP_GETGLOBAL,    // u16 const idx (name string); throws when missing
     OP_GETGLOBAL_SOFT,   // pushes undefined when missing (typeof)
     OP_SETGLOBAL,    // u16 const idx; keeps value
+    OP_DELGLOBAL,    // u16 const idx; removes a global binding -> bool
     OP_SETCONST_ERR, // a store to an immutable binding: throws TypeError
 
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
