@@ -1572,6 +1572,14 @@ private bool get_prop_atom(VM* vm, Value objv, u32 a, Value* out) {
             *out = value_int(value_as_string(objv).u16len);
             return true;
         }
+        // the characters are own properties, so an index spelled as a name
+        // reaches them as `s[0]` does
+        u32 si = 0;
+        if vm_key_array_index(vm, a, &si) {
+            GcString* sv = value_as_string(objv);
+            if cast(i32, si) < sv.u16len { *out = vm_string_char(vm, sv, cast(i32, si)); }
+            return true;
+        }
         if vm.string_proto != null { ignore js_get_prop(vm.string_proto, a, out); }
         return true;
     }
@@ -4787,28 +4795,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_string(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
-                        GcString* s = value_as_string(objv);
-                        if idx < s.u16len {
-                            str view = gc_string_view(s);
-                            // fast path: ASCII strings index by byte, and
-                            // the character is a shared cell
-                            if s.u16len == s.len {
-                                Value ch = vm_ascii_char(vm, *(view.data + idx));
-                                vm.sp -= 2;
-                                vpush(vm, ch);
-                            } else {
-                                str_buf sb;
-                                str_buf_init(&sb);
-                                u16_slice_into_cur(&sb, view, idx, idx + 1, &s.cur_u, &s.cur_off);
-                                GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
-                                str_buf_free(&sb);
-                                vm.sp -= 2;
-                                vpush(vm, value_cell(&g.head));
-                            }
-                        } else {
-                            vm.sp -= 2;
-                            vpush(vm, value_undefined());
+                        Value ch = value_undefined();
+                        if idx < value_as_string(objv).u16len {
+                            ch = vm_string_char(vm, value_as_string(objv), idx);
                         }
+                        vm.sp -= 2;
+                        vpush(vm, ch);
                         break case;
                     }
                 }
@@ -5069,41 +5061,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !vm.has_pending { vm.sp--; }
             }
             case OP_OBJ_REST: {
-                Value exv = *(t.consts + rd_u16(code, ip));
                 ip += 2;
-                Value src = vpeek(vm, 0);
-                JsObject* r = js_new_object(&vm.heap, vm.object_proto);
-                vpush(vm, value_cell(&r.head));
-                // a string's own properties are its characters
-                if value_is_string(src) { spread_string_into(vm, r, src); }
-                if value_is_object(src) && value_is_object(exv) {
-                    JsObject* s = value_as_object(src);
-                    JsObject* ex = value_as_object(exv);
-                    vm_props_order(vm, &s.props);
-                    for i32 i = 0; i < s.props.len; i++ {
-                        Prop* pr = s.props.items + i;
-                        if !prop_copyable(vm, pr) { continue; }
-                        bool skip = false;
-                        for i32 j = 0; j < ex.elen; j++ {
-                            Value kv = js_array_get(ex, j);
-                            if value_is_int(kv) && cast(u32, value_as_int(kv)) == pr.key {
-                                skip = true;
-                                break;
-                            }
-                        }
-                        if skip { continue; }
-                        Value pv = pr.val;
-                        if value_is_accessor(pv) {
-                            if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
-                        }
-                        js_set_prop(r, pr.key, pv);
-                    }
-                }
-                if !vm.has_pending {
-                    Value rv = vpop(vm);
-                    vm.sp--;
-                    vpush(vm, rv);
-                }
+                op_obj_rest(vm, fr, rd_u16(code, ip - 2));
             }
             case OP_ARR_SLICE_FROM: {
                 i32 start = rd_u16(code, ip);
@@ -5353,6 +5312,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
 // split("") hand these out instead of allocating a cell per character.
 Value vm_ascii_char(VM* vm, u8 c) {
     return value_cell(&vm.ascii_chars[c].head);
+}
+
+// The one-character string at `idx`, which the caller has checked is inside
+// `s`. An all-ASCII string indexes by byte and answers with a shared cell.
+Value vm_string_char(VM* vm, GcString* s, i32 idx) {
+    str view = gc_string_view(s);
+    if s.u16len == s.len { return vm_ascii_char(vm, *(view.data + idx)); }
+    str_buf sb;
+    str_buf_init(&sb);
+    u16_slice_into_cur(&sb, view, idx, idx + 1, &s.cur_u, &s.cur_off);
+    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str_buf_free(&sb);
+    return value_cell(&g.head);
 }
 
 // Runs a compiled script template. 0 ok, 1 uncaught exception.
@@ -5650,6 +5622,64 @@ private void op_delete_index(VM* vm, bool strict) {
     if r < 0 { return; }
     vm.sp -= 2;
     vpush(vm, value_bool(r == 1));
+}
+
+// True when `key` is one of the atoms the pattern already took.
+private bool rest_key_excluded(JsObject* ex, u32 key) {
+    for i32 j = 0; j < ex.elen; j++ {
+        Value kv = js_array_get(ex, j);
+        if value_is_int(kv) && cast(u32, value_as_int(kv)) == key { return true; }
+    }
+    return false;
+}
+
+// [src] -> [rest]: the own enumerable properties of `src` that the pattern
+// did not take, as a fresh object. The excluded keys are the values the
+// pattern collected as it ran — a computed key is only known then — and are
+// turned into atoms once, in place, before the copy.
+private void op_obj_rest(VM* vm, Frame* fr, i32 slot) {
+    Value exv = *(vm.stack + fr.base + slot);
+    Value src = vpeek(vm, 0);
+    JsObject* r = js_new_object(&vm.heap, vm.object_proto);
+    vpush(vm, value_cell(&r.head));
+    JsObject* ex = value_is_array(exv) ? value_as_object(exv) : null;
+    if ex != null {
+        for i32 j = 0; j < ex.elen; j++ {
+            u32 ka = key_to_atom(vm, js_array_get(ex, j));
+            if vm.has_pending { return; }
+            js_array_set(ex, j, value_int(cast(i32, ka)));
+        }
+    }
+    // a string's own properties are its characters, and the pattern may have
+    // taken some of them by index
+    if value_is_string(src) {
+        spread_string_into(vm, r, src);
+        if ex != null {
+            for i32 j = 0; j < ex.elen; j++ {
+                Value kv = js_array_get(ex, j);
+                if value_is_int(kv) { ignore js_delete_prop(r, cast(u32, value_as_int(kv))); }
+            }
+        }
+    }
+    if value_is_object(src) && ex != null {
+        JsObject* s = value_as_object(src);
+        vm_props_order(vm, &s.props);
+        for i32 i = 0; i < s.props.len; i++ {
+            if vm.has_pending { break; }
+            Prop* pr = s.props.items + i;
+            if !prop_copyable(vm, pr) { continue; }
+            if rest_key_excluded(ex, pr.key) { continue; }
+            Value pv = pr.val;
+            if value_is_accessor(pv) {
+                if !vm_get_prop_value(vm, src, pr.key, &pv) { break; }
+            }
+            js_set_prop(r, pr.key, pv);
+        }
+    }
+    if vm.has_pending { return; }
+    Value rv = vpop(vm);
+    vm.sp--;
+    vpush(vm, rv);
 }
 
 // A return completion is not catchable: hand it straight back to the unwinder,

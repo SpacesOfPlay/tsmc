@@ -549,6 +549,13 @@ private i32 private_key_const(Compiler* co, Node* at, str name) {
     return name_const(co, m);
 }
 
+// A non-computed key as the value it stands for: the string a name or a
+// string literal spells, the number a numeric key holds.
+private i32 key_value_const(Compiler* co, Node* key) {
+    if key.kind == N_NUMBER { return ch_add_const(&co.cur.ch, num_value(key.num)); }
+    return str_const(co, key.name);
+}
+
 private i32 prop_key_const(Compiler* co, Node* key) {
     if key.kind == N_NUMBER { return num_key_const(co, key.num); }
     if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key, key.name); }
@@ -889,13 +896,6 @@ private void emit_store_ident(Compiler* co, Node* n) {
     i32 li = find_local(fs, n.name);
     if li >= 0 {
         CBind b = vec_get(&fs.binds, li);
-        if b.is_const {
-            ch_op(&fs.ch, OP_SETCONST_ERR);
-            return;
-        }
-        ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
-        if b.exported { emit_export_writes(co, n.name, n); }
-        return;
         // A binding that has not been initialized refuses the store, and says
         // so before the const check does. The checked read throws on the hole;
         // its value is dropped.
@@ -903,10 +903,21 @@ private void emit_store_ident(Compiler* co, Node* n) {
             ch_op_u16(&fs.ch, b.is_cell ? OP_GETCELL_CHK : OP_GETLOCAL_CHK, b.slot);
             ch_op(&fs.ch, OP_POP);
         }
+        if b.is_const {
+            ch_op(&fs.ch, OP_SETCONST_ERR);
+            return;
+        }
+        ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
+        if b.exported { emit_export_writes(co, n.name, n); }
+        return;
     }
     i32 ui = resolve_upval(fs, n.name);
     if ui >= 0 {
         CUp u = vec_get(&fs.ups, ui);
+        if u.tdz {
+            ch_op_u16(&fs.ch, OP_GETUPVAL_CHK, ui);
+            ch_op(&fs.ch, OP_POP);
+        }
         if u.is_const {
             ch_op(&fs.ch, OP_SETCONST_ERR);
             return;
@@ -914,10 +925,6 @@ private void emit_store_ident(Compiler* co, Node* n) {
         ch_op_u16(&fs.ch, OP_SETUPVAL, ui);
         if u.exported { emit_export_writes(co, n.name, n); }
         return;
-        if u.tdz {
-            ch_op_u16(&fs.ch, OP_GETUPVAL_CHK, ui);
-            ch_op(&fs.ch, OP_POP);
-        }
     }
     if co.in_module && strmap_get<ModImport>(&co.mod_imports, n.name) != null {
         // an import is an immutable binding, refused when the store runs
@@ -1056,6 +1063,19 @@ private void split_assign_element(Node* e, Node** tgt, Node** dflt) {
 // Consumes the value on top of the stack, storing per pattern leaf.
 // declare_mode initializes bindings; otherwise leaves are assignment
 // targets (ident, member, index).
+// Appends a key the pattern consumed to the excluded list in `t_ex`. The key
+// comes from a slot when it was computed, and from the pattern otherwise.
+// Does nothing when the pattern has no rest element.
+private void note_taken_key(Compiler* co, i32 t_ex, i32 from_slot, Node* keyn) {
+    if t_ex < 0 { return; }
+    Chunk* ch = &co.cur.ch;
+    ch_op_u16(ch, OP_GETLOCAL, t_ex);
+    if from_slot >= 0 { ch_op_u16(ch, OP_GETLOCAL, from_slot); }
+    else { ch_op_u16(ch, OP_CONST, key_value_const(co, keyn)); }
+    ch_op(ch, OP_ARR_APPEND);
+    ch_op(ch, OP_POP);
+}
+
 private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
     Chunk* ch = &co.cur.ch;
     i32 k = pat.kind;
@@ -1203,22 +1223,30 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         i32 tmp = alloc_slot(co.cur);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, OP_POP);
-        Vec<i32> taken = vec_new<i32>(4);
+        // A rest element needs the keys the pattern took, and a computed key is
+        // only known once it has run, so the list is collected as the pattern
+        // goes. Nothing is collected when there is no rest element.
+        bool has_rest = false;
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pr0 = *(pat.kids.items + i);
+            if pr0.kind == N_REST || pr0.kind == N_SPREAD { has_rest = true; }
+        }
+        i32 t_ex = 0 - 1;
+        if has_rest {
+            t_ex = alloc_slot(co.cur);
+            ch_op_u16(ch, OP_NEWARR, 0);
+            ch_op_u16(ch, OP_SETLOCAL, t_ex);
+            ch_op(ch, OP_POP);
+        }
         for i32 i = 0; i < pat.kids.len; i++ {
             Node* pp = *(pat.kids.items + i);
             if pp.kind == N_REST || pp.kind == N_SPREAD {
                 if i != pat.kids.len - 1 {
                     cerror(co, pp, "a rest property must be last");
                 }
-                // rest object: copy remaining own props
-                JsObject* ex = js_new_array(co.heap, null);
-                gc_root(co.heap, value_cell(&ex.head));
-                for i32 j = 0; j < taken.len; j++ {
-                    js_array_set(ex, j, value_int(vec_get(&taken, j)));
-                }
-                i32 ci = ch_add_const(ch, value_cell(&ex.head));
+                // rest object: copy the own props the list does not name
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
-                ch_op_u16(ch, OP_OBJ_REST, ci);
+                ch_op_u16(ch, OP_OBJ_REST, t_ex);
                 compile_destructure(co, pp.a, declare_mode);
                 continue;
             }
@@ -1241,8 +1269,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                     compile_expr(co, pp.b);
                     ch_patch(ch, j2);
                     compile_destructure(co, target, declare_mode);
-                    u32 a2 = atom_intern(co.atoms, keyn.name);
-                    vec_push(&taken, cast(i32, a2));
+                    note_taken_key(co, t_ex, 0 - 1, keyn);
                     continue;
                 }
             }
@@ -1252,11 +1279,14 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             bool by_ref = !declare_mode && target_is_ref(tgt);
             i32 t_k = -1;
             if (pp.flags & NF_COMPUTED) != 0 {
-                // the key is evaluated first, then a reference target
+                // the key is evaluated first, and converted once: the read and
+                // the rest element's exclusion use the same property key
                 t_k = alloc_slot(co.cur);
                 compile_expr(co, keyn);
+                ch_op(ch, OP_TOPROPKEY);
                 ch_op_u16(ch, OP_SETLOCAL, t_k);
                 ch_op(ch, OP_POP);
+                note_taken_key(co, t_ex, t_k, keyn);
             }
             i32 r_obj = 0;
             i32 r_key = 0;
@@ -1268,10 +1298,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             } else {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
                 ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
-                if keyn.kind != N_NUMBER {
-                    u32 a2 = atom_intern(co.atoms, keyn.name);
-                    vec_push(&taken, cast(i32, a2));
-                }
+                note_taken_key(co, t_ex, 0 - 1, keyn);
             }
             if by_ref {
                 if dflt != null { emit_default_value(co, dflt); }
@@ -1281,7 +1308,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             }
             if t_k >= 0 { co.cur.cur_slots--; }
         }
-        vec_free(&taken);
+        if t_ex >= 0 { co.cur.cur_slots--; }
         co.cur.cur_slots--;
         return;
     }

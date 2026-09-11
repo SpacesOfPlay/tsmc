@@ -104,7 +104,7 @@ enum Op {
     OP_ARR_APPEND,   // [arr, v] pops v, keeps arr
     OP_ARR_SPREAD,   // [arr, src] pops src; appends elements/chars
     OP_OBJ_SPREAD,   // [obj, src] pops src; copies own props
-    OP_OBJ_REST,     // u16 const idx of excluded-keys array; [src] -> rest obj
+    OP_OBJ_REST,     // u16 slot of the excluded-keys array; [src] -> rest obj
     OP_ARR_SLICE_FROM, // u16 start; [arr/str] -> new array of the tail
     OP_CALL_ARRAY,   // [fn, this, argsarr] -> result
     OP_NEW_ARRAY,    // [ctor, argsarr] -> instance
