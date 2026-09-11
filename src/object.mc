@@ -43,6 +43,10 @@ const i32 OBJF_FROZEN = 64;
 // The one global object. Its properties ARE the global bindings rather than a
 // copy of them, so `globalThis.x = 1` and a bare `x = 1` reach the same place.
 const i32 OBJF_GLOBAL = 128;
+// A module namespace object. Its properties are the module's exports: the
+// set is fixed, they cannot be written from outside, and they read in code
+// unit order whatever order the module declared them in.
+const i32 OBJF_MODULE_NS = 256;
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.

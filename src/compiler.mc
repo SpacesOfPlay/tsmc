@@ -879,7 +879,7 @@ private void emit_export_writes(Compiler* co, str name, Node* at) {
         ExportName e = vec_get(&co.export_names, i);
         emit_load_name(co, co.ns_name, at);
         emit_load_name(co, name, at);
-        ch_op_u16(ch, OP_SETPROP, name_const(co, e.exported));
+        ch_op_u16(ch, OP_SETEXPORT, name_const(co, e.exported));
         ch_op(ch, OP_POP);
         i = e.next;
     }
@@ -4392,7 +4392,7 @@ private void mirror_export(Compiler* co, str ns_name, str name, str exported) {
     Chunk* ch = &co.cur.ch;
     emit_load_name(co, ns_name, null);
     emit_load_name(co, name, null);
-    ch_op_u16(ch, OP_SETPROP, name_const(co, exported));
+    ch_op_u16(ch, OP_SETEXPORT, name_const(co, exported));
     ch_op(ch, OP_POP);
 }
 
@@ -4642,7 +4642,7 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
             emit_load_name(co, mname, null);
             if s.b != null {
                 // export * as name from "m": the dependency namespace itself
-                ch_op_u16(ch, OP_SETPROP, name_const(co, s.b.name));
+                ch_op_u16(ch, OP_SETEXPORT, name_const(co, s.b.name));
             } else {
                 ch_op(ch, OP_OBJ_SPREAD);
             }
@@ -4655,7 +4655,7 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
             emit_load_name(co, ns_name, null);
             emit_load_name(co, mname, null);
             ch_op_u16(ch, OP_GETPROP, name_const(co, sp.name));
-            ch_op_u16(ch, OP_SETPROP, name_const(co, exported));
+            ch_op_u16(ch, OP_SETEXPORT, name_const(co, exported));
             ch_op(ch, OP_POP);
         }
         return;
@@ -4690,7 +4690,7 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
         // export default <expr | class-expr | function-expr>
         emit_load_name(co, ns_name, null);
         compile_expr(co, d);
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "default"));
+        ch_op_u16(ch, OP_SETEXPORT, name_const(co, "default"));
         ch_op(ch, OP_POP);
         return;
     }

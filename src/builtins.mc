@@ -511,7 +511,11 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
     Value pv = arg_at(args, argc, 1);
     if value_is_object(ov) {
         JsObject* o = value_as_object(ov);
-        if (o.obj_flags & OBJF_NONEXT) != 0 {
+        // setting the prototype it already has changes nothing, so it is
+        // allowed even where a change would not be
+        bool same = value_is_null(pv) ? o.proto == null
+            : value_is_object(pv) && value_as_object(pv) == o.proto;
+        if !same && (o.obj_flags & OBJF_NONEXT) != 0 {
             vm_throw_error(as_vm(vmp), ERR_TYPE, "cannot change the prototype of a non-extensible object");
             return value_undefined();
         }
@@ -699,6 +703,13 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
         return value_undefined();
     }
 
+    // A module namespace object takes no definition: its names are the
+    // module's exports, and their attributes are not the caller's to set.
+    if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_MODULE_NS) != 0 {
+        gc_root_reset(&vm.heap, rm);
+        vm_throw_error(vm, ERR_TYPE, "cannot define a property of a module namespace object");
+        return value_undefined();
+    }
     // start from the existing attributes, or all-false for a new property
     Prop* existing = props_entry(props, key);
     u8 flags = existing != null ? existing.flags : 0;

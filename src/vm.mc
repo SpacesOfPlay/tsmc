@@ -1188,6 +1188,20 @@ private bool set_global(VM* vm, u32 a, Value v, bool strict) {
     return true;
 }
 
+// [ns, val] -> [val]: the module's own copy of an exported binding. It goes
+// straight into the namespace, since the object refuses every write from
+// outside.
+private void set_export(VM* vm, FnTemplate* t, i32 ci) {
+    Value v = vpeek(vm, 0);
+    Value nsv = vpeek(vm, 1);
+    if value_is_object(nsv) {
+        vm_ns_set(vm, value_as_object(nsv),
+            cast(u32, value_as_int(*(t.consts + ci))), v);
+    }
+    vm.sp -= 2;
+    vpush(vm, v);
+}
+
 // `delete name` in sloppy code, where the name is not a binding: the global
 // goes, unless it is one of the three the specification fixes.
 private void del_global(VM* vm, u32 a) {
@@ -1712,6 +1726,10 @@ bool vm_delete_prop_value(VM* vm, Value objv, u32 a) {
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
+        if (o.obj_flags & OBJF_MODULE_NS) != 0 {
+            return write_refused(vm, strict,
+                "cannot assign to a property of a module namespace object");
+        }
         if (o.obj_flags & OBJF_PROXY) != 0 {
             return proxy_set(vm, cast(JsProxy*, o), a, v, objv, strict);
         }
@@ -4129,6 +4147,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
                     vpeek(vm, 0), !t.sloppy);
             }
+            case OP_SETEXPORT: {
+                ip += 2;
+                set_export(vm, t, rd_u16(code, ip - 2));
+            }
             case OP_DELGLOBAL: {
                 ip += 2;
                 del_global(vm, cast(u32,
@@ -5014,6 +5036,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_OBJ_SPREAD: {
                 Value src = vpeek(vm, 0);
                 Value dstv = vpeek(vm, 1);
+                // `export * from "m"` spreads into the namespace, whose names
+                // are settled afterwards
+                bool into_ns = value_is_object(dstv)
+                    && (value_as_object(dstv).obj_flags & OBJF_MODULE_NS) != 0;
                 if value_is_object(dstv) && value_is_string(src) {
                     spread_string_into(vm, value_as_object(dstv), src);
                 } else if value_is_object(dstv) && value_is_object(src) {
@@ -5058,6 +5084,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         js_set_prop(d, pr.key, pv);
                     }
                 }
+                if into_ns && !vm.has_pending { vm_ns_sort(vm, value_as_object(dstv)); }
                 if !vm.has_pending { vm.sp--; }
             }
             case OP_OBJ_REST: {
@@ -5572,6 +5599,10 @@ private i32 delete_key(VM* vm, Value objv, u32 a, bool strict) {
         return 1;
     }
     Prop* pe = props_entry(&o.props, a);
+    if pe != null && (o.obj_flags & OBJF_MODULE_NS) != 0 {
+        return delete_refused(vm, strict,
+            "cannot delete a property of a module namespace object");
+    }
     if pe != null && (pe.flags & PROP_CONFIGURABLE) == 0 {
         return delete_refused(vm, strict, "cannot delete non-configurable property");
     }
@@ -7236,10 +7267,55 @@ void vm_add_template_root(VM* vm, FnTemplate* t) {
     vec_push(&vm.troots, t);
 }
 
-// A module namespace object, permanently rooted for the run.
+// Sorts a namespace's exported names into code unit order, symbols last.
+// The set only grows by whole names, so the order is settled on insertion.
+void vm_ns_sort(VM* vm, JsObject* ns) {
+    PropList* p = &ns.props;
+    // an exported name is writable and enumerable, and never configurable;
+    // the toStringTag symbol keeps the attributes it was given
+    for i32 i = 0; i < p.len; i++ {
+        Prop* at0 = p.items + i;
+        if (at0.key & 0x80000000) == 0 { at0.flags = PROP_WRITABLE | PROP_ENUMERABLE; }
+    }
+    for i32 i = 1; i < p.len; i++ {
+        Prop hold = *(p.items + i);
+        bool hold_sym = (hold.key & 0x80000000) != 0;
+        i32 j = i - 1;
+        while j >= 0 {
+            Prop* at = p.items + j;
+            bool at_sym = (at.key & 0x80000000) != 0;
+            bool after = false;
+            if at_sym && !hold_sym { after = true; }
+            else if at_sym == hold_sym && !hold_sym {
+                after = js_str_cmp(atom_name(&vm.atoms, at.key),
+                    atom_name(&vm.atoms, hold.key)) > 0;
+            }
+            if !after { break; }
+            *(p.items + j + 1) = *at;
+            j--;
+        }
+        *(p.items + j + 1) = hold;
+    }
+    props_reindex(p);
+}
+
+// One exported name on a namespace: writable and enumerable, never
+// configurable, and only the module that owns it may write. A new name
+// re-settles the order.
+void vm_ns_set(VM* vm, JsObject* ns, u32 a, Value v) {
+    bool fresh = props_get(&ns.props, a) == null;
+    props_set_desc(&ns.props, a, v, PROP_WRITABLE | PROP_ENUMERABLE);
+    if fresh { vm_ns_sort(vm, ns); }
+}
+
+// A module namespace object, permanently rooted for the run. It is not
+// extensible, and answers Symbol.toStringTag with "Module".
 JsObject* vm_new_namespace(VM* vm) {
     JsObject* o = js_new_object(&vm.heap, null);
     gc_root(&vm.heap, value_cell(&o.head));
+    o.obj_flags = o.obj_flags | OBJF_MODULE_NS | OBJF_NONEXT;
+    GcString* tag = gc_new_string(&vm.heap, "Module");
+    props_set_desc(&o.props, vm_sym_to_string_tag_id(vm), value_cell(&tag.head), 0);
     return o;
 }
 

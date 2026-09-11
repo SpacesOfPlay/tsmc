@@ -31,6 +31,8 @@ enum Op {
     OP_GETGLOBAL,    // u16 const idx (name string); throws when missing
     OP_GETGLOBAL_SOFT,   // pushes undefined when missing (typeof)
     OP_SETGLOBAL,    // u16 const idx; keeps value
+    OP_SETEXPORT,    // u16 name; [ns, val] -> [val]: the namespace's own copy
+                     // of an exported binding, which only the module writes
     OP_DELGLOBAL,    // u16 const idx; removes a global binding -> bool
     OP_SETCONST_ERR, // a store to an immutable binding: throws TypeError
 
