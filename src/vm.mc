@@ -1174,7 +1174,7 @@ private bool proxy_get(VM* vm, JsProxy* p, u32 a, Value receiver, Value* out) {
 // properties of the global object are read-only whatever the mode.
 private bool set_global(VM* vm, u32 a, Value v, bool strict) {
     if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
-        return write_refused(vm, strict,
+        return write_refused(vm, strict ? SET_STRICT : SET_SLOPPY,
             "cannot assign to read only property of the global object");
     }
     if strict && intmap_get<Value>(&vm.globals, a) == null {
@@ -1213,12 +1213,18 @@ private void del_global(VM* vm, u32 a) {
     vpush(vm, value_bool(true));
 }
 
-// A write the object refuses. Strict-mode code makes that a TypeError;
-// sloppy code drops the write and carries on, which is what the assignment
-// expression's value being `v` already reflects.
-private bool write_refused(VM* vm, bool strict, str msg) {
-    if !strict { return true; }
-    vm_throw_error(vm, ERR_TYPE, msg);
+// How a write the object refuses is reported. Sloppy code drops it and
+// carries on, which is what the assignment expression's value being `v`
+// already reflects; strict code makes it a TypeError; and the reflective
+// entries answer their caller with false instead, since a refusal is the
+// outcome they were asked for rather than an error.
+const i32 SET_SLOPPY = 0;
+const i32 SET_STRICT = 1;
+const i32 SET_REPORT = 2;
+
+private bool write_refused(VM* vm, i32 mode, str msg) {
+    if mode == SET_SLOPPY { return true; }
+    if mode == SET_STRICT { vm_throw_error(vm, ERR_TYPE, msg); }
     return false;
 }
 
@@ -1229,11 +1235,11 @@ private i32 delete_refused(VM* vm, bool strict, str msg) {
     return 0 - 1;
 }
 
-private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver, bool strict) {
+private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver, i32 mode) {
     Value trap;
     i32 tr = proxy_trap(vm, p, "set", &trap);
     if tr < 0 { return false; }
-    if tr == 0 { return set_prop_atom(vm, p.target, a, v, strict); }
+    if tr == 0 { return set_prop_atom(vm, p.target, a, v, mode); }
     i32 rm = gc_root_mark(&vm.heap);
     Value key = atom_to_key(vm, a);
     gc_root(&vm.heap, key);
@@ -1242,9 +1248,14 @@ private bool proxy_set(VM* vm, JsProxy* p, u32 a, Value v, Value receiver, bool 
     cargs[1] = key;
     cargs[2] = v;
     cargs[3] = receiver;
-    ignore vm_call_value(vm, trap, p.handler, &cargs[0], 4);
+    Value tr_r = vm_call_value(vm, trap, p.handler, &cargs[0], 4);
     gc_root_reset(&vm.heap, rm);
-    return !vm.has_pending;
+    if vm.has_pending { return false; }
+    // a trap that says no is a refusal, reported the way any other is
+    if !js_truthy(tr_r) {
+        return write_refused(vm, mode, "proxy refused to set the property");
+    }
+    return true;
 }
 
 // [[DefineOwnProperty]] on a proxy: the trap is handed the data descriptor a
@@ -1704,8 +1715,13 @@ bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
 // Public property set through the full path (proxy set trap, array length,
 // typed arrays, accessors). Used by Reflect.set and similar.
 bool vm_set_prop_value(VM* vm, Value objv, u32 a, Value v) {
-    // the reflective entry reports a refusal as an error, as Reflect.set does
-    return set_prop_atom(vm, objv, a, v, true);
+    return set_prop_atom(vm, objv, a, v, SET_STRICT);
+}
+
+// Reflect.set: a refusal is the answer, not an error. Only user code running
+// inside the write — a setter, a proxy trap — still throws.
+bool vm_set_prop_report(VM* vm, Value objv, u32 a, Value v) {
+    return set_prop_atom(vm, objv, a, v, SET_REPORT);
 }
 
 // Public delete through the full path, so a proxy's deleteProperty trap
@@ -1721,24 +1737,30 @@ bool vm_delete_prop_value(VM* vm, Value objv, u32 a) {
     return true;
 }
 
-// `strict` is the strictness of the code performing the write, which is what
-// decides whether a refusal throws or is dropped.
-private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
+// Reflect.deleteProperty: the attributes decide, and the answer is a boolean
+// rather than an error. A name the object does not have is deleted already.
+bool vm_delete_prop_report(VM* vm, Value objv, u32 a) {
+    return delete_key(vm, objv, a, false) == 1;
+}
+
+// `mode` says what a refusal means to the caller: SET_SLOPPY, SET_STRICT or
+// SET_REPORT.
+private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
     if value_is_object(objv) {
         JsObject* o = value_as_object(objv);
         if (o.obj_flags & OBJF_MODULE_NS) != 0 {
-            return write_refused(vm, strict,
+            return write_refused(vm, mode,
                 "cannot assign to a property of a module namespace object");
         }
         if (o.obj_flags & OBJF_PROXY) != 0 {
-            return proxy_set(vm, cast(JsProxy*, o), a, v, objv, strict);
+            return proxy_set(vm, cast(JsProxy*, o), a, v, objv, mode);
         }
         if (o.obj_flags & OBJF_GLOBAL) != 0 {
             // writing a property of the global object creates or updates the
             // binding a bare name resolves to; the three value properties
             // of the global object are read-only
             if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
-                return write_refused(vm, strict,
+                return write_refused(vm, mode,
                     "cannot assign to read only property of the global object");
             }
             intmap_set<Value>(&vm.globals, a, v);
@@ -1759,11 +1781,11 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
             i32 idx = ta_atom_index(vm, a);
             if idx >= 0 {
                 if (o.obj_flags & OBJF_FROZEN) != 0 {
-                    return write_refused(vm, strict,
+                    return write_refused(vm, mode,
                         "cannot assign to read-only property of a frozen array");
                 }
                 if idx >= o.elen && (o.obj_flags & OBJF_NONEXT) != 0 {
-                    return write_refused(vm, strict,
+                    return write_refused(vm, mode,
                         "cannot add property to a non-extensible array");
                 }
                 js_array_set(o, idx, v);
@@ -1789,19 +1811,19 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
                         ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                         return !vm.has_pending;
                     }
-                    return write_refused(vm, strict,
+                    return write_refused(vm, mode,
                         "cannot set property which has only a getter");
                 }
                 if cur == o {
                     if (pe.flags & PROP_WRITABLE) == 0 {
-                        return write_refused(vm, strict, "cannot assign to read-only property");
+                        return write_refused(vm, mode, "cannot assign to read-only property");
                     }
                     pe.val = v;
                     return true;
                 }
                 // an inherited non-writable data property blocks the write
                 if (pe.flags & PROP_WRITABLE) == 0 {
-                    return write_refused(vm, strict, "cannot assign to read-only property");
+                    return write_refused(vm, mode, "cannot assign to read-only property");
                 }
                 break;
             }
@@ -1809,7 +1831,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
         }
         // a fresh property cannot be added to a non-extensible object
         if (o.obj_flags & OBJF_NONEXT) != 0 {
-            return write_refused(vm, strict, "cannot add property to a non-extensible object");
+            return write_refused(vm, mode, "cannot add property to a non-extensible object");
         }
         js_set_prop(o, a, v);
         return true;
@@ -1824,17 +1846,17 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
                 ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                 return !vm.has_pending;
             }
-            return write_refused(vm, strict, "cannot set property which has only a getter");
+            return write_refused(vm, mode, "cannot set property which has only a getter");
         }
         PropList* fprops = value_props(objv);
         if fn_synth_bit(vm, a) != 0 && props_get(fprops, a) == null && !vm_fn_synth_hidden(vm, objv, a) {
-            return write_refused(vm, strict,
+            return write_refused(vm, mode,
                 "cannot assign to read only property of a function");
         }
         // a read-only own property refuses the write, as it does on an object
         Prop* fe = props_entry(fprops, a);
         if fe != null && (fe.flags & PROP_WRITABLE) == 0 {
-            return write_refused(vm, strict, "cannot assign to read-only property");
+            return write_refused(vm, mode, "cannot assign to read-only property");
         }
         props_set(fprops, a, v);
         return true;
@@ -1844,7 +1866,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, bool strict) {
         return false;
     }
     // a primitive keeps no properties of its own, so the write goes nowhere
-    return write_refused(vm, strict, "cannot create a property on a primitive value");
+    return write_refused(vm, mode, "cannot create a property on a primitive value");
 }
 
 private i32 val_to_index(Value v) {
@@ -2235,7 +2257,7 @@ private void private_set(VM* vm, FnTemplate* t, i32 ci) {
     Value v = vpeek(vm, 0);
     Value objv = vpeek(vm, 1);
     if !has_private(vm, objv, a) { private_missing(vm, a, true); return; }
-    if set_prop_atom(vm, objv, a, v, true) {   // a class body is strict
+    if set_prop_atom(vm, objv, a, v, SET_STRICT) {   // a class body is strict
         vm.sp -= 2;
         vpush(vm, v);
     }
@@ -4764,7 +4786,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 Value v = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
-                if set_prop_atom(vm, objv, a, v, !t.sloppy) {
+                if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
                     vm.sp -= 2;
                     vpush(vm, v);
                 }
@@ -4840,7 +4862,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_array(objv) {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
-                        if !array_index_writable(vm, value_as_object(objv), idx, !t.sloppy) {
+                        if !array_index_writable(vm, value_as_object(objv), idx,
+                            t.sloppy ? SET_SLOPPY : SET_STRICT) {
                             // sloppy code drops the write; the value stays the
                             // assignment expression's own
                             if !vm.has_pending { vm.sp -= 3; vpush(vm, v); }
@@ -4862,7 +4885,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
                 u32 a = key_to_atom(vm, key);
-                if set_prop_atom(vm, objv, a, v, !t.sloppy) {
+                if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
                     vm.sp -= 3;
                     vpush(vm, v);
                 }
@@ -5552,13 +5575,13 @@ private bool instanceof_hook(VM* vm) {
 // False means the element must not be written: either it threw (strict) or
 // the write is simply dropped (sloppy), which the caller cannot tell apart
 // and does not need to.
-private bool array_index_writable(VM* vm, JsObject* a, i32 idx, bool strict) {
+private bool array_index_writable(VM* vm, JsObject* a, i32 idx, i32 mode) {
     if (a.obj_flags & OBJF_FROZEN) != 0 {
-        ignore write_refused(vm, strict, "cannot assign to read-only property of a frozen array");
+        ignore write_refused(vm, mode, "cannot assign to read-only property of a frozen array");
         return false;
     }
     if idx >= a.elen && (a.obj_flags & OBJF_NONEXT) != 0 {
-        ignore write_refused(vm, strict, "cannot add property to a non-extensible array");
+        ignore write_refused(vm, mode, "cannot add property to a non-extensible array");
         return false;
     }
     return true;

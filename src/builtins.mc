@@ -506,7 +506,8 @@ private Value nat_object_getownsymbols(void* vmp, Value callee, Value thisv, Val
     return value_cell(&arr.head);
 }
 
-private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+// `report` says a refusal is the caller's answer rather than an error.
+private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
     Value ov = arg_at(args, argc, 0);
     Value pv = arg_at(args, argc, 1);
     if value_is_object(ov) {
@@ -516,8 +517,11 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
         bool same = value_is_null(pv) ? o.proto == null
             : value_is_object(pv) && value_as_object(pv) == o.proto;
         if !same && (o.obj_flags & OBJF_NONEXT) != 0 {
-            vm_throw_error(as_vm(vmp), ERR_TYPE, "cannot change the prototype of a non-extensible object");
-            return value_undefined();
+            if !report {
+                vm_throw_error(as_vm(vmp), ERR_TYPE,
+                    "cannot change the prototype of a non-extensible object");
+            }
+            return false;
         }
         if value_is_object(pv) {
             o.proto = value_as_object(pv);
@@ -533,7 +537,12 @@ private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* a
             value_as_function(ov).fproto = value_null();
         }
     }
-    return ov;
+    return true;
+}
+
+private Value nat_object_setproto(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    ignore set_proto_core(vmp, args, argc, false);
+    return arg_at(args, argc, 0);
 }
 
 // `obj.__proto__` — the accessor form of Object.get/setPrototypeOf, defined on
@@ -643,7 +652,17 @@ private bool desc_has(VM* vm, Value ov, str name) {
     return false;
 }
 
-private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+// The refusal a definition can meet: an error for Object.defineProperty, a
+// false answer for Reflect.defineProperty.
+private bool def_refused(VM* vm, i32 rm, bool report, str msg) {
+    gc_root_reset(&vm.heap, rm);
+    if !report { vm_throw_error(vm, ERR_TYPE, msg); }
+    return false;
+}
+
+// `report` says a refusal is the caller's answer rather than an error.
+// Returns whether the property was defined.
+private bool define_property_core(void* vmp, Value* args, i32 argc, bool report) {
     VM* vm = as_vm(vmp);
     Value ov = arg_at(args, argc, 0);
     // The receiver's own-property table: objects, functions, and natives each
@@ -664,34 +683,34 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
                 ca[0] = p.target;
                 ca[1] = arg_at(args, argc, 1);
                 ca[2] = arg_at(args, argc, 2);
-                ignore vm_call_value(vm, trap, p.handler, &ca[0], 3);
+                Value tr = vm_call_value(vm, trap, p.handler, &ca[0], 3);
                 gc_root_reset(&vm.heap, rmp);
-                return ov;
+                if vm.has_pending { return false; }
+                return js_truthy(tr);
             }
             // default: defineProperty(target, key, desc)
             noinit Value[3] ca;
             ca[0] = p.target;
             ca[1] = arg_at(args, argc, 1);
             ca[2] = arg_at(args, argc, 2);
-            ignore nat_object_defineproperty(vmp, callee, thisv, &ca[0], 3);
-            return ov;
+            return define_property_core(vmp, &ca[0], 3, report);
         }
         props = &o.props;
     } else {
         vm_throw_error(vm, ERR_TYPE, "Object.defineProperty called on non-object");
-        return value_undefined();
+        return false;
     }
     i32 rm = gc_root_mark(&vm.heap);
     // a Symbol is a valid property key, so take the reflection key path
     // rather than a plain ToString (which throws on a Symbol)
     str sk;
     u32 key = reflect_key(vm, arg_at(args, argc, 1), &sk);
-    if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    if vm.has_pending { gc_root_reset(&vm.heap, rm); return false; }
     Value desc = arg_at(args, argc, 2);
     if !value_is_object(desc) {
         gc_root_reset(&vm.heap, rm);
         vm_throw_error(vm, ERR_TYPE, "property description must be an object");
-        return value_undefined();
+        return false;
     }
     Value tmp0;
 
@@ -700,15 +719,14 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
     if wants_accessor && (desc_has(vm, desc, "value") || desc_has(vm, desc, "writable")) {
         gc_root_reset(&vm.heap, rm);
         vm_throw_error(vm, ERR_TYPE, "descriptor cannot be both data and accessor");
-        return value_undefined();
+        return false;
     }
 
     // A module namespace object takes no definition: its names are the
     // module's exports, and their attributes are not the caller's to set.
     if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_MODULE_NS) != 0 {
-        gc_root_reset(&vm.heap, rm);
-        vm_throw_error(vm, ERR_TYPE, "cannot define a property of a module namespace object");
-        return value_undefined();
+        return def_refused(vm, rm, report,
+            "cannot define a property of a module namespace object");
     }
     // start from the existing attributes, or all-false for a new property
     Prop* existing = props_entry(props, key);
@@ -717,9 +735,8 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
     if existing == null {
         // a new property needs an extensible object
         if value_is_object(ov) && (value_as_object(ov).obj_flags & OBJF_NONEXT) != 0 {
-            gc_root_reset(&vm.heap, rm);
-            vm_throw_error(vm, ERR_TYPE, "cannot define property on a non-extensible object");
-            return value_undefined();
+            return def_refused(vm, rm, report,
+                "cannot define property on a non-extensible object");
         }
     } else if (existing.flags & PROP_CONFIGURABLE) == 0 {
         // A non-configurable property admits almost no change: only turning a
@@ -742,9 +759,7 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
             }
         }
         if bad {
-            gc_root_reset(&vm.heap, rm);
-            vm_throw_error(vm, ERR_TYPE, "cannot redefine non-configurable property");
-            return value_undefined();
+            return def_refused(vm, rm, report, "cannot redefine non-configurable property");
         }
     }
 
@@ -797,7 +812,12 @@ private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Va
     }
     props_set_desc(props, key, stored, flags);
     gc_root_reset(&vm.heap, rm);
-    return ov;
+    return true;
+}
+
+private Value nat_object_defineproperty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    ignore define_property_core(vmp, args, argc, false);
+    return arg_at(args, argc, 0);
 }
 
 private Value nat_object_defineproperties(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -18212,7 +18232,7 @@ private Value nat_reflect_set(void* vmp, Value callee, Value thisv, Value* args,
     if !reflect_target(vm, args, argc, "Reflect.set called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
-    bool ok = vm_set_prop_value(vm, t, a, arg_at(args, argc, 2));
+    bool ok = vm_set_prop_report(vm, t, a, arg_at(args, argc, 2));
     return value_bool(ok);
 }
 
@@ -18234,13 +18254,9 @@ private Value nat_reflect_delete(void* vmp, Value callee, Value thisv, Value* ar
     if !reflect_target(vm, args, argc, "Reflect.deleteProperty called on non-object", &t) { return value_undefined(); }
     str sk;
     u32 a = reflect_key(vm, arg_at(args, argc, 1), &sk);
-    JsObject* o = reflect_obj(t);
-    if o == null {
-        PropList* props = value_props(t);
-        return value_bool(props != null ? props_remove(props, a) : false);
-    }
-    bool r = (o.obj_flags & OBJF_PROXY) != 0 ? proxy_delete(vm, cast(JsProxy*, o), a) : js_delete_prop(o, a);
-    return value_bool(r);
+    // a non-configurable property answers false, and one the object never had
+    // is deleted already
+    return value_bool(vm_delete_prop_report(vm, t, a));
 }
 
 private Value nat_reflect_getprototypeof(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -18255,8 +18271,7 @@ private Value nat_reflect_setprototypeof(void* vmp, Value callee, Value thisv, V
     VM* vm = as_vm(vmp);
     Value t;
     if !reflect_target(vm, args, argc, "Reflect.setPrototypeOf called on non-object", &t) { return value_undefined(); }
-    ignore nat_object_setproto(vmp, callee, thisv, args, argc);
-    return value_bool(!vm.has_pending);
+    return value_bool(set_proto_core(vmp, args, argc, true));
 }
 
 private Value nat_reflect_ownkeys(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -18297,8 +18312,7 @@ private Value nat_reflect_defineproperty(void* vmp, Value callee, Value thisv, V
     VM* vm = as_vm(vmp);
     Value t;
     if !reflect_target(vm, args, argc, "Reflect.defineProperty called on non-object", &t) { return value_undefined(); }
-    ignore nat_object_defineproperty(vmp, callee, thisv, args, argc);
-    return value_bool(!vm.has_pending);
+    return value_bool(define_property_core(vmp, args, argc, true));
 }
 
 // Elements of an array-like args list into a heap buffer (caller frees).
