@@ -896,6 +896,13 @@ private void emit_store_ident(Compiler* co, Node* n) {
         ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
         if b.exported { emit_export_writes(co, n.name, n); }
         return;
+        // A binding that has not been initialized refuses the store, and says
+        // so before the const check does. The checked read throws on the hole;
+        // its value is dropped.
+        if b.tdz {
+            ch_op_u16(&fs.ch, b.is_cell ? OP_GETCELL_CHK : OP_GETLOCAL_CHK, b.slot);
+            ch_op(&fs.ch, OP_POP);
+        }
     }
     i32 ui = resolve_upval(fs, n.name);
     if ui >= 0 {
@@ -907,6 +914,10 @@ private void emit_store_ident(Compiler* co, Node* n) {
         ch_op_u16(&fs.ch, OP_SETUPVAL, ui);
         if u.exported { emit_export_writes(co, n.name, n); }
         return;
+        if u.tdz {
+            ch_op_u16(&fs.ch, OP_GETUPVAL_CHK, ui);
+            ch_op(&fs.ch, OP_POP);
+        }
     }
     if co.in_module && strmap_get<ModImport>(&co.mod_imports, n.name) != null {
         // an import is an immutable binding, refused when the store runs
