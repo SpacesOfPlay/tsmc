@@ -21,6 +21,11 @@ enum Op {
 
     OP_GETLOCAL,     // u16 slot
     OP_SETLOCAL,     // u16 slot; keeps value on stack
+    // u16 slot: the local stepped by one, ToNumeric first. What `i++` in
+    // statement position on a plain local compiles to, in place of a load, a
+    // ToNumeric, an increment and a store.
+    OP_INCLOCAL,
+    OP_DECLOCAL,
     OP_GETLOCAL_CHK, // TDZ-checked read
     OP_SETHOLE,      // u16 slot := hole
     OP_NEWCELL_UNDEF,// u16 slot := box(undefined)

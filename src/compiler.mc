@@ -959,6 +959,30 @@ private void emit_with_access(Compiler* co, Node* n, i32 mode) {
     vec_free(&dones);
 }
 
+// `i++` or `i--` whose value is thrown away, on a name that is a plain local
+// slot: one opcode does the load, the ToNumeric, the step and the store. False
+// when any of that does not hold, and the ordinary path runs instead.
+private bool emit_update_discarded(Compiler* co, Node* e) {
+    if e == null || e.kind != N_UPDATE { return false; }
+    Node* t = e.a;
+    if t == null || t.kind != N_IDENT { return false; }
+    FScope* fs = co.cur;
+    // a `with` object, a strict-mode name check or an exported binding all
+    // need the paths the general form takes
+    if with_may_bind(fs, t.name) { return false; }
+    if co.strict && (str_equal(t.name, "eval") || str_equal(t.name, "arguments")) {
+        return false;
+    }
+    i32 li = find_local(fs, t.name);
+    if li < 0 { return false; }
+    CBind b = vec_get(&fs.binds, li);
+    // a captured binding lives in a cell and a const refuses the store; the
+    // opcode makes the TDZ check the load it replaces would have made
+    if b.is_cell || b.is_const || b.exported { return false; }
+    ch_op_u16(&fs.ch, e.op == TOK_PLUSPLUS ? OP_INCLOCAL : OP_DECLOCAL, b.slot);
+    return true;
+}
+
 // `with (obj) body`: the object goes into a hidden binding of its own, and the
 // body is compiled with that binding on the scope's with list.
 private void compile_with(Compiler* co, Node* n) {
@@ -3957,6 +3981,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     emit_pos(co, n);   // source position for stack traces
 
     if k == N_EXPR_STMT {
+        if emit_update_discarded(co, n.a) { return; }
         compile_expr(co, n.a);
         ch_op(ch, OP_POP);
         return;
@@ -4051,7 +4076,7 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_op_u16(ch, OP_CELLIFY, b.slot);
             }
         }
-        if n.c != null {
+        if n.c != null && !emit_update_discarded(co, n.c) {
             compile_expr(co, n.c);
             ch_op(ch, OP_POP);
         }

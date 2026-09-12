@@ -4299,6 +4299,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
                 ip += 2;
             }
+            case OP_INCLOCAL: {
+                ip += 2;
+                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 1);
+            }
+            case OP_DECLOCAL: {
+                ip += 2;
+                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 0 - 1);
+            }
             case OP_GETLOCAL_CHK: {
                 Value v = *(vm.stack + fr.base + rd_u16(code, ip));
                 ip += 2;
@@ -4416,11 +4424,17 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
             }
             case OP_ADD: {
-                if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm, HINT_DEFAULT) { break case; }
-                }
+                // two numbers is the common case, and needs none of the
+                // ToPrimitive machinery below
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if !value_is_number(a) || !value_is_number(b) {
+                    if !value_is_primitive(a) || !value_is_primitive(b) {
+                        if !coerce_top2_prim(vm, HINT_DEFAULT) { break case; }
+                        b = vpeek(vm, 0);
+                        a = vpeek(vm, 1);
+                    }
+                }
                 if value_is_int(a) && value_is_int(b) {
                     i64 s = cast(i64, value_as_int(a)) + value_as_int(b);
                     vm.sp -= 2;
@@ -4453,11 +4467,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SUB: {
-                if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
-                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if !value_is_number(a) || !value_is_number(b) {
+                    if !value_is_primitive(a) || !value_is_primitive(b) {
+                        if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
+                        b = vpeek(vm, 0);
+                        a = vpeek(vm, 1);
+                    }
+                }
                 if value_is_int(a) && value_is_int(b) {
                     i64 s = cast(i64, value_as_int(a)) - value_as_int(b);
                     vm.sp -= 2;
@@ -4478,11 +4496,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_MUL: {
-                if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
-                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if !value_is_number(a) || !value_is_number(b) {
+                    if !value_is_primitive(a) || !value_is_primitive(b) {
+                        if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
+                        b = vpeek(vm, 0);
+                        a = vpeek(vm, 1);
+                    }
+                }
                 if value_is_int(a) && value_is_int(b) {
                     i64 s = cast(i64, value_as_int(a)) * value_as_int(b);
                     vm.sp -= 2;
@@ -4507,11 +4529,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DIV, OP_MOD, OP_POW: {
-                if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
-                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if !value_is_number(a) || !value_is_number(b) {
+                    if !value_is_primitive(a) || !value_is_primitive(b) {
+                        if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
+                        b = vpeek(vm, 0);
+                        a = vpeek(vm, 1);
+                    }
+                }
                 if value_is_bigint(a) || value_is_bigint(b) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, op, &r);
@@ -4552,6 +4578,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_TONUM: {
                 Value v = vpeek(vm, 0);
+                if value_is_int(v) { break case; }      // already a number
                 if value_is_bigint(v) { break case; }   // ToNumeric keeps BigInt
                 f64 r = vm_to_number(vm, v);
                 vm.sp--;
@@ -4644,11 +4671,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_LT, OP_GT, OP_LE, OP_GE: {
-                if !value_is_primitive(vpeek(vm, 0)) || !value_is_primitive(vpeek(vm, 1)) {
-                    if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
-                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
+                if !value_is_number(a) || !value_is_number(b) {
+                    if !value_is_primitive(a) || !value_is_primitive(b) {
+                        if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
+                        b = vpeek(vm, 0);
+                        a = vpeek(vm, 1);
+                    }
+                }
                 bool r = false;
                 if value_is_int(a) && value_is_int(b) {
                     i32 x = value_as_int(a);
@@ -4814,12 +4845,23 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_JUMPF: {
                 i32 target = rd_u16(code, ip);
                 ip += 2;
-                if !js_truthy(vpop(vm)) { ip = target; }
+                // what a comparison leaves is a boolean, which needs no test
+                vm.sp--;
+                if value_is_bool(*(vm.stack + vm.sp)) {
+                    if value_same_bits(*(vm.stack + vm.sp), value_bool(false)) { ip = target; }
+                } else if !js_truthy(*(vm.stack + vm.sp)) {
+                    ip = target;
+                }
             }
             case OP_JUMPT: {
                 i32 target = rd_u16(code, ip);
                 ip += 2;
-                if js_truthy(vpop(vm)) { ip = target; }
+                vm.sp--;
+                if value_is_bool(*(vm.stack + vm.sp)) {
+                    if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { ip = target; }
+                } else if js_truthy(*(vm.stack + vm.sp)) {
+                    ip = target;
+                }
             }
             case OP_JF_KEEP: {
                 i32 target = rd_u16(code, ip);
@@ -4875,7 +4917,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else if value_is_function(fnv) {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
-                        if call_kind_error(vm, ft, op) {
+                        if (ft.not_ctor || ft.is_class) && call_kind_error(vm, ft, op) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
@@ -4946,7 +4988,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.super_pending && !value_is_reference(res) {
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
                 } else {
-                    res = ctor_result(vm, fr, res);
+                    if fr.is_ctor || fr.super_for >= 0 { res = ctor_result(vm, fr, res); }
                     vm.sp = fr.base - 2;
                     vpush(vm, res);
                     // A return inside a try leaves that try's handler open;
@@ -6016,6 +6058,35 @@ private bool call_kind_error(VM* vm, FnTemplate* ft, i32 op) {
         return true;
     }
     return false;
+}
+
+// OP_INCLOCAL and OP_DECLOCAL: the local stepped by one, ToNumeric first, in
+// place of the load, ToNumeric, step and store it replaces. The value stays in
+// its slot, so a ToPrimitive that runs user code cannot lose it.
+private void op_step_local(VM* vm, i32 at, i32 delta) {
+    Value v = *(vm.stack + at);
+    // a lexical binding is checked here rather than by the load it replaces
+    if value_is_hole(v) {
+        vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
+        return;
+    }
+    if value_is_int(v) {
+        i64 s = cast(i64, value_as_int(v)) + delta;
+        if s >= -2147483648 && s <= 2147483647 {
+            *(vm.stack + at) = value_int(cast(i32, s));
+        } else {
+            *(vm.stack + at) = value_number(cast(f64, s));
+        }
+        return;
+    }
+    if value_is_bigint(v) {
+        Value r = bigint_step(vm, v, delta > 0);
+        if !vm.has_pending { *(vm.stack + at) = r; }
+        return;
+    }
+    f64 d = vm_to_number(vm, v);
+    if vm.has_pending { return; }
+    *(vm.stack + at) = num_norm(d + cast(f64, delta));
 }
 
 // Likewise kept out of the loop: `for await`'s iterator acquisition.
