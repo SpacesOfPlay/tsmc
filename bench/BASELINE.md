@@ -44,55 +44,65 @@ of. Every table below takes that difference out.
 
 | bench | tsmc | node | work ratio | what it measures |
 |---|---|---|---|---|
-| `exceptions` | 61 ms | 92 ms | **1.0x** | throw, catch and finally in a loop |
-| `strbuild` | 167 ms | 106 ms | 2.5x | a string built by `+=` and templates |
-| `objprop` | 200 ms | 91 ms | 4.0x | computed string keys on fresh objects |
-| `regexloop` | 215 ms | 93 ms | 4.1x | `new RegExp`, `test`, `replace` with a function |
-| `json` | 308 ms | 107 ms | 4.7x | `JSON.stringify` and `parse` of nested data |
-| `promises` | 398 ms | 77 ms | 12x | `await` chains and `Promise.all` |
-| `iterators` | 652 ms | 77 ms | 20x | generators, `for-of`, spread, destructuring |
-| `fib` | 1,268 ms | 91 ms | 27x | recursive calls and arithmetic (fib(34)) |
-| `arrays` | 538 ms | 63 ms | 29x | `map`/`filter`/`reduce` with closures |
-| `strindex` | 496 ms | 61 ms | 30x | `charCodeAt` and indexing over 420k units |
-| `bytes` | 711 ms | 61 ms | 44x | typed-array element loops |
-| `classes` | 896 ms | 62 ms | 52x | instantiation and dispatch through inheritance |
-| `proto_chain` | 661 ms | 46 ms | >65x | reads down a four-deep prototype chain |
-| `collections` | 1,249 ms | 61 ms | 77x | `Map` and `Set` insert, look up, iterate |
-| `sort` | 1,417 ms | 60 ms | 94x | `Array#sort` with a comparator |
+| `exceptions` | 61 ms | 91 ms | **1.0x** | throw, catch and finally in a loop |
+| `strbuild` | 154 ms | 107 ms | 2.2x | a string built by `+=` and templates |
+| `sort` | 45 ms | 46 ms | >3.1x | `Array#sort` with a comparator |
+| `objprop` | 184 ms | 92 ms | 3.6x | computed string keys on fresh objects |
+| `regexloop` | 199 ms | 91 ms | 4.0x | `new RegExp`, `test`, `replace` with a function |
+| `json` | 306 ms | 106 ms | 4.7x | `JSON.stringify` and `parse` of nested data |
+| `collections` | 93 ms | 61 ms | 4.9x | `Map` and `Set` insert, look up, iterate |
+| `promises` | 387 ms | 77 ms | 12x | `await` chains and `Promise.all` |
+| `iterators` | 632 ms | 77 ms | 19x | generators, `for-of`, spread, destructuring |
+| `fib` | 1,230 ms | 92 ms | 26x | recursive calls and arithmetic (fib(34)) |
+| `strindex` | 437 ms | 60 ms | 28x | `charCodeAt` and indexing over 420k units |
+| `arrays` | 496 ms | 60 ms | 32x | `map`/`filter`/`reduce` with closures |
+| `bytes` | 588 ms | 61 ms | 36x | typed-array element loops |
+| `classes` | 895 ms | 61 ms | 55x | instantiation and dispatch through inheritance |
+| `proto_chain` | 604 ms | 45 ms | >59x | reads down a four-deep prototype chain |
+
+## What changed on 2026-09-12
+
+Two algorithms and three interpreter costs, in that order of size.
+
+`Array#sort` was an insertion sort and `Map`/`Set` looked a key up by scanning
+every entry, so filling either cost O(n^2):
+
+| n | `sort(n)` before | after | `Map` of n keys before | after |
+|---|---|---|---|---|
+| 500 | 3 ms | 0 ms | 3 ms | 0 ms |
+| 1,000 | 12 ms | 1 ms | 13 ms | 1.5 ms |
+| 2,000 | 49 ms | 1 ms | 47 ms | 1.5 ms |
+| 4,000 | 202 ms | 2.5 ms | 196 ms | 3.9 ms |
+
+A merge sort and a hash index took those two benchmarks from 94x and 77x to 3x
+and 4.9x.
+
+Then the interpreter itself, measured with `minc profile` rather than guessed
+at: the arithmetic and relational opcodes asked whether both operands were
+primitive before trying the integer path, the two helpers on the call and return
+path were called only to test two flags each, and `i++` in statement position
+was six opcodes. A tight loop went from 51 to 23 ns an iteration and a
+call-heavy one from 113 to 71.
+
+What is left is the dispatch loop, where 8-15% of the time is calls to
+four-line value predicates that are not inlined -- 15% of a property-heavy
+benchmark, 7.6% of `fib`. That is a compiler matter, written up for minc.
 
 ## Reading the numbers
 
-- **Startup is a genuine strength**, and `exceptions` is the one workload
-  where tsmc matches V8 outright — a throw costs the same on both, and the
-  process starts sooner.
-- **Everything the interpreter does one bytecode at a time lands at 20-50x.**
-  That is the architecture, not a regression: V8 compiles `fib`, array
-  callbacks and typed-array loops to native code with unboxed values.
+- **Startup is a genuine strength**, and `exceptions` is the one workload where
+  tsmc matches V8 outright -- a throw costs the same on both, and the process
+  starts sooner.
+- **The runtime-bound band is 2-5x** (`strbuild`, `sort`, `objprop`,
+  `regexloop`, `json`, `collections`): the work happens in C-like code either
+  way, and V8's compiler has little to add. Real dynamic JavaScript lives closer
+  to this band than to `fib`.
+- **What the interpreter walks one bytecode at a time is 19-36x.** That is the
+  architecture: V8 compiles `fib`, array callbacks and typed-array loops to
+  native code with unboxed values.
 - **A shape-heavy read is the worst of it** (`proto_chain`, `classes`): V8's
-  inline caches turn a property read into a slot load, and an interpreter with
-  a property table per object pays a lookup every time.
-- **Dynamic keys and JSON stay near 4x** (`objprop`, `json`, `regexloop`,
-  `strbuild`). Computed `"k" + i` keys put V8 into dictionary mode too, and
-  the work is in the runtime rather than the generated code. Real dynamic
-  JavaScript runs relatively closer to Node than `fib` implies.
-
-## Two of these are algorithms, not interpretation
-
-`sort` and `collections` are not paying the interpreter's 20-50x. They are
-quadratic, and their numbers say so:
-
-| n | `sort(n)` with a comparator | `Map` of n string keys, set then get |
-|---|---|---|
-| 500 | 3 ms | 3 ms |
-| 1,000 | 12 ms | 13 ms |
-| 2,000 | 49 ms | 47 ms |
-| 4,000 | 202 ms | 196 ms |
-
-Node does every one of those in 0-1 ms. Doubling n quadruples the time in
-both cases, because `Array#sort` is an insertion sort and `Map`/`Set` look a
-key up by scanning every entry. A merge sort and a hash index would each be a
-change of algorithm, not a tuning pass, and would move these two rows by
-orders of magnitude rather than percent.
+  inline caches turn a property read into a slot load, and a property table per
+  object pays a lookup every time. This is where the next real work is.
 
 ## Loading packages (2026-09-06, minc 0.9.14, same machine)
 
