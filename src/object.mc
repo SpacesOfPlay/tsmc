@@ -220,6 +220,25 @@ struct JsObject {
 // and the fundamental operations detect the flag and route through `handler`.
 // `proto` is a snapshot of the target's prototype at construction (untrapped
 // proto walks then behave like the target). The props/elems are unused.
+// A TypedArray view. The leading fields are byte-identical to JsObject, as
+// with JsProxy, so value_is_object and value_as_object work unchanged; the
+// element accessors read the layout out of these fields, which they do once per
+// element and would otherwise look up in the property table three times. The
+// same three are kept as hidden properties, which is what the prototype getters
+// and the reflective paths read.
+struct JsTypedArray {
+    GcCell head;
+    i32 obj_flags;
+    JsObject* proto;
+    PropList props;
+    Value* elems;
+    i32 elen;
+    i32 ecap;
+    i32 ta_off;    // byte offset into the buffer
+    i32 ta_len;    // elements
+    i32 ta_kind;   // which element type
+}
+
 struct JsProxy {
     GcCell head;
     i32 obj_flags;
@@ -504,6 +523,16 @@ JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     o.proto = proto;
     props_init(&o.props);
     return o;
+}
+
+// A view, with room for its layout. OBJF_TYPEDARRAY is what says an object is
+// one of these, so nothing else may set that flag.
+JsTypedArray* js_new_typed_array(GcHeap* h, JsObject* proto) {
+    JsTypedArray* t = cast(JsTypedArray*, gc_alloc(h, GC_OBJECT, sizeof(JsTypedArray)));
+    t.obj_flags = OBJF_TYPEDARRAY;
+    t.proto = proto;
+    props_init(&t.props);
+    return t;
 }
 
 JsProxy* js_new_proxy(GcHeap* h, JsObject* proto, Value target, Value handler) {

@@ -2126,25 +2126,24 @@ private i32 ta_prop_int(VM* vm, JsObject* o, u32 atom) {
     return value_as_int(*p);
 }
 
+// One element, in and out. The layout comes from the view's own fields: this
+// runs once per element of every loop over a view, and reading it out of the
+// property table cost three lookups a time.
 Value vm_ta_get(VM* vm, JsObject* o, i32 idx) {
-    i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
-    if idx < 0 || idx >= len { return value_undefined(); }
+    JsTypedArray* t = cast(JsTypedArray*, o);
+    if idx < 0 || idx >= t.ta_len { return value_undefined(); }
     if o.elen < 1 { return value_undefined(); }
     GcBytes* gb = value_as_bytes(*(o.elems));
-    i32 off = ta_prop_int(vm, o, vm.atom_ta_off);
-    i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
-    return ta_read(gb_data(gb) + off + idx * ta_elem_size(kind), kind);
+    return ta_read(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind);
 }
 
 void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
-    i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
-    if idx < 0 || idx >= len { return; }
+    JsTypedArray* t = cast(JsTypedArray*, o);
+    if idx < 0 || idx >= t.ta_len { return; }
     if o.elen < 1 { return; }
     GcBytes* gb = value_as_bytes(*(o.elems));
-    i32 off = ta_prop_int(vm, o, vm.atom_ta_off);
-    i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
     f64 num = js_to_number(v);
-    ta_write(gb_data(gb) + off + idx * ta_elem_size(kind), kind, num);
+    ta_write(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind, num);
 }
 
 // Key value → property atom; key must stay rooted by the caller.

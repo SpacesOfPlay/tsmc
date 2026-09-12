@@ -11102,12 +11102,16 @@ private JsObject* ab_new(VM* vm, i32 nbytes) {
 private Value ta_make(VM* vm, i32 kind, JsObject* buffer, i32 boff, i32 len) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&buffer.head));
-    JsObject* ta = js_new_object(&vm.heap, vm.ta_protos[kind]);
-    ta.obj_flags = ta.obj_flags | OBJF_TYPEDARRAY;
+    JsTypedArray* tv = js_new_typed_array(&vm.heap, vm.ta_protos[kind]);
+    JsObject* ta = cast(JsObject*, tv);
     gc_root(&vm.heap, value_cell(&ta.head));
     GcBytes* gb = value_as_bytes(*(buffer.elems));
     js_array_set(ta, 0, value_cell(&gb.head));
-    // hidden layout; length/byteLength/byteOffset/buffer are prototype getters
+    // the layout, in fields for the element accessors and as hidden properties
+    // for the prototype getters and the reflective paths
+    tv.ta_off = boff;
+    tv.ta_len = len;
+    tv.ta_kind = kind;
     props_set_desc(&ta.props, vm.atom_ta_off, value_int(boff), 0);
     props_set_desc(&ta.props, vm.atom_ta_len, value_int(len), 0);
     props_set_desc(&ta.props, vm.atom_ta_kind, value_int(kind), 0);
