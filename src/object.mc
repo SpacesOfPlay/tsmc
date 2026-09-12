@@ -298,6 +298,10 @@ struct JsMap {
     i32 len;      // slots used, including tombstones
     i32 cap;
     i32 count;    // live entries
+    // Key hash -> entry index, open-addressed, -1 for an empty slot. Null
+    // while the collection is small enough that scanning it is cheaper.
+    i32* index;
+    i32 icap;     // a power of two, 0 with no index
     bool is_set;
     bool weak;    // WeakMap/WeakSet: keys held weakly, not traced
 }
@@ -488,6 +492,7 @@ void js_finalize(GcCell* c) {
         if mp.keys != null { free(mp.keys); }
         if mp.vals != null { free(mp.vals); }
         if mp.live != null { free(mp.live); }
+        if mp.index != null { free(mp.index); }
         return;
     }
 }

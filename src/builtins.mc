@@ -2383,38 +2383,129 @@ private Value nat_arr_fill(void* vmp, Value callee, Value thisv, Value* args, i3
 }
 
 // Insertion sort; comparator errors abort mid-sort like a throw would.
+// One comparison for Array#sort: the comparator when there is one, the string
+// forms otherwise. Undefined never reaches here -- it sorts last without being
+// compared. A comparator that throws leaves has_pending set.
+private f64 sort_cmp(VM* vm, Value cmp, bool has_cmp, Value x, Value y) {
+    if has_cmp {
+        noinit Value[2] cargs;
+        cargs[0] = x;
+        cargs[1] = y;
+        Value r = vm_call_value(vm, cmp, value_undefined(), &cargs[0], 2);
+        if vm.has_pending { return 0.0; }
+        f64 d = js_to_number(r);
+        // NaN, and both zeroes, mean "keep the order they were in"
+        if d != d { return 0.0; }
+        return d;
+    }
+    i32 rm = gc_root_mark(&vm.heap);
+    Value sx = js_to_string_value(vm, x);
+    gc_root(&vm.heap, sx);
+    Value sy = js_to_string_value(vm, y);
+    gc_root(&vm.heap, sy);
+    f64 d = cast(f64, js_str_cmp(sview(sx), sview(sy)));
+    gc_root_reset(&vm.heap, rm);
+    return d;
+}
+
+// A bottom-up merge sort over `n` elements of `src`, using `dst` as the other
+// half of the pair. Stable, because a merge takes from the left run unless the
+// right element is strictly smaller, and n log n comparisons -- which is what
+// matters when every comparison is a call into user code. Returns the buffer
+// holding the result, or null if a comparator threw.
+private Value* sort_merge(VM* vm, Value cmp, bool has_cmp, Value* src, Value* dst, i32 n) {
+    i32 width = 1;
+    while width < n {
+        i32 i = 0;
+        while i < n {
+            i32 mid = i + width;
+            i32 end = mid + width;
+            if mid > n { mid = n; }
+            if end > n { end = n; }
+            i32 l = i;
+            i32 r = mid;
+            i32 k = i;
+            while k < end {
+                bool left = l < mid;
+                if left && r < end {
+                    f64 d = sort_cmp(vm, cmp, has_cmp, *(src + l), *(src + r));
+                    if vm.has_pending { return null; }
+                    left = d <= 0.0;
+                }
+                if left {
+                    *(dst + k) = *(src + l);
+                    l++;
+                } else {
+                    *(dst + k) = *(src + r);
+                    r++;
+                }
+                k++;
+            }
+            i = end;
+        }
+        Value* swap = src;
+        src = dst;
+        dst = swap;
+        width = width + width;
+    }
+    return src;
+}
+
+// Array#sort. The elements that take part are the ones that are there: a hole
+// takes no part and ends up at the end, and undefined is held back and written
+// after the sorted values without ever being handed to the comparator. The
+// scratch buffers are arrays of their own, so the values in them stay reachable
+// while a comparator runs.
 private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     JsObject* a = this_array(vm, thisv);
     if a == null { return value_undefined(); }
     Value cmp = arg_at(args, argc, 0);
     bool has_cmp = value_is_callable(cmp);
-    for i32 i = 1; i < a.elen; i++ {
-        Value key = *(a.elems + i);
-        i32 j = i - 1;
-        while j >= 0 {
-            Value other = *(a.elems + j);
-            bool greater = false;
-            if has_cmp {
-                Value[2] cargs = { other, key };
-                Value r = vm_call_value(vm, cmp, value_undefined(), &cargs[0], 2);
-                if vm.has_pending { return value_undefined(); }
-                greater = js_to_number(r) > 0.0;
-            } else {
-                i32 rm = gc_root_mark(&vm.heap);
-                Value sa = js_to_string_value(vm, other);
-                gc_root(&vm.heap, sa);
-                Value sb2 = js_to_string_value(vm, key);
-                gc_root(&vm.heap, sb2);
-                greater = js_str_cmp(sview(sa), sview(sb2)) > 0;
-                gc_root_reset(&vm.heap, rm);
-            }
-            if !greater { break; }
-            *(a.elems + j + 1) = other;
-            j--;
-        }
-        *(a.elems + j + 1) = key;
+    if !has_cmp && !value_is_undefined(cmp) {
+        vm_throw_error(vm, ERR_TYPE,
+            "the comparison function must be either a function or undefined");
+        return value_undefined();
     }
+    i32 n = a.elen;
+    if n < 2 { return thisv; }
+
+    i32 rm = gc_root_mark(&vm.heap);
+    JsObject* src = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&src.head));
+    JsObject* dst = js_new_array(&vm.heap, vm.array_proto);
+    gc_root(&vm.heap, value_cell(&dst.head));
+    i32 count = 0;
+    i32 undefs = 0;
+    for i32 i = 0; i < n; i++ {
+        if !js_array_has(a, i) { continue; }
+        Value v = *(a.elems + i);
+        if value_is_undefined(v) {
+            undefs++;
+            continue;
+        }
+        js_array_set(src, count, v);
+        count++;
+    }
+    if count > 1 {
+        js_array_set(dst, count - 1, value_undefined());   // the same room
+        Value* res = sort_merge(vm, cmp, has_cmp, src.elems, dst.elems, count);
+        if res == null {
+            gc_root_reset(&vm.heap, rm);
+            return value_undefined();
+        }
+        // a comparator may have shrunk the array under us; write what fits
+        for i32 i = 0; i < count && i < a.elen; i++ { *(a.elems + i) = *(res + i); }
+    } else if count == 1 && a.elen > 0 {
+        *(a.elems) = *(src.elems);
+    }
+    for i32 i = count; i < count + undefs && i < a.elen; i++ {
+        *(a.elems + i) = value_undefined();
+    }
+    for i32 i = count + undefs; i < n && i < a.elen; i++ {
+        *(a.elems + i) = value_hole();
+    }
+    gc_root_reset(&vm.heap, rm);
     return thisv;
 }
 
@@ -7469,12 +7560,81 @@ private Value nat_queue_microtask(void* vmp, Value callee, Value thisv, Value* a
 
 // --- Map and Set ------------------------------------------------------------------
 
-// Finds the live slot index of key, or -1.
-private i32 map_find(JsMap* mp, Value key) {
-    for i32 i = 0; i < mp.len; i++ {
-        if *(mp.live + i) && js_same_value_zero(*(mp.keys + i), key) { return i; }
+// Below this many entries a scan is cheaper than a hash, and most collections
+// never grow past it.
+const i32 MAP_INDEX_MIN = 8;
+
+// The hash of a Map or Set key. Keys the same under SameValueZero must hash
+// alike: a number by its value, so 5 and 5.0 meet, -0 meets +0 and NaN meets
+// NaN; a string and a BigInt by their contents; anything else by identity,
+// which is its bits.
+private u32 map_hash(Value key) {
+    if value_is_string(key) {
+        return map_hash_str(gc_string_view(value_as_string(key)));
     }
-    return -1;
+    if value_is_number(key) {
+        f64 d = js_to_number(key);
+        if d != d { return 0x7FF80000; }
+        if d == 0.0 { d = 0.0; }        // -0 hashes with +0
+        // a double is stored as its own bits, so this is the number itself
+        u64 b = value_number(d).bits;
+        return map_hash_u32(cast(u32, b & 0xFFFFFFFF))
+             ^ map_hash_u32(cast(u32, b >> 32));
+    }
+    if value_is_bigint(key) {
+        BigNum n = bigint_view(value_as_bigint(key));
+        u32 h = n.neg ? cast(u32, 0x9E3779B9) : cast(u32, 0x85EBCA6B);
+        for i32 i = 0; i < n.n; i++ {
+            h = h ^ map_hash_u32(cast(u32, *(n.limbs + i)));
+            h = h * 0x01000193;
+        }
+        return h;
+    }
+    return map_hash_u32(cast(u32, key.bits & 0xFFFFFFFF))
+         ^ map_hash_u32(cast(u32, key.bits >> 32));
+}
+
+// Records one entry at the first free slot on its probe path.
+private void map_index_put(JsMap* mp, Value key, i32 at) {
+    u32 mask = cast(u32, mp.icap - 1);
+    u32 i = map_hash(key) & mask;
+    while *(mp.index + cast(i32, i)) >= 0 { i = (i + 1) & mask; }
+    *(mp.index + cast(i32, i)) = at;
+}
+
+// Builds the index over every entry, sized to stay under half full so a probe
+// for a key that is not there always reaches an empty slot.
+private void map_reindex(JsMap* mp) {
+    i32 want = 16;
+    while want < mp.len * 2 { want = want + want; }
+    if mp.index != null { free(mp.index); }
+    mp.index = alloc<i32>(want);
+    mp.icap = want;
+    for i32 i = 0; i < want; i++ { *(mp.index + i) = 0 - 1; }
+    for i32 i = 0; i < mp.len; i++ {
+        if *(mp.live + i) { map_index_put(mp, *(mp.keys + i), i); }
+    }
+}
+
+// Finds the live slot index of key, or -1. A deleted entry keeps its place on
+// the probe path and answers for nothing, so the walk continues past it -- and
+// past a stale one a weak collection's sweep left behind.
+private i32 map_find(JsMap* mp, Value key) {
+    if mp.index == null {
+        for i32 i = 0; i < mp.len; i++ {
+            if *(mp.live + i) && js_same_value_zero(*(mp.keys + i), key) { return i; }
+        }
+        return 0 - 1;
+    }
+    u32 mask = cast(u32, mp.icap - 1);
+    u32 i = map_hash(key) & mask;
+    while true {
+        i32 at = *(mp.index + cast(i32, i));
+        if at < 0 { return 0 - 1; }
+        if *(mp.live + at) && js_same_value_zero(*(mp.keys + at), key) { return at; }
+        i = (i + 1) & mask;
+    }
+    return 0 - 1;
 }
 
 private void map_put(JsMap* mp, Value key, Value val) {
@@ -7490,8 +7650,16 @@ private void map_put(JsMap* mp, Value key, Value val) {
     *(mp.keys + mp.len) = key;
     *(mp.vals + mp.len) = val;
     *(mp.live + mp.len) = true;
+    i32 slot = mp.len;
     mp.len++;
     mp.count++;
+    if mp.index == null {
+        // the index starts paying for itself here
+        if mp.len >= MAP_INDEX_MIN { map_reindex(mp); }
+        return;
+    }
+    if mp.len * 2 >= mp.icap { map_reindex(mp); return; }
+    map_index_put(mp, key, slot);
 }
 
 // The collection's storage. A `class X extends Set` instance is an ordinary
@@ -8186,6 +8354,12 @@ private Value nat_map_clear(void* vmp, Value callee, Value thisv, Value* args, i
     if mp == null { return value_undefined(); }
     mp.len = 0;
     mp.count = 0;
+    // the index described entries that are gone
+    if mp.index != null {
+        free(mp.index);
+        mp.index = null;
+        mp.icap = 0;
+    }
     return value_undefined();
 }
 

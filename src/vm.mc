@@ -916,6 +916,11 @@ bool js_same_value_zero(Value a, Value b) {
     if value_is_string(a) && value_is_string(b) {
         return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
     }
+    // two BigInts are the same key when they are the same number, whichever
+    // cells they happen to live in
+    if value_is_bigint(a) && value_is_bigint(b) {
+        return bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b))) == 0;
+    }
     return value_same_bits(a, b);
 }
 
