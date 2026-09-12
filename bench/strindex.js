@@ -1,7 +1,7 @@
 // Unit-indexed loops over a non-ASCII string: the pattern a base64
 // decoder or a byte-string scanner falls into. Each pass reads every unit
 // once, forward or backward, through charCodeAt, indexing and split("").
-const s = 'aÕ€😀b'.repeat(6000);   // 36,000 units, one to four bytes each
+const s = 'aÕ€😀b'.repeat(70000);  // 420,000 units, one to four bytes each
 let acc = 0;
 for (let i = 0; i < s.length; i++) acc = (acc + s.charCodeAt(i)) | 0;
 for (let i = s.length - 1; i >= 0; i--) acc = (acc + s.charCodeAt(i)) | 0;

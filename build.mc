@@ -4,7 +4,7 @@
 //   minc build      compile build/tsmc
 //   minc test       build, then unit + cli + golden + neg + wasm + gc-stress
 //   minc test <scope>  one stage: unit, cli, run, neg, wasm or gc
-//   minc bench      build, then time bench/*.ts
+//   minc bench      build, then time bench/*.js, against node when found
 //   minc wasm       build tsmc.wasm and the page into build/web, serve it
 //   minc clean      remove build/
 //
@@ -982,40 +982,147 @@ i32 run_tests(str scope) {
 
 // --- bench ------------------------------------------------------------
 
+// Runs are timed by the wall clock of the whole process, and the least of
+// several is reported: the one the machine interfered with least. Anything
+// slower is interference, not the engine.
+const i32 BENCH_RUNS = 3;
+
+// One run: its milliseconds, and its output when asked for.
+private i64 bench_once(str exe, str script, string* text) {
+    ProcCmd c = { .args = { exe, script }, .capture = true };
+    i64 t0 = qpc();
+    ProcResult r = proc_run(&c);
+    i64 ms = (qpc() - t0) * 1000 / qpf();
+    if text != null { *text = normalize(str_from(r.out.data, r.out.len)); }
+    proc_result_free(&r);
+    return ms;
+}
+
+private i64 bench_min(str exe, str script, string* text) {
+    i64 best = 0;
+    // one run thrown away: a cold binary is not what is being measured
+    ignore bench_once(exe, script, null);
+    for i32 i = 0; i < BENCH_RUNS; i++ {
+        i64 ms = bench_once(exe, script, i == 0 ? text : null);
+        if i == 0 || ms < best { best = ms; }
+    }
+    return best;
+}
+
+// Right-aligns a number in a column, so the table reads down.
+private void out_col(i64 v, i32 width) {
+    i64 n = v;
+    i32 digits = 1;
+    while n >= 10 { n = n / 10; digits++; }
+    if v < 0 { digits++; }
+    for i32 i = digits; i < width; i++ { out(" "); }
+    out_int(v);
+}
+
+private void out_name(str name, i32 width) {
+    out(name);
+    for i32 i = name.len; i < width; i++ { out(" "); }
+}
+
+// The floor an engine pays before a line of the script runs. Subtracting it
+// leaves the work, which is what the ratio is worth comparing -- so it is
+// worth more runs than a benchmark: every ratio is scaled by it.
+private i64 bench_floor(str exe, str empty) {
+    i64 best = 0;
+    ignore bench_once(exe, empty, null);
+    for i32 i = 0; i < 7; i++ {
+        i64 ms = bench_once(exe, empty, null);
+        if i == 0 || ms < best { best = ms; }
+    }
+    return best;
+}
+
+// `minc bench`: times every bench/*.js under tsmc and, when node is present,
+// under node as well. The two must print the same thing -- a benchmark that
+// diverges is measuring different work on the two engines.
 i32 run_bench() {
     build_tsmc();
     step("benchmarks");
     string exe = out_exe();
-    DirList benches = dir_list_ext("bench", ".ts");
+    defer free(exe);
+    string node = find_node();
+    defer free(node);
+    DirList benches = dir_list_ext("bench", ".js");
+    defer dir_list_free(&benches);
     if benches.count == 0 {
         outln("  (none)");
-        dir_list_free(&benches);
-        free(exe);
         return 0;
     }
-    i64 freq = qpf();
+    // the floor is measured the same way as the benchmarks themselves
+    string empty = path_join("build", "bench-empty.js");
+    defer free(empty);
+    ignore file_write_str(str_from(empty.data, empty.len), "\n");
+    str emptys = str_from(empty.data, empty.len);
+    str exes = str_from(exe.data, exe.len);
+    str nodes = str_from(node.data, node.len);
+    i64 tfloor = bench_floor(exes, emptys);
+    i64 nfloor = node.len > 0 ? bench_floor(nodes, emptys) : 0;
+
+    out("  ");
+    out_name("bench", 14);
+    out("    tsmc");
+    if node.len > 0 { out("    node   ratio"); }
+    outln("");
+    i32 bad = 0;
     for i32 i = 0; i < benches.count; i++ {
         string src = path_join("bench", benches.items[i]);
-        ProcCmd c = {
-            .args = { str_from(exe.data, exe.len), str_from(src.data, src.len) },
-            .capture = true
-        };
-        i64 t0 = qpc();
-        ProcResult r = proc_run(&c);
-        i64 ms = (qpc() - t0) * 1000 / freq;
+        defer free(src);
+        str s = str_from(src.data, src.len);
+        string tout = string("");
+        i64 tms = bench_min(exes, s, &tout);
+        defer free(tout);
         out("  ");
-        out_int(ms);
-        out(" ms  ");
-        out(path_stem(benches.items[i]));
-        out("  -> ");
-        string clean = normalize(str_from(r.out.data, r.out.len));
-        outln(str_from(clean.data, clean.len));
-        free(clean);
-        proc_result_free(&r);
-        free(src);
+        out_name(path_stem(benches.items[i]), 14);
+        out_col(tms, 6);
+        out(" ms");
+        if node.len > 0 {
+            string nout = string("");
+            i64 nms = bench_min(nodes, s, &nout);
+            defer free(nout);
+            out_col(nms, 6);
+            out(" ms");
+            // the ratio of the work, with each engine's own floor taken off.
+            // Node can finish a benchmark inside the noise of its own startup,
+            // and dividing by that is meaningless: the ratio is then reported
+            // as the lower bound 10 ms of work gives.
+            i64 tw = tms - tfloor;
+            i64 nw = nms - nfloor;
+            if tw < 1 { tw = 1; }
+            bool bound = nw < 10;
+            if bound { nw = 10; }
+            out(bound ? "    >" : "     ");
+            out_col(tw * 10 / nw / 10, 2);
+            out(".");
+            out_int(tw * 10 / nw % 10);
+            out("x");
+            if !same_text(str_from(tout.data, tout.len), str_from(nout.data, nout.len)) {
+                out("   DIFFERENT RESULT");
+                bad = bad + 1;
+            }
+        }
+        outln("");
     }
-    dir_list_free(&benches);
-    free(exe);
+    out("  ");
+    out_name("startup floor", 14);
+    out_col(tfloor, 6);
+    out(" ms");
+    if node.len > 0 {
+        out_col(nfloor, 6);
+        out(" ms");
+    } else {
+        out("   (node not found; set NODE to compare)");
+    }
+    outln("");
+    outln("  ratio is of the work: each total less that engine's own floor");
+    if bad > 0 {
+        fail("benchmarks", " printed different results on the two engines");
+        return 1;
+    }
     return 0;
 }
 
