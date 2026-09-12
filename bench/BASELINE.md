@@ -44,65 +44,83 @@ of. Every table below takes that difference out.
 
 | bench | tsmc | node | work ratio | what it measures |
 |---|---|---|---|---|
-| `exceptions` | 61 ms | 91 ms | **1.0x** | throw, catch and finally in a loop |
-| `strbuild` | 154 ms | 107 ms | 2.2x | a string built by `+=` and templates |
-| `sort` | 45 ms | 46 ms | >3.1x | `Array#sort` with a comparator |
-| `objprop` | 184 ms | 92 ms | 3.6x | computed string keys on fresh objects |
-| `regexloop` | 199 ms | 91 ms | 4.0x | `new RegExp`, `test`, `replace` with a function |
-| `json` | 306 ms | 106 ms | 4.7x | `JSON.stringify` and `parse` of nested data |
-| `collections` | 93 ms | 61 ms | 4.9x | `Map` and `Set` insert, look up, iterate |
-| `promises` | 387 ms | 77 ms | 12x | `await` chains and `Promise.all` |
-| `iterators` | 632 ms | 77 ms | 19x | generators, `for-of`, spread, destructuring |
-| `fib` | 1,230 ms | 92 ms | 26x | recursive calls and arithmetic (fib(34)) |
-| `strindex` | 437 ms | 60 ms | 28x | `charCodeAt` and indexing over 420k units |
-| `arrays` | 496 ms | 60 ms | 32x | `map`/`filter`/`reduce` with closures |
-| `bytes` | 588 ms | 61 ms | 36x | typed-array element loops |
-| `classes` | 895 ms | 61 ms | 55x | instantiation and dispatch through inheritance |
-| `proto_chain` | 604 ms | 45 ms | >59x | reads down a four-deep prototype chain |
+| `exceptions` | 61 ms | 92 ms | **0.9x** | throw, catch and finally in a loop |
+| `strbuild` | 139 ms | 110 ms | 1.9x | a string built by `+=` and templates |
+| `sort` | 46 ms | 61 ms | 1.9x | `Array#sort` with a comparator |
+| `objprop` | 171 ms | 91 ms | 3.3x | computed string keys on fresh objects |
+| `json` | 263 ms | 109 ms | 3.8x | `JSON.stringify` and `parse` of nested data |
+| `collections` | 91 ms | 60 ms | 5.0x | `Map` and `Set` insert, look up, iterate |
+| `regexloop` | 188 ms | 78 ms | 5.2x | `new RegExp`, `test`, `replace` with a function |
+| `promises` | 341 ms | 78 ms | 9.8x | `await` chains and `Promise.all` |
+| `iterators` | 590 ms | 77 ms | 18x | generators, `for-of`, spread, destructuring |
+| `fib` | 1,137 ms | 91 ms | 24x | recursive calls and arithmetic (fib(34)) |
+| `arrays` | 448 ms | 62 ms | 25x | `map`/`filter`/`reduce` with closures |
+| `strindex` | 435 ms | 60 ms | 28x | `charCodeAt` and indexing over 420k units |
+| `bytes` | 495 ms | 61 ms | 30x | typed-array element loops |
+| `classes` | 864 ms | 62 ms | 50x | instantiation and dispatch through inheritance |
+| `proto_chain` | 532 ms | 47 ms | >52x | reads down a four-deep prototype chain |
 
-## What changed on 2026-09-12
+## What five rounds of 2026-09-12 changed
 
-Two algorithms and three interpreter costs, in that order of size.
+| bench | before | after |
+|---|---|---|
+| `sort` | 94x | 1.9x |
+| `collections` | 77x | 5.0x |
+| `bytes` | 44x | 30x |
+| `proto_chain` | >65x | >52x |
+| `classes` | 52x | 50x |
+| `arrays` | 29x | 25x |
+| `fib` | 27x | 24x |
+| a tight loop | 51 ns/iteration | 20 ns |
 
-`Array#sort` was an insertion sort and `Map`/`Set` looked a key up by scanning
-every entry, so filling either cost O(n^2):
+**Two algorithms.** `Array#sort` was an insertion sort and `Map`/`Set` looked a
+key up by scanning every entry, so filling either cost O(n^2): 500, 1k, 2k and
+4k keys took 3, 12, 49 and 202 ms where node takes none of them longer than a
+millisecond. A merge sort and a hash index made those 0, 1, 1 and 2.5 ms.
 
-| n | `sort(n)` before | after | `Map` of n keys before | after |
-|---|---|---|---|---|
-| 500 | 3 ms | 0 ms | 3 ms | 0 ms |
-| 1,000 | 12 ms | 1 ms | 13 ms | 1.5 ms |
-| 2,000 | 49 ms | 1 ms | 47 ms | 1.5 ms |
-| 4,000 | 202 ms | 2.5 ms | 196 ms | 3.9 ms |
+**Three costs in the interpreter,** found with `minc profile` rather than
+guessed at: the arithmetic and relational opcodes asked whether both operands
+were primitive -- two calls that each make three more -- before trying the
+integer path; two helpers ran on every call and every return only to test two
+flags; and `i++` in statement position on a plain local was six opcodes.
 
-A merge sort and a hash index took those two benchmarks from 94x and 77x to 3x
-and 4.9x.
+**Two more in what the opcodes call.** A property read went through four nested
+calls per level of the prototype chain, and one function does it now. A typed
+array looked its own layout up in its property table three times per element,
+and it is fields now. The garbage collector walked every cell in the heap
+looking for weak collections, twice per collection, for programs that have none.
 
-Then the interpreter itself, measured with `minc profile` rather than guessed
-at: the arithmetic and relational opcodes asked whether both operands were
-primitive before trying the integer path, the two helpers on the call and return
-path were called only to test two flags each, and `i++` in statement position
-was six opcodes. A tight loop went from 51 to 23 ns an iteration and a
-call-heavy one from 113 to 71.
-
-What is left is the dispatch loop, where 8-15% of the time is calls to
-four-line value predicates that are not inlined -- 15% of a property-heavy
-benchmark, 7.6% of `fib`. That is a compiler matter, written up for minc.
+**And one pair of opcodes became one.** A comparison whose result the next
+instruction consumes -- a loop test, an `if`, a ternary -- is a single
+instruction, with the boolean never reaching the stack.
 
 ## Reading the numbers
 
 - **Startup is a genuine strength**, and `exceptions` is the one workload where
-  tsmc matches V8 outright -- a throw costs the same on both, and the process
+  tsmc beats V8 outright: a throw costs about the same on both, and the process
   starts sooner.
-- **The runtime-bound band is 2-5x** (`strbuild`, `sort`, `objprop`,
-  `regexloop`, `json`, `collections`): the work happens in C-like code either
-  way, and V8's compiler has little to add. Real dynamic JavaScript lives closer
-  to this band than to `fib`.
-- **What the interpreter walks one bytecode at a time is 19-36x.** That is the
+- **The runtime-bound band is 2-5x** (`strbuild`, `sort`, `objprop`, `json`,
+  `collections`, `regexloop`): the work happens in C-like code either way, and
+  V8's compiler has little to add. Real dynamic JavaScript lives closer to this
+  band than to `fib`.
+- **What the interpreter walks one bytecode at a time is 18-30x.** That is the
   architecture: V8 compiles `fib`, array callbacks and typed-array loops to
   native code with unboxed values.
-- **A shape-heavy read is the worst of it** (`proto_chain`, `classes`): V8's
-  inline caches turn a property read into a slot load, and a property table per
-  object pays a lookup every time. This is where the next real work is.
+- **A shape-heavy read is the worst of it** (`proto_chain` >52x, `classes` 50x).
+  V8's inline caches turn a property read into a slot load; a property table per
+  object pays a lookup every time. This is where the next work is.
+- **8-15% of the remaining time is calls the compiler does not inline** -- the
+  tag predicates a NaN-boxed interpreter asks several times per bytecode. Written
+  up for minc, which fixed it in the inliner's round 2; tsmc gets it on the next
+  release.
+
+## Measuring on this machine
+
+Two numbers from the same binary twenty minutes apart differed by 8% (`fib`
+1,160 then 1,252 ms). Anything under about 10% has to be measured back to back,
+one variant after the other in the same minute, or it is drift rather than a
+result. `minc bench` running both engines in one pass is exactly that, and the
+A/B of two builds wants the same treatment.
 
 ## Loading packages (2026-09-06, minc 0.9.14, same machine)
 
