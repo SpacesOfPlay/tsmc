@@ -57,4 +57,23 @@ const re2 = /a/msuy;
 r('flags-msuy', [re2.global, re2.ignoreCase, re2.multiline, re2.dotAll, re2.unicode, re2.sticky].join(','));
 r('flags-string', re.flags + ',' + re.source);
 
+// Object.prototype's methods take ToObject(this) first, so a nullish receiver
+// is a TypeError rather than an answer, and a primitive one is boxed.
+const t = (label, f) => { try { r(label, f()); } catch (e) { r(label, 'threw ' + e.constructor.name); } };
+t('hasown-undefined', () => Object.prototype.hasOwnProperty.call(undefined, 'x'));
+t('hasown-null', () => Object.prototype.hasOwnProperty.call(null, 'x'));
+t('hasown-string-index', () => Object.prototype.hasOwnProperty.call('abc', 1));
+t('hasown-string-miss', () => Object.prototype.hasOwnProperty.call('abc', 9));
+t('hasown-number', () => Object.prototype.hasOwnProperty.call(7, 'x'));
+t('enumerable-undefined', () => Object.prototype.propertyIsEnumerable.call(undefined, 'x'));
+t('enumerable-null', () => Object.prototype.propertyIsEnumerable.call(null, 'x'));
+t('enumerable-string-index', () => Object.prototype.propertyIsEnumerable.call('abc', 1));
+t('isprotoof-undefined', () => Object.prototype.isPrototypeOf.call(undefined, 'x'));
+t('isprotoof-nullish-arg', () => Object.prototype.isPrototypeOf.call({}, null));
+t('isprotoof-undefined-object-arg', () => Object.prototype.isPrototypeOf.call(undefined, {}));
+t('hasown-nullish-throwing-key', () => Object.prototype.hasOwnProperty.call(null, { toString() { throw new RangeError('k'); } }));
+t('enumerable-nullish-throwing-key', () => Object.prototype.propertyIsEnumerable.call(null, { toString() { throw new RangeError('k'); } }));
+t('valueof-undefined', () => Object.prototype.valueOf.call(undefined));
+t('tostring-undefined', () => Object.prototype.toString.call(undefined));
+
 console.log(out.join('\n'));

@@ -433,7 +433,14 @@ private Value nat_object_getproto(void* vmp, Value callee, Value thisv, Value* a
 private Value nat_is_prototype_of(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value v = arg_at(args, argc, 0);
-    if !value_is_reference(v) || !value_is_cell(thisv) { return value_bool(false); }
+    // a non-object argument is answered before the receiver is looked at; an
+    // object one means ToObject(this), which a nullish receiver cannot do
+    if !value_is_reference(v) { return value_bool(false); }
+    if bi_nullish(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "isPrototypeOf called on null or undefined");
+        return value_undefined();
+    }
+    if !value_is_cell(thisv) { return value_bool(false); }
     GcCell* want = value_as_cell(thisv);
     Value cur = proto_of_value(vm, v);
     i32 guard = 0;
@@ -1192,6 +1199,15 @@ private bool own_prop_exists(VM* vm, Value ov, Value kv) {
 
 private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
+    if bi_nullish(thisv) {
+        // ToObject(this) has nothing to look the property up on -- but the key
+        // is coerced first, so a key whose coercion throws does so instead
+        str sk;
+        ignore reflect_key(vm, arg_at(args, argc, 0), &sk);
+        if vm.has_pending { return value_undefined(); }
+        vm_throw_error(vm, ERR_TYPE, "hasOwnProperty called on null or undefined");
+        return value_undefined();
+    }
     return value_bool(own_prop_exists(vm, thisv, arg_at(args, argc, 0)));
 }
 
@@ -1199,6 +1215,14 @@ private Value nat_has_own(void* vmp, Value callee, Value thisv, Value* args, i32
 private Value nat_property_is_enumerable(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value kv = arg_at(args, argc, 0);
+    if bi_nullish(thisv) {
+        // the key is coerced before the receiver, as in hasOwnProperty
+        str sk0;
+        ignore reflect_key(vm, kv, &sk0);
+        if vm.has_pending { return value_undefined(); }
+        vm_throw_error(vm, ERR_TYPE, "propertyIsEnumerable called on null or undefined");
+        return value_undefined();
+    }
     if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_PROXY) != 0 {
         noinit Value[2] ca;
         ca[0] = thisv;
@@ -1215,6 +1239,12 @@ private Value nat_property_is_enumerable(void* vmp, Value callee, Value thisv, V
     if value_is_object(thisv) && (value_as_object(thisv).obj_flags & OBJF_ARRAY) != 0 {
         i32 idx = ta_atom_index(vm, a);
         if idx >= 0 { return value_bool(js_array_has(value_as_object(thisv), idx)); }
+    }
+    if value_is_string(thisv) {
+        // the characters of the boxed string are own and enumerable; length
+        // is own but not, which the property table answers for
+        i32 sidx = ta_atom_index(vm, a);
+        if sidx >= 0 { return value_bool(sidx < value_as_string(thisv).u16len); }
     }
     PropList* props = value_props(thisv);
     if props == null { return value_bool(false); }
