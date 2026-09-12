@@ -2214,7 +2214,9 @@ Node* parse_statement(Parser* p) {
         return nfin(p, n);
     }
     if k == TOK_KW_LET && single != 0 {
-        if peek(p).newline_before {
+        // `let [` can begin no expression statement, so it is a declaration
+        // even across a line break -- and a declaration is refused here
+        if peek(p).newline_before && peek(p).kind != TOK_LBRACK {
             // `let` alone on a line, in a position where a declaration
             // cannot appear: it is an identifier reference, and the
             // semicolon ASI inserts ends the statement here
@@ -2263,6 +2265,19 @@ Node* parse_statement(Parser* p) {
     if k == TOK_KW_WHILE {
         Node* n = nnew(p, N_WHILE);
         advance(p);
+        expect(p, TOK_LPAREN, "expected '('");
+        n.a = parse_expression(p);
+        expect(p, TOK_RPAREN, "expected ')'");
+        n.b = parse_body(p, 2);
+        return nfin(p, n);
+    }
+    if k == TOK_KW_WITH {
+        Node* n = nnew(p, N_WITH);
+        advance(p);
+        // the statement is a strict-mode early error, not a runtime one
+        if p.strict > 0 {
+            perror(p, "Strict mode code may not include a with statement");
+        }
         expect(p, TOK_LPAREN, "expected '('");
         n.a = parse_expression(p);
         expect(p, TOK_RPAREN, "expected ')'");

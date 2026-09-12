@@ -24,6 +24,7 @@ enum NodeKind {
     N_FOR_OF,         // a: left, b: right, c: body; NF_AWAIT for-await
     N_WHILE,          // a: cond, b: body
     N_DO_WHILE,       // a: body, b: cond
+    N_WITH,           // a: object, b: body
     N_RETURN,         // a: value?
     N_BREAK,          // name: label?
     N_CONTINUE,       // name: label?
@@ -161,6 +162,7 @@ str node_kind_name(i32 kind) {
         case N_FOR_OF: { return "for-of"; }
         case N_WHILE: { return "while"; }
         case N_DO_WHILE: { return "do-while"; }
+        case N_WITH: { return "with"; }
         case N_RETURN: { return "return"; }
         case N_BREAK: { return "break"; }
         case N_CONTINUE: { return "continue"; }

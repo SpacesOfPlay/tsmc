@@ -65,6 +65,17 @@ struct FinEntry {
     i32 done_slot;
 }
 
+// A `with` whose body is being compiled: the hidden binding holding its
+// object, and where that binding sits in the binding stack, so a name declared
+// inside the body is known to shadow it. An entry inherited from an enclosing
+// function has no index there -- any local of this one is inside it, since the
+// function itself was defined in the body.
+struct WithScope {
+    str name;
+    i32 bind_index;
+    bool inherited;
+}
+
 struct FScope {
     FScope* parent;
     Chunk ch;
@@ -87,6 +98,7 @@ struct FScope {
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
     Vec<FinEntry> finallys;
+    Vec<WithScope> withs;
     i32 loop_id_counter;
 }
 
@@ -172,6 +184,7 @@ struct Compiler {
     bool strict;        // strict-mode code: modules, classes, after "use strict"
     bool static_this;   // inside a static block / field: `this` is the class ctor
     bool next_static_home;  // the next function compiled is a static member
+    i32 next_with;          // numbers the hidden bindings `with` introduces
     Vec<str> outer_names;       // names the next block's lexical declarations may
                                 // not repeat: the parameters of its function, or
                                 // the catch parameter
@@ -210,6 +223,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.in_params = false;
     strmap_init<ModImport>(&co.mod_imports);
     co.ns_name = "";
+    co.next_with = 0;
     strmap_init<i32>(&co.export_heads);
     vec_init<ExportName>(&co.export_names, 8);
     vec_init<PrivScope>(&co.priv_scopes, 4);
@@ -294,6 +308,18 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
     vec_init<FinEntry>(&fs.finallys, 4);
+    vec_init<WithScope>(&fs.withs, 2);
+    // a `with` scope is lexical, so a function defined in the body keeps
+    // resolving against its object; the hidden binding is captured like any
+    // other name the body mentions
+    if parent != null {
+        for i32 i = 0; i < parent.withs.len; i++ {
+            WithScope w = vec_get(&parent.withs, i);
+            w.bind_index = 0 - 1;
+            w.inherited = true;
+            vec_push(&fs.withs, w);
+        }
+    }
     fs.loop_id_counter = 1;
 }
 
@@ -305,6 +331,7 @@ private void fscope_free(FScope* fs) {
     vec_free(&fs.cont_jumps);
     vec_free(&fs.loops);
     vec_free(&fs.finallys);
+    vec_free(&fs.withs);
 }
 
 private i32 alloc_slot(FScope* fs) {
@@ -807,16 +834,184 @@ private void hoist_vars(Compiler* co, Node* n) {
     }
 }
 
+// --- with scopes ---------------------------------------------------------------
+
+// What a probe does once the object has answered for the name.
+const i32 W_LOAD = 0;
+const i32 W_STORE = 1;
+const i32 W_TYPEOF = 2;
+const i32 W_DELETE = 3;
+const i32 W_CALL = 4;
+
+// Whether any `with` in scope could answer for this name. One that a binding
+// declared inside its body shadows cannot, and a name bound by nothing at all
+// could be answered by every one of them.
+private bool with_may_bind(FScope* fs, str name) {
+    if fs.withs.len == 0 { return false; }
+    i32 li = find_local(fs, name);
+    for i32 i = fs.withs.len - 1; i >= 0; i-- {
+        WithScope w = vec_get(&fs.withs, i);
+        if w.inherited {
+            if li < 0 { return true; }
+        } else if li < w.bind_index {
+            return true;
+        }
+    }
+    return false;
+}
+
+// `typeof name` where no `with` is in the way: an unresolved name reads
+// undefined rather than throwing, which only the global path can do.
+private void emit_typeof_ident(Compiler* co, Node* id) {
+    Chunk* ch = &co.cur.ch;
+    FScope* fs = co.cur;
+    // A module import reads from a dependency namespace, not a global, so it
+    // must go through the normal expression path.
+    bool is_import = co.in_module
+        && strmap_get<ModImport>(&co.mod_imports, id.name) != null;
+    // Own `arguments` must go through the expression path so it loads the
+    // arguments object, not a soft-undefined global.
+    bool is_own_args = str_equal(id.name, "arguments")
+        && !fs.is_arrow && fs.parent != null
+        && find_local(fs, "arguments") < 0;
+    if !is_import && !is_own_args
+       && find_local(fs, id.name) < 0 && resolve_upval(fs, id.name) < 0 {
+        ch_op_u16(ch, OP_GETGLOBAL_SOFT, name_const(co, id.name));
+        ch_op(ch, OP_TYPEOF);
+        return;
+    }
+    emit_load_ident_static(co, id);
+    ch_op(ch, OP_TYPEOF);
+}
+
+// `delete name` in sloppy code where no `with` is in the way: a binding
+// refuses, and only a global that an assignment created can go.
+private void emit_delete_ident(Compiler* co, Node* id) {
+    Chunk* ch = &co.cur.ch;
+    FScope* fs = co.cur;
+    if find_local(fs, id.name) >= 0 || resolve_upval(fs, id.name) >= 0 {
+        ch_op(ch, OP_FALSE);
+    } else {
+        ch_op_u16(ch, OP_DELGLOBAL, name_const(co, id.name));
+    }
+}
+
+// Loads the object of one `with` by its hidden binding. The static path, since
+// a hidden name is never a property of a `with` object.
+private void emit_load_with_obj(Compiler* co, str name, Node* at) {
+    Node tmp;
+    tmp.kind = N_IDENT;
+    tmp.name = name;
+    tmp.span = at.span;
+    emit_load_ident_static(co, &tmp);
+}
+
+// A free name inside one or more `with` bodies: each object is asked in turn,
+// innermost first, and the name falls through to the resolution the compiler
+// would have made on its own. The objects are asked at run time, so the shape
+// of the code is the same either way -- only a name inside a `with` body pays
+// for it.
+private void emit_with_access(Compiler* co, Node* n, i32 mode) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+    i32 li = find_local(fs, n.name);
+    Vec<i32> dones = vec_new<i32>(4);
+    for i32 i = fs.withs.len - 1; i >= 0; i-- {
+        WithScope w = vec_get(&fs.withs, i);
+        if w.inherited {
+            if li >= 0 { continue; }
+        } else if li >= w.bind_index {
+            continue;
+        }
+        emit_load_with_obj(co, w.name, n);
+        ch_op(ch, OP_DUP);
+        ch_op_u16(ch, OP_WITH_HAS, name_const(co, n.name));
+        i32 miss = ch_jump(ch, OP_JUMPF);
+        if mode == W_LOAD {
+            ch_op_u16(ch, OP_WITH_GET, name_const(co, n.name));
+        } else if mode == W_CALL {
+            ch_op_u16(ch, OP_WITH_METH, name_const(co, n.name));
+        } else if mode == W_STORE {
+            ch_op_u16(ch, OP_WITH_SET, name_const(co, n.name));
+        } else if mode == W_TYPEOF {
+            ch_op_u16(ch, OP_WITH_GET, name_const(co, n.name));
+            ch_op(ch, OP_TYPEOF);
+        } else {
+            ch_op_u16(ch, OP_DELPROP, name_const(co, n.name));
+        }
+        vec_push(&dones, ch_jump(ch, OP_JUMP));
+        ch_patch(ch, miss);
+        ch_op(ch, OP_POP);
+    }
+    if mode == W_LOAD {
+        emit_load_ident_static(co, n);
+    } else if mode == W_STORE {
+        emit_store_ident_static(co, n);
+    } else if mode == W_CALL {
+        emit_load_ident_static(co, n);
+        ch_op(ch, OP_UNDEF);
+    } else if mode == W_TYPEOF {
+        emit_typeof_ident(co, n);
+    } else {
+        emit_delete_ident(co, n);
+    }
+    for i32 i = 0; i < dones.len; i++ { ch_patch(ch, vec_get(&dones, i)); }
+    vec_free(&dones);
+}
+
+// `with (obj) body`: the object goes into a hidden binding of its own, and the
+// body is compiled with that binding on the scope's with list.
+private void compile_with(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
+    Chunk* ch = &fs.ch;
+    compile_expr(co, n.a);
+    ch_op(ch, OP_WITH_OBJ);
+    fs.depth++;
+    i32 saved_binds = fs.binds.len;
+    i32 saved_slots = fs.cur_slots;
+    // the name is unique across the program, so a `with` nested inside another
+    // one in a different function cannot shadow the outer binding
+    str hn = hidden_name(co, "%with", co.next_with);
+    co.next_with++;
+    // always a cell, whether or not the body defines a function: that is what
+    // a nested one captures, and the binding is invisible to the inner-name
+    // scan that would otherwise decide it
+    strmap_set<i32>(&fs.inner, hn, 1);
+    i32 bi = declare(co, hn, true, false);
+    CBind b = vec_get(&fs.binds, bi);
+    ch_op_u16(ch, OP_NEWCELL_UNDEF, b.slot);
+    ch_op_u16(ch, OP_SETCELL, b.slot);
+    ch_op(ch, OP_POP);
+    WithScope w;
+    w.name = hn;
+    w.bind_index = bi;
+    w.inherited = false;
+    vec_push(&fs.withs, w);
+    compile_stmt(co, n.b);
+    fs.withs.len--;
+    fs.binds.len = saved_binds;
+    fs.cur_slots = saved_slots;
+    fs.depth--;
+}
+
 // --- identifier load/store -----------------------------------------------------
 
 private void emit_load_ident(Compiler* co, Node* n) {
-    FScope* fs = co.cur;
     if co.strict && strict_reserved(n.name) {
         cerror(co, n, "Unexpected strict mode reserved word");
     }
     if co.in_static_block && str_equal(n.name, "await") {
         cerror(co, n, "Unexpected reserved word");
     }
+    if with_may_bind(co.cur, n.name) {
+        emit_with_access(co, n, W_LOAD);
+        return;
+    }
+    emit_load_ident_static(co, n);
+}
+
+private void emit_load_ident_static(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
     // `arguments` in an ordinary function is that function's OWN arguments
     // object, never a capture of an enclosing function's — so resolve it
     // before the local/upvalue walk, unless a real local/param shadows it.
@@ -889,10 +1084,18 @@ private void emit_export_writes(Compiler* co, str name, Node* at) {
 // a class's own name or to an import is not an early error: the value is
 // computed and the store throws, so the opcode stands in for the write.
 private void emit_store_ident(Compiler* co, Node* n) {
-    FScope* fs = co.cur;
     if co.strict && (str_equal(n.name, "eval") || str_equal(n.name, "arguments")) {
         cerror(co, n, "Unexpected eval or arguments in strict mode");
     }
+    if with_may_bind(co.cur, n.name) {
+        emit_with_access(co, n, W_STORE);
+        return;
+    }
+    emit_store_ident_static(co, n);
+}
+
+private void emit_store_ident_static(Compiler* co, Node* n) {
+    FScope* fs = co.cur;
     i32 li = find_local(fs, n.name);
     if li >= 0 {
         CBind b = vec_get(&fs.binds, li);
@@ -1769,6 +1972,9 @@ private void compile_call(Compiler* co, Node* n) {
         compile_expr(co, callee.a);
         compile_expr(co, callee.b);
         ch_op(ch, OP_GETMETHOD_DYN);
+    } else if callee.kind == N_IDENT && with_may_bind(co.cur, callee.name) {
+        // the object that answered for the name is the receiver of the call
+        emit_with_access(co, callee, W_CALL);
     } else {
         compile_expr(co, callee);
         ch_op(ch, OP_UNDEF);
@@ -2131,11 +2337,10 @@ private void compile_expr(Compiler* co, Node* n) {
                     ch_op(ch, OP_FALSE);
                     return;
                 }
-                FScope* fs = co.cur;
-                if find_local(fs, t.name) >= 0 || resolve_upval(fs, t.name) >= 0 {
-                    ch_op(ch, OP_FALSE);
+                if with_may_bind(co.cur, t.name) {
+                    emit_with_access(co, t, W_DELETE);
                 } else {
-                    ch_op_u16(ch, OP_DELGLOBAL, name_const(co, t.name));
+                    emit_delete_ident(co, t);
                 }
             } else {
                 // deleting anything that is not a reference is vacuously
@@ -2148,22 +2353,12 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         if n.op == TOK_KW_TYPEOF {
             if n.a.kind == N_IDENT {
-                FScope* fs = co.cur;
-                // A module import reads from a dependency namespace, not a
-                // global, so it must go through the normal expression path.
-                bool is_import = co.in_module
-                    && strmap_get<ModImport>(&co.mod_imports, n.a.name) != null;
-                // Own `arguments` must go through the expression path so it
-                // loads the arguments object, not a soft-undefined global.
-                bool is_own_args = str_equal(n.a.name, "arguments")
-                    && !fs.is_arrow && fs.parent != null
-                    && find_local(fs, "arguments") < 0;
-                if !is_import && !is_own_args
-                   && find_local(fs, n.a.name) < 0 && resolve_upval(fs, n.a.name) < 0 {
-                    ch_op_u16(ch, OP_GETGLOBAL_SOFT, name_const(co, n.a.name));
-                    ch_op(ch, OP_TYPEOF);
+                if with_may_bind(co.cur, n.a.name) {
+                    emit_with_access(co, n.a, W_TYPEOF);
                     return;
                 }
+                emit_typeof_ident(co, n.a);
+                return;
             }
             compile_expr(co, n.a);
             ch_op(ch, OP_TYPEOF);
@@ -3298,7 +3493,15 @@ private void compile_var_stmt(Compiler* co, Node* n) {
             if d.b != null {
                 infer_name(d.b, d.a.name);
                 compile_expr(co, d.b);
-                emit_init_binding(co, li);
+                // a `var` declares in the function scope, but its initializer
+                // is an ordinary assignment: inside a `with` body it lands on
+                // the object when the object answers for the name
+                if !lexical && with_may_bind(co.cur, d.a.name) {
+                    emit_store_ident(co, d.a);
+                    ch_op(&co.cur.ch, OP_POP);
+                } else {
+                    emit_init_binding(co, li);
+                }
             } else if lexical {
                 if (n.flags & NF_CONST) != 0 {
                     cerror(co, d, "const declaration needs an initializer");
@@ -3773,6 +3976,10 @@ private void compile_stmt(Compiler* co, Node* n) {
         } else {
             ch_patch(ch, j1);
         }
+        return;
+    }
+    if k == N_WITH {
+        compile_with(co, n);
         return;
     }
     if k == N_WHILE {

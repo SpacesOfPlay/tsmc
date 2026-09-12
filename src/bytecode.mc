@@ -34,6 +34,16 @@ enum Op {
     OP_SETEXPORT,    // u16 name; [ns, val] -> [val]: the namespace's own copy
                      // of an exported binding, which only the module writes
     OP_DELGLOBAL,    // u16 const idx; removes a global binding -> bool
+    OP_WITH_OBJ,     // [v] -> [ToObject(v)]; TypeError on null or undefined
+    OP_WITH_HAS,     // u16 const idx (name); [obj] -> [bool]: does the object
+                     // a `with` introduced answer for this name
+    OP_WITH_GET,     // u16 name; [obj] -> [value]. The object is asked for the
+                     // property again: a getter or a proxy trap may have
+                     // removed it since it answered for the name, and then the
+                     // reference is unresolvable.
+    OP_WITH_SET,     // u16 name; [value, obj] -> [value], with the same recheck
+    OP_WITH_METH,    // u16 name; [obj] -> [fn, obj]: a call through a `with`
+                     // object takes the object as its receiver
     OP_SETCONST_ERR, // a store to an immutable binding: throws TypeError
 
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,

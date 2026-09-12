@@ -76,4 +76,12 @@ t('enumerable-nullish-throwing-key', () => Object.prototype.propertyIsEnumerable
 t('valueof-undefined', () => Object.prototype.valueOf.call(undefined));
 t('tostring-undefined', () => Object.prototype.toString.call(undefined));
 
+// ToObject of a string is the wrapper the String constructor builds: it holds
+// the primitive, its length, and its code units as own properties.
+t('boxed-length', () => Object('abc').length);
+t('boxed-index', () => Object('abc')[1]);
+t('boxed-own-names', () => Object.getOwnPropertyNames(Object('abc')).join(','));
+t('boxed-number', () => [typeof Object(7), Object(7) + 1].join(','));
+t('boxed-valueof', () => Object('abc').valueOf());
+
 console.log(out.join('\n'));

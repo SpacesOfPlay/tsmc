@@ -231,6 +231,8 @@ struct VM {
     u32 sym_to_string_tag_id;
     Value sym_has_instance;  // well-known Symbol.hasInstance
     u32 sym_has_instance_id;
+    Value sym_unscopables;   // well-known Symbol.unscopables
+    u32 sym_unscopables_id;
     u32 atom_pstate;
     u32 atom_pvalue;
     u32 atom_pcbs;
@@ -424,6 +426,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     gc_mark_value(h, vm.sym_async_iterator);
     gc_mark_value(h, vm.sym_to_string_tag);
     gc_mark_value(h, vm.sym_has_instance);
+    gc_mark_value(h, vm.sym_unscopables);
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.gen != null { gc_mark_cell(h, &fr.gen.head); }
@@ -2611,6 +2614,101 @@ bool vm_global_hidden(VM* vm, u32 a) {
     return false;
 }
 
+// `with (expr)`: null and undefined have no scope to open. Anything else is
+// taken as it is -- a primitive is not boxed, since its properties answer
+// through the same path a member read takes, which is all the body can see of
+// the wrapper the specification would make.
+private void op_with_obj(VM* vm) {
+    Value v = vpeek(vm, 0);
+    if value_is_undefined(v) || value_is_null(v) {
+        vm_throw_error(vm, ERR_TYPE, "cannot convert undefined or null to an object");
+    }
+}
+
+// [[HasProperty]] on a scope object, including an unboxed primitive: a name it
+// carries is found the way a member read finds it.
+private bool with_has(VM* vm, Value objv, u32 a) {
+    if !value_is_primitive(objv) { return has_prop_of(vm, objv, a); }
+    Value probe;
+    if !vm_get_prop_value(vm, objv, a, &probe) { return false; }
+    return !value_is_undefined(probe);
+}
+
+// Whether the object a `with` introduced answers for a name: it has the
+// property, and its Symbol.unscopables does not hide it. The object stays on
+// the stack throughout, since asking can run a proxy trap or a getter.
+private bool with_answers(VM* vm, Value objv, u32 a) {
+    if !with_has(vm, objv, a) { return false; }
+    Value bl;
+    if !vm_get_prop_value(vm, objv, vm.sym_unscopables_id, &bl) { return false; }
+    if value_is_primitive(bl) { return true; }
+    Value hidden;
+    if !vm_get_prop_value(vm, bl, a, &hidden) { return false; }
+    return !js_truthy(hidden);
+}
+
+private void op_with_has(VM* vm, u32 a) {
+    bool r = with_answers(vm, vpeek(vm, 0), a);
+    if vm.has_pending { return; }
+    vm.sp--;
+    vpush(vm, value_bool(r));
+}
+
+// The name no longer resolves: in strict code that is a ReferenceError, the
+// same one an undeclared name gets.
+private bool with_gone(VM* vm, u32 a, bool strict) {
+    if !strict { return false; }
+    string msg = format("{} is not defined", atom_name(&vm.atoms, a));
+    str mv = msg;
+    vm_throw_error(vm, ERR_REF, mv);
+    free(msg);
+    return true;
+}
+
+// GetBindingValue for a `with` object: it is asked whether it still has the
+// property, since answering for the name may have run a getter or a trap that
+// removed it. The object stays on the stack until the value replaces it.
+private void op_with_get(VM* vm, u32 a, bool strict) {
+    Value objv = vpeek(vm, 0);
+    bool has = with_has(vm, objv, a);
+    if vm.has_pending { return; }
+    Value out = value_undefined();
+    if !has {
+        if with_gone(vm, a, strict) { return; }
+    } else if !vm_get_prop_value(vm, objv, a, &out) {
+        return;
+    }
+    vm.sp--;
+    vpush(vm, out);
+}
+
+// SetMutableBinding: the same recheck, then an ordinary property write.
+private void op_with_set(VM* vm, u32 a, bool strict) {
+    Value objv = vpeek(vm, 0);
+    Value v = vpeek(vm, 1);
+    bool has = with_has(vm, objv, a);
+    if vm.has_pending { return; }
+    if !has && with_gone(vm, a, strict) { return; }
+    if !set_prop_atom(vm, objv, a, v, strict ? SET_STRICT : SET_SLOPPY) { return; }
+    vm.sp -= 2;
+    vpush(vm, v);
+}
+
+// As op_with_get, but the object stays on as the receiver of the call.
+private void op_with_meth(VM* vm, u32 a, bool strict) {
+    Value objv = vpeek(vm, 0);
+    bool has = with_has(vm, objv, a);
+    if vm.has_pending { return; }
+    Value callee = value_undefined();
+    if !has {
+        if with_gone(vm, a, strict) { return; }
+    } else if !vm_get_prop_value(vm, objv, a, &callee) {
+        return;
+    }
+    *(vm.stack + vm.sp - 1) = callee;
+    vpush(vm, objv);
+}
+
 // A name Object.defineProperty gave its own descriptor on the global object,
 // rather than the plain binding an assignment would make. Its attributes and
 // accessors are what answer for it, so every path that would otherwise reach
@@ -3859,6 +3957,8 @@ void vm_init(VM* vm) {
     vm.sym_to_string_tag_id = 0;
     vm.sym_has_instance = value_undefined();
     vm.sym_has_instance_id = 0;
+    vm.sym_unscopables = value_undefined();
+    vm.sym_unscopables_id = 0;
     vm.atom_pstate = atom_intern(&vm.atoms, "%state");
     vm.atom_pvalue = atom_intern(&vm.atoms, "%value");
     vm.atom_pcbs = atom_intern(&vm.atoms, "%cbs");
@@ -3890,6 +3990,9 @@ void vm_init(VM* vm) {
     Value hisym = vm_new_wellknown_symbol(vm, "Symbol.hasInstance");
     vm.sym_has_instance = hisym;
     vm.sym_has_instance_id = value_as_symbol(hisym).id;
+    Value unsym = vm_new_wellknown_symbol(vm, "Symbol.unscopables");
+    vm.sym_unscopables = unsym;
+    vm.sym_unscopables_id = value_as_symbol(unsym).id;
 }
 
 void vm_destroy(VM* vm) {
@@ -4276,6 +4379,27 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_SETEXPORT: {
                 ip += 2;
                 set_export(vm, t, rd_u16(code, ip - 2));
+            }
+            case OP_WITH_OBJ: { op_with_obj(vm); }
+            case OP_WITH_HAS: {
+                ip += 2;
+                op_with_has(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
+            }
+            case OP_WITH_GET: {
+                ip += 2;
+                op_with_get(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+            }
+            case OP_WITH_SET: {
+                ip += 2;
+                op_with_set(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+            }
+            case OP_WITH_METH: {
+                ip += 2;
+                op_with_meth(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
             }
             case OP_DELGLOBAL: {
                 ip += 2;

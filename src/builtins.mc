@@ -139,7 +139,11 @@ private Value js_to_object(VM* vm, Value v) {
     vm_push(vm, v);
     JsObject* o = js_new_object(&vm.heap, proto);
     vm_push(vm, value_cell(&o.head));
-    set_wrapped_prim(vm, o, v);
+    if value_is_string(v) {
+        box_string_into(vm, o, v);
+    } else {
+        set_wrapped_prim(vm, o, v);
+    }
     vm_pop(vm);
     vm_pop(vm);
     return value_cell(&o.head);
@@ -2561,6 +2565,27 @@ private f64 num_this(VM* vm, Value thisv) {
     return js_to_number(thisv);
 }
 
+// A String wrapper holds its primitive, its length, and its code units as own
+// enumerable index properties, so it indexes, spreads and enumerates like the
+// string it holds. Both `new String(s)` and ToObject(s) build one.
+private void box_string_into(VM* vm, JsObject* o, Value p) {
+    set_wrapped_prim(vm, o, p);
+    props_set_desc(&o.props, bi_atom(vm, "length"), value_int(value_as_string(p).u16len), 0);
+    str sv = sview(p);
+    i32 off = 0;
+    i32 idx = 0;
+    while off < sv.len {
+        i32 n;
+        ignore utf8_decode(sv, off, &n);
+        str one;
+        one.data = sv.data + off;
+        one.len = n;
+        props_set_desc(&o.props, index_atom(vm, idx), new_str(vm, one), PROP_ENUMERABLE);
+        off += n;
+        idx++;
+    }
+}
+
 private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value p;
@@ -2579,24 +2604,7 @@ private Value nat_string_ctor(void* vmp, Value callee, Value thisv, Value* args,
     if vm.has_pending { return value_undefined(); }
     // new String(x): box the primitive on the fresh instance.
     if value_is_object(thisv) {
-        JsObject* o = value_as_object(thisv);
-        set_wrapped_prim(vm, o, p);
-        props_set_desc(&o.props, bi_atom(vm, "length"), value_int(value_as_string(p).u16len), 0);
-        // the code units are own enumerable index properties, so the wrapper
-        // indexes, spreads and enumerates like the string it holds
-        str sv = sview(p);
-        i32 off = 0;
-        i32 idx = 0;
-        while off < sv.len {
-            i32 n;
-            ignore utf8_decode(sv, off, &n);
-            str one;
-            one.data = sv.data + off;
-            one.len = n;
-            props_set_desc(&o.props, index_atom(vm, idx), new_str(vm, one), PROP_ENUMERABLE);
-            off += n;
-            idx++;
-        }
+        box_string_into(vm, value_as_object(thisv), p);
         return thisv;
     }
     return p;
@@ -18639,6 +18647,30 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.array_proto, "keys", &nat_arr_keys);
     def_method(vm, vm.array_proto, "entries", &nat_arr_entries);
 
+    // Array.prototype[Symbol.unscopables]: the methods added after the third
+    // edition, which a `with` body resolves to the enclosing scope instead --
+    // old code written against an array's own `values` or `keys` keeps working.
+    JsObject* unsc = js_new_object(&vm.heap, null);
+    u8 data = PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE;
+    props_set_desc(&unsc.props, bi_atom(vm, "at"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "copyWithin"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "entries"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "fill"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "find"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "findIndex"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "findLast"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "findLastIndex"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "flat"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "flatMap"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "includes"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "keys"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "toReversed"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "toSorted"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "toSpliced"), value_bool(true), data);
+    props_set_desc(&unsc.props, bi_atom(vm, "values"), value_bool(true), data);
+    props_set_desc(&vm.array_proto.props, vm.sym_unscopables_id,
+        value_cell(&unsc.head), PROP_CONFIGURABLE);
+
     // String
     JsNative* string_ctor = def_global_fn(vm, "String", &nat_string_ctor);
     props_set_desc(&string_ctor.props, vm.atom_prototype, value_cell(&vm.string_proto.head), 0);
@@ -18870,6 +18902,7 @@ void builtins_install(VM* vm) {
     props_set(&symbol_ctor.props, bi_atom(vm, "asyncIterator"), vm.sym_async_iterator);
     props_set(&symbol_ctor.props, bi_atom(vm, "toStringTag"), vm.sym_to_string_tag);
     props_set(&symbol_ctor.props, bi_atom(vm, "hasInstance"), vm.sym_has_instance);
+    props_set(&symbol_ctor.props, bi_atom(vm, "unscopables"), vm.sym_unscopables);
     def_static(vm, symbol_ctor, "for", &nat_symbol_for);
     def_static(vm, symbol_ctor, "keyFor", &nat_symbol_key_for);
     vm.symbol_proto = js_new_object(&vm.heap, vm.object_proto);
