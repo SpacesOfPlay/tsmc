@@ -129,6 +129,9 @@ struct VM {
     // The entry file's module object, for require.main. Node's entry is a
     // module like any other; here it is a script, so this stands in for it.
     JsObject* main_module;
+    // globalThis. A name it holds a property for is a global binding, so the
+    // free-identifier paths consult it when the bindings table has no entry.
+    JsObject* global_obj;
     // Bindings stored in the globals table that the global object must not
     // report. In node these are module-scoped, so a bare `__dirname` resolves
     // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
@@ -1181,7 +1184,13 @@ private bool set_global(VM* vm, u32 a, Value v, bool strict) {
         return write_refused(vm, strict ? SET_STRICT : SET_SLOPPY,
             "cannot assign to read only property of the global object");
     }
-    if strict && intmap_get<Value>(&vm.globals, a) == null {
+    // a name with its own descriptor is written as that property: its setter
+    // runs, and a read-only one refuses the write
+    if global_own_prop(vm, a) != null {
+        return set_prop_atom(vm, value_cell(&vm.global_obj.head), a, v,
+            strict ? SET_STRICT : SET_SLOPPY);
+    }
+    if strict && !global_resolves(vm, a) {
         string msg = format("{} is not defined", atom_name(&vm.atoms, a));
         str mv = msg;
         vm_throw_error(vm, ERR_REF, mv);
@@ -1207,10 +1216,16 @@ private void set_export(VM* vm, FnTemplate* t, i32 ci) {
 }
 
 // `delete name` in sloppy code, where the name is not a binding: the global
-// goes, unless it is one of the three the specification fixes.
+// goes, unless it is one of the three the specification fixes. A name with its
+// own descriptor is deleted as that property, so a non-configurable one stays.
 private void del_global(VM* vm, u32 a) {
     if a == vm.atom_undefined_g || a == vm.atom_nan_g || a == vm.atom_infinity_g {
         vpush(vm, value_bool(false));
+        return;
+    }
+    if global_own_prop(vm, a) != null {
+        i32 r = delete_key(vm, value_cell(&vm.global_obj.head), a, false);
+        if r >= 0 { vpush(vm, value_bool(r == 1)); }
         return;
     }
     intmap_remove<Value>(&vm.globals, a);
@@ -1812,8 +1827,12 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
                 return write_refused(vm, mode,
                     "cannot assign to read only property of the global object");
             }
-            intmap_set<Value>(&vm.globals, a, v);
-            return true;
+            // a name with its own descriptor keeps it, and falls through to
+            // the ordinary property path; anything else is a binding
+            if global_own_prop(vm, a) == null {
+                intmap_set<Value>(&vm.globals, a, v);
+                return true;
+            }
         }
         if (o.obj_flags & OBJF_ARRAY) != 0 {
             if a == vm.atom_length {
@@ -2590,6 +2609,73 @@ bool vm_global_hidden(VM* vm, u32 a) {
         if vm.hidden_globals[i] == a { return true; }
     }
     return false;
+}
+
+// A name Object.defineProperty gave its own descriptor on the global object,
+// rather than the plain binding an assignment would make. Its attributes and
+// accessors are what answer for it, so every path that would otherwise reach
+// straight into the bindings table checks here first. A name the table holds
+// is a binding and wins: that is where a declared global lives.
+private Prop* global_own_prop(VM* vm, u32 a) {
+    if vm.global_obj == null { return null; }
+    if intmap_get<Value>(&vm.globals, a) != null { return null; }
+    return props_entry(&vm.global_obj.props, a);
+}
+
+// A free identifier the bindings table does not hold. The global object
+// answers for it: a property defined on it directly, and anything it inherits
+// from Object.prototype -- which is what makes a bare `toString` resolve.
+// Throws when the name is nowhere, unless `soft` (typeof), which reads
+// undefined instead.
+private void get_global_miss(VM* vm, u32 a, bool soft) {
+    if vm.global_obj != null && chain_has(vm, vm.global_obj, a) {
+        Value gv;
+        if vm_get_prop_value(vm, value_cell(&vm.global_obj.head), a, &gv) {
+            vpush(vm, gv);
+        }
+        return;
+    }
+    if vm.has_pending { return; }
+    if soft {
+        vpush(vm, value_undefined());
+        return;
+    }
+    string msg = format("{} is not defined", atom_name(&vm.atoms, a));
+    vm_throw_error(vm, ERR_REF, msg);
+    free(msg);
+}
+
+// OP_GETGLOBAL and OP_GETGLOBAL_SOFT. A lazy global is stored as an accessor
+// (see vm_set_lazy_global), so the value it stands for is built on first read.
+private void get_global(VM* vm, u32 a, bool soft) {
+    Value* g = intmap_get<Value>(&vm.globals, a);
+    if g == null {
+        get_global_miss(vm, a, soft);
+        return;
+    }
+    Value gv = *g;
+    if !value_is_accessor(gv) {
+        vpush(vm, gv);
+        return;
+    }
+    JsAccessor* lac = value_as_accessor(gv);
+    if !value_is_callable(lac.get) {
+        vpush(vm, value_undefined());
+        return;
+    }
+    Value dummy = value_undefined();
+    Value r = vm_call_value(vm, lac.get, value_undefined(), &dummy, 0);
+    if vm.has_pending { return; }
+    vpush(vm, r);
+}
+
+// Whether a free identifier resolves at all: a binding, or any property of
+// the global object. This is what decides a strict-mode assignment to an
+// undeclared name.
+private bool global_resolves(VM* vm, u32 a) {
+    if intmap_get<Value>(&vm.globals, a) != null { return true; }
+    if vm.global_obj == null { return false; }
+    return chain_has(vm, vm.global_obj, a);
 }
 
 // Whether a global binding of this atom exists. The global object needs to
@@ -3675,6 +3761,7 @@ void vm_init(VM* vm) {
     intmap_init<Value>(&vm.globals);
     vm.n_hidden_globals = 0;
     vm.main_module = null;
+    vm.global_obj = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;
@@ -4176,44 +4263,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 b.v = vpeek(vm, 0);
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                Value* g = intmap_get<Value>(&vm.globals, a);
-                if g != null {
-                    Value gv0 = *g;
-                    // a lazy global (see vm_set_lazy_global): an accessor
-                    // resolves through its getter, so the value it stands for
-                    // is only built when something actually reads the name
-                    if value_is_accessor(gv0) {
-                        JsAccessor* lac = value_as_accessor(gv0);
-                        if value_is_callable(lac.get) {
-                            Value dummy0 = value_undefined();
-                            gv0 = vm_call_value(vm, lac.get, value_undefined(), &dummy0, 0);
-                            if vm.has_pending { break case; }
-                        } else {
-                            gv0 = value_undefined();
-                        }
-                    }
-                    vpush(vm, gv0);
-                } else {
-                    // Free identifiers resolve against the global object, which
-                    // inherits Object.prototype, so bare `toString` /
-                    // `hasOwnProperty` / `valueOf` (and `typeof` of them) work
-                    // as in Node. Only the intmap-miss path pays this lookup.
-                    Value gv;
-                    if vm.object_proto != null
-                       && vm_get_prop_value(vm, value_cell(&vm.object_proto.head), a, &gv)
-                       && !value_is_undefined(gv) {
-                        vpush(vm, gv);
-                    } else if op == OP_GETGLOBAL_SOFT {
-                        vpush(vm, value_undefined());
-                    } else {
-                        str nm = atom_name(&vm.atoms, a);
-                        string msg = format("{} is not defined", nm);
-                        vm_throw_error(vm, ERR_REF, msg);
-                        free(msg);
-                    }
-                }
+                get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    op == OP_GETGLOBAL_SOFT);
             }
             case OP_SETGLOBAL: {
                 ip += 2;
@@ -5648,9 +5700,12 @@ private i32 delete_key(VM* vm, Value objv, u32 a, bool strict) {
     }
     if (o.obj_flags & OBJF_GLOBAL) != 0 {
         // removing the binding, not a copy of it: the bare name stops
-        // resolving too
-        intmap_remove<Value>(&vm.globals, a);
-        return 1;
+        // resolving too. A name with its own descriptor is deleted as that
+        // property, so the attributes decide.
+        if global_own_prop(vm, a) == null {
+            intmap_remove<Value>(&vm.globals, a);
+            return 1;
+        }
     }
     Prop* pe = props_entry(&o.props, a);
     if pe != null && (o.obj_flags & OBJF_MODULE_NS) != 0 {

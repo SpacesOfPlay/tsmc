@@ -19145,6 +19145,7 @@ void builtins_install(VM* vm) {
     // are lexical bindings and never enter the table at all.
     JsObject* gt = js_new_object(&vm.heap, vm.object_proto);
     gt.obj_flags = gt.obj_flags | OBJF_GLOBAL;
+    vm.global_obj = gt;
     Value gtv = value_cell(&gt.head);
     vm_set_global(vm, "globalThis", gtv);
     // Node exposes the same global object as `global` too (=== globalThis).
