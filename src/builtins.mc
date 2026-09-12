@@ -8282,6 +8282,7 @@ private Value make_weak(VM* vm, Value iterable, bool is_set) {
     JsObject* proto = is_set ? vm_weakset_proto(vm) : vm_weakmap_proto(vm);
     JsMap* mp = js_new_map(&vm.heap, proto, is_set);
     mp.weak = true;
+    vm.any_weak = true;
     if bi_nullish(iterable) { return value_cell(&mp.head); }
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&mp.head));

@@ -132,6 +132,11 @@ struct VM {
     // globalThis. A name it holds a property for is a global binding, so the
     // free-identifier paths consult it when the bindings table has no entry.
     JsObject* global_obj;
+    // Whether a WeakMap or WeakSet has ever been made. The ephemeron pass and
+    // the pass that drops dead keys both walk every cell in the heap looking
+    // for one, and the marking pass is looped until it marks nothing new, so a
+    // program that has none should not pay for them at all.
+    bool any_weak;
     // Bindings stored in the globals table that the global object must not
     // report. In node these are module-scoped, so a bare `__dirname` resolves
     // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
@@ -279,6 +284,8 @@ private void mark_template(GcHeap* h, FnTemplate* t) {
 // entry whose key survived. Returns true if it marked anything new, so
 // the collector loops it (a value may itself be another map's key).
 private bool vm_weak_mark(GcHeap* h, void* ctx) {
+    VM* vmw = cast(VM*, ctx);
+    if !vmw.any_weak { return false; }
     bool any = false;
     GcCell* c = h.all;
     while c != null {
@@ -307,6 +314,8 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
 // Drops entries whose key did not survive marking, from every live weak
 // collection. Runs before the sweep, while marks are still valid.
 private void vm_weak_sweep(GcHeap* h, void* ctx) {
+    VM* vms = cast(VM*, ctx);
+    if !vms.any_weak { return; }
     GcCell* c = h.all;
     while c != null {
         if c.mark != 0 && c.kind == GC_MAP {
@@ -1769,6 +1778,60 @@ private JsAccessor* fn_find_accessor(Value objv, u32 a) {
 }
 
 // Resolves accessor properties through their getter; false = threw.
+// The flags that make an object answer for a property some other way than by
+// looking in its table: a proxy asks its handler, a view answers for its
+// indices, the global object answers for its bindings, and a module namespace
+// refuses most of it. An array is not here -- it answers for `length` and for
+// its indices, and for every other name it is an ordinary object.
+const i32 OBJF_NOT_PLAIN = OBJF_PROXY | OBJF_PROXY_REVOKED
+    | OBJF_TYPEDARRAY | OBJF_GLOBAL | OBJF_MODULE_NS;
+
+// A property read, walking the prototype chain in one function: the table of
+// each object, and the getter when the name is an accessor. An object that
+// answers some other way, or a receiver that is not an object at all, falls
+// through to the full path. This is the commonest operation a program performs,
+// and the path it replaces was four nested calls per level.
+private bool prop_get(VM* vm, Value objv, u32 a, Value* out) {
+    JsObject* o = value_is_object(objv) ? value_as_object(objv) : null;
+    bool plain = o != null;
+    while o != null {
+        i32 fl = o.obj_flags;
+        if (fl & OBJF_NOT_PLAIN) != 0 {
+            plain = false;
+            break;
+        }
+        if (fl & OBJF_ARRAY) != 0 && (a == vm.atom_length || ta_atom_index(vm, a) >= 0) {
+            plain = false;
+            break;
+        }
+        Value* p = props_get(&o.props, a);
+        if p == null {
+            o = o.proto;
+            continue;
+        }
+        if !value_is_accessor(*p) {
+            *out = *p;
+            return true;
+        }
+        JsAccessor* ac = value_as_accessor(*p);
+        if !value_is_callable(ac.get) {
+            *out = value_undefined();
+            return true;
+        }
+        // the receiver is the object the read started from, not the one the
+        // accessor was found on
+        Value none = value_undefined();
+        *out = vm_call_value(vm, ac.get, objv, &none, 0);
+        return !vm.has_pending;
+    }
+    // the whole chain was ordinary and none of it had the name
+    if plain {
+        *out = value_undefined();
+        return true;
+    }
+    return vm_get_prop_value(vm, objv, a, out);
+}
+
 bool vm_get_prop_value(VM* vm, Value objv, u32 a, Value* out) {
     if !get_prop_atom(vm, objv, a, out) { return false; }
     if value_is_accessor(*out) {
@@ -3865,6 +3928,7 @@ void vm_init(VM* vm) {
     vm.n_hidden_globals = 0;
     vm.main_module = null;
     vm.global_obj = null;
+    vm.any_weak = false;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;
@@ -5024,7 +5088,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
                 Value out;
-                if vm_get_prop_value(vm, vpeek(vm, 0), a, &out) {
+                if prop_get(vm, vpeek(vm, 0), a, &out) {
                     vm.sp--;
                     vpush(vm, out);
                 }
@@ -5149,7 +5213,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip += 2;
                 Value objv = vpeek(vm, 0);
                 Value out;
-                if vm_get_prop_value(vm, objv, a, &out) {
+                if prop_get(vm, objv, a, &out) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
