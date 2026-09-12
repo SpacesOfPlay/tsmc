@@ -191,18 +191,18 @@ procedure.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 33
-scripts are checked against golden output. 178 differential scripts run
+scripts are checked against golden output. 200 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
-most of it was written by sweeping one area at a time against node. 101
+most of it was written by sweeping one area at a time against node. 127
 negative tests are programs the compiler must refuse with a named
-message. All 210 scripts then run again under `--gc-stress`, which collects on every
-allocation and poisons what it sweeps, and must print what they printed
-without it. The wasm build is cross-compiled on every run, and the golden
-tests run through it under node when node is present, followed by the
-playground's examples that need no package. `build/build.exe examples`
-runs every example, fetching its packages from the live registry the way
-the page does.
+message. All 233 scripts then run again under `--gc-stress`, which
+collects on every allocation and poisons what it sweeps, and must print
+what they printed without it. The wasm build is cross-compiled on every
+run, and the golden tests run through it under node when node is present,
+followed by the playground's examples that need no package.
+`build/build.exe examples` runs every example, fetching its packages from
+the live registry the way the page does.
 
 ## Conformance (test262)
 
@@ -232,31 +232,28 @@ not passing; the list is at the top of the script. Failing paths go to
 `build/test262-fails.txt`. The run is split into shards (`--jobs`). Pin a
 revision with `T262_COMMIT`.
 
-`test/language`, at the pinned revision, measured 2026-09-10:
+`test/language`, at the pinned revision, measured 2026-09-12:
 
 | | tests |
 |---|---|
-| in the tree | 23,714 |
-| passed | 19,457 (82%; 92% of those that ran) |
-| failed | 1,580 |
-| skipped | 2,677 |
+| in the tree | 23,713 |
+| passed | 20,552 (86%; 95% of those that ran) |
+| failed | 1,122 |
+| skipped | 2,039 |
 
 Where the failures are, each counted once:
 
 | | tests |
 |---|---|
-| class elements and definitions | 288 |
-| early errors | 215 |
+| dynamic import and module instantiation | 150 |
 | `with`, not implemented | 134 |
-| generators and async iteration | 114 |
-| destructuring | 105 |
-| dynamic import and module instantiation | 77 |
-| `eval` and `new Function`, refused by design | 52 |
-| parameter and `arguments` rules | 47 |
-| everything else | 548 |
-
-The snapshot predates the module tests, which the runner now runs:
-`module-code` passes 418 of 599.
+| class elements and definitions | 129 |
+| early errors | 112 |
+| `eval` and `new Function`, refused by design | 54 |
+| generators and async iteration | 52 |
+| parameter and `arguments` rules | 43 |
+| destructuring | 17 |
+| everything else | 431 |
 
 ## Layout
 
