@@ -4734,56 +4734,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_LT, OP_GT, OP_LE, OP_GE: {
-                Value b = vpeek(vm, 0);
-                Value a = vpeek(vm, 1);
-                if !value_is_number(a) || !value_is_number(b) {
-                    if !value_is_primitive(a) || !value_is_primitive(b) {
-                        if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
-                        b = vpeek(vm, 0);
-                        a = vpeek(vm, 1);
-                    }
-                }
-                bool r = false;
-                if value_is_int(a) && value_is_int(b) {
-                    i32 x = value_as_int(a);
-                    i32 y = value_as_int(b);
-                    if op == OP_LT { r = x < y; }
-                    if op == OP_GT { r = x > y; }
-                    if op == OP_LE { r = x <= y; }
-                    if op == OP_GE { r = x >= y; }
-                } else if value_is_string(a) && value_is_string(b) {
-                    i32 c = js_str_cmp(gc_string_view(value_as_string(a)),
-                        gc_string_view(value_as_string(b)));
-                    if op == OP_LT { r = c < 0; }
-                    if op == OP_GT { r = c > 0; }
-                    if op == OP_LE { r = c <= 0; }
-                    if op == OP_GE { r = c >= 0; }
-                } else if value_is_bigint(a) || value_is_bigint(b) {
-                    i32 c = 0;
-                    bool unordered = false;
-                    if value_is_bigint(a) && value_is_bigint(b) {
-                        c = bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b)));
-                    } else {
-                        f64 x = value_is_bigint(a) ? bn_to_f64(bigint_view(value_as_bigint(a))) : vm_to_number(vm, a);
-                        f64 y = value_is_bigint(b) ? bn_to_f64(bigint_view(value_as_bigint(b))) : vm_to_number(vm, b);
-                        if x != x || y != y { unordered = true; }
-                        else if x < y { c = -1; } else if x > y { c = 1; }
-                    }
-                    if unordered { r = false; }
-                    else if op == OP_LT { r = c < 0; }
-                    else if op == OP_GT { r = c > 0; }
-                    else if op == OP_LE { r = c <= 0; }
-                    else { r = c >= 0; }
-                } else {
-                    f64 x = vm_to_number(vm, a);
-                    f64 y = vm_to_number(vm, b);
-                    if op == OP_LT { r = x < y; }
-                    if op == OP_GT { r = x > y; }
-                    if op == OP_LE { r = x <= y; }
-                    if op == OP_GE { r = x >= y; }
-                }
-                vm.sp -= 2;
-                vpush(vm, value_bool(r));
+                i32 r = cmp_rel(vm, op);
+                if r >= 0 { vpush(vm, value_bool(r == 1)); }
+            }
+            case OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF: {
+                ip += 2;
+                i32 r = cmp_rel(vm, rel_base(op));
+                if r == 0 { ip = rd_u16(code, ip - 2); }
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
                 // an object operand becomes a primitive first, which is how
@@ -6150,6 +6107,71 @@ private void op_step_local(VM* vm, i32 at, i32 delta) {
     f64 d = vm_to_number(vm, v);
     if vm.has_pending { return; }
     *(vm.stack + at) = num_norm(d + cast(f64, delta));
+}
+
+// A relational comparison, out of the interpreter's switch: it is the biggest
+// case body there, and every local in it counted towards the frame of every
+// other. Returns 1, 0, or -1 when a coercion threw -- in which case the
+// operands stay on the stack, as the handler expects.
+private i32 cmp_rel(VM* vm, i32 op) {
+    Value b = vpeek(vm, 0);
+    Value a = vpeek(vm, 1);
+    if !value_is_number(a) || !value_is_number(b) {
+        if !value_is_primitive(a) || !value_is_primitive(b) {
+            if !coerce_top2_prim(vm, HINT_NUMBER) { return 0 - 1; }
+            b = vpeek(vm, 0);
+            a = vpeek(vm, 1);
+        }
+    }
+    bool r = false;
+    if value_is_int(a) && value_is_int(b) {
+        i32 x = value_as_int(a);
+        i32 y = value_as_int(b);
+        if op == OP_LT { r = x < y; }
+        if op == OP_GT { r = x > y; }
+        if op == OP_LE { r = x <= y; }
+        if op == OP_GE { r = x >= y; }
+    } else if value_is_string(a) && value_is_string(b) {
+        i32 c = js_str_cmp(gc_string_view(value_as_string(a)),
+            gc_string_view(value_as_string(b)));
+        if op == OP_LT { r = c < 0; }
+        if op == OP_GT { r = c > 0; }
+        if op == OP_LE { r = c <= 0; }
+        if op == OP_GE { r = c >= 0; }
+    } else if value_is_bigint(a) || value_is_bigint(b) {
+        i32 c = 0;
+        bool unordered = false;
+        if value_is_bigint(a) && value_is_bigint(b) {
+            c = bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b)));
+        } else {
+            f64 x = value_is_bigint(a) ? bn_to_f64(bigint_view(value_as_bigint(a))) : vm_to_number(vm, a);
+            f64 y = value_is_bigint(b) ? bn_to_f64(bigint_view(value_as_bigint(b))) : vm_to_number(vm, b);
+            if x != x || y != y { unordered = true; }
+            else if x < y { c = -1; } else if x > y { c = 1; }
+        }
+        if unordered { r = false; }
+        else if op == OP_LT { r = c < 0; }
+        else if op == OP_GT { r = c > 0; }
+        else if op == OP_LE { r = c <= 0; }
+        else { r = c >= 0; }
+    } else {
+        f64 x = vm_to_number(vm, a);
+        f64 y = vm_to_number(vm, b);
+        if op == OP_LT { r = x < y; }
+        if op == OP_GT { r = x > y; }
+        if op == OP_LE { r = x <= y; }
+        if op == OP_GE { r = x >= y; }
+    }
+    vm.sp -= 2;
+    return r ? 1 : 0;
+            }
+
+// The comparison a fused compare-and-jump performs.
+private i32 rel_base(i32 op) {
+    if op == OP_LT_JF { return OP_LT; }
+    if op == OP_GT_JF { return OP_GT; }
+    if op == OP_LE_JF { return OP_LE; }
+    return OP_GE;
 }
 
 // Likewise kept out of the loop: `for await`'s iterator acquisition.

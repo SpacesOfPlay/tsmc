@@ -71,6 +71,9 @@ enum Op {
 
     OP_JUMP,         // u16 target
     OP_JUMPF,        // pop; jump when falsy
+    // u16 target: the comparison and the jump that consumes it, in one
+    // instruction. A loop test and an `if` are both this pair.
+    OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF,
     OP_JUMPT,        // pop; jump when truthy
     OP_JF_KEEP,      // falsy: jump, keep; else pop      (&&)
     OP_JT_KEEP,      // truthy: jump, keep; else pop     (||)
@@ -211,6 +214,13 @@ struct PosEntry {
 
 struct Chunk {
     Vec<u8> code;
+    // Where the last instruction's opcode byte went, so the compiler can
+    // recognise what it just emitted and fold a pair into one instruction.
+    i32 last_op;
+    // The furthest position any jump has been pointed at. A pair may only be
+    // folded when nothing jumps into the second half of it, and a jump patched
+    // to the position the second half would occupy is exactly that.
+    i32 max_target;
     Vec<Value> consts;
     Vec<TmplUpval> upvals;
     Vec<TmplPtr> subs;
@@ -219,6 +229,8 @@ struct Chunk {
 
 void chunk_init(Chunk* ch) {
     vec_init<u8>(&ch.code, 64);
+    ch.last_op = 0 - 1;
+    ch.max_target = 0 - 1;
     vec_init<Value>(&ch.consts, 8);
     vec_init<TmplUpval>(&ch.upvals, 4);
     vec_init<TmplPtr>(&ch.subs, 4);
@@ -243,6 +255,7 @@ void ch_record_pos(Chunk* ch, i32 line, i32 col) {
 }
 
 void ch_op(Chunk* ch, i32 op) {
+    ch.last_op = ch.code.len;
     vec_push(&ch.code, cast(u8, op));
 }
 
@@ -271,11 +284,13 @@ i32 ch_jump(Chunk* ch, i32 op) {
 
 void ch_patch(Chunk* ch, i32 at) {
     i32 target = ch.code.len;
+    if target > ch.max_target { ch.max_target = target; }
     vec_set(&ch.code, at, cast(u8, target));
     vec_set(&ch.code, at + 1, cast(u8, target >> 8));
 }
 
 void ch_patch_to(Chunk* ch, i32 at, i32 target) {
+    if target > ch.max_target { ch.max_target = target; }
     vec_set(&ch.code, at, cast(u8, target));
     vec_set(&ch.code, at + 1, cast(u8, target >> 8));
 }

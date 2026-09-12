@@ -191,12 +191,12 @@ procedure.
 ## Tests
 
 27 unit tests in minc exercise the interpreter from the inside. 33
-scripts are checked against golden output. 205 differential scripts run
+scripts are checked against golden output. 206 differential scripts run
 under both tsmc and a reference node, and the two outputs are compared
 byte for byte — that suite is the guard against quiet divergence, and
 most of it was written by sweeping one area at a time against node. 131
 negative tests are programs the compiler must refuse with a named
-message. All 238 scripts then run again under `--gc-stress`, which
+message. All 239 scripts then run again under `--gc-stress`, which
 collects on every allocation and poisons what it sweeps, and must print
 what they printed without it. The wasm build is cross-compiled on every
 run, and the golden tests run through it under node when node is present,
@@ -237,27 +237,23 @@ revision with `T262_COMMIT`.
 | | tests |
 |---|---|
 | in the tree | 23,713 |
-| passed | 20,552 (86%; 95% of those that ran) |
-| failed | 1,122 |
+| passed | 20,714 (87%; 96% of those that ran) |
+| failed | 960 |
 | skipped | 2,039 |
 
 Where the failures are, each counted once:
 
 | | tests |
 |---|---|
-| dynamic import and module instantiation | 150 |
-| `with`, then unimplemented | 134 |
+| dynamic import and module instantiation | 148 |
 | class elements and definitions | 129 |
-| early errors | 112 |
+| early errors | 106 |
 | `eval` and `new Function`, refused by design | 54 |
-| generators and async iteration | 52 |
+| generators and async iteration | 51 |
 | parameter and `arguments` rules | 43 |
-| destructuring | 17 |
-| everything else | 431 |
-
-The snapshot predates the `with` statement, which now runs:
-`statements/with` passes 114 of 150, the rest needing a global `eval`
-to compare against.
+| `with`, needing a global `eval` to compare against | 36 |
+| destructuring | 16 |
+| everything else | 377 |
 
 ## Layout
 

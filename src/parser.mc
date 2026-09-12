@@ -1807,6 +1807,9 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     Node* c = nnew(p, N_CLASS);
     c.flags = flags;
     advance(p);
+    // a class definition is strict-mode code throughout: its own name, the
+    // expression it extends, and its body
+    p.strict++;
     if is_binding_ident(p.cur.kind) {
         c.name = p.cur.text;
         advance(p);
@@ -1827,7 +1830,6 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     }
     expect(p, TOK_LBRACE, "expected '{'");
     i32 mark = p.scratch.len;
-    p.strict++;   // a class body is strict-mode code
     while !at(p, TOK_RBRACE) && !at(p, TOK_EOF) {
         if eat(p, TOK_SEMI) { continue; }
         i32 before = p.cur.start;
@@ -1837,8 +1839,8 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
             advance(p);
         }
     }
-    p.strict--;
     expect(p, TOK_RBRACE, "expected '}'");
+    p.strict--;
     c.kids = finish_kids(p, mark);
     return nfin(p, c);
 }

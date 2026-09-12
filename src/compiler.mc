@@ -834,6 +834,31 @@ private void hoist_vars(Compiler* co, Node* n) {
     }
 }
 
+// A conditional jump over a condition that has just been compiled. When the
+// last instruction is a bare relational comparison, the two become one: the
+// comparison's result is consumed by the jump and never has to reach the stack.
+// Nothing can be jumping into the middle of a pair, since the two are emitted
+// together here. Returns the patch position, as ch_jump does.
+private i32 emit_jumpf(Chunk* ch) {
+    i32 at = ch.last_op;
+    // A jump pointed at where this one is about to go -- which is what the
+    // short-circuit operators do in `a && b < c` -- would land in the middle of
+    // the folded instruction, so the pair stays two.
+    if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len {
+        i32 fused = 0 - 1;
+        i32 was = cast(i32, vec_get(&ch.code, at));
+        if was == OP_LT { fused = OP_LT_JF; }
+        if was == OP_GT { fused = OP_GT_JF; }
+        if was == OP_LE { fused = OP_LE_JF; }
+        if was == OP_GE { fused = OP_GE_JF; }
+        if fused >= 0 {
+            ch.code.len = at;          // the comparison becomes the fused op
+            return ch_jump(ch, fused);
+        }
+    }
+    return ch_jump(ch, OP_JUMPF);
+}
+
 // --- with scopes ---------------------------------------------------------------
 
 // What a probe does once the object has answered for the name.
@@ -926,7 +951,7 @@ private void emit_with_access(Compiler* co, Node* n, i32 mode) {
         emit_load_with_obj(co, w.name, n);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_WITH_HAS, name_const(co, n.name));
-        i32 miss = ch_jump(ch, OP_JUMPF);
+        i32 miss = emit_jumpf(ch);
         if mode == W_LOAD {
             ch_op_u16(ch, OP_WITH_GET, name_const(co, n.name));
         } else if mode == W_CALL {
@@ -1270,7 +1295,7 @@ private void emit_default_value(Compiler* co, Node* dflt) {
     ch_op(ch, OP_DUP);
     ch_op(ch, OP_UNDEF);
     ch_op(ch, OP_SEQ);
-    i32 j = ch_jump(ch, OP_JUMPF);
+    i32 j = emit_jumpf(ch);
     ch_op(ch, OP_POP);
     compile_expr(co, dflt);
     ch_patch(ch, j);
@@ -1351,7 +1376,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         ch_op(ch, OP_DUP);
         ch_op(ch, OP_UNDEF);
         ch_op(ch, OP_SEQ);
-        i32 j = ch_jump(ch, OP_JUMPF);
+        i32 j = emit_jumpf(ch);
         ch_op(ch, OP_POP);
         // named evaluation: an anonymous default takes the bound name
         if pat.a != null && pat.a.kind == N_IDENT { infer_name(pat.b, pat.a.name); }
@@ -1489,7 +1514,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                     ch_op(ch, OP_DUP);
                     ch_op(ch, OP_UNDEF);
                     ch_op(ch, OP_SEQ);
-                    i32 j2 = ch_jump(ch, OP_JUMPF);
+                    i32 j2 = emit_jumpf(ch);
                     ch_op(ch, OP_POP);
                     // named evaluation: an anonymous default takes the name
                     if target != null && target.kind == N_IDENT { infer_name(pp.b, target.name); }
@@ -2326,7 +2351,7 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_ASSIGN { compile_assign(co, n); return; }
     if k == N_COND {
         compile_expr(co, n.a);
-        i32 j1 = ch_jump(ch, OP_JUMPF);
+        i32 j1 = emit_jumpf(ch);
         compile_expr(co, n.b);
         i32 j2 = ch_jump(ch, OP_JUMP);
         ch_patch(ch, j1);
@@ -2688,7 +2713,7 @@ private void compile_expr(Compiler* co, Node* n) {
 private void emit_await_if_wrapped(Compiler* co, i32 t_wrapped) {
     Chunk* ch = &co.cur.ch;
     ch_op_u16(ch, OP_GETLOCAL, t_wrapped);
-    i32 j = ch_jump(ch, OP_JUMPF);
+    i32 j = emit_jumpf(ch);
     ch_op(ch, OP_AWAIT);
     ch_patch(ch, j);
 }
@@ -2724,7 +2749,7 @@ private void bind_params_in_order(Compiler* co, FScope* fs, Node* f, i32 n_param
             ch_op(ch, OP_DUP);
             ch_op(ch, OP_UNDEF);
             ch_op(ch, OP_SEQ);
-            i32 j = ch_jump(ch, OP_JUMPF);
+            i32 j = emit_jumpf(ch);
             ch_op(ch, OP_POP);
             // named evaluation: an anonymous default takes the parameter's name
             if prm.a != null && prm.a.kind == N_IDENT { infer_name(prm.b, prm.a.name); }
@@ -3756,7 +3781,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
     ch_op_u16(ch, OP_GETLOCAL, t_len);
     ch_op(ch, OP_LT);
-    i32 jend = ch_jump(ch, OP_JUMPF);
+    i32 jend = emit_jumpf(ch);
 
     for i32 i = bind_start; i < bind_end; i++ {
         CBind b = vec_get(&fs.binds, i);
@@ -3991,7 +4016,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_EMPTY { return; }
     if k == N_IF {
         compile_expr(co, n.a);
-        i32 j1 = ch_jump(ch, OP_JUMPF);
+        i32 j1 = emit_jumpf(ch);
         compile_stmt(co, n.b);
         if n.c != null {
             i32 j2 = ch_jump(ch, OP_JUMP);
@@ -4011,7 +4036,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         LoopCtx lc = make_loop_ctx(co, true);
         i32 lcond = ch_pos(ch);
         compile_expr(co, n.a);
-        i32 jend = ch_jump(ch, OP_JUMPF);
+        i32 jend = emit_jumpf(ch);
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.b);
         ignore vec_pop(&fs.loops);
@@ -4059,7 +4084,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 jend = -1;
         if n.b != null {
             compile_expr(co, n.b);
-            jend = ch_jump(ch, OP_JUMPF);
+            jend = emit_jumpf(ch);
         }
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.d);
