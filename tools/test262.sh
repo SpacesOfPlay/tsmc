@@ -30,10 +30,8 @@
 # lands in the skip list costs the same as failing it.
 #
 # A `flags: [module]` test is written beside the original as .mjs and run
-# once; a test that imports itself by name has that reference repointed at the
-# copy, since the copy is the module being run.
-# once, since module code is strict and its relative imports have to
-# resolve against the real directory.
+# once; a test that imports itself by name has that reference repointed at
+# the copy, since the copy is the module being run.
 #
 # `flags: [async]` tests report through print(): doneprintHandle.js turns
 # $DONE into one of two markers on stdout, and a test passes only if the
@@ -182,7 +180,7 @@ if command -v timeout >/dev/null 2>&1; then T262_RUN="timeout 10"; else T262_RUN
 # A shard keeps one such file at a time and drops it when the directory
 # changes. A killed run can leave one behind, so they are swept first and
 # never picked up as tests.
-find "$ROOT" -name '.t262-tmp-*' -delete 2>/dev/null
+find "$ROOT" -name '.t262-tmp*' -delete 2>/dev/null
 TMP=""
 TMPM=""
 TMPDIR_SEEN=""
@@ -195,8 +193,45 @@ trap 'rm -f "$TMP" "$TMPM"' EXIT
 
 pass=0; failc=0; skip=0
 
-# Extracts field VALUE from a test's YAML frontmatter block.
-frontmatter() { sed -n '/\/\*---/,/---\*\//p' "$1"; }
+# Reads what a test's frontmatter decides in one pass over the file: its
+# flags, the features and harness files it names, its negative expectation,
+# and whether it evaluates code at runtime. One field per line, six lines.
+# Starting a process costs far more than reading the file, so the fields are
+# taken together rather than one pipeline each.
+FM_AWK='
+function bracket(line, key,   s) {
+    if (!match(line, key ":[ \t]*\\[[^]]*\\]")) { return "" }
+    s = substr(line, RSTART, RLENGTH)
+    sub(key ":[ \t]*\\[", "", s)
+    sub(/\]$/, "", s)
+    return s
+}
+function word(line, key, chars,   s) {
+    if (!match(line, "^[ \t]*" key ":[ \t]*" chars "+")) { return "" }
+    s = line
+    sub("^[ \t]*" key ":[ \t]*", "", s)
+    match(s, "^" chars "+")
+    return substr(s, 1, RLENGTH)
+}
+{
+    if (!ended) {
+        if (!inblock && index($0, "/*---")) { inblock = 1 }
+        if (inblock) {
+            if (flags == "") { flags = bracket($0, "flags");    gsub(/[ \t]/, "", flags) }
+            if (feats == "") { feats = bracket($0, "features"); gsub(/,/, " ", feats) }
+            if (incs  == "") { incs  = bracket($0, "includes"); gsub(/,/, " ", incs) }
+            if (phase == "") { phase = word($0, "phase", "[a-z]") }
+            if (etype == "") { etype = word($0, "type", "[A-Za-z]") }
+            if (index($0, "---*/")) { inblock = 0; ended = 1 }
+        }
+    }
+    if (!dyn && $0 ~ /(^|[^A-Za-z0-9_])(eval|Function)[ \t]*\(/) { dyn = 1 }
+}
+END { print flags; print feats; print incs; print phase; print etype; print dyn + 0 }'
+
+# The source of each harness file a test includes, kept by name: a handful of
+# them are named by thousands of tests.
+declare -A INC_SRC
 
 # TARGET is the file the variant is written to: the .mjs one for a module.
 run_variant() {   # <body-with-harness> <negative-phase> <negative-type> <async>
@@ -245,12 +280,12 @@ run_one() {
         TMP="$d/.t262-tmp-$SHARD.js"
         TMPM="$d/.t262-tmp-$SHARD.mjs"
     fi
-    local fm; fm="$(frontmatter "$f")"
-
-    local flags feats incs
-    flags="$(printf '%s\n' "$fm" | sed -n 's/.*flags:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d ' ')"
-    feats="$(printf '%s\n' "$fm" | sed -n 's/.*features:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr ',' ' ')"
-    incs="$(printf '%s\n'  "$fm" | sed -n 's/.*includes:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr ',' ' ')"
+    local flags feats incs nphase ntype hasdyn
+    {   IFS= read -r flags; IFS= read -r feats; IFS= read -r incs
+        IFS= read -r nphase; IFS= read -r ntype; IFS= read -r hasdyn
+    } <<FM
+$(awk "$FM_AWK" "$f")
+FM
 
     # skip: modes we cannot drive
     case ",$flags," in
@@ -273,21 +308,20 @@ run_one() {
         done
     done
     # skip: dynamic code eval / Function() — out of scope, no feature tag
-    if grep -qE '\b(eval|Function)[[:space:]]*\(' "$f"; then skip=$((skip + 1)); return; fi
-
-    # negative expectation
-    local nphase ntype
-    nphase="$(printf '%s\n' "$fm" | sed -n 's/^[[:space:]]*phase:[[:space:]]*\([a-z]*\).*/\1/p' | head -1)"
-    ntype="$(printf '%s\n'  "$fm" | sed -n 's/^[[:space:]]*type:[[:space:]]*\([A-Za-z]*\).*/\1/p' | head -1)"
+    if [ "$hasdyn" = "1" ]; then skip=$((skip + 1)); return; fi
 
     # assemble includes
     local inc_src=""
     for inc in $incs; do
-        [ -f "$HBASE/$inc" ] && inc_src="$inc_src$(cat "$HBASE/$inc")"$'\n'
+        if [ -z "${INC_SRC[$inc]+set}" ]; then
+            INC_SRC[$inc]=""
+            [ -f "$HBASE/$inc" ] && INC_SRC[$inc]="$(<"$HBASE/$inc")"$'\n'
+        fi
+        inc_src="$inc_src${INC_SRC[$inc]}"
     done
     # doneprintHandle.js is implied by the flag, not listed in includes
     [ "$isasync" = "1" ] && inc_src="$inc_src$ASYNC_HARNESS"
-    local body; body="$(cat "$f")"
+    local body; body="$(<"$f")"
 
     # which strict variants to run
     local do_strict=1 do_sloppy=1 raw=0
@@ -370,7 +404,7 @@ if [ -n "$LIST" ]; then
         esac
     done < "$LIST" | sort > "$WORK/all.txt"
 else
-    find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp-*' | sort > "$WORK/all.txt"
+    find "$ROOT" -name '*.js' ! -name '*_FIXTURE.js' ! -name '.t262-tmp*' | sort > "$WORK/all.txt"
 fi
 total="$(wc -l < "$WORK/all.txt")"
 if [ "$total" -eq 0 ]; then
@@ -411,7 +445,7 @@ while [ "$i" -lt "$JOBS" ]; do
     i=$((i + 1))
 done
 cat "$WORK"/fails.* 2>/dev/null | sort > "$FAILS_OUT"
-find "$ROOT" -name '.t262-tmp-*' -delete 2>/dev/null
+find "$ROOT" -name '.t262-tmp*' -delete 2>/dev/null
 rm -rf "$WORK"
 
 ran=$((pass + failc))
