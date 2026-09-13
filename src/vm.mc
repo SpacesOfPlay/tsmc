@@ -2914,7 +2914,11 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
 // A primitive value is anything that is not an object-like reference.
 bool value_is_primitive(Value v) {
     if !value_is_cell(v) { return true; }
-    return value_is_string(v) || value_is_symbol(v) || value_is_bigint(v);
+    // one read of the kind rather than three predicates, each of which reads it
+    // again: this runs on both operands of every arithmetic and relational
+    // opcode that is not already two numbers
+    i32 k = value_as_cell(v).kind;
+    return k == GC_STRING || k == GC_SYMBOL || k == GC_BIGINT;
 }
 
 // ToPrimitive (ES 7.1.1): if the object has a Symbol.toPrimitive method,
