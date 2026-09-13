@@ -83,6 +83,12 @@ struct RegexProg {
     bool global;
     bool sticky;
     bool has_indices;        // d: a match result carries group indices
+    // The bytes a match may begin with, when the program's shape says so. A
+    // start position whose byte is not in here cannot match, and skipping it
+    // costs one bit test instead of entering the matcher -- which is what a
+    // scan over text spends most of its time not doing.
+    u64[4] first_bits;
+    bool first_known;
 }
 
 // --- parser ---------------------------------------------------------------
@@ -1362,6 +1368,104 @@ bool regex_flags_valid(str flags) {
     return true;
 }
 
+private void rx_first_add(RegexProg* prog, i32 b) {
+    if b < 0 || b > 255 { return; }
+    prog.first_bits[b >> 6] = prog.first_bits[b >> 6] | (cast(u64, 1) << cast(i32, b & 63));
+}
+
+private bool rx_first_has(RegexProg* prog, u8 b) {
+    return (prog.first_bits[b >> 6] & (cast(u64, 1) << cast(i32, b & 63))) != 0;
+}
+
+// Any byte a non-ASCII code point can start with, lead or continuation: the
+// filter works on bytes and does not try to be exact above ASCII.
+private void rx_first_add_high(RegexProg* prog) {
+    for i32 b = 128; b < 256; b++ { rx_first_add(prog, b); }
+}
+
+private void rx_first_class(RegexProg* prog, i32 cls) {
+    i32 off = *(prog.class_off + cls);
+    i32 n = *(prog.class_len + cls);
+    if *(prog.class_neg + cls) {
+        // a negated class matches every code point its ranges leave out, which
+        // includes everything above ASCII
+        for i32 b = 0; b < 128; b++ {
+            bool hit = false;
+            for i32 i = 0; i < n; i++ {
+                RxRange r = *(prog.class_ranges + off + i);
+                if b >= r.lo && b <= r.hi { hit = true; }
+            }
+            if !hit { rx_first_add(prog, b); }
+        }
+        rx_first_add_high(prog);
+        return;
+    }
+    for i32 i = 0; i < n; i++ {
+        RxRange r = *(prog.class_ranges + off + i);
+        if r.hi >= 128 { rx_first_add_high(prog); }
+        i32 lo = r.lo < 0 ? 0 : r.lo;
+        i32 hi = r.hi > 127 ? 127 : r.hi;
+        for i32 b = lo; b <= hi; b++ { rx_first_add(prog, b); }
+    }
+}
+
+// Follows the program from `pc`, adding what a match may begin with. False for
+// a shape this does not model -- an anchor, an assertion, a backreference, `.`,
+// lookaround -- and then there is no filter at all, which is what the matcher
+// did before this existed.
+private bool rx_first_walk(RegexProg* prog, i32 pc, i32 depth) {
+    if depth > 8 { return false; }
+    i32 guard = 0;
+    while guard < 64 {
+        guard++;
+        if pc < 0 || pc >= prog.code_len { return false; }
+        RxInst* ins = prog.code + pc;
+        if ins.op == I_SAVE {
+            pc++;
+            continue;
+        }
+        if ins.op == I_JMP {
+            pc = ins.x;
+            continue;
+        }
+        if ins.op == I_CHAR {
+            rx_first_add(prog, ins.x);
+            return true;
+        }
+        if ins.op == I_CLASS {
+            rx_first_class(prog, ins.cls);
+            return true;
+        }
+        if ins.op == I_SPLIT {
+            // both arms, since either may be what matches -- and a quantifier
+            // that can match nothing puts its continuation in the second
+            if !rx_first_walk(prog, ins.x, depth + 1) { return false; }
+            return rx_first_walk(prog, ins.y, depth + 1);
+        }
+        return false;
+    }
+    return false;
+}
+
+private void rx_compute_first(RegexProg* prog) {
+    for i32 i = 0; i < 4; i++ { prog.first_bits[i] = 0; }
+    prog.first_known = false;
+    // a sticky pattern is only ever tried at one position, so there is nothing
+    // to skip and the filter must not move the cursor
+    if prog.sticky { return; }
+    if !rx_first_walk(prog, 0, 0) { return; }
+    if prog.ignore_case {
+        // the matcher folds ASCII case, so both cases of a letter may begin it
+        for i32 b = 'a'; b <= 'z'; b++ {
+            if rx_first_has(prog, cast(u8, b)) { rx_first_add(prog, b - 32); }
+        }
+        for i32 b = 'A'; b <= 'Z'; b++ {
+            if rx_first_has(prog, cast(u8, b)) { rx_first_add(prog, b + 32); }
+        }
+    }
+    prog.first_known = true;
+}
+
 RegexProg* regex_compile(str pattern, str flags) {
     RxParser p;
     p.src = pattern;
@@ -1494,6 +1598,7 @@ RegexProg* regex_compile(str pattern, str flags) {
         if f == 'd' { prog.has_indices = true; }
         if f == 'u' || f == 'v' { prog.unicode = true; }
     }
+    rx_compute_first(prog);
     return prog;
 }
 
@@ -1756,6 +1861,14 @@ bool regex_exec(RegexProg* prog, str subject, i32 start, i32* caps) {
     i32 last = subject.len;
     i32 i = base_i;
     while i <= last {
+        // skip what cannot begin a match; a position with no byte left is
+        // still tried, since a match may be empty
+        if prog.first_known {
+            while i < last && !rx_first_has(prog, *(subject.data + i)) {
+                if prog.unicode { i += utf8_seq_len(*(subject.data + i)); }
+                else { i++; }
+            }
+        }
         for i32 j = 0; j < ncap; j++ { *(caps + j) = -1; }
         cx.steps = 0;
         i32 r = m(&cx, 0, i);
