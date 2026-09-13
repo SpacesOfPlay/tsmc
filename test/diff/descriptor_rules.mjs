@@ -98,4 +98,12 @@ T('function-length-descriptor', () => { function f(a, b) {} return D(f, 'length'
 T('proto-method-descriptor', () => { class C { m() {} } return D(C.prototype, 'm'); });
 T('class-field-descriptor', () => { class C { x = 1; } return D(new C(), 'x'); });
 
+// --- a define replaces the whole descriptor ---
+T('literal-data-over-getter', () => D({ get a() { return 1; }, a: 2 }, 'a'));
+T('literal-data-over-getter-value', () => ({ get a() { return 1; }, a: 2 }).a);
+T('literal-getter-over-data', () => { const d = Object.getOwnPropertyDescriptor({ a: 2, get a() { return 1; } }, 'a'); return [typeof d.get, d.value, d.enumerable]; });
+T('define-over-readonly-configurable', () => { const o = {}; Object.defineProperty(o, 'x', { value: 1, configurable: true }); return D({ ...o, x: 2 }, 'x'); });
+T('static-field-over-fn-name', () => { class C { static name = 'x'; } return [C.name, D(C, 'name')]; });
+T('class-field-over-getter', () => { class C { get a() { return 1; } } class E extends C { a = 2; } return [new E().a, D(new E(), 'a')]; });
+
 console.log(rows.join('\n'));

@@ -2263,9 +2263,12 @@ private void def_prop_atom(VM* vm, Value objv, u32 a, Value v) {
             vm_throw_error(vm, ERR_TYPE, "cannot define property, object is not extensible");
             return;
         }
-        js_set_prop(o, a, v);
+        // a define, not an assignment: the attributes are replaced too, so a
+        // key that held an accessor or a read-only property becomes an ordinary
+        // writable one.
+        props_set_desc(&o.props, a, v, PROP_DEFAULT);
     } else if value_props(objv) != null {
-        props_set(value_props(objv), a, v);
+        props_set_desc(value_props(objv), a, v, PROP_DEFAULT);
     }
 }
 
