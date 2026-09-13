@@ -6840,11 +6840,41 @@ private i32 index_iter_len(VM* vm, Value src, bool* ok) {
     return 0;
 }
 
-// IterFastFn: one step of an iterator whose `next` is still the native that
-// make_index_iterator installed. Anything else -- a generator, a Map or Set
-// iterator, a user object, or one of these whose `next` has been replaced --
-// answers 0 and takes the ordinary protocol. `entries` builds a pair per step,
-// so it is left to that path too.
+// One step of a Map or Set iterator, in the state make_map_iterator left it.
+// `entries` still builds the pair it yields, but no result object around it.
+private i32 map_iter_step(VM* vm, JsNative* nx, Value* val, bool* done) {
+    JsMap* mp = value_as_map(nx.env0);
+    i32 i = value_as_int(nx.env1);
+    while i < mp.len && !*(mp.live + i) { i++; }
+    if i >= mp.len {
+        nx.env1 = value_int(i);
+        *val = value_undefined();
+        *done = true;
+        return 1;
+    }
+    Value key = *(mp.keys + i);
+    Value v = mp.is_set ? key : *(mp.vals + i);
+    nx.env1 = value_int(i + 1);
+    *done = false;
+    i32 kind = value_as_int(nx.env2);
+    if kind == 0 { *val = key; return 1; }
+    if kind == 1 { *val = v; return 1; }
+    JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&pair.head));
+    js_array_reserve(pair, 2);
+    js_array_set(pair, 0, key);
+    js_array_set(pair, 1, v);
+    vm_pop(vm);
+    *val = value_cell(&pair.head);
+    return 1;
+}
+
+// IterFastFn: one step of an iterator whose `next` is still the native the
+// built-ins installed, without the {value, done} object the protocol would
+// otherwise make for each element. Anything else -- a generator, a user object,
+// or one of these whose `next` has been replaced -- answers 0 and takes the
+// ordinary protocol. An index iterator's `entries` builds a pair per step, so
+// that kind is left to that path too.
 i32 arr_iter_fast_step(void* vmp, Value iter, Value* val, bool* done) {
     VM* vm = as_vm(vmp);
     if !value_is_object(iter) { return 0; }
@@ -6853,6 +6883,7 @@ i32 arr_iter_fast_step(void* vmp, Value iter, Value* val, bool* done) {
     Value* nv = props_get(&it.props, vm.atom_next);
     if nv == null || !value_is_native(*nv) { return 0; }
     JsNative* nx = value_as_native(*nv);
+    if nx.fun == &nat_map_iter_next { return map_iter_step(vm, nx, val, done); }
     if nx.fun != &nat_arr_iter_next { return 0; }
     i32 kind = value_is_int(nx.env2) ? value_as_int(nx.env2) : 0;
     if kind == 2 { return 0; }
