@@ -1813,6 +1813,7 @@ private Value nat_arr_slice(void* vmp, Value callee, Value thisv, Value* args, i
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&r.head));
+    js_array_reserve(r, end > start ? end - start : 0);
     i32 n = 0;
     for i32 i = start; i < end; i++ {
         js_array_set(r, n, js_array_raw(a, i));   // preserve holes
@@ -1871,6 +1872,12 @@ private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, 
     JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&r.head));
+    i32 total = a.elen;
+    for i32 s = 0; s < argc; s++ {
+        Value av = *(args + s);
+        total = total + (value_is_array(av) ? value_as_object(av).elen : 1);
+    }
+    js_array_reserve(r, total);
     i32 n = 0;
     for i32 i = 0; i < a.elen; i++ {
         js_array_set(r, n, js_array_raw(a, i));   // preserve holes
@@ -2073,6 +2080,13 @@ private Value arr_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) 
     if mode == IT_MAP || mode == IT_FILTER {
         out = js_new_array(&vm.heap, vm.array_proto);
         gc_root(&vm.heap, value_cell(&out.head));
+        // map's result is as long as the source. A filter's is at most that,
+        // and the guess stops at 1024 so one that keeps a handful out of very
+        // many does not hold a slot per element it dropped -- past that, the
+        // doubling it falls back to costs little against the work already done.
+        i32 want = a.elen;
+        if mode == IT_FILTER && want > 1024 { want = 1024; }
+        js_array_reserve(out, want);
     }
     // find/findIndex visit holes as undefined; the rest skip them
     bool skip_holes = mode != IT_FIND && mode != IT_FINDINDEX;

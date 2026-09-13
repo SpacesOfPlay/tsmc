@@ -5058,6 +5058,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 n = rd_u16(code, ip);
                 ip += 2;
                 JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
+                js_array_reserve(arr, n);
                 for i32 i = 0; i < n; i++ {
                     js_array_set(arr, i, *(vm.stack + vm.sp - n + i));
                 }
@@ -5322,6 +5323,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     JsObject* d = value_as_object(arrv);
                     if value_is_array(src) {
                         JsObject* s = value_as_object(src);
+                        js_array_reserve(d, d.elen + s.elen);
                         for i32 i = 0; i < s.elen; i++ {
                             js_array_set(d, d.elen, js_array_get(s, i));
                         }
@@ -5805,6 +5807,12 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     }
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&arr.head));
+    // at most one key per element slot and own property, which the object is
+    // already holding room for
+    if value_is_object(objv) {
+        JsObject* ko = value_as_object(objv);
+        js_array_reserve(arr, ko.elen + ko.props.len);
+    }
     i32 n = 0;
     if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
         JsObject* o = value_as_object(objv);

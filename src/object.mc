@@ -816,6 +816,20 @@ void js_array_set(JsObject* o, i32 idx, Value v) {
     if idx >= o.elen { o.elen = idx + 1; }
 }
 
+// Makes room for n elements in one go, for a caller that knows how many are
+// coming. Never shrinks, and does not change the length -- the elements are
+// still written one at a time, only without growing the storage as they go.
+void js_array_reserve(JsObject* o, i32 n) {
+    if n <= o.ecap { return; }
+    Value* ne = alloc<Value>(n);
+    for i32 i = 0; i < o.elen; i++ {
+        *(ne + i) = *(o.elems + i);
+    }
+    if o.elems != null { free(o.elems); }
+    o.elems = ne;
+    o.ecap = n;
+}
+
 // Truncates or hole-extends the dense part.
 void js_array_set_length(JsObject* o, i32 n) {
     if n < 0 { return; }
