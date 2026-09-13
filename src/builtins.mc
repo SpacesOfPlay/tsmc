@@ -6810,6 +6810,79 @@ private Value nat_arr_symiter(void* vmp, Value callee, Value thisv, Value* args,
     return make_index_iterator(as_vm(vmp), thisv, 0);
 }
 
+// The length an index iterator walks to, read the way its `next` reads it.
+private i32 index_iter_len(VM* vm, Value src, bool* ok) {
+    *ok = true;
+    if value_is_array(src) { return value_as_object(src).elen; }
+    if value_is_string(src) { return value_as_string(src).len; }
+    if value_is_object(src) {
+        Value lv;
+        if !vm_get_prop_value(vm, src, vm.atom_length, &lv) {
+            *ok = false;
+            return 0;
+        }
+        return cast(i32, js_to_number(lv));
+    }
+    return 0;
+}
+
+// IterFastFn: one step of an iterator whose `next` is still the native that
+// make_index_iterator installed. Anything else -- a generator, a Map or Set
+// iterator, a user object, or one of these whose `next` has been replaced --
+// answers 0 and takes the ordinary protocol. `entries` builds a pair per step,
+// so it is left to that path too.
+i32 arr_iter_fast_step(void* vmp, Value iter, Value* val, bool* done) {
+    VM* vm = as_vm(vmp);
+    if !value_is_object(iter) { return 0; }
+    JsObject* it = value_as_object(iter);
+    if (it.obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 { return 0; }
+    Value* nv = props_get(&it.props, vm.atom_next);
+    if nv == null || !value_is_native(*nv) { return 0; }
+    JsNative* nx = value_as_native(*nv);
+    if nx.fun != &nat_arr_iter_next { return 0; }
+    i32 kind = value_is_int(nx.env2) ? value_as_int(nx.env2) : 0;
+    if kind == 2 { return 0; }
+    Value src = nx.env0;
+    i32 i = value_as_int(nx.env1);
+    bool ok = true;
+    i32 len = index_iter_len(vm, src, &ok);
+    if !ok { return 0 - 1; }
+    if i >= len {
+        *val = value_undefined();
+        *done = true;
+        return 1;
+    }
+    *done = false;
+    if kind == 1 {
+        nx.env1 = value_int(i + 1);
+        *val = value_int(i);
+        return 1;
+    }
+    if value_is_array(src) {
+        nx.env1 = value_int(i + 1);
+        *val = js_array_get(value_as_object(src), i);
+        return 1;
+    }
+    if value_is_string(src) {
+        // a string iterates by code point, and `i` is a byte offset
+        str view = gc_string_view(value_as_string(src));
+        i32 n;
+        ignore utf8_decode(view, i, &n);
+        nx.env1 = value_int(i + n);
+        str one;
+        one.data = view.data + i;
+        one.len = n;
+        *val = new_str(vm, one);
+        return 1;
+    }
+    // an array-like: the element is a property read, which may run user code
+    Value elem;
+    if !vm_get_prop_value(vm, src, index_atom(vm, i), &elem) { return 0 - 1; }
+    nx.env1 = value_int(i + 1);
+    *val = elem;
+    return 1;
+}
+
 private Value nat_arr_values(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return make_index_iterator(as_vm(vmp), thisv, 0);
 }
@@ -19385,6 +19458,7 @@ void builtins_install(VM* vm) {
     // for the indirection -- reading a bare name still goes straight to the
     // table. Module-local top-level declarations are unaffected, since they
     // are lexical bindings and never enter the table at all.
+    vm.iter_fast = &arr_iter_fast_step;
     JsObject* gt = js_new_object(&vm.heap, vm.object_proto);
     gt.obj_flags = gt.obj_flags | OBJF_GLOBAL;
     vm.global_obj = gt;

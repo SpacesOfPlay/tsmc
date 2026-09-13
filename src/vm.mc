@@ -132,6 +132,9 @@ struct VM {
     // globalThis. A name it holds a property for is a global binding, so the
     // free-identifier paths consult it when the bindings table has no entry.
     JsObject* global_obj;
+    // Steps an index iterator directly (see IterFastFn), or null before the
+    // built-ins are installed.
+    IterFastFn iter_fast;
     // Whether a WeakMap or WeakSet has ever been made. The ephemeron pass and
     // the pass that drops dead keys both walk every cell in the heap looking
     // for one, and the marking pass is looped until it marks nothing new, so a
@@ -3932,6 +3935,7 @@ void vm_init(VM* vm) {
     vm.main_module = null;
     vm.global_obj = null;
     vm.any_weak = false;
+    vm.iter_fast = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
     vm.has_pending = false;
@@ -6393,6 +6397,15 @@ bool vm_iter_send(VM* vm, Value iter, Value sent, Value* val, bool* done) {
 }
 
 private bool iter_next_impl(VM* vm, Value iter, Value* nargs, i32 nargc, Value* val, bool* done) {
+    // an iterator over an array, a string or an array-like, stepped without
+    // making a result object for the element -- which is what for-of, spread
+    // and array destructuring otherwise spend their time on. `yield*` sends a
+    // value into next() and cannot take this path.
+    if nargc == 0 && vm.iter_fast != null {
+        i32 fr = vm.iter_fast(cast(void*, vm), iter, val, done);
+        if fr > 0 { return true; }
+        if fr < 0 { return false; }
+    }
     Value m;
     if !vm_get_prop_value(vm, iter, vm.atom_next, &m) { return false; }
     if !value_is_callable(m) {

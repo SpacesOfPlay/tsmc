@@ -289,6 +289,12 @@ const u8 SYNTH_LENGTH = 2;
 // ctx is the owning VM; typed as void* to keep layering one-way.
 type NativeFn = fn(void*, Value, Value, Value*, i32): Value;
 
+// Steps an iterator the built-ins recognise, without the call and the
+// {value, done} object the protocol would otherwise make for each element.
+// 1: stepped, 0: not one of those iterators, -1: threw. The built-ins install
+// it on the VM, since the interpreter is built without them.
+type IterFastFn = fn(void*, Value, Value*, bool*): i32;
+
 struct JsNative {
     GcCell head;
     NativeFn fun;
