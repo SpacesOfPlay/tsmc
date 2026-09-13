@@ -123,6 +123,7 @@ void gc_init(GcHeap* h) {
 }
 
 void gc_destroy(GcHeap* h) {
+    gc_report_poison();
     GcCell* c = h.all;
     while c != null {
         GcCell* n = c.next;
@@ -244,11 +245,27 @@ void gc_collect(GcHeap* h) {
             }
         }
     }
+    gc_report_poison();
     h.bytes_live = live_bytes;
     h.n_cells = live_cells;
     h.next_gc = live_bytes * 2;
     if h.next_gc < GC_MIN_THRESHOLD { h.next_gc = GC_MIN_THRESHOLD; }
     h.n_collections++;
+}
+
+// A cell swept in stress mode keeps its memory and reads as kind -1, which
+// `value_is_kind` notices. That predicate is called several times per bytecode
+// and has to stay a leaf to be inlined, so it records the hit here and the
+// collector reports it -- which in stress mode is the next allocation.
+i32 gc_poison_hits = 0;
+i32 gc_poison_last_kind = 0;
+
+void gc_report_poison() {
+    if gc_poison_hits == 0 { return; }
+    eprint("gc: {} reference(s) to a freed cell were reached, last asked for kind {}
+",
+        gc_poison_hits, gc_poison_last_kind);
+    gc_poison_hits = 0;
 }
 
 GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
