@@ -72,6 +72,10 @@ struct RegexProg {
     i32* class_off;          // per-class start offset into class_ranges
     i32* class_len;
     bool* class_neg;
+    // Membership for code points below 128, two words per class, which is what
+    // almost every character tested against a class is. Above that the ranges
+    // are walked; this only answers the common half.
+    u64* class_ascii;
     i32 n_classes;
     i32 n_groups;            // capturing groups (excludes whole match)
     str* group_names;        // index 1..n_groups -> name (empty if unnamed)
@@ -1567,6 +1571,10 @@ RegexProg* regex_compile(str pattern, str flags) {
     prog.class_off = alloc<i32>(p.classes.len > 0 ? p.classes.len : 1);
     prog.class_len = alloc<i32>(p.classes.len > 0 ? p.classes.len : 1);
     prog.class_neg = alloc<bool>(p.classes.len > 0 ? p.classes.len : 1);
+    prog.class_ascii = alloc<u64>(p.classes.len > 0 ? p.classes.len * 2 : 2);
+    for i32 i = 0; i < (p.classes.len > 0 ? p.classes.len * 2 : 2); i++ {
+        *(prog.class_ascii + i) = 0;
+    }
     i32 off = 0;
     for i32 i = 0; i < p.classes.len; i++ {
         RxClass c = vec_get(&p.classes, i);
@@ -1574,8 +1582,17 @@ RegexProg* regex_compile(str pattern, str flags) {
         *(prog.class_len + i) = c.n;
         *(prog.class_neg + i) = c.negate;
         for i32 j = 0; j < c.n; j++ {
-            *(prog.class_ranges + off) = *(c.ranges + j);
+            RxRange r = *(c.ranges + j);
+            *(prog.class_ranges + off) = r;
             off++;
+            // the ASCII half of the range, as bits. Negation is applied by
+            // class_match, so these words describe the ranges as written.
+            i32 lo = r.lo < 0 ? 0 : r.lo;
+            i32 hi = r.hi > 127 ? 127 : r.hi;
+            for i32 b = lo; b <= hi; b++ {
+                *(prog.class_ascii + i * 2 + (b >> 6)) =
+                    *(prog.class_ascii + i * 2 + (b >> 6)) | (cast(u64, 1) << cast(i32, b & 63));
+            }
         }
         free(c.ranges);
     }
@@ -1605,6 +1622,7 @@ RegexProg* regex_compile(str pattern, str flags) {
 void regex_free(RegexProg* prog) {
     if prog == null { return; }
     free(prog.code);
+    free(prog.class_ascii);
     free(prog.class_ranges);
     free(prog.class_off);
     free(prog.class_len);
@@ -1663,6 +1681,10 @@ private bool byte_eq(RxCtx* cx, u8 a, u8 b) {
 }
 
 private bool in_class_raw(RxCtx* cx, i32 cls, i32 cp) {
+    if cp >= 0 && cp < 128 {
+        u64 w = *(cx.prog.class_ascii + cls * 2 + (cp >> 6));
+        return (w & (cast(u64, 1) << cast(i32, cp & 63))) != 0;
+    }
     i32 off = *(cx.prog.class_off + cls);
     i32 n = *(cx.prog.class_len + cls);
     for i32 i = 0; i < n; i++ {
