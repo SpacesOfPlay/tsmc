@@ -84,6 +84,8 @@ enum Op {
     OP_NEW,          // u16 argc; stack: ctor args...
     OP_RETURN,
 
+    // u16 own-property count, or 0 when it is not known: the table is sized
+    // once instead of growing as the properties are defined.
     OP_NEWOBJ,
     OP_NEWARR,       // u16 element count popped
     OP_GETPROP,      // u16 const idx (name)
@@ -110,6 +112,11 @@ enum Op {
     // Object literals define their own properties rather than assigning them,
     // so an inherited setter (notably __proto__) is not invoked.
     OP_DEFPROP,      // u16 name; [obj, val] pops val, keeps obj
+    // u16 name; as DEFPROP, for a key the compiler knows the object has not
+    // got: a plain key of an object literal, with no spread or computed key
+    // before it and no earlier key of the same name. Such an object is not
+    // reachable from user code yet, so it is still extensible and unsealed.
+    OP_DEFPROP_NEW,
     OP_DEFPROP_DYN,  // u16 name-it; [obj, key, val] pops key+val, keeps obj
     // Accessor definition. The trailing u16 is 1 when the property is
     // enumerable (object literals) and 0 when it is not (class bodies).

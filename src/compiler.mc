@@ -583,6 +583,24 @@ private i32 key_value_const(Compiler* co, Node* key) {
     return str_const(co, key.name);
 }
 
+// How many own properties an object literal defines, so its table is sized
+// once. A spread brings an unknown number, so it is not counted; a `__proto__:`
+// key and a repeated one each leave a slot unused, which costs nothing.
+private i32 own_prop_estimate(Node* n) {
+    i32 c = 0;
+    for i32 i = 0; i < n.kids.len; i++ {
+        if (*(n.kids.items + i)).kind != N_SPREAD { c++; }
+    }
+    return c > 65535 ? 65535 : c;
+}
+
+// The atom a non-computed key interns to, for telling whether a literal has
+// already defined it.
+private u32 prop_key_atom(Compiler* co, Node* key) {
+    if key.kind == N_NUMBER { return atom_intern(co.atoms, num_key_text(co, key.num)); }
+    return atom_intern(co.atoms, key.name);
+}
+
 private i32 prop_key_const(Compiler* co, Node* key) {
     if key.kind == N_NUMBER { return num_key_const(co, key.num); }
     if key.kind == N_PRIVATE_IDENT { return private_key_const(co, key, key.name); }
@@ -2098,7 +2116,7 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_IMPORT_META {
         // import.meta: `url` as a file:// URL, plus the filename and dirname
         // node exposes, which is what an ESM file uses to reach a sibling.
-        ch_op(ch, OP_NEWOBJ);
+        ch_op_u16(ch, OP_NEWOBJ, 3);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_url_const(co));
         ch_op_u16(ch, OP_SETPROP, name_const(co, "url"));
@@ -2174,13 +2192,20 @@ private void compile_expr(Compiler* co, Node* n) {
         return;
     }
     if k == N_OBJECT {
-        ch_op(ch, OP_NEWOBJ);
+        ch_op_u16(ch, OP_NEWOBJ, own_prop_estimate(n));
         bool proto_seen = false;
+        // The keys defined so far, and whether a spread or a computed key may
+        // have brought in one that is not among them. A plain key that is
+        // neither is known to be new, and is defined without a lookup.
+        Vec<u32> seen = vec_new<u32>(8);
+        defer vec_free(&seen);
+        bool any_unknown = false;
         for i32 i = 0; i < n.kids.len; i++ {
             Node* p = *(n.kids.items + i);
             if p.kind == N_SPREAD {
                 compile_expr(co, p.a);
                 ch_op(ch, OP_OBJ_SPREAD);
+                any_unknown = true;
                 continue;
             }
             if (p.flags & (NF_GETTER | NF_SETTER)) != 0 {
@@ -2190,7 +2215,9 @@ private void compile_expr(Compiler* co, Node* n) {
                     compile_expr(co, p.b);
                     i32 aop = (p.flags & NF_GETTER) != 0 ? OP_DEFGETTER_DYN : OP_DEFSETTER_DYN;
                     ch_op_u16(ch, aop, 1);   // object-literal accessors are enumerable
+                    any_unknown = true;
                 } else {
+                    vec_push(&seen, prop_key_atom(co, p.a));
                     str an = accessor_name(co, (p.flags & NF_GETTER) != 0 ? "get" : "set", p.a);
                     if an.len > 0 { infer_name(p.b, an); }
                     compile_expr(co, p.b);
@@ -2202,6 +2229,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 continue;
             }
             if (p.flags & NF_COMPUTED) != 0 {
+                any_unknown = true;
                 ch_op(ch, OP_DUP);
                 compile_expr(co, p.a);
                 if p.b != null { compile_expr(co, p.b); } else { ch_op(ch, OP_UNDEF); }
@@ -2231,7 +2259,8 @@ private void compile_expr(Compiler* co, Node* n) {
                 ch_op(ch, OP_POP);
                 continue;
             }
-            ch_op(ch, OP_DUP);
+            // DEFPROP leaves the object in place, so the value goes straight
+            // on top of it -- no copy of the object per property.
             if p.b != null {
                 // named evaluation: `{ fn: function(){} }` names the function
                 // `fn`. A computed key is only known at run time, so those
@@ -2245,8 +2274,13 @@ private void compile_expr(Compiler* co, Node* n) {
             } else {
                 emit_load_name(co, p.a.name, p);
             }
-            ch_op_u16(ch, OP_DEFPROP, prop_key_const(co, p.a));
-            ch_op(ch, OP_POP);
+            u32 ka = prop_key_atom(co, p.a);
+            bool is_new = !any_unknown;
+            for i32 j = 0; j < seen.len; j++ {
+                if vec_get(&seen, j) == ka { is_new = false; }
+            }
+            vec_push(&seen, ka);
+            ch_op_u16(ch, is_new ? OP_DEFPROP_NEW : OP_DEFPROP, prop_key_const(co, p.a));
         }
         return;
     }
@@ -3324,7 +3358,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     }
 
     // C.prototype: fresh object chained to the parent's prototype
-    ch_op(ch, OP_NEWOBJ);
+    ch_op_u16(ch, OP_NEWOBJ, 0);
     if derived {
         emit_load_name(co, "%super", c);
         ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));

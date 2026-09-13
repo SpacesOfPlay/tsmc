@@ -83,6 +83,15 @@ void props_init(PropList* p) {
     p.idx = null;
 }
 
+// Makes room for n entries in one go, for a caller that knows how many are
+// coming -- an object literal. Only on an untouched table, so it never shrinks
+// one and never moves entries.
+void props_reserve(PropList* p, i32 n) {
+    if p.cap > 0 || n <= 0 { return; }
+    p.items = alloc<Prop>(n);
+    p.cap = n;
+}
+
 void props_free(PropList* p) {
     if p.items != null { free(p.items); }
     if p.idx != null {
@@ -153,6 +162,13 @@ private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
         props_build_index(p);
     }
     return p.items + pos;
+}
+
+// Appends a property the caller knows is absent, with the ordinary attributes.
+// What an object literal does, where the general define asks three times over
+// whether the key is there.
+void props_add_new(PropList* p, u32 key, Value v) {
+    ignore props_append(p, key, v, PROP_DEFAULT);
 }
 
 void props_set(PropList* p, u32 key, Value v) {

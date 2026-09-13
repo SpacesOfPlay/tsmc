@@ -2278,6 +2278,16 @@ private void def_prop(VM* vm, u32 a) {
     def_prop_atom(vm, vpeek(vm, 0), a, v);
 }
 
+// [obj, val] -> [obj]: a key of an object literal that is not there yet, so
+// straight onto the table (see OP_DEFPROP_NEW).
+private void def_prop_new(VM* vm, u32 a) {
+    Value v = vpop(vm);
+    Value objv = vpeek(vm, 0);
+    if value_is_object(objv) {
+        props_add_new(&value_as_object(objv).props, a, v);
+    }
+}
+
 // [obj, key, val] -> [obj]: a computed-key property of an object literal.
 // With name_it, an anonymous function or class value takes the key as its
 // name.
@@ -5038,7 +5048,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_NEWOBJ: {
+                i32 nprops = rd_u16(code, ip);
+                ip += 2;
                 JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+                props_reserve(&o.props, nprops);
                 vpush(vm, value_cell(&o.head));
             }
             case OP_NEWARR: {
@@ -5262,6 +5275,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
                 def_prop(vm, a);
+            }
+            case OP_DEFPROP_NEW: {
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
+                ip += 2;
+                def_prop_new(vm, a);
             }
             case OP_REQUIRE_OBJ: {
                 require_object(vm);
