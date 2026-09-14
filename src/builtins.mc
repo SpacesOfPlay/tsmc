@@ -4136,41 +4136,61 @@ private Value nat_parsefloat(void* vmp, Value callee, Value thisv, Value* args, 
 // digits, so the rounding follows the double's real value. Beyond the 17
 // digits a double carries the tail is zeros, where a bignum expansion would
 // keep going. Caller frees.
+// The digits of round(av * 10^d), exactly, for a finite av below 1e21 and a d
+// between 0 and 100. A double is m * 2^e with m an integer below 2^53, so
+// av * 10^d is (m * 5^d) * 2^(e+d): an exact integer when e+d is not negative,
+// and otherwise that integer shifted down, where adding half a unit first is the
+// round-half-up the spec asks for (a tie takes the larger n). Done in doubles
+// this is only right while the product stays inside 53 bits; done in integers it
+// is right for every d, which is what the fraction digits past the seventeenth
+// need.
 private string tofixed_digits(f64 av, i32 d) {
     if av == 0.0 { return format("{}", 0); }
-    u8[24] sd;
-    i32 e = decimal_sig(av, 17, &sd[0]);   // digit i has place value 10^(e-i)
-    i32 keep = e + d + 1;                  // digits down to 10^-d
-    if keep <= 0 {
-        // below half of the last kept place, unless it rounds up into it
-        if keep == 0 && sd[0] >= cast(u8, '5') { return format("{}", 1); }
-        return format("{}", 0);
+    // av as m * 2^e: double until nothing is left after the point, then halve
+    // while m is above 2^53, where a double is always even.
+    f64 m = av;
+    i64 e = 0;
+    while m != floor(m) {
+        m = m * 2.0;
+        e = e - 1;
     }
-    u8[40] out;
-    i32 n = 0;
-    while n < keep && n < 40 {
-        out[n] = n < 17 ? sd[n] : cast(u8, '0');
-        n++;
+    while m >= 9007199254740992.0 {
+        m = m / 2.0;
+        e = e + 1;
     }
-    bool round_up = keep < 17 && sd[keep] >= cast(u8, '5');
-    if round_up {
-        i32 i = n - 1;
-        while i >= 0 {
-            if out[i] < cast(u8, '9') { out[i] = cast(u8, out[i] + 1); break; }
-            out[i] = '0';
-            i--;
-        }
-        if i < 0 && n < 39 {
-            // carried past the leading digit: "999" -> "1000"
-            for i32 k = n; k > 0; k-- { out[k] = out[k - 1]; }
-            out[0] = '1';
-            n++;
-        }
+    BigNum n = bn_from_i64(cast(i64, m));
+    if d > 0 {
+        bool ok = true;
+        BigNum five = bn_from_i64(5);
+        BigNum dexp = bn_from_i64(cast(i64, d));
+        BigNum p5 = bn_pow(five, dexp, &ok);
+        BigNum scaled = bn_mul(n, p5);
+        bn_free(&five);
+        bn_free(&dexp);
+        bn_free(&p5);
+        bn_free(&n);
+        n = scaled;
     }
-    str s;
-    s.data = &out[0];
-    s.len = n;
-    return format("{}", s);
+    i64 sh = e + cast(i64, d);
+    if sh >= 0 {
+        BigNum up = bn_shl(n, sh);
+        bn_free(&n);
+        n = up;
+    } else {
+        i64 k = 0 - sh;
+        BigNum one = bn_from_i64(1);
+        BigNum half = bn_shl(one, k - 1);
+        BigNum rounded = bn_add(n, half);
+        BigNum down = bn_shr(rounded, k);
+        bn_free(&one);
+        bn_free(&half);
+        bn_free(&rounded);
+        bn_free(&n);
+        n = down;
+    }
+    string out = bn_to_str(n);
+    bn_free(&n);
+    return out;
 }
 
 // 10^e for the small non-negative e a fixed-point format asks for. Exact up to
@@ -4185,6 +4205,45 @@ private f64 pow10(i32 e) {
     return pow(10.0, cast(f64, e));
 }
 
+// a * b - p, where p is the rounded product: the part the multiply dropped. A
+// double always holds it exactly, and Dekker's split computes it without a fused
+// multiply-add. Both halves of each operand are exact, so nothing here rounds
+// except the products that are then subtracted back out.
+private f64 mul_err(f64 a, f64 b, f64 p) {
+    f64 c = 134217729.0;   // 2^27 + 1
+    f64 a1 = c * a;
+    f64 ah = a1 - (a1 - a);
+    f64 al = a - ah;
+    f64 b1 = c * b;
+    f64 bh = b1 - (b1 - b);
+    f64 bl = b - bh;
+    return al * bl - (((p - ah * bh) - al * bh) - ah * bl);
+}
+
+// round(av * 10^d) when a double can carry it: 10^d is exact up to 22, the
+// product's dropped part says which side of a halfway case the true value is on,
+// and the product has to stay below 2^52. Past that a double's steps are a whole
+// unit, so a product that is really halfway cannot be told from one that is not
+// -- 631345510776.78125 times 10^4 is exactly ...812.5 and lands on ...812, which
+// reads as nothing to round. Answers false for all of that, and the exact route
+// runs instead.
+private bool tofixed_small(f64 av, i32 d, i64* out) {
+    if d > 22 { return false; }
+    f64 scale = g_tofixed_pow10[d];
+    f64 p = av * scale;
+    if p >= 4503599627370496.0 { return false; }   // 2^52
+    f64 fl = floor(p);
+    f64 frac = p - fl;
+    bool up = frac > 0.5;
+    if frac == 0.5 {
+        // exactly halfway as computed: the dropped part decides, and a true tie
+        // takes the larger n
+        up = mul_err(av, scale, p) >= 0.0;
+    }
+    *out = cast(i64, fl) + (up ? 1 : 0);
+    return true;
+}
+
 private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     f64 v = num_this(vm, thisv);
@@ -4193,20 +4252,15 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
         vm_throw_error(vm, ERR_RANGE, "toFixed() digits argument must be between 0 and 100");
         return value_undefined();
     }
-    if d > 20 { d = 20; }
     f64 inf = 1.0e308 * 10.0;
     f64 av = fabs(v);
     if v != v || v == inf || v == -inf || av >= 1.0e21 {
         return js_to_string_value(vm, js_number_value(v));
     }
-    // Scaling into an i64 keeps the most precision, but only while the product
-    // stays inside the range where a double still counts integers exactly;
-    // past that (large d) fall back to the value's significant digits, which
-    // costs a little accuracy but never produces garbage.
-    f64 scale = pow10(cast(i32, d));
+    i64 small;
     string digits;
-    if av * scale < 9.0e15 {
-        digits = format("{}", cast(i64, floor(av * scale + 0.5)));
+    if tofixed_small(av, d, &small) {
+        digits = format("{}", small);
     } else {
         digits = tofixed_digits(av, d);
     }
