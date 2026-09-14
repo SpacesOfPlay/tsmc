@@ -912,11 +912,22 @@ bool js_strict_eq(Value a, Value b) {
     if value_is_number(a) && value_is_number(b) {
         return js_to_number(a) == js_to_number(b);
     }
-    if value_is_string(a) && value_is_string(b) {
-        return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
-    }
-    if value_is_bigint(a) && value_is_bigint(b) {
-        return bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b))) == 0;
+    // Only two kinds compare by content rather than by cell, and both operands
+    // have to be that same kind, so one read of each answers all of it.
+    // js_same_value_zero and js_same_value repeat this; the three differ only in
+    // how they treat numbers, so a change here belongs in all three.
+    if value_is_cell(a) && value_is_cell(b) {
+        i32 k = value_as_cell(a).kind;
+        if k == value_as_cell(b).kind {
+            if k == GC_STRING {
+                return str_equal(gc_string_view(value_as_string(a)),
+                    gc_string_view(value_as_string(b)));
+            }
+            if k == GC_BIGINT {
+                return bn_cmp(bigint_view(value_as_bigint(a)),
+                    bigint_view(value_as_bigint(b))) == 0;
+            }
+        }
     }
     return value_same_bits(a, b);
 }
@@ -929,13 +940,21 @@ bool js_same_value_zero(Value a, Value b) {
         if x != x && y != y { return true; }
         return x == y;
     }
-    if value_is_string(a) && value_is_string(b) {
-        return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
-    }
-    // two BigInts are the same key when they are the same number, whichever
-    // cells they happen to live in
-    if value_is_bigint(a) && value_is_bigint(b) {
-        return bn_cmp(bigint_view(value_as_bigint(a)), bigint_view(value_as_bigint(b))) == 0;
+    // as in js_strict_eq: the two kinds that compare by content, read once. Two
+    // BigInts are the same key when they are the same number, whichever cells
+    // they happen to live in.
+    if value_is_cell(a) && value_is_cell(b) {
+        i32 k = value_as_cell(a).kind;
+        if k == value_as_cell(b).kind {
+            if k == GC_STRING {
+                return str_equal(gc_string_view(value_as_string(a)),
+                    gc_string_view(value_as_string(b)));
+            }
+            if k == GC_BIGINT {
+                return bn_cmp(bigint_view(value_as_bigint(a)),
+                    bigint_view(value_as_bigint(b))) == 0;
+            }
+        }
     }
     return value_same_bits(a, b);
 }
@@ -949,8 +968,21 @@ bool js_same_value(Value a, Value b) {
         if x == 0.0 && y == 0.0 { return (1.0 / x < 0.0) == (1.0 / y < 0.0); }
         return x == y;
     }
-    if value_is_string(a) && value_is_string(b) {
-        return str_equal(gc_string_view(value_as_string(a)), gc_string_view(value_as_string(b)));
+    // the two kinds that compare by content, read once, as in js_strict_eq. A
+    // BigInt is the same value as another of the same number, whichever cells
+    // the two happen to live in.
+    if value_is_cell(a) && value_is_cell(b) {
+        i32 k = value_as_cell(a).kind;
+        if k == value_as_cell(b).kind {
+            if k == GC_STRING {
+                return str_equal(gc_string_view(value_as_string(a)),
+                    gc_string_view(value_as_string(b)));
+            }
+            if k == GC_BIGINT {
+                return bn_cmp(bigint_view(value_as_bigint(a)),
+                    bigint_view(value_as_bigint(b))) == 0;
+            }
+        }
     }
     return value_same_bits(a, b);
 }

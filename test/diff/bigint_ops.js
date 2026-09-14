@@ -110,4 +110,13 @@ for (const [n, f] of [
   ['Boolean(0n)', () => Boolean(0n)],
   ['[1n, 2n].join()', () => [1n, 2n].join()],
   ['JSON.stringify(1n)', () => JSON.stringify(1n)],
+  // identity by value, not by cell: two 10n are one key and one same-value
+  ['Object.is(10n, 10n)', () => Object.is(10n, 10n)],
+  ['Object.is(10n, 11n)', () => Object.is(10n, 11n)],
+  ['Object.is(10n, 10)', () => Object.is(10n, 10)],
+  ['10n === 10n', () => 10n === 10n],
+  ['new Set([1n, 1n]).size', () => new Set([1n, 1n]).size],
+  ['new Map([[2n, "a"]]).get(2n)', () => new Map([[2n, 'a']]).get(2n)],
+  ['[1n, 2n].includes(2n)', () => [1n, 2n].includes(2n)],
+  ['[1n, 2n].indexOf(2n)', () => [1n, 2n].indexOf(2n)],
 ]) at(n, f);
