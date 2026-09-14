@@ -254,9 +254,9 @@ void gc_collect(GcHeap* h) {
 }
 
 // A cell swept in stress mode keeps its memory and reads as kind -1, which
-// `value_is_kind` notices. That predicate is called several times per bytecode
-// and has to stay a leaf to be inlined, so it records the hit here and the
-// collector reports it -- which in stress mode is the next allocation.
+// `value_is_kind` notices. That predicate runs several times per bytecode, so it
+// records the hit here instead of reporting it, and the collector reports what
+// has accumulated -- which in stress mode is the next allocation.
 i32 gc_poison_hits = 0;
 i32 gc_poison_last_kind = 0;
 

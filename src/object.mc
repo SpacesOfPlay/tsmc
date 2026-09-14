@@ -670,10 +670,11 @@ bool value_is_kind(Value v, i32 kind) {
     if !value_is_cell(v) { return false; }
     i32 k = value_as_cell(v).kind;
     // Only --gc-stress leaves a swept cell behind, poisoned to kind -1.
-    // This records the hit rather than reporting it: the report is a call,
-    // and a predicate the interpreter runs several times per bytecode has
-    // to stay a leaf to be inlined at all. The collector prints what
-    // accumulates here, which in stress mode is the next allocation.
+    // This records the hit rather than reporting it: reporting is a call, and
+    // this runs several times per bytecode, where anything but a load and a
+    // compare is the most expensive thing in the interpreter. The collector
+    // prints what accumulates here, which in stress mode is the next
+    // allocation.
     if k == -1 {
         gc_poison_hits = gc_poison_hits + 1;
         gc_poison_last_kind = kind;
