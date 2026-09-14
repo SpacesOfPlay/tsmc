@@ -4450,8 +4450,12 @@ private Value nat_num_toexponential(void* vmp, Value callee, Value thisv, Value*
     Value fdv = arg_at(args, argc, 0);
     bool have_f = !value_is_undefined(fdv);
     i32 f = have_f ? to_int_arg(fdv) : 6;
-    if f < 0 { f = 0; }
-    if f > 100 { f = 100; }
+    // the range is checked after the non-finite values have returned, which is
+    // why Infinity.toExponential(101) is a string and 1.5's is an error
+    if have_f && (f < 0 || f > 100) {
+        vm_throw_error(vm, ERR_RANGE, "toExponential() argument must be between 0 and 100");
+        return value_undefined();
+    }
     i32 sig = f + 1;
     u8[128] digits;
     i32 e = 0;
@@ -4499,8 +4503,10 @@ private Value nat_num_toprecision(void* vmp, Value callee, Value thisv, Value* a
     if v == inf { return new_str(vm, "Infinity"); }
     if v == -inf { return new_str(vm, "-Infinity"); }
     i32 p = to_int_arg(pv);
-    if p < 1 { p = 1; }
-    if p > 100 { p = 100; }
+    if p < 1 || p > 100 {
+        vm_throw_error(vm, ERR_RANGE, "toPrecision() argument must be between 1 and 100");
+        return value_undefined();
+    }
     bool neg = v < 0.0;
     f64 av = neg ? -v : v;
     u8[128] digits;
