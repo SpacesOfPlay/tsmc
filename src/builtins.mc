@@ -4141,18 +4141,10 @@ private Value nat_parsefloat(void* vmp, Value callee, Value thisv, Value* args, 
 // digits, so the rounding follows the double's real value. Beyond the 17
 // digits a double carries the tail is zeros, where a bignum expansion would
 // keep going. Caller frees.
-// The digits of round(av * 10^d), exactly, for a finite av below 1e21 and a d
-// between 0 and 100. A double is m * 2^e with m an integer below 2^53, so
-// av * 10^d is (m * 5^d) * 2^(e+d): an exact integer when e+d is not negative,
-// and otherwise that integer shifted down, where adding half a unit first is the
-// round-half-up the spec asks for (a tie takes the larger n). Done in doubles
-// this is only right while the product stays inside 53 bits; done in integers it
-// is right for every d, which is what the fraction digits past the seventeenth
-// need.
-private string tofixed_digits(f64 av, i32 d) {
-    if av == 0.0 { return format("{}", 0); }
-    // av as m * 2^e: double until nothing is left after the point, then halve
-    // while m is above 2^53, where a double is always even.
+// av (above zero, finite) as m * 2^e with m a whole number below 2^53: double
+// until nothing is left after the point, then halve while m is above 2^53, where
+// a double is always even. Exact both ways.
+private f64 f64_split(f64 av, i64* e_out) {
     f64 m = av;
     i64 e = 0;
     while m != floor(m) {
@@ -4163,38 +4155,116 @@ private string tofixed_digits(f64 av, i32 d) {
         m = m / 2.0;
         e = e + 1;
     }
-    BigNum n = bn_from_i64(cast(i64, m));
-    if d > 0 {
-        bool ok = true;
-        BigNum five = bn_from_i64(5);
-        BigNum dexp = bn_from_i64(cast(i64, d));
-        BigNum p5 = bn_pow(five, dexp, &ok);
-        BigNum scaled = bn_mul(n, p5);
-        bn_free(&five);
-        bn_free(&dexp);
+    *e_out = e;
+    return m;
+}
+
+private BigNum bn_pow10(i32 k) {
+    bool ok = true;
+    BigNum ten = bn_from_i64(10);
+    BigNum ex = bn_from_i64(cast(i64, k));
+    BigNum r = bn_pow(ten, ex, &ok);
+    bn_free(&ten);
+    bn_free(&ex);
+    return r;
+}
+
+// Whether av is at least 10^k, decided exactly. log10 cannot answer this: it
+// returns -7 for the double just below 1e-7, and a first digit placed one place
+// out gives 17 digits that are the rounding of 16.
+private bool at_least_pow10(f64 av, i32 k) {
+    i64 e = 0;
+    f64 m = f64_split(av, &e);
+    BigNum lhs = bn_from_i64(cast(i64, m));
+    BigNum rhs = bn_from_i64(1);
+    if k > 0 {
+        bn_free(&rhs);
+        rhs = bn_pow10(k);
+    } else if k < 0 {
+        BigNum p = bn_pow10(0 - k);
+        BigNum t = bn_mul(lhs, p);
+        bn_free(&p);
+        bn_free(&lhs);
+        lhs = t;
+    }
+    if e > 0 {
+        BigNum t = bn_shl(lhs, e);
+        bn_free(&lhs);
+        lhs = t;
+    } else if e < 0 {
+        BigNum t = bn_shl(rhs, 0 - e);
+        bn_free(&rhs);
+        rhs = t;
+    }
+    bool r = bn_cmp(lhs, rhs) >= 0;
+    bn_free(&lhs);
+    bn_free(&rhs);
+    return r;
+}
+
+private BigNum bn_pow5(i32 k) {
+    bool ok = true;
+    BigNum five = bn_from_i64(5);
+    BigNum ex = bn_from_i64(cast(i64, k));
+    BigNum r = bn_pow(five, ex, &ok);
+    bn_free(&five);
+    bn_free(&ex);
+    return r;
+}
+
+// The digits of round(av * 10^p10), exactly, for a finite av above zero and any
+// p10. A double is m * 2^e with m an integer below 2^53, so av * 10^p10 is
+// (m * 5^p10) * 2^(e+p10): a shift of an integer when both parts go up, and a
+// fraction to round otherwise. Ties take the larger value, which is what every
+// one of these formats asks for. In doubles this is only right while the product
+// stays inside 53 bits, and in integers it is right for every p10 -- which is
+// what the digits past the seventeenth need, whether a fixed-point format asks
+// for them or a significant-digit one.
+private string scaled_digits(f64 av, i32 p10) {
+    if av == 0.0 { return format("{}", 0); }
+    i64 e = 0;
+    f64 m = f64_split(av, &e);
+    BigNum num = bn_from_i64(cast(i64, m));
+    BigNum den = bn_from_i64(1);
+    if p10 > 0 {
+        BigNum p5 = bn_pow5(p10);
+        BigNum t = bn_mul(num, p5);
         bn_free(&p5);
-        bn_free(&n);
-        n = scaled;
+        bn_free(&num);
+        num = t;
+    } else if p10 < 0 {
+        bn_free(&den);
+        den = bn_pow5(0 - p10);
     }
-    i64 sh = e + cast(i64, d);
-    if sh >= 0 {
-        BigNum up = bn_shl(n, sh);
-        bn_free(&n);
-        n = up;
-    } else {
-        i64 k = 0 - sh;
+    i64 sh = e + cast(i64, p10);
+    if sh > 0 {
+        BigNum t = bn_shl(num, sh);
+        bn_free(&num);
+        num = t;
+    } else if sh < 0 {
+        BigNum t = bn_shl(den, 0 - sh);
+        bn_free(&den);
+        den = t;
+    }
+    bool ok = true;
+    BigNum rem;
+    BigNum q = bn_divmod(num, den, &rem, &ok);
+    // twice the remainder against the divisor: at or above it, the next value up
+    // is the closer one, and a tie takes the larger
+    BigNum twice = bn_shl(rem, 1);
+    if bn_cmp(twice, den) >= 0 {
         BigNum one = bn_from_i64(1);
-        BigNum half = bn_shl(one, k - 1);
-        BigNum rounded = bn_add(n, half);
-        BigNum down = bn_shr(rounded, k);
+        BigNum inc = bn_add(q, one);
         bn_free(&one);
-        bn_free(&half);
-        bn_free(&rounded);
-        bn_free(&n);
-        n = down;
+        bn_free(&q);
+        q = inc;
     }
-    string out = bn_to_str(n);
-    bn_free(&n);
+    string out = bn_to_str(q);
+    bn_free(&twice);
+    bn_free(&rem);
+    bn_free(&q);
+    bn_free(&num);
+    bn_free(&den);
     return out;
 }
 
@@ -4267,7 +4337,7 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     if tofixed_small(av, d, &small) {
         digits = format("{}", small);
     } else {
-        digits = tofixed_digits(av, d);
+        digits = scaled_digits(av, d);
     }
     str_buf sb;
     str_buf_init(&sb);
@@ -4300,6 +4370,43 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     return r;
 }
 
+// The integer part of av in the given radix, appended to sb, for a value an i64
+// cannot hold exactly. The part above 2^53 is a whole number of powers of two, so
+// the exact integer is a shift, and the digits come out of repeated division --
+// a thousand of them for the largest double in base 2.
+private void big_int_radix(f64 av, i32 radix, str_buf* sb) {
+    i64 e = 0;
+    f64 m = f64_split(floor(av), &e);
+    BigNum n = bn_from_i64(cast(i64, m));
+    if e > 0 {
+        BigNum up = bn_shl(n, e);
+        bn_free(&n);
+        n = up;
+    }
+    BigNum base = bn_from_i64(cast(i64, radix));
+    Vec<u8> rev = vec_new<u8>(64);
+    while !bn_is_zero(n) {
+        bool ok = true;
+        BigNum rem;
+        BigNum q = bn_divmod(n, base, &rem, &ok);
+        i32 d = cast(i32, bn_to_f64(rem));
+        vec_push(&rev, d < 10 ? cast(u8, d + '0') : cast(u8, d - 10 + 'a'));
+        bn_free(&rem);
+        bn_free(&n);
+        n = q;
+    }
+    for i32 i = rev.len - 1; i >= 0; i-- {
+        u8 c = vec_get(&rev, i);
+        str one;
+        one.data = &c;
+        one.len = 1;
+        str_buf_add(sb, one);
+    }
+    vec_free(&rev);
+    bn_free(&base);
+    bn_free(&n);
+}
+
 private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     f64 nval = num_this(vm, thisv);
@@ -4315,10 +4422,16 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
     f64 v = nval;
     if v != v { return new_str(vm, "NaN"); }
     bool neg = v < 0.0;
-    i64 iv = cast(i64, fabs(v));
+    f64 av0 = fabs(v);
+    f64 inf0 = 1.0e308 * 10.0;
+    if av0 == inf0 { return new_str(vm, neg ? "-Infinity" : "Infinity"); }
+    // An integer part above 2^53 has more digits than an i64 can carry, and in
+    // base 2 a thousand of them, so it is built exactly instead.
+    bool big = av0 >= 9007199254740992.0;
+    i64 iv = big ? 0 : cast(i64, av0);
     u8[80] buf;
     i32 n = 0;
-    if iv == 0 {
+    if !big && iv == 0 {
         buf[n] = '0';
         n++;
     }
@@ -4333,6 +4446,7 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
     str_buf sb;
     str_buf_init(&sb);
     if neg { str_buf_add(&sb, "-"); }
+    if big { big_int_radix(av0, radix, &sb); }
     for i32 i = n - 1; i >= 0; i-- {
         str one;
         one.data = &buf[i];
@@ -4394,37 +4508,39 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
 // of av (av > 0, finite), correctly rounded, and returns the base-10
 // exponent of the leading digit. Digits beyond the 17 a double can
 // carry are padded with '0'.
+// The first `sig` significant digits of av (above zero, finite), and the decimal
+// exponent e with 10^e <= av < 10^(e+1) once those digits are rounded. Every digit
+// is a digit of the value: asking for more than a double prints is what
+// toPrecision(21) and toExponential(30) do, and they used to be given zeros.
 private i32 decimal_sig(f64 av, i32 sig, u8* digits) {
-    i32 calc = sig;
-    if calc > 17 { calc = 17; }
+    // log10 only guesses the first digit's place -- it says -7 for the double just
+    // below 1e-7 -- so the guess is then walked to the exact answer. Without that
+    // the digits come out as the rounding of one place too few: 17 digits of
+    // 9.9999999999999995e-8 read as 1.0000000000000000e-7.
     i32 e = cast(i32, floor(log10(av)));
-    f64 p = pow(10.0, cast(f64, calc - 1 - e));
-    i64 scaled = cast(i64, floor(av * p + 0.5));
-    i64 lo = 1;
-    for i32 i = 0; i < calc - 1; i++ { lo = lo * 10; }
-    i64 hi = lo * 10;
-    // correct off-by-one from log10 rounding at the boundaries
-    i32 guard = 0;
-    while scaled >= hi && guard < 4 {
-        e++;
-        p = pow(10.0, cast(f64, calc - 1 - e));
-        scaled = cast(i64, floor(av * p + 0.5));
-        guard++;
-    }
-    guard = 0;
-    while scaled < lo && scaled > 0 && guard < 4 {
+    i32 walk = 0;
+    while !at_least_pow10(av, e) && walk < 4 {
         e--;
-        p = pow(10.0, cast(f64, calc - 1 - e));
-        scaled = cast(i64, floor(av * p + 0.5));
+        walk++;
+    }
+    walk = 0;
+    while at_least_pow10(av, e + 1) && walk < 4 {
+        e++;
+        walk++;
+    }
+    string ds = scaled_digits(av, sig - 1 - e);
+    str s = ds;
+    i32 guard = 0;
+    while s.len != sig && guard < 4 {
+        if s.len > sig { e++; } else { e--; }
+        free(ds);
+        ds = scaled_digits(av, sig - 1 - e);
+        s = ds;
         guard++;
     }
-    string ds = format("{}", scaled);
-    str s = ds;
-    i32 n = s.len;
-    for i32 i = 0; i < calc; i++ {
-        digits[i] = i < n ? *(s.data + i) : cast(u8, '0');
+    for i32 i = 0; i < sig; i++ {
+        digits[i] = i < s.len ? *(s.data + i) : cast(u8, '0');
     }
-    for i32 i = calc; i < sig; i++ { digits[i] = '0'; }
     free(ds);
     return e;
 }

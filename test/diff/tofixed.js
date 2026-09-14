@@ -74,3 +74,31 @@ try { Number.prototype.toFixed.call('2.345', 2); }
 catch (e) { rows.push('on a string -> THROW:' + e.constructor.name); }
 
 console.log(rows.join('\n'));
+
+// toPrecision and toExponential ask for a digit count too, and the digits past
+// the seventeenth are just as real -- they used to be zeros. toString(radix)
+// needs the integer part exactly, which for the largest double is a thousand
+// binary digits.
+const more = [];
+const m = (label, f) => { try { more.push(label + ' -> ' + f()); } catch (e) { more.push(label + ' -> THROW:' + e.constructor.name); } };
+for (const v of [1.1, 0.1, 123.456, 1 / 3, 0.5, 255.5, 9.995, 1e-7, 1e21]) {
+  for (const p of [1, 2, 5, 17, 18, 21, 100]) m(v + '.toPrecision(' + p + ')', () => v.toPrecision(p));
+  for (const d of [0, 2, 10, 17, 20, 30, 100]) m(v + '.toExponential(' + d + ')', () => v.toExponential(d));
+}
+m('MAX.toPrecision(21)', () => Number.MAX_VALUE.toPrecision(21));
+m('MIN.toExponential(30)', () => Number.MIN_VALUE.toExponential(30));
+m('MAX.toString(2).length', () => Number.MAX_VALUE.toString(2).length);
+m('MAX.toString(16)', () => Number.MAX_VALUE.toString(16));
+m('MAX.toString(8).length', () => Number.MAX_VALUE.toString(8).length);
+m('2^53.toString(2)', () => Math.pow(2, 53).toString(2));
+m('2^53+2.toString(16)', () => (Math.pow(2, 53) + 2).toString(16));
+m('-MAX.toString(2).length', () => (-Number.MAX_VALUE).toString(2).length);
+m('1e300.toString(7).length', () => 1e300.toString(7).length);
+m('255.5.toString(16)', () => (255.5).toString(16));
+m('0.5.toString(2)', () => (0.5).toString(2));
+m('Infinity.toString(2)', () => Infinity.toString(2));
+m('NaN.toString(2)', () => NaN.toString(2));
+m('precision range', () => (1.5).toPrecision(0));
+m('precision 101', () => (1.5).toPrecision(101));
+m('exponential 101', () => (1.5).toExponential(101));
+console.log(more.join('\n'));
