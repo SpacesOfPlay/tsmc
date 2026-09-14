@@ -4173,6 +4173,18 @@ private string tofixed_digits(f64 av, i32 d) {
     return format("{}", s);
 }
 
+// 10^e for the small non-negative e a fixed-point format asks for. Exact up to
+// 22, which is as far as a double counts powers of ten exactly.
+private f64[23] g_tofixed_pow10 = {
+    1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+};
+
+private f64 pow10(i32 e) {
+    if e >= 0 && e <= 22 { return g_tofixed_pow10[e]; }
+    return pow(10.0, cast(f64, e));
+}
+
 private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     f64 v = num_this(vm, thisv);
@@ -4191,7 +4203,7 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     // stays inside the range where a double still counts integers exactly;
     // past that (large d) fall back to the value's significant digits, which
     // costs a little accuracy but never produces garbage.
-    f64 scale = pow(10.0, cast(f64, d));
+    f64 scale = pow10(cast(i32, d));
     string digits;
     if av * scale < 9.0e15 {
         digits = format("{}", cast(i64, floor(av * scale + 0.5)));

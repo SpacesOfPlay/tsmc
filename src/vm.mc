@@ -6181,6 +6181,9 @@ private void op_step_local(VM* vm, i32 at, i32 delta) {
 // case body there, and every local in it counted towards the frame of every
 // other. Returns 1, 0, or -1 when a coercion threw -- in which case the
 // operands stay on the stack, as the handler expects.
+// Which of less / equal / greater each relational operator accepts, as bits for
+// c+1 where c is the three-way comparison: 1 is <, 4 is >, 3 is <=, 6 is >=.
+// Indexed by op - OP_LT, so the four must stay adjacent in that order.
 private i32 cmp_rel(VM* vm, i32 op) {
     Value b = vpeek(vm, 0);
     Value a = vpeek(vm, 1);
