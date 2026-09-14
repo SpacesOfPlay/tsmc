@@ -20,10 +20,9 @@ next person starts from numbers rather than from scratch.
 | allocation and GC | — | 5% |
 | the call path | — | 4% |
 
-Against node these two are the worst of the fifteen benchmarks, >52x and 50x,
-where the runtime-bound ones sit at 2-5x. The predicate share is the compiler's
-(see `doc/inliner_improvements.md` in the minc tree); everything else here is
-ours.
+Against node these two are the worst of the sixteen benchmarks, where the
+runtime-bound ones sit at 2-5x. The predicate share is the call overhead in the
+value tests themselves; everything else here is ours.
 
 ## Why a read costs what it does
 
@@ -55,7 +54,7 @@ Landed, and measured in `bench/BASELINE.md`:
 - `value_is_primitive` reads the cell kind once instead of asking three
   predicates: ~2% on the object-heavy benchmarks.
 
-Tried and reverted, both with numbers, so they are not re-tried:
+Tried and reverted, all with numbers, so they are not re-tried:
 
 - **A 64-bit key fingerprint per table**, so a level that lacks a name is
   rejected with a bit test. Measured **1% slower** across seven benchmarks. The
@@ -67,10 +66,26 @@ Tried and reverted, both with numbers, so they are not re-tried:
   skip levels that cannot intercept it. `Object.prototype` carries the
   `__proto__` accessor, so the bit is set on the one level every chain ends at,
   and the fast path never applies. Making it per-name is the fingerprint above.
+- **Spelling `value_is_object` out** as a cell test and one kind compare, rather
+  than `value_is_kind(v, GC_OBJECT)` with the poisoned-cell diagnostic's second
+  store in it. The predicate itself gets cheaper, and it is asked at 244 places,
+  so the binary grows by 21 KB.
 
-The pattern in both: every scheme that avoids re-deriving the answer needs
+  `proto_chain` gains 6-9% and every other measured workload loses: `classes`,
+  `arrays`, `bytes`, `objlit` and the markdown render each 2-5% worse. The growth
+  is paid by everything while the win is concentrated in the one workload that
+  does nothing but chase pointers. Not taken.
+
+  The shape is worth remembering: a value test that is a little too big to be
+  expanded at its call sites keeps every function above it out of the same
+  treatment, so the lever is the size of the test, not the callers. Re-measure it
+  whenever the toolchain changes -- this one went from a clear win to a clear loss
+  between two of them.
+
+The pattern in the first two: a scheme that avoids re-deriving the answer needs
 per-object state, and per-object state costs about 1% globally before it buys
-anything.
+anything. In the third: what is left in this path is small enough that a change
+big enough to show up on one benchmark is paid for by the others.
 
 ## The change that would matter
 
