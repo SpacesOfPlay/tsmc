@@ -2663,11 +2663,16 @@ private bool wrapped_prim(VM* vm, Value v, Value* out) {
 
 // Numeric this for Number.prototype methods: the number itself, or a
 // Number wrapper's boxed value. NaN for anything else (loose callers).
+// thisNumberValue: a number, or a Number wrapper's own primitive. Anything else
+// is a TypeError -- these methods do not coerce their receiver, so
+// Number.prototype.toFixed.call('2.345', 2) throws rather than formatting the
+// string. The caller's result is discarded once the throw is pending.
 private f64 num_this(VM* vm, Value thisv) {
     if value_is_number(thisv) { return js_to_number(thisv); }
     Value p;
     if wrapped_prim(vm, thisv, &p) && value_is_number(p) { return js_to_number(p); }
-    return js_to_number(thisv);
+    vm_throw_error(vm, ERR_TYPE, "Number.prototype method called on an incompatible receiver");
+    return 0.0 / 0.0;
 }
 
 // A String wrapper holds its primitive, its length, and its code units as own
