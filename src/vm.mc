@@ -647,6 +647,10 @@ const i32 HINT_NUMBER = 2;
 // a Symbol throws. On a thrown coercion the caller sees NaN and unwinds
 // via has_pending.
 f64 vm_to_number(VM* vm, Value v) {
+    // already a number, which is what nearly every coercion is handed: two tag
+    // tests, before anything asks a cell what kind it is
+    if value_is_int(v) { return value_as_int(v); }
+    if value_is_double(v) { return value_as_f64(v); }
     if value_is_symbol(v) {
         vm_throw_error(vm, ERR_TYPE, "Cannot convert a Symbol value to a number");
         return 0.0 / 0.0;
