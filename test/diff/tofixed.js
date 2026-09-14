@@ -95,6 +95,17 @@ m('2^53+2.toString(16)', () => (Math.pow(2, 53) + 2).toString(16));
 m('-MAX.toString(2).length', () => (-Number.MAX_VALUE).toString(2).length);
 m('1e300.toString(7).length', () => 1e300.toString(7).length);
 m('255.5.toString(16)', () => (255.5).toString(16));
+// fraction digits stop as soon as they identify the double, as on the decimal side
+m('0.1.toString(3)', () => (0.1).toString(3));
+m('(1/3).toString(2)', () => (1 / 3).toString(2));
+m('0.1.toString(16)', () => (0.1).toString(16));
+m('3.25.toString(4)', () => (3.25).toString(4));
+m('0.0001.toString(36)', () => (0.0001).toString(36));
+m('(2/3).toString(6)', () => (2 / 3).toString(6));
+m('123.75.toString(8)', () => (123.75).toString(8));
+m('0.9999999999.toString(2)', () => (0.9999999999).toString(2));
+m('1e-20.toString(2)', () => (1e-20).toString(2));
+m('4.9e-324.toString(2).length', () => (4.9e-324).toString(2).length);
 m('0.5.toString(2)', () => (0.5).toString(2));
 m('Infinity.toString(2)', () => Infinity.toString(2));
 m('NaN.toString(2)', () => NaN.toString(2));

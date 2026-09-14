@@ -4169,39 +4169,6 @@ private BigNum bn_pow10(i32 k) {
     return r;
 }
 
-// Whether av is at least 10^k, decided exactly. log10 cannot answer this: it
-// returns -7 for the double just below 1e-7, and a first digit placed one place
-// out gives 17 digits that are the rounding of 16.
-private bool at_least_pow10(f64 av, i32 k) {
-    i64 e = 0;
-    f64 m = f64_split(av, &e);
-    BigNum lhs = bn_from_i64(cast(i64, m));
-    BigNum rhs = bn_from_i64(1);
-    if k > 0 {
-        bn_free(&rhs);
-        rhs = bn_pow10(k);
-    } else if k < 0 {
-        BigNum p = bn_pow10(0 - k);
-        BigNum t = bn_mul(lhs, p);
-        bn_free(&p);
-        bn_free(&lhs);
-        lhs = t;
-    }
-    if e > 0 {
-        BigNum t = bn_shl(lhs, e);
-        bn_free(&lhs);
-        lhs = t;
-    } else if e < 0 {
-        BigNum t = bn_shl(rhs, 0 - e);
-        bn_free(&rhs);
-        rhs = t;
-    }
-    bool r = bn_cmp(lhs, rhs) >= 0;
-    bn_free(&lhs);
-    bn_free(&rhs);
-    return r;
-}
-
 private BigNum bn_pow5(i32 k) {
     bool ok = true;
     BigNum five = bn_from_i64(5);
@@ -4222,6 +4189,8 @@ private BigNum bn_pow5(i32 k) {
 // for them or a significant-digit one.
 private string scaled_digits(f64 av, i32 p10) {
     if av == 0.0 { return format("{}", 0); }
+    i64 small = 0;
+    if scaled_small(av, p10, &small) { return format("{}", small); }
     i64 e = 0;
     f64 m = f64_split(av, &e);
     BigNum num = bn_from_i64(cast(i64, m));
@@ -4280,6 +4249,14 @@ private f64 pow10(i32 e) {
     return pow(10.0, cast(f64, e));
 }
 
+// The next double above x, for a finite x above zero: the mantissa's low bit is
+// one step, and a step at the top of a binade is the same bit pattern plus one.
+private f64 next_up(f64 x) {
+    u64 bits = *cast(u64*, &x);
+    bits = bits + 1;
+    return *cast(f64*, &bits);
+}
+
 // a * b - p, where p is the rounded product: the part the multiply dropped. A
 // double always holds it exactly, and Dekker's split computes it without a fused
 // multiply-add. Both halves of each operand are exact, so nothing here rounds
@@ -4295,25 +4272,33 @@ private f64 mul_err(f64 a, f64 b, f64 p) {
     return al * bl - (((p - ah * bh) - al * bh) - ah * bl);
 }
 
-// round(av * 10^d) when a double can carry it: 10^d is exact up to 22, the
-// product's dropped part says which side of a halfway case the true value is on,
-// and the product has to stay below 2^52. Past that a double's steps are a whole
-// unit, so a product that is really halfway cannot be told from one that is not
-// -- 631345510776.78125 times 10^4 is exactly ...812.5 and lands on ...812, which
-// reads as nothing to round. Answers false for all of that, and the exact route
-// runs instead.
-private bool tofixed_small(f64 av, i32 d, i64* out) {
-    if d > 22 { return false; }
-    f64 scale = g_tofixed_pow10[d];
-    f64 p = av * scale;
-    if p >= 4503599627370496.0 { return false; }   // 2^52
-    f64 fl = floor(p);
-    f64 frac = p - fl;
+// round(av * 10^p10) when a double can carry the answer. 10^p10 is exact for
+// |p10| up to 22 and the scaled value has to stay below 2^52: past that a
+// double's steps are a whole unit, so a value that is really halfway cannot be
+// told from one that is not -- 631345510776.78125 times 10^4 is exactly ...812.5
+// and lands on ...812, which reads as nothing to round.
+//
+// Scaling up is one multiply, whose dropped part (mul_err) says exactly which
+// side of a halfway case the true value is on, ties included. Scaling down is a
+// divide, and recovering its dropped part costs more than it saves, so anything
+// within a few roundings of halfway is handed to the exact route instead.
+// Answers false when the double cannot decide.
+private bool scaled_small(f64 av, i32 p10, i64* out) {
+    if p10 > 22 || p10 < 0 - 22 { return false; }
+    bool up_scale = p10 >= 0;
+    f64 scale = g_tofixed_pow10[up_scale ? p10 : 0 - p10];
+    f64 x = up_scale ? av * scale : av / scale;
+    if x >= 4503599627370496.0 { return false; }   // 2^52
+    f64 fl = floor(x);
+    f64 frac = x - fl;
     bool up = frac > 0.5;
-    if frac == 0.5 {
-        // exactly halfway as computed: the dropped part decides, and a true tie
-        // takes the larger n
-        up = mul_err(av, scale, p) >= 0.0;
+    if up_scale {
+        // a true tie takes the larger value, which is what every one of these
+        // formats asks for
+        if frac == 0.5 { up = mul_err(av, scale, x) >= 0.0; }
+    } else {
+        f64 slack = x * 8.881784197001252e-16;   // four times 2^-52
+        if frac <= 0.5 + slack && frac >= 0.5 - slack { return false; }
     }
     *out = cast(i64, fl) + (up ? 1 : 0);
     return true;
@@ -4332,13 +4317,7 @@ private Value nat_num_tofixed(void* vmp, Value callee, Value thisv, Value* args,
     if v != v || v == inf || v == -inf || av >= 1.0e21 {
         return js_to_string_value(vm, js_number_value(v));
     }
-    i64 small;
-    string digits;
-    if tofixed_small(av, d, &small) {
-        digits = format("{}", small);
-    } else {
-        digits = scaled_digits(av, d);
-    }
+    string digits = scaled_digits(av, d);
     str_buf sb;
     str_buf_init(&sb);
     // the sign survives a value that rounds to zero: (-0.001).toFixed(2) is
@@ -4453,36 +4432,75 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
         one.len = 1;
         str_buf_add(&sb, one);
     }
-    // Fractional digits. Enough are generated to cover the mantissa, then the
-    // tail is rounded with a carry and trailing zeros are dropped — which is
-    // what collapses a repeating expansion such as 1/3 in base 3 to "0.1".
-    f64 frac = fabs(v) - cast(f64, cast(i64, fabs(v)));
+    // Fractional digits, as many as it takes to tell this double from its
+    // neighbours and no more -- the same rule the decimal side follows, and what
+    // every engine prints. `delta` is half the distance to the next double, so
+    // once what is left of the fraction is smaller than that, another digit would
+    // say nothing about the value. The last digit is rounded up when the tail is
+    // past halfway and the value it stands for is still inside the same double.
+    f64 av1 = fabs(v);
+    f64 frac = av1 - floor(av1);
     if frac > 0.0 {
-        i32 limit = 0;
-        f64 acc = 1.0;
-        while acc < 9.0e15 && limit < 60 {
-            acc = acc * cast(f64, radix);
-            limit++;
-        }
-        u8[80] fd;
+        f64 delta = 0.5 * (next_up(av1) - av1);
+        f64 tiny = 4.9406564584124654e-324;   // the smallest subnormal
+        if delta < tiny { delta = tiny; }
+        u8[1100] fd;
         i32 nfd = 0;
-        i32 sig = 0;   // leading zeros cost no precision, so they do not count
-        while sig < limit && nfd < 76 && frac > 0.0 {
-            frac = frac * cast(f64, radix);
-            i32 d = cast(i32, frac);
-            if d >= radix { d = radix - 1; }
-            fd[nfd] = cast(u8, d);
-            nfd++;
-            if d != 0 || sig > 0 { sig++; }
-            frac = frac - cast(f64, d);
+        bool round_up = false;
+        if frac >= delta {
+            while nfd < 1090 {
+                frac = frac * cast(f64, radix);
+                delta = delta * cast(f64, radix);
+                i32 d = cast(i32, frac);
+                if d >= radix { d = radix - 1; }
+                frac = frac - cast(f64, d);
+                fd[nfd] = cast(u8, d);
+                nfd++;
+                if frac > 0.5 || (frac == 0.5 && (d & 1) != 0) {
+                    if frac + delta > 1.0 {
+                        round_up = true;
+                        break;
+                    }
+                }
+                if frac < delta { break; }
+            }
         }
-        if frac >= 0.5 {
+        if round_up {
             i32 i = nfd - 1;
             while i >= 0 {
                 i32 d = cast(i32, fd[i]) + 1;
                 if d < radix { fd[i] = cast(u8, d); break; }
                 fd[i] = 0;
                 i--;
+            }
+            if i < 0 {
+                // the carry ran off the front: the integer part takes it, which
+                // only happens for a value that rounds up to the next whole one
+                nfd = 0;
+                str_buf_free(&sb);
+                str_buf_init(&sb);
+                if neg { str_buf_add(&sb, "-"); }
+                f64 up = floor(av1) + 1.0;
+                if up >= 9007199254740992.0 {
+                    big_int_radix(up, radix, &sb);
+                } else {
+                    u8[80] ib;
+                    i32 nib = 0;
+                    i64 iv2 = cast(i64, up);
+                    if iv2 == 0 { ib[nib] = '0'; nib++; }
+                    while iv2 > 0 {
+                        i32 d2 = cast(i32, iv2 % radix);
+                        ib[nib] = d2 < 10 ? cast(u8, d2 + '0') : cast(u8, d2 - 10 + 'a');
+                        nib++;
+                        iv2 = iv2 / radix;
+                    }
+                    for i32 j = nib - 1; j >= 0; j-- {
+                        str one;
+                        one.data = &ib[j];
+                        one.len = 1;
+                        str_buf_add(&sb, one);
+                    }
+                }
             }
         }
         while nfd > 0 && fd[nfd - 1] == 0 { nfd--; }
@@ -4513,21 +4531,9 @@ private Value nat_num_tostring(void* vmp, Value callee, Value thisv, Value* args
 // is a digit of the value: asking for more than a double prints is what
 // toPrecision(21) and toExponential(30) do, and they used to be given zeros.
 private i32 decimal_sig(f64 av, i32 sig, u8* digits) {
-    // log10 only guesses the first digit's place -- it says -7 for the double just
-    // below 1e-7 -- so the guess is then walked to the exact answer. Without that
-    // the digits come out as the rounding of one place too few: 17 digits of
-    // 9.9999999999999995e-8 read as 1.0000000000000000e-7.
+    // log10 only guesses where the first digit sits. The digit count corrects the
+    // guess: too few digits means the guess was high, too many means it was low.
     i32 e = cast(i32, floor(log10(av)));
-    i32 walk = 0;
-    while !at_least_pow10(av, e) && walk < 4 {
-        e--;
-        walk++;
-    }
-    walk = 0;
-    while at_least_pow10(av, e + 1) && walk < 4 {
-        e++;
-        walk++;
-    }
     string ds = scaled_digits(av, sig - 1 - e);
     str s = ds;
     i32 guard = 0;
@@ -4537,6 +4543,28 @@ private i32 decimal_sig(f64 av, i32 sig, u8* digits) {
         ds = scaled_digits(av, sig - 1 - e);
         s = ds;
         guard++;
+    }
+    // One digit count cannot correct: a one followed by zeros is also what the
+    // place below produces when its digits round up, and then the answer belongs
+    // to that place -- 17 digits of the double just below 1e-7 are
+    // 9.9999999999999995e-8, not 1.0000000000000000e-7. Asking the place below
+    // settles it, since a value that really is at 10^e overflows to sig+1 digits
+    // there.
+    bool one_then_zeros = s.len == sig && *(s.data) == '1';
+    for i32 i = 1; i < s.len; i++ {
+        if *(s.data + i) != '0' { one_then_zeros = false; }
+    }
+    if one_then_zeros {
+        string below = scaled_digits(av, sig - e);
+        str b = below;
+        if b.len == sig {
+            free(ds);
+            ds = below;
+            s = ds;
+            e--;
+        } else {
+            free(below);
+        }
     }
     for i32 i = 0; i < sig; i++ {
         digits[i] = i < s.len ? *(s.data + i) : cast(u8, '0');
