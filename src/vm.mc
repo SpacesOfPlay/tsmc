@@ -17,6 +17,7 @@ import bigint;
 import os_time;
 import net;
 import bytecode;
+import numparse;
 import ast;
 import bump;
 import parser;
@@ -567,22 +568,14 @@ private f64 vm_str_to_num(str s) {
             return sign * v;
         }
     }
-    // decimal
-    u64 mant = 0;
-    i32 sig = 0;
-    i32 exp_adj = 0;
+    // Decimal: this walks the text to check the shape ToNumber accepts and to
+    // find where it ends, and the value comes from the one conversion that
+    // rounds correctly. Scaling the digits here in doubles rounded twice.
     i32 n_digits = 0;
     i32 i = a;
     while i < b {
         u8 c = *(s.data + i);
         if !(c >= '0' && c <= '9') { break; }
-        if sig < 19 {
-            u64 d = c - '0';
-            mant = mant * 10 + d;
-            if mant != 0 { sig++; }
-        } else {
-            exp_adj++;
-        }
         n_digits++;
         i++;
     }
@@ -591,12 +584,6 @@ private f64 vm_str_to_num(str s) {
         while i < b {
             u8 c = *(s.data + i);
             if !(c >= '0' && c <= '9') { break; }
-            if sig < 19 {
-                u64 d = c - '0';
-                mant = mant * 10 + d;
-                if mant != 0 { sig++; }
-                exp_adj--;
-            }
             n_digits++;
             i++;
         }
@@ -604,27 +591,21 @@ private f64 vm_str_to_num(str s) {
     if n_digits == 0 { return 0.0 / 0.0; }
     if i < b && (*(s.data + i) == 'e' || *(s.data + i) == 'E') {
         i++;
-        f64 esign = 1.0;
-        if i < b && (*(s.data + i) == '+' || *(s.data + i) == '-') {
-            if *(s.data + i) == '-' { esign = -1.0; }
-            i++;
-        }
-        i32 ev = 0;
+        if i < b && (*(s.data + i) == '+' || *(s.data + i) == '-') { i++; }
         i32 ed = 0;
         while i < b {
             u8 c = *(s.data + i);
             if !(c >= '0' && c <= '9') { break; }
-            i32 dd = c - '0';
-            if ev < 1000000 { ev = ev * 10 + dd; }
             ed++;
             i++;
         }
         if ed == 0 { return 0.0 / 0.0; }
-        if esign < 0.0 { exp_adj -= ev; } else { exp_adj += ev; }
     }
     if i != b { return 0.0 / 0.0; }
-    f64 v = cast(f64, mant) * pow(10.0, exp_adj);
-    return sign * v;
+    str body;
+    body.data = s.data + a;
+    body.len = b - a;
+    return sign * dec_to_f64(body);
 }
 
 f64 js_to_number(Value v) {

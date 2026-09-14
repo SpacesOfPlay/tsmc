@@ -10,6 +10,7 @@
 import vec;
 import map;
 import diag;
+import numparse;
 import "regex_uniprops_data.mc";   // general-category runs, for Unicode identifiers
 
 enum TokKind {
@@ -620,36 +621,6 @@ private void scan_private_name(Lexer* lx, Token* t) {
 
 // --- numbers --------------------------------------------------------
 
-private f64[23] g_pow10 = {
-    1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
-    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
-};
-
-// mant * 10^e. Correctly rounded when mant < 2^53 and |e| <= 22;
-// otherwise stepped multiplies, within ~2 ulp. A correctly-rounded
-// parser is a later infrastructure task.
-private f64 scale10(u64 mant, i32 e) {
-    if mant == 0 { return 0.0; }
-    f64 v = cast(f64, mant);
-    bool exact = mant < 9007199254740992;
-    if exact && e >= 0 && e <= 22 { return v * g_pow10[e]; }
-    if exact && e < 0 && e >= -22 { return v / g_pow10[-e]; }
-    while e > 22 {
-        v = v * g_pow10[22];
-        e -= 22;
-    }
-    if e > 0 {
-        v = v * g_pow10[e];
-        e = 0;
-    }
-    while e < -22 {
-        v = v / g_pow10[22];
-        e += 22;
-    }
-    if e < 0 { v = v / g_pow10[-e]; }
-    return v;
-}
-
 private void finish_number(Lexer* lx, Token* t, i32 start, f64 v, bool allow_bigint) {
     if lx.pos < lx.src.len && lx_cur(lx) == 'n' {
         if !allow_bigint {
@@ -705,9 +676,6 @@ private void scan_radix(Lexer* lx, Token* t, i32 start, i32 base) {
 }
 
 private void scan_decimal(Lexer* lx, Token* t, i32 start) {
-    u64 mant = 0;
-    i32 sig = 0;
-    i32 exp_adjust = 0;
     bool has_frac = false;
     bool has_exp = false;
     bool sep_err = false;
@@ -723,13 +691,6 @@ private void scan_decimal(Lexer* lx, Token* t, i32 start) {
             continue;
         }
         if !is_digit(c) { break; }
-        if sig < 19 {
-            u64 d = c - '0';
-            mant = mant * 10 + d;
-            if mant != 0 { sig++; }
-        } else {
-            exp_adjust++;
-        }
         prev_digit = true;
         last_us = false;
         lx.pos++;
@@ -750,12 +711,6 @@ private void scan_decimal(Lexer* lx, Token* t, i32 start) {
                 continue;
             }
             if !is_digit(c) { break; }
-            if sig < 19 {
-                u64 d = c - '0';
-                mant = mant * 10 + d;
-                if mant != 0 { sig++; }
-                exp_adjust--;
-            }
             prev_digit = true;
             last_us = false;
             lx.pos++;
@@ -776,7 +731,6 @@ private void scan_decimal(Lexer* lx, Token* t, i32 start) {
             lx.pos = save;
         } else {
             has_exp = true;
-            i32 ev = 0;
             prev_digit = false;
             last_us = false;
             while lx.pos < lx.src.len {
@@ -788,21 +742,19 @@ private void scan_decimal(Lexer* lx, Token* t, i32 start) {
                     continue;
                 }
                 if !is_digit(c) { break; }
-                i32 d = c - '0';
-                if ev < 1000000 { ev = ev * 10 + d; }
                 prev_digit = true;
                 last_us = false;
                 lx.pos++;
             }
             if last_us { sep_err = true; }
-            if neg { exp_adjust -= ev; } else { exp_adjust += ev; }
+            ignore neg;
         }
     }
 
     if sep_err {
         lex_error(lx, start, lx.pos, "numeric separator must be between digits");
     }
-    f64 v = scale10(mant, exp_adjust);
+    f64 v = dec_to_f64(lx_view(lx, start, lx.pos));
     finish_number(lx, t, start, v, !has_frac && !has_exp);
 }
 
