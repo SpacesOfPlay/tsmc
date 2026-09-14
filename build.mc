@@ -281,6 +281,12 @@ void build_tsmc() {
         exit(1);
     }
     pass(str_from(exe.data, exe.len));
+    // What built it. `bench` and `diff` rebuild through here, and the install is
+    // whichever of MINC, ./minc and PATH answers first, so a binary can be
+    // replaced by one built differently without anything being said. Printing it
+    // is what keeps a set of timings comparable.
+    out("        with ");
+    outln(str_from(g_minc_dir.data, g_minc_dir.len));
     return;
 }
 
@@ -1029,8 +1035,12 @@ private void out_name(str name, i32 width) {
 // worth more runs than a benchmark: every ratio is scaled by it.
 private i64 bench_floor(str exe, str empty) {
     i64 best = 0;
-    ignore bench_once(exe, empty, null);
-    for i32 i = 0; i < 7; i++ {
+    // more warm-up than the benchmarks get: the floor is measured on a binary
+    // that was just written, and the first few launches of one pay for whatever
+    // the system does to a new file. An overstated floor is subtracted from
+    // every total and flatters every ratio.
+    for i32 i = 0; i < 4; i++ { ignore bench_once(exe, empty, null); }
+    for i32 i = 0; i < 9; i++ {
         i64 ms = bench_once(exe, empty, null);
         if i == 0 || ms < best { best = ms; }
     }

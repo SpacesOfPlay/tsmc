@@ -8,7 +8,7 @@ materially; keep the methodology fixed so runs stay comparable.
 
 | | |
 |---|---|
-| Date | 2026-09-12 |
+| Date | 2026-09-13 |
 | CPU | AMD Ryzen 9 5900X |
 | OS | Windows 11 x64 |
 | minc | 0.9.14 |
@@ -20,7 +20,8 @@ materially; keep the methodology fixed so runs stay comparable.
 the whole process, one warm-up run discarded, then the least of three. The
 least, not the mean — anything slower is the machine interfering.
 
-Each engine's own startup floor (an empty script, least of seven) is
+Each engine's own startup floor (an empty script, least of nine after four
+warm-up launches) is
 subtracted to get the work, and the ratio is of the work. The scripts are
 plain JavaScript so both engines run the same file, and the runner compares
 what they print: a benchmark that prints different results is measuring
@@ -44,21 +45,57 @@ of. Every table below takes that difference out.
 
 | bench | tsmc | node | work ratio | what it measures |
 |---|---|---|---|---|
-| `exceptions` | 61 ms | 92 ms | **0.9x** | throw, catch and finally in a loop |
-| `strbuild` | 139 ms | 110 ms | 1.9x | a string built by `+=` and templates |
-| `sort` | 46 ms | 61 ms | 1.9x | `Array#sort` with a comparator |
-| `objprop` | 171 ms | 91 ms | 3.3x | computed string keys on fresh objects |
-| `json` | 263 ms | 109 ms | 3.8x | `JSON.stringify` and `parse` of nested data |
-| `collections` | 91 ms | 60 ms | 5.0x | `Map` and `Set` insert, look up, iterate |
-| `regexloop` | 188 ms | 78 ms | 5.2x | `new RegExp`, `test`, `replace` with a function |
-| `promises` | 341 ms | 78 ms | 9.8x | `await` chains and `Promise.all` |
-| `iterators` | 590 ms | 77 ms | 18x | generators, `for-of`, spread, destructuring |
-| `fib` | 1,137 ms | 91 ms | 24x | recursive calls and arithmetic (fib(34)) |
-| `arrays` | 448 ms | 62 ms | 25x | `map`/`filter`/`reduce` with closures |
-| `strindex` | 435 ms | 60 ms | 28x | `charCodeAt` and indexing over 420k units |
-| `bytes` | 495 ms | 61 ms | 30x | typed-array element loops |
-| `classes` | 864 ms | 62 ms | 50x | instantiation and dispatch through inheritance |
-| `proto_chain` | 532 ms | 47 ms | >52x | reads down a four-deep prototype chain |
+| `exceptions` | 61 ms | 90 ms | **1.0x** | throw, catch and finally in a loop |
+| `strbuild` | 138 ms | 109 ms | 1.9x | a string built by `+=` and templates |
+| `sort` | 46 ms | 47-61 ms | 2-3x | `Array#sort` with a comparator |
+| `collections` | 60 ms | 62 ms | 2.6x | `Map` and `Set` insert, look up, iterate |
+| `objprop` | 170 ms | 93 ms | 3.2x | computed string keys on fresh objects |
+| `regexloop` | 190 ms | 92 ms | 3.7x | `new RegExp`, `test`, `replace` with a function |
+| `json` | 266 ms | 108 ms | 3.9x | `JSON.stringify` and `parse` of nested data |
+| `promises` | 344 ms | 77 ms | 10x | `await` chains and `Promise.all` |
+| `iterators` | 511 ms | 76 ms | 16x | generators, `for-of`, spread, destructuring |
+| `objlit` | 420 ms | 61 ms | 25x | fresh records with fixed keys, kept and read back |
+| `fib` | 1,200 ms | 90 ms | 26x | recursive calls and arithmetic (fib(34)) |
+| `arrays` | 438 ms | 61 ms | 26x | `map`/`filter`/`reduce` with closures |
+| `strindex` | 451 ms | 61 ms | 27x | `charCodeAt` and indexing over 420k units |
+| `bytes` | 509 ms | 61 ms | 31x | typed-array element loops |
+| `proto_chain` | 533 ms | 47-61 ms | 32-53x | reads down a four-deep prototype chain |
+| `classes` | 821 ms | 60 ms | 54x | instantiation and dispatch through inheritance |
+
+`sort` and `proto_chain` finish inside the noise of node's own startup floor, so
+their ratios swing between passes on node's variance alone (`proto_chain` read
+32x and >53x in two passes minutes apart). The tsmc column is the stable half of
+this table.
+
+## What the allocation round of 2026-09-13 changed
+
+Before and after are the two commits built with the same compiler and timed
+interleaved -- not two bench passes, which drift by more than this on workloads
+nothing touched:
+
+| bench | before | after | |
+|---|---|---|---|
+| `objlit` (new) | 576 ms | 440 ms | -24% |
+| `collections` | 71 ms | 62 ms | -12% |
+| the other thirteen | | | see below |
+
+| workload | before | after | |
+|---|---|---|---|
+| 400k six-key object literals | 200 ms | 115 ms | -42% |
+| iterating 2k-entry `Map`s and `Set`s, 300 times | 927 ms | 460 ms | -50% |
+| copying 50k-element arrays | 127 ms | 120 ms | -5% |
+| `filter`/`map`/`slice` over 2k elements | 195 ms | 192 ms | - |
+| markdown render, data plumbing, `JSON.parse` | | | within 3% |
+
+Three paths stopped allocating what they did not need: a literal's plain keys go
+onto a table sized once, without the three lookups a general define makes; an
+array whose size is known before it is filled is allocated once instead of
+doubling from eight; and a `Map` or `Set` iterator hands over its entry without a
+result object. `doc/DESIGN_allocation.md`.
+
+`objprop` and `iterators` not moving is the fast paths' guards working as
+intended: `objprop` writes computed keys, and `iterators` is generators and array
+`for-of`, which the previous round already handled.
 
 ## What five rounds of 2026-09-12 changed
 
@@ -109,18 +146,41 @@ instruction, with the boolean never reaching the stack.
 - **A shape-heavy read is the worst of it** (`proto_chain` >52x, `classes` 50x).
   V8's inline caches turn a property read into a slot load; a property table per
   object pays a lookup every time. This is where the next work is.
-- **8-15% of the remaining time is calls the compiler does not inline** -- the
-  tag predicates a NaN-boxed interpreter asks several times per bytecode. Written
-  up for minc, which fixed it in the inliner's round 2; tsmc gets it on the next
-  release.
+- **8-15% of the remaining time is in the value predicates themselves** -- the
+  tag tests a NaN-boxed interpreter asks several times per bytecode, each one a
+  call. Keeping them small and free of anything cold is what makes that share
+  shrink; `doc/DESIGN_property_access.md` has the measurements.
 
 ## Measuring on this machine
 
-Two numbers from the same binary twenty minutes apart differed by 8% (`fib`
-1,160 then 1,252 ms). Anything under about 10% has to be measured back to back,
-one variant after the other in the same minute, or it is drift rather than a
-result. `minc bench` running both engines in one pass is exactly that, and the
-A/B of two builds wants the same treatment.
+Three ways to get a number that is not about the change being measured:
+
+- **What built the binary.** `bench` and `diff` build tsmc themselves, so the
+  binary under measurement can be replaced between two timings without anything
+  being said about it. Build every binary in a comparison the same way, from its
+  own commit, and check the line the build prints; a toolchain of a different
+  version is a different measurement, not a data point in the same set.
+- **Drift between passes.** Two `minc bench` passes minutes apart put `fib` at
+  1,108 and 1,200 ms and `classes` at 761 and 821 -- 9% on workloads nothing in
+  between touched. `minc bench` is a snapshot against node, not an A/B between
+  builds; for that, time the binaries interleaved.
+- **Position inside a round.** The binary timed second read up to 6% faster than
+  the same binary timed first. Reverse the order on every other run, and keep a
+  control of one binary in both positions.
+
+What is not a source of noise: the build is deterministic (the same source gives
+a byte-identical binary), a comment edit leaves `.text` byte-identical, and moving
+a private function changes 261 bytes of it.
+
+With the order alternated and the least of eight taken, the same comparison
+repeated minutes later moves by about 2% on the steady workloads and 5% on the
+short allocation-heavy ones. Below that, rely on the mechanism rather than the
+clock.
+
+`minc bench`'s own startup floor is measured on a binary that was just written,
+so it takes four warm-up launches before counting: it read 29 ms against a true
+15 once, and an overstated floor is subtracted from every total and flatters
+every ratio.
 
 ## Loading packages (2026-09-06, minc 0.9.14, same machine)
 
