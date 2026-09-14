@@ -58,7 +58,7 @@ of. Every table below takes that difference out.
 | `fib` | 1,200 ms | 90 ms | 26x | recursive calls and arithmetic (fib(34)) |
 | `arrays` | 438 ms | 61 ms | 26x | `map`/`filter`/`reduce` with closures |
 | `strindex` | 451 ms | 61 ms | 27x | `charCodeAt` and indexing over 420k units |
-| `bytes` | 509 ms | 61 ms | 31x | typed-array element loops |
+| `bytes` | 488 ms | 61 ms | 29x | typed-array element loops |
 | `proto_chain` | 533 ms | 47-61 ms | 32-53x | reads down a four-deep prototype chain |
 | `classes` | 821 ms | 60 ms | 54x | instantiation and dispatch through inheritance |
 
@@ -96,6 +96,47 @@ result object. `doc/DESIGN_allocation.md`.
 `objprop` and `iterators` not moving is the fast paths' guards working as
 intended: `objprop` writes computed keys, and `iterators` is generators and array
 `for-of`, which the previous round already handled.
+
+## What the round of 2026-09-14 changed
+
+Profiled first, three of the four items came straight off the profile, and the
+fourth was a mistake the next profile caught.
+
+| bench | before | after | |
+|---|---|---|---|
+| `bytes` | 453 ms | 423 ms | -6.6% |
+| string-keyed comparisons (a micro) | 434 ms | 414 ms | -4.6% |
+| `arrays` | 401 ms | 387 ms | -3.5% |
+| data plumbing | 386 ms | 374 ms | -3.1% |
+| `iterators` | 509 ms | 496 ms | -2.6% |
+| `sort` | 35 ms | 34 ms | -2.5% |
+| `classes` | 786 ms | 768 ms | -2.3% |
+| `collections`, `json`, `objprop`, `fib` | | | -1.4 to -1.7% |
+| the rest | | | flat, none worse |
+
+**ToNumber asked whether its argument was a Symbol first**, which is a question
+about a heap cell, before any tag test -- and nearly every coercion is handed a
+number. Two tag tests first. Typed-array writes coerce on every element, which is
+where the 6% comes from.
+
+**The three equality predicates asked up to four kind questions each** (string?
+string? BigInt? BigInt?). Only two kinds compare by content rather than by cell,
+and both sides must be that same kind, so one read of each answers all of it. It
+also fixed `Object.is(10n, 10n)`, which was false because SameValue had no BigInt
+branch where the other two did.
+
+**`toFixed` called `pow` for ten to a small integer**, 2.2% of the data workload
+by itself; it is a table up to 22, which is as far as a double counts powers of
+ten exactly.
+
+**Tried and reverted: folding the four relational operators into a mask.**
+`cmp_rel` ends in four compares of the opcode against a constant, so a
+branchless `(x>y)-(x<y)` plus a table lookup looked strictly better. It measured
+worse everywhere -- `strindex` +2.7%, markdown +0.9%, `fib` +0.7%, and it gave up
+1.6% of the `bytes` win -- because the operator is the same on every iteration of
+a loop, so those four compares are perfectly predicted, while the three-way
+compare does real work on both sides. The next profile showed `cmp_rel` had grown
+its share while the program got faster, which is what gave it away.
 
 ## What five rounds of 2026-09-12 changed
 
