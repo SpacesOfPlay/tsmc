@@ -5272,15 +5272,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     value_as_function(objv).fproto = protov;
                 }
             }
-            case OP_DEFPROP: {
+            case OP_DEFPROP, OP_DEFPROP_NEW: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
                 ip += 2;
-                def_prop(vm, a);
-            }
-            case OP_DEFPROP_NEW: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
-                def_prop_new(vm, a);
+                if op == OP_DEFPROP_NEW { def_prop_new(vm, a); } else { def_prop(vm, a); }
             }
             case OP_REQUIRE_OBJ: {
                 require_object(vm);
