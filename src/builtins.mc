@@ -12472,22 +12472,15 @@ private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* ar
 }
 
 // Half-close: stop sending, keep reading. end() needs this, or a peer that
-// replies after our FIN is talking to a socket that is already gone.
-when os(windows) {
-    private extern "ws2_32.dll" i32 shutdown(i64 s, i32 how);
-    private i32 net_shutdown_send(i64 fd) { return shutdown(fd, 1); }   // SD_SEND
-}
-else when os(macos) || os(ios) {
-    private extern "libSystem.B.dylib" i32 shutdown(i32 s, i32 how);
-    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
-}
-else when os(linux) || os(android) {
-    when os(android) { private extern "libc.so" i32 shutdown(i32 s, i32 how); }
-    else { private extern "libc.so.6" i32 shutdown(i32 s, i32 how); }
-    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
+// replies after our FIN is talking to a socket that is already gone. The
+// net library carries it on every target that has sockets at all, so this
+// is one call rather than a chain of them.
+when os(android) {
+    private extern "libc.so" i32 shutdown(i32 s, i32 how);
+    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }
 }
 else {
-    private i32 net_shutdown_send(i64 fd) { return 0; }
+    private i32 net_shutdown_send(i64 fd) { return net_shutdown_write(fd); }
 }
 
 private Value nat_net_shutdown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
