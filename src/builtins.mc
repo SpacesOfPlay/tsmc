@@ -16661,6 +16661,17 @@ else {
     tsmc_unsupported_target__add_a_when_os_arm _unsupported_random;
 }
 
+// picotls reaches for a syscall where there is one. Where there is not,
+// it takes the same source the crypto builtins use, so there is one
+// answer to "where does entropy come from" per target rather than two.
+when os(uefi) || os(wasm) {
+    private bool crypto_csprng_source(u8* buf, i32 n) { return os_random(buf, n); }
+    private void crypto_install_csprng() { mc_csprng_set_source(crypto_csprng_source); }
+}
+else {
+    private void crypto_install_csprng() { }
+}
+
 // Coerce a key/data argument to a byte Buffer: a Buffer passes through, a
 // string is encoded as UTF-8.
 private Value crypto_to_byte_buffer(VM* vm, Value v) {
@@ -19192,6 +19203,7 @@ private void install_proxy_reflect(VM* vm) {
 }
 
 void builtins_install(VM* vm) {
+    crypto_install_csprng();
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
     vm.array_proto = js_new_object(&vm.heap, vm.object_proto);

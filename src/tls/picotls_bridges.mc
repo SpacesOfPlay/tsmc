@@ -593,6 +593,11 @@ st_ptls_get_time_t mc_picotls_get_time = st_ptls_get_time_t{.cb = mc_picotls_get
 
 // Fill `buf` with cryptographic random bytes from the OS. Safe to
 // call from multiple threads.
+//
+// Every caller is about to make a key. A source that cannot deliver must
+// not be allowed to look as though it did, so a target with no arm here
+// does not compile and a source that fails at runtime stops the program
+// rather than handing picotls whatever the buffer happened to hold.
 when os(windows) {
     extern "bcrypt.dll" {
         i32 BCryptGenRandom(void* hAlgorithm, u8* pbBuffer, u32 cbBuffer, u32 dwFlags);
@@ -609,26 +614,43 @@ when os(macos) || os(ios) {
     }
 }
 
+// Targets whose entropy does not come from a syscall get it from here.
+// The builtins layer owns the per-platform source and installs it; null
+// is not a fallback, because there is no safe one.
+fn(u8*, i32): bool mc_csprng_source = null;
+
+void mc_csprng_set_source(fn(u8*, i32): bool f) { mc_csprng_source = f; }
+
+private void mc_csprng_fail() {
+    eprint("tsmc: no entropy; refusing to generate key material\n");
+    exit(1);
+}
+
 void mc_csprng_bytes(void* buf, u64 len) {
     u8* p = cast(u8*, buf);
     u64 remaining = len;
     when os(windows) {
         while remaining > cast(u64, 0) {
             u32 chunk = remaining > cast(u64, 0x40000000) ? cast(u32, 0x40000000) : cast(u32, remaining);
-            BCryptGenRandom(null, p, chunk, cast(u32, 2));
+            if BCryptGenRandom(null, p, chunk, cast(u32, 2)) != 0 { mc_csprng_fail(); }
             p = p + chunk;
             remaining = remaining - cast(u64, chunk);
         }
-    }
-    when os(linux) {
+    } else when os(linux) {
         while remaining > cast(u64, 0) {
             i64 n = getrandom(p, remaining, cast(u32, 0));
-            if n <= cast(i64, 0) { return; }
+            if n <= cast(i64, 0) { mc_csprng_fail(); }
             p = p + cast(u64, n);
             remaining = remaining - cast(u64, n);
         }
-    }
-    when os(macos) || os(ios) {
+    } else when os(macos) || os(ios) {
         arc4random_buf(cast(void*, p), remaining);
+    } else when os(uefi) || os(wasm) {
+        if mc_csprng_source == null { mc_csprng_fail(); }
+        if !mc_csprng_source(p, cast(i32, remaining)) { mc_csprng_fail(); }
+    } else {
+        // No arm for this target. Add a `when os(...)` arm above rather
+        // than leaving key material to whatever the buffer held.
+        tsmc_unsupported_target__add_a_when_os_arm _unsupported_csprng;
     }
 }
