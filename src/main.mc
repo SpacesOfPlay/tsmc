@@ -18,7 +18,11 @@ private void print_usage() {
     print("       tsmc --version\n");
 }
 
-i32 main() {
+// The run itself. Separate from main() because a freestanding embedder
+// has to equip the machine -- entropy, directories, whatever else it can
+// answer for -- before a script is able to observe it, and that means
+// owning the entry point. See src/uefi_host.mc.
+i32 tsmc_main() {
     // Optional flags precede the script path.
     bool gc_stress = false;
     i32 i = 1;
@@ -64,4 +68,11 @@ i32 main() {
     i32 status = module_run_entry(&m, source, arg);
     vm_destroy(&m);
     return status;
+}
+
+// Everywhere with an operating system under it, the CLI is the whole
+// program. On the freestanding target the embedder writes main(), calls
+// tsmc_set_uefi_host() and then tsmc_main().
+when !os(uefi) {
+    i32 main() { return tsmc_main(); }
 }

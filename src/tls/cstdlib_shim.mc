@@ -56,13 +56,14 @@ when os(windows) {
     extern "libc.so" i32 fprintf(void* stream, u8* fmt, ...);
 } else when os(macos) || os(ios) {
     extern "libSystem.B.dylib" i32 fprintf(void* stream, u8* fmt, ...);
-} else when os(wasm) {
+} else when os(wasm) || os(uefi) {
     // No stream to write to. The one caller is a path the port never takes.
     i32 fprintf(void* stream, u8* fmt) { return 0; }
 }
 
-// No system allocator on wasm; the C shapes go over the builtin one.
-when os(wasm) {
+// No system allocator on wasm or on the freestanding target; the C shapes
+// go over the builtin one.
+when os(wasm) || os(uefi) {
     void* malloc(u64 size)            { return alloc(cast(i64, size)); }
     void* calloc(u64 count, u64 size) {
         i64 total = cast(i64, count) * cast(i64, size);

@@ -22,6 +22,7 @@ import deflate;
 import inflate;
 import net;
 import os_time;
+import uefi_host;
 import tls_native;
 import tls_chain;
 import tsmc_plugin_abi;
@@ -10287,6 +10288,17 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         }
     }
 }
+else when os(uefi) {
+    // One program, one address space, no environment to inherit and
+    // nowhere to have been started from. The console is a framebuffer or
+    // a serial line rather than a terminal, so nothing here claims a TTY
+    // and the colour paths stay off.
+    private str os_platform_name() { return "uefi"; }
+    private bool os_isatty(i32 fd) { return false; }
+    private i32 os_pid() { return 0; }
+    private Value os_cwd_str(VM* vm) { return new_str(vm, "/"); }
+    private void os_env_install(VM* vm, JsObject* env) { }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
@@ -13344,6 +13356,14 @@ else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
     private u8 path_sep_ch() { return cast(u8, '/'); }
     private str path_delim_str() { return ":"; }
 }
+else when os(uefi) {
+    // The file namespace is flat and posix-shaped: one root, forward
+    // slashes, no drive letters.
+    private bool path_is_sep(u8 c) { return c == '/'; }
+    private str path_sep_str() { return "/"; }
+    private u8 path_sep_ch() { return cast(u8, '/'); }
+    private str path_delim_str() { return ":"; }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than assuming another platform's path conventions.
@@ -13370,6 +13390,9 @@ when os(windows) {
     private bool pf_host() { return true; }
 }
 else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
+    private bool pf_host() { return false; }
+}
+else when os(uefi) {
     private bool pf_host() { return false; }
 }
 else {
@@ -14245,6 +14268,45 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
             if !dot { js_array_set(arr, idx, new_str(vm, name)); idx++; }
         }
         ignore closedir(dp);
+    }
+}
+else when os(uefi) {
+    // Reading and writing files needs nothing from here: open, read,
+    // write, close and remove cross over as runtime contract calls, and
+    // the builtins above use them directly. Directories do not cross
+    // over, so they go through whatever the embedder attached. With
+    // nothing attached the view is flat and these report failure, which
+    // is the same answer a read-only file view gives.
+    private bool fs_mkdir1(u8* p) { return uefi_mkdir(p); }
+    private bool fs_rmdir1(u8* p) { return uefi_rmdir(p); }
+    private bool fs_unlink1(u8* p) { return remove(p) == 0; }
+    // No rename in the contract. Reporting failure sends the caller down
+    // its copy-and-unlink path rather than silently losing the file.
+    private bool fs_rename1(u8* a, u8* b) { return false; }
+    private bool fs_is_dir(u8* p) { return uefi_is_dir(p); }
+    // ns since the Unix epoch -> ms. A target that keeps no stamp reports
+    // zero, which surfaces as the epoch rather than as a wrong date.
+    private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
+
+    private void fs_readdir_into(VM* vm, str dir, JsObject* arr) {
+        u8* cdir = str_to_cstr(dir);
+        defer free(cdir);
+        noinit u8[256] name;
+        i32 idx = 0;
+        i32 out = 0;
+        while true {
+            i32 n = uefi_list(cdir, idx, &name[0], 256);
+            if n < 0 { break; }
+            idx++;
+            bool dot = (n == 1 && name[0] == '.')
+                || (n == 2 && name[0] == '.' && name[1] == '.');
+            if dot { continue; }
+            str nm;
+            nm.data = &name[0];
+            nm.len = n;
+            js_array_set(arr, out, new_str(vm, nm));
+            out++;
+        }
     }
 }
 else {
@@ -15150,6 +15212,42 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
     private u8* os_shell() { return getenv("SHELL"); }
     private i32 os_uid() { return getuid(); }
     private i32 os_gid() { return getgid(); }
+}
+else when os(uefi) {
+    // Two of these are real: the machine says how many cores it brought
+    // up, and the monotonic counter says how long ago that was. The rest
+    // describe an identity this target does not have, and report the
+    // neutral values the accessors already use for "unknown" rather than
+    // inventing a user or a hostname.
+    private str os_type_str() { return "Uefi"; }
+    private str os_eol_str() { return "\n"; }
+    private i32 os_ncpu() { return cpu_count(); }
+
+    private f64 os_uptime_s() {
+        i64 f = qpf();
+        if f == 0 { return 0.0; }
+        return cast(f64, qpc()) / cast(f64, f);
+    }
+
+    // There is no allocator-independent view of machine memory here, and
+    // guessing at one would make os.freemem() a number that means
+    // nothing.
+    private f64 os_mem(bool want_free) { return 0.0; }
+
+    private void os_loadavg_into(f64* out) {
+        *(out) = 0.0;
+        *(out + 1) = 0.0;
+        *(out + 2) = 0.0;
+    }
+
+    private str os_devnull_str() { return "/dev/null"; }
+    private bool os_hostname_into(u8* buf, i32 cap) { return false; }
+    private u8* os_home() { return null; }
+    private u8* os_tmp() { return null; }
+    private u8* os_user() { return null; }
+    private u8* os_shell() { return null; }
+    private i32 os_uid() { return 0 - 1; }
+    private i32 os_gid() { return 0 - 1; }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
@@ -16520,6 +16618,13 @@ else when os(wasm) {
     // Entropy comes from the host's CSPRNG. When it reports failure the
     // crypto functions throw rather than fall back to a weaker source.
     private bool os_random(u8* buf, i32 n) { return host_random_bytes(buf, n) != 0; }
+}
+else when os(uefi) {
+    // Entropy comes from whatever the embedder attached to the machine's
+    // source. When there is none, or it reports failure, the crypto
+    // functions throw rather than fall back to a weaker source: a key
+    // that looks random and is not is worse than no key.
+    private bool os_random(u8* buf, i32 n) { return uefi_random_bytes(buf, n); }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather

@@ -21,10 +21,13 @@ const i32 TLS_EOF = 4;
 const i32 TLS_ERR = 8;
 const i32 TLS_WANT_WRITE = 16;
 
-// The sandbox has no sockets (the net library has no wasm arm), so a
-// session could never handshake. The API is stubbed: __tls_connect sees
-// the null session and reports -1 to the JS layer.
-when os(wasm) {
+// Neither the sandbox nor the freestanding target has sockets (the net
+// library has no arm for either), so a session could never handshake. The
+// API is stubbed on both: __tls_connect sees the null session and reports
+// -1 to the JS layer, and the session machinery below -- which is all
+// that needs a socket -- is left out. The picotls core itself still comes
+// in, because the crypto module's digests use it.
+when os(wasm) || os(uefi) {
     struct TlsSession { bool established; bool failed; }
     const i32 TLS_ERR_NOT_TLS = 400;
     void tls_set_ecdsa_pin(u8* spki32) { }

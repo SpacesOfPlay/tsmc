@@ -6,6 +6,8 @@
 // is real time (unix epoch milliseconds — used for certificate validity);
 // `vm_wait_ms` blocks the calling thread for the given milliseconds.
 
+import uefi_host;
+
 when os(windows) {
     private extern "kernel32.dll" i32 QueryPerformanceCounter(i64* p);
     private extern "kernel32.dll" i32 QueryPerformanceFrequency(i64* p);
@@ -98,6 +100,30 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         req.tv_nsec = (ms % 1000) * 1000000;
         ignore nanosleep(&req, null);
     }
+}
+else when os(uefi) {
+    // The image is the machine. The monotonic counter and the sleep come
+    // from the runtime contract, so both are real; the wall clock has no
+    // portable source once firmware hands over, and is whatever the
+    // embedder can answer for.
+    u64 vm_clock_ns() {
+        i64 f = qpf();
+        if f == 0 { return 0; }
+        u64 c = cast(u64, qpc());
+        u64 uf = cast(u64, f);
+        // Split, so a counter of any frequency cannot overflow the
+        // multiply: ns = secs*1e9 + rem*1e9/freq.
+        u64 secs = c / uf;
+        u64 rem = c % uf;
+        return secs * 1000000000 + rem * 1000000000 / uf;
+    }
+
+    void vm_wait_ms(i64 ms) {
+        if ms <= 0 { return; }
+        thread_sleep(cast(i32, ms));
+    }
+
+    i64 os_wall_ms() { return uefi_wall_ms(); }
 }
 else {
     // No arm for this target. Add a `when os(...)` arm above rather than
