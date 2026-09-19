@@ -14356,8 +14356,44 @@ private bool fs_path_is_dir(str path) {
 }
 
 // True when the path names something, directory or not.
+// Everything below asks this rather than file_stamp directly, because one
+// target cannot answer a stamp at all and has to be served another way.
+when os(uefi) {
+    private FileStamp fs_stat1(str path) {
+        FileStamp r = { .mtime = 0, .size = 0 - 1, .ok = false };
+        u8* c = str_to_cstr(path);
+        defer free(c);
+        if uefi_is_dir(c) {
+            r.ok = true;
+            r.size = 0;
+            return r;
+        }
+        if file_exists(c) == 0 { return r; }
+        r.ok = true;
+        // No size call crosses over: the contract carries open, read,
+        // write, close and remove and nothing else. Counting the bytes is
+        // what is left, and a stat is not a hot path on a machine whose
+        // whole file view was baked into its own image.
+        i64 fd = open(c, 0);
+        if fd == 0 - 1 { return r; }
+        noinit u8[4096] buf;
+        i64 n = 0;
+        while true {
+            i32 got = read(fd, &buf[0], 4096);
+            if got <= 0 { break; }
+            n = n + cast(i64, got);
+        }
+        ignore close(fd);
+        r.size = n;
+        return r;
+    }
+}
+else {
+    private FileStamp fs_stat1(str path) { return file_stamp(path); }
+}
+
 private bool fs_path_exists(str path) {
-    return file_stamp(path).ok || fs_path_is_dir(path);
+    return fs_stat1(path).ok || fs_path_is_dir(path);
 }
 
 // The directory a path sits in, as a view into it; empty when there is none.
@@ -14561,7 +14597,7 @@ private Value nat_fs_write_file(void* vmp, Value callee, Value thisv, Value* arg
     bool ok = file_write(path, fd);
     // a zero-length write reports failure even where the file was created, so
     // confirm before turning that into an error
-    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
+    if !ok && bytes.len == 0 { ok = fs_stat1(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -14584,7 +14620,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     fd.data = bytes.data;
     fd.len = bytes.len;
     bool ok = file_write(path, fd);
-    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
+    if !ok && bytes.len == 0 { ok = fs_stat1(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -14600,7 +14636,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
 private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    bool ok = file_stamp(path).ok;
+    bool ok = fs_stat1(path).ok;
     vm_pop(vm);
     return value_bool(ok);
 }
@@ -14760,7 +14796,7 @@ private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i3
 private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    FileStamp st = file_stamp(path);
+    FileStamp st = fs_stat1(path);
     if !st.ok {
         fs_throw(vm, "stat", path);
         vm_pop(vm);
