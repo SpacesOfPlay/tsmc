@@ -226,7 +226,7 @@ i32 ecdsa_p256_pinned_verify_cert_cb(ptls_verify_certificate_t* self,
 
     ecdsa_p256_verify_ctx_t* ctx = new(ecdsa_p256_verify_ctx_t);
     if mc_spki_extract_p256_pubkey(spki_start, spki_len, &ctx.public_key_xy[0]) != 0 {
-        free(cast(void*, ctx));
+        free(ctx);
         eprint("verify: SPKI pubkey extract failed (not P-256?)\n");
         return 0 - 1;
     }
@@ -277,6 +277,8 @@ void mc_ecdsa_p256_sign_init() {
     uECC_set_rng(mc_uecc_rng);
 }
 
+// LOCAL (tsmc): server-side signing. picotls-minc verifies certificates
+// and never presents one, so this whole path is ours.
 struct ecdsa_sign_cert_ctx_t {
     ptls_sign_certificate_t super;
     u8[32] private_key;   // P-256 scalar, big-endian

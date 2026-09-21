@@ -3,6 +3,7 @@
 // Imports added on export so this module resolves standalone (LSP).
 import cstdlib_shim;
 import cfile_shim;
+import cvararg_shim;
 import picotls_shim;
 
 // transminc: C stdlib constants referenced by source
@@ -11,207 +12,6 @@ const i32 UINT16_MAX = 65535;
 const u32 UINT32_MAX = 4294967295;
 const u64 UINT64_MAX = 18446744073709551615;
 const u64 SIZE_MAX = 18446744073709551615;
-
-// transminc: C #define values surfaced as compile-time configuration
-@define "PTLS_HAVE_LOG" 0
-@define "PTLS_FUZZ_HANDSHAKE" 0
-@define "PTLS_HELLO_RANDOM_SIZE" 32
-@define "PTLS_AES128_KEY_SIZE" 16
-@define "PTLS_AES256_KEY_SIZE" 32
-@define "PTLS_AES_BLOCK_SIZE" 16
-@define "PTLS_AES_IV_SIZE" 16
-@define "PTLS_AESGCM_IV_SIZE" 12
-@define "PTLS_AESGCM_TAG_SIZE" 16
-@define "PTLS_AESGCM_CONFIDENTIALITY_LIMIT" 33554432
-@define "PTLS_AESCCM_CONFIDENTIALITY_LIMIT" 11863283
-@define "PTLS_AESCCM_INTEGRITY_LIMIT" 11863283
-@define "PTLS_CHACHA20_KEY_SIZE" 32
-@define "PTLS_CHACHA20_IV_SIZE" 16
-@define "PTLS_CHACHA20POLY1305_IV_SIZE" 12
-@define "PTLS_CHACHA20POLY1305_TAG_SIZE" 16
-@define "PTLS_AEGIS128L_KEY_SIZE" 16
-@define "PTLS_AEGIS128L_IV_SIZE" 16
-@define "PTLS_AEGIS128L_TAG_SIZE" 16
-@define "PTLS_AEGIS256_KEY_SIZE" 32
-@define "PTLS_AEGIS256_IV_SIZE" 32
-@define "PTLS_AEGIS256_TAG_SIZE" 16
-@define "PTLS_BLOWFISH_KEY_SIZE" 16
-@define "PTLS_BLOWFISH_BLOCK_SIZE" 8
-@define "PTLS_QUICLB_KEY_SIZE" 16
-@define "PTLS_QUICLB_MIN_BLOCK_SIZE" 7
-@define "PTLS_QUICLB_MAX_BLOCK_SIZE" 19
-@define "PTLS_QUICLB_DEFAULT_BLOCK_SIZE" 8
-@define "PTLS_SHA256_BLOCK_SIZE" 64
-@define "PTLS_SHA256_DIGEST_SIZE" 32
-@define "PTLS_SHA384_BLOCK_SIZE" 128
-@define "PTLS_SHA384_DIGEST_SIZE" 48
-@define "PTLS_SHA512_BLOCK_SIZE" 128
-@define "PTLS_SHA512_DIGEST_SIZE" 64
-@define "PTLS_MAX_SECRET_SIZE" 32
-@define "PTLS_MAX_IV_SIZE" 32
-@define "PTLS_MAX_DIGEST_SIZE" 64
-@define "PTLS_MAX_SIGNATURE_ALGORITHMS" 64
-@define "PTLS_PROTOCOL_VERSION_TLS12" 771
-@define "PTLS_PROTOCOL_VERSION_TLS13" 772
-@define "PTLS_CIPHER_SUITE_AES_128_GCM_SHA256" 4865
-@define "PTLS_CIPHER_SUITE_AES_256_GCM_SHA384" 4866
-@define "PTLS_CIPHER_SUITE_CHACHA20_POLY1305_SHA256" 4867
-@define "PTLS_CIPHER_SUITE_AEGIS256_SHA512" 4870
-@define "PTLS_CIPHER_SUITE_AEGIS128L_SHA256" 4871
-@define "PTLS_CIPHER_SUITE_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" 49195
-@define "PTLS_CIPHER_SUITE_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" 49196
-@define "PTLS_CIPHER_SUITE_ECDHE_RSA_WITH_AES_128_GCM_SHA256" 49199
-@define "PTLS_CIPHER_SUITE_ECDHE_RSA_WITH_AES_256_GCM_SHA384" 49200
-@define "PTLS_CIPHER_SUITE_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" 52392
-@define "PTLS_CIPHER_SUITE_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" 52393
-@define "PTLS_GROUP_SECP256R1" 23
-@define "PTLS_GROUP_SECP384R1" 24
-@define "PTLS_GROUP_SECP521R1" 25
-@define "PTLS_GROUP_X25519" 29
-@define "PTLS_GROUP_X448" 30
-@define "PTLS_GROUP_SECP256R1MLKEM768" 4587
-@define "PTLS_GROUP_X25519MLKEM768" 4588
-@define "PTLS_GROUP_SECP384R1MLKEM1024" 4589
-@define "PTLS_GROUP_MLKEM512" 512
-@define "PTLS_GROUP_MLKEM768" 513
-@define "PTLS_GROUP_MLKEM1024" 514
-@define "PTLS_SIGNATURE_RSA_PKCS1_SHA1" 513
-@define "PTLS_SIGNATURE_RSA_PKCS1_SHA256" 1025
-@define "PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256" 1027
-@define "PTLS_SIGNATURE_ECDSA_SECP384R1_SHA384" 1283
-@define "PTLS_SIGNATURE_ECDSA_SECP521R1_SHA512" 1539
-@define "PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256" 2052
-@define "PTLS_SIGNATURE_RSA_PSS_RSAE_SHA384" 2053
-@define "PTLS_SIGNATURE_RSA_PSS_RSAE_SHA512" 2054
-@define "PTLS_SIGNATURE_ED25519" 2055
-@define "PTLS_HPKE_MODE_BASE" 0
-@define "PTLS_HPKE_MODE_PSK" 1
-@define "PTLS_HPKE_MODE_AUTH" 2
-@define "PTLS_HPKE_MODE_AUTH_PSK" 3
-@define "PTLS_HPKE_KEM_P256_SHA256" 16
-@define "PTLS_HPKE_KEM_P384_SHA384" 17
-@define "PTLS_HPKE_KEM_X25519_SHA256" 32
-@define "PTLS_HPKE_HKDF_SHA256" 1
-@define "PTLS_HPKE_HKDF_SHA384" 2
-@define "PTLS_HPKE_HKDF_SHA512" 3
-@define "PTLS_HPKE_AEAD_AES_128_GCM" 1
-@define "PTLS_HPKE_AEAD_AES_256_GCM" 2
-@define "PTLS_HPKE_AEAD_CHACHA20POLY1305" 3
-@define "PTLS_ERROR_CLASS_SELF_ALERT" 0
-@define "PTLS_ERROR_CLASS_PEER_ALERT" 256
-@define "PTLS_ERROR_CLASS_INTERNAL" 512
-@define "PTLS_ALERT_LEVEL_WARNING" 1
-@define "PTLS_ALERT_LEVEL_FATAL" 2
-@define "PTLS_ALERT_CLOSE_NOTIFY" 0
-@define "PTLS_ALERT_UNEXPECTED_MESSAGE" 10
-@define "PTLS_ALERT_BAD_RECORD_MAC" 20
-@define "PTLS_ALERT_HANDSHAKE_FAILURE" 40
-@define "PTLS_ALERT_BAD_CERTIFICATE" 42
-@define "PTLS_ALERT_UNSUPPORTED_CERTIFICATE" 43
-@define "PTLS_ALERT_CERTIFICATE_REVOKED" 44
-@define "PTLS_ALERT_CERTIFICATE_EXPIRED" 45
-@define "PTLS_ALERT_CERTIFICATE_UNKNOWN" 46
-@define "PTLS_ALERT_ILLEGAL_PARAMETER" 47
-@define "PTLS_ALERT_UNKNOWN_CA" 48
-@define "PTLS_ALERT_ACCESS_DENIED" 49
-@define "PTLS_ALERT_DECODE_ERROR" 50
-@define "PTLS_ALERT_DECRYPT_ERROR" 51
-@define "PTLS_ALERT_PROTOCOL_VERSION" 70
-@define "PTLS_ALERT_INTERNAL_ERROR" 80
-@define "PTLS_ALERT_USER_CANCELED" 90
-@define "PTLS_ALERT_MISSING_EXTENSION" 109
-@define "PTLS_ALERT_UNSUPPORTED_EXTENSION" 110
-@define "PTLS_ALERT_UNRECOGNIZED_NAME" 112
-@define "PTLS_ALERT_UNKNOWN_PSK_IDENTITY" 115
-@define "PTLS_ALERT_CERTIFICATE_REQUIRED" 116
-@define "PTLS_ALERT_NO_APPLICATION_PROTOCOL" 120
-@define "PTLS_ALERT_ECH_REQUIRED" 121
-@define "PTLS_TLS12_MASTER_SECRET_SIZE" 48
-@define "PTLS_TLS12_AAD_SIZE" 13
-@define "PTLS_TLS12_AESGCM_FIXED_IV_SIZE" 4
-@define "PTLS_TLS12_AESGCM_RECORD_IV_SIZE" 8
-@define "PTLS_TLS12_CHACHAPOLY_FIXED_IV_SIZE" 12
-@define "PTLS_TLS12_CHACHAPOLY_RECORD_IV_SIZE" 0
-@define "PTLS_HANDSHAKE_TYPE_CLIENT_HELLO" 1
-@define "PTLS_HANDSHAKE_TYPE_SERVER_HELLO" 2
-@define "PTLS_HANDSHAKE_TYPE_NEW_SESSION_TICKET" 4
-@define "PTLS_HANDSHAKE_TYPE_END_OF_EARLY_DATA" 5
-@define "PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS" 8
-@define "PTLS_HANDSHAKE_TYPE_CERTIFICATE" 11
-@define "PTLS_HANDSHAKE_TYPE_CERTIFICATE_REQUEST" 13
-@define "PTLS_HANDSHAKE_TYPE_CERTIFICATE_VERIFY" 15
-@define "PTLS_HANDSHAKE_TYPE_FINISHED" 20
-@define "PTLS_HANDSHAKE_TYPE_KEY_UPDATE" 24
-@define "PTLS_HANDSHAKE_TYPE_COMPRESSED_CERTIFICATE" 25
-@define "PTLS_HANDSHAKE_TYPE_MESSAGE_HASH" 254
-@define "PTLS_HANDSHAKE_TYPE_PSEUDO_HRR" -1
-@define "PTLS_CERTIFICATE_TYPE_X509" 0
-@define "PTLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY" 2
-@define "PTLS_DEFAULT_MAX_TICKETS_TO_SERVE" 4
-@define "PTLS_ENCODE_QUICINT_CAPACITY" 8
-@define "PTLS_QUICINT_MAX" 4611686018427387903
-@define "PTLS_MAX_PLAINTEXT_RECORD_SIZE" 16384
-@define "PTLS_RECORD_VERSION_MAJOR" 3
-@define "PTLS_RECORD_VERSION_MINOR" 3
-@define "PTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC" 20
-@define "PTLS_CONTENT_TYPE_ALERT" 21
-@define "PTLS_CONTENT_TYPE_HANDSHAKE" 22
-@define "PTLS_CONTENT_TYPE_APPDATA" 23
-@define "PTLS_PSK_KE_MODE_PSK" 0
-@define "PTLS_PSK_KE_MODE_PSK_DHE" 1
-@define "PTLS_HANDSHAKE_HEADER_SIZE" 4
-@define "PTLS_EXTENSION_TYPE_SERVER_NAME" 0
-@define "PTLS_EXTENSION_TYPE_STATUS_REQUEST" 5
-@define "PTLS_EXTENSION_TYPE_SUPPORTED_GROUPS" 10
-@define "PTLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS" 13
-@define "PTLS_EXTENSION_TYPE_ALPN" 16
-@define "PTLS_EXTENSION_TYPE_SERVER_CERTIFICATE_TYPE" 20
-@define "PTLS_EXTENSION_TYPE_COMPRESS_CERTIFICATE" 27
-@define "PTLS_EXTENSION_TYPE_PRE_SHARED_KEY" 41
-@define "PTLS_EXTENSION_TYPE_EARLY_DATA" 42
-@define "PTLS_EXTENSION_TYPE_SUPPORTED_VERSIONS" 43
-@define "PTLS_EXTENSION_TYPE_COOKIE" 44
-@define "PTLS_EXTENSION_TYPE_PSK_KEY_EXCHANGE_MODES" 45
-@define "PTLS_EXTENSION_TYPE_CERTIFICATE_AUTHORITIES" 47
-@define "PTLS_EXTENSION_TYPE_KEY_SHARE" 51
-@define "PTLS_EXTENSION_TYPE_TICKET_REQUEST" 58
-@define "PTLS_EXTENSION_TYPE_ECH_OUTER_EXTENSIONS" 64768
-@define "PTLS_EXTENSION_TYPE_ENCRYPTED_CLIENT_HELLO" 65037
-@define "PTLS_SERVER_NAME_TYPE_HOSTNAME" 0
-@define "PTLS_ECH_CONFIG_VERSION" 65037
-@define "PTLS_ECH_CLIENT_HELLO_TYPE_OUTER" 0
-@define "PTLS_ECH_CLIENT_HELLO_TYPE_INNER" 1
-@define "PTLS_ECH_CONFIRM_LENGTH" 8
-@define "PTLS_EARLY_DATA_MAX_DELAY" 10000
-@define "PTLS_MAX_EARLY_DATA_SKIP_SIZE" 65536
-@define "PTLS_MEMORY_DEBUG" 0
-@define "MAX_UNKNOWN_EXTENSIONS" 16
-@define "MAX_CERTIFICATE_TYPES" 8
-@define "CF_CHASH_MAXCTX" 360
-@define "CF_CHASH_MAXBLK" 128
-@define "CF_MAXHASH" 64
-@define "CF_SHA224_HASHSZ" 28
-@define "CF_SHA224_BLOCKSZ" 64
-@define "CF_SHA256_HASHSZ" 32
-@define "CF_SHA256_BLOCKSZ" 64
-@define "CF_SHA384_HASHSZ" 48
-@define "CF_SHA384_BLOCKSZ" 128
-@define "CF_SHA512_HASHSZ" 64
-@define "CF_SHA512_BLOCKSZ" 128
-@define "CF_SIDE_CHANNEL_PROTECTION" 1
-@define "CF_MAXBLOCK" 16
-@define "AES_BLOCKSZ" 16
-@define "AES128_ROUNDS" 10
-@define "AES192_ROUNDS" 12
-@define "AES256_ROUNDS" 14
-@define "CF_AES_ENCRYPT_ONLY" 0
-@define "STATE_INVALID" 0
-@define "STATE_AAD" 1
-@define "STATE_CIPHER" 2
-@define "ENCRYPT" 1
-@define "DECRYPT" 0
-@define "SUCCESS" 0
-@define "FAILURE" 1
 
 /**
  *
@@ -272,6 +72,12 @@ enum __enum_HANDSHAKE_MODE_FULL {
     HANDSHAKE_MODE_PSK_DHE = 2,
 }
 
+/* __builtin_types_compatible_p yields incorrect results when older versions of GCC is used; see #303.
+ * Clang with Xcode 9.4 or prior is known to not work correctly when a pointer is const-qualified; see
+ * https://github.com/h2o/quicly/pull/306#issuecomment-626037269. Older versions of clang upstream works fine, but we do not need
+ * best coverage. This macro is for preventing misuse going into the master branch, having it work one of the compilers supported in
+ * our CI is enough.
+ */
 /* versions */
 /* cipher-suites */
 /* TLS/1.2 cipher-suites that we support (for compatibility, OpenSSL names are used) */
@@ -315,6 +121,7 @@ type ptls_async_job_t = st_ptls_async_job_t;
 type ptls_sign_certificate_t = st_ptls_sign_certificate_t;
 type ptls_verify_certificate_t = st_ptls_verify_certificate_t;
 type ptls_encrypt_ticket_t = st_ptls_encrypt_ticket_t;
+type ptls_save_ticket_properties_t = st_ptls_save_ticket_properties_t;
 type ptls_save_ticket_t = st_ptls_save_ticket_t;
 type ptls_log_event_t = st_ptls_log_event_t;
 type ptls_update_open_count_t = st_ptls_update_open_count_t;
@@ -327,32 +134,6 @@ type ptls_early_data_acceptance_t = en_ptls_early_data_acceptance_t;
 type ptls_handshake_properties_t = st_ptls_handshake_properties_t;
 type ptls_log_getsni_t = st_ptls_log_getsni_t;
 type ptls_log_conn_state_t = st_ptls_log_conn_state_t;
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
 /*
  * cifra - embedded cryptography library
  * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
@@ -442,84 +223,6 @@ type cf_blockwise_out_fn = fn(void*, u8*): void;
  * along with this software. If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/**
- * Library configuration
- * =====================
- */
-/* .. c:macro:: CF_SIDE_CHANNEL_PROTECTION
- * Define this as 1 if you need all available side channel protections.
- * **This option may alter the ABI**.
- *
- * This has a non-trivial performance penalty.  Where a
- * side-channel free option is cheap or free (like checking
- * a MAC) this is always done in a side-channel free way.
- *
- * The default is **on** for all available protections.
- */
-/* .. c:macro:: CF_TIME_SIDE_CHANNEL_PROTECTION
- * Define this as 1 if you need timing/branch prediction side channel
- * protection.
- *
- * You probably want this.  The default is on. */
-/* .. c:macro:: CF_CACHE_SIDE_CHANNEL_PROTECTION
- * Define this as 1 if you need cache side channel protection.
- *
- * If you have a microcontroller with no cache, you can turn this off
- * without negative effects.
- *
- * The default is on.  This will have some performance impact,
- * especially on AES.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/**
- * The AES block cipher
- * ====================
- *
- * This is a small, simple implementation of AES.  Key expansion is done
- * first, filling in a :c:type:`cf_aes_context`.  Then encryption and
- * decryption can be performed as desired.
- *
- * Usually you don't want to use AES directly; you should use it via
- * a :doc:`block cipher mode <modes>`.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
 /**
  * General block cipher description
  * ================================
@@ -550,45 +253,6 @@ type cf_prp_block = fn(void*, u8*, u8*): void;
  * along with this software. If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
 /**
  * @brief Operations in GF(2^128).
  *
@@ -596,7 +260,6 @@ type cf_prp_block = fn(void*, u8*, u8*): void;
  */
 type cf_gf128 = u32[4];
 type cf_chacha20_ctx = cf_salsa20_ctx;
-type __arr_void_4 = u8*[4];
 type __fnptr_0 = fn(void*, u16, ptls_iovec_t, ptls_iovec_t): i32;
 /**
  * represents a sequence of octets
@@ -834,7 +497,7 @@ struct st_ptls_emit_certificate_t {
  */
 struct st_ptls_async_job_t {
     fn(st_ptls_async_job_t*): void destroy_;
-    fn(st_ptls_async_job_t*): i32 get_fd;
+    fn(st_ptls_async_job_t*): i64 get_fd;
     fn(st_ptls_async_job_t*, fn(void*): void, void*): void set_completion_callback;
 }
 
@@ -871,10 +534,19 @@ struct st_ptls_encrypt_ticket_t {
 }
 
 /**
+ * properties of a session ticket being saved
+ */
+struct st_ptls_save_ticket_properties_t {
+    u32 lifetime;
+    u32 early_data;
+    u32 max_early_data_size;
+}
+
+/**
  * saves a ticket (client-only)
  */
 struct st_ptls_save_ticket_t {
-    fn(st_ptls_save_ticket_t*, ptls_t*, ptls_iovec_t): i32 cb;
+    fn(st_ptls_save_ticket_t*, ptls_t*, ptls_iovec_t, ptls_save_ticket_properties_t*): i32 cb;
 }
 
 /**
@@ -1062,6 +734,7 @@ struct st_ptls_log_point_t {
 struct st_ptls_log_conn_state_t {
     f32 random_;
     u8[16] address;
+    u64 conn_id;
     st_ptls_log_state_t state;
 }
 
@@ -1240,7 +913,7 @@ struct st_ptls_client_hello_t {
         u32 early_data_indication;
         u32 is_last_extension;
     } psk;
-    ptls_raw_extension_t[17] unknown_extensions;
+    ptls_raw_extension_t[16 + 1] unknown_extensions;
     u64 first_extension_at;
 }
 
@@ -1280,24 +953,24 @@ struct st_ptls_extension_bitmap_t {
     u64 bits;
 }
 
-struct __anon_picotls_struct_44 {
+private struct psk_t {
     ptls_iovec_t secret;
     ptls_iovec_t identity;
     u8* label;
 }
 
-struct __anon_picotls_struct_45 {
+private struct key_share_t {
     ptls_key_exchange_algorithm_t* algorithm;
     ptls_iovec_t peer_key;
 }
 
-struct __anon_picotls_struct_46 {
+private struct ech_t {
     u8* encoded_ch_inner;
     u8* ch_outer_aad;
     ptls_buffer_t ch_inner;
 }
 
-struct __anon_picotls_struct_47 {
+private struct client_secret_t {
     void* key;
     void* iv;
 }
@@ -1309,7 +982,7 @@ struct st_picotls_hmac_context_t {
     u8[1] key;
 }
 
-struct __anon_picotls_struct_48 {
+private struct key_iv_t {
     u8[32] key;
     u8[32] iv;
 }
@@ -1450,9 +1123,6 @@ struct cf_prp {
     cf_prp_block decrypt;
 }
 
-/* .. c:macro:: CF_MAXBLOCK
- * The maximum block cipher blocksize we support, in bytes.
- */
 /* .. c:macro:: AES_BLOCKSZ
  * AES has a 128-bit block size.  This quantity is in bytes.
  */
@@ -1500,22 +1170,9 @@ struct cf_prp {
  */
 struct cf_aes_context {
     u32 rounds;
-    u32[60] ks;
+    u32[16 / 4 * (14 + 1)] ks;
 }
 
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
 /**
  * Block cipher modes
  * ==================
@@ -1751,19 +1408,6 @@ struct cf_salsa20_ctx {
  * along with this software. If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
 /**
  * Poly1305
  * ========
@@ -1822,14 +1466,6 @@ struct cf_poly1305 {
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-when os(windows) {
-}
-when !(os(windows)) {
-}
-when os(linux) {
-}
-when os(macos) || os(ios) {
-}
 /*
  * Copyright (c) 2016 DeNA Co., Ltd., Kazuho Oku
  *
@@ -1851,33 +1487,15 @@ when os(macos) || os(ios) {
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-when os(windows) {
-}
-/* __builtin_types_compatible_p yields incorrect results when older versions of GCC is used; see #303.
- * Clang with Xcode 9.4 or prior is known to not work correctly when a pointer is const-qualified; see
- * https://github.com/h2o/quicly/pull/306#issuecomment-626037269. Older versions of clang upstream works fine, but we do not need
- * best coverage. This macro is for preventing misuse going into the master branch, having it work one of the compilers supported in
- * our CI is enough.
- */
-when os(windows) {
-} else {
-}
 /**
  * optional arguments to client-driven handshake
  */
-when os(windows) {
-}
-when os(windows) {
-}
-when os(windows) {
-}
 /**
  * see `ptls_get_log_state`
  */
 /**
  * global variables exposed
  */
-st_ptls_log_t ptls_log;
 /**
  * clears memory
  */
@@ -1887,6 +1505,7 @@ st_ptls_log_t ptls_log;
 /**
  * the default get_time callback
  */
+
 private {
 u8* ptls_log_getsni_cb_ptls(void* _arg) {
     var arg = cast(ptls_t*, _arg);
@@ -1894,31 +1513,36 @@ u8* ptls_log_getsni_cb_ptls(void* _arg) {
         return ptls_get_server_name(arg);
     }
 }
-}
-private {
+
 ptls_log_getsni_t ptls_log_getsni_ptls(ptls_t* arg) {
     return ptls_log_getsni_t{ptls_log_getsni_cb_ptls, arg};
 }
 }
+
 /* inline functions */
 u32 ptls_log_point_maybe_active(st_ptls_log_point_t* point) {
     return 0;
 }
+
 void ptls_log_recalc_conn_state(ptls_log_conn_state_t* state) {
     state.state.generation = 0;
 }
+
 u32 ptls_log_conn_maybe_active(ptls_log_conn_state_t* conn, ptls_log_getsni_t getsni) {
     return 0;
 }
+
 ptls_t* ptls_new(ptls_context_t* ctx, i32 is_server) {
     return is_server != 0 ? ptls_server_new(ctx) : ptls_client_new(ctx);
 }
+
 ptls_iovec_t ptls_iovec_init(void* p, u64 len) {
-    ptls_iovec_t r;
+    noinit ptls_iovec_t r;
     r.base = cast(u8*, p);
     r.len = len;
     return r;
 }
+
 void ptls_buffer_init(ptls_buffer_t* buf, void* smallbuf, u64 smallbuf_size) {
     assert(smallbuf != null);
     buf.base = cast(u8*, smallbuf);
@@ -1927,20 +1551,22 @@ void ptls_buffer_init(ptls_buffer_t* buf, void* smallbuf, u64 smallbuf_size) {
     buf.is_allocated = 0;
     buf.align_bits = 0;
 }
+
 void ptls_buffer_dispose(ptls_buffer_t* buf) {
     ptls_buffer__release_memory(buf);
     *buf = ptls_buffer_t{};
 }
+
 u8* ptls_encode_quicint(u8* p, u64 v) {
     if v > 63 {
         if v > 16383 {
             u32 sb;
             if v > 1073741823 {
                 assert(v <= 4611686018427387903);
-                *p++ = 192 | cast(u8, v >> 56);
+                *p++ = 0xc0 | cast(u8, v >> 56);
                 sb = cast(u32, 6 * 8);
             } else {
-                *p++ = 128 | cast(u8, v >> 24);
+                *p++ = 0x80 | cast(u8, v >> 24);
                 sb = cast(u32, 2 * 8);
             }
             while true {
@@ -1949,43 +1575,54 @@ u8* ptls_encode_quicint(u8* p, u64 v) {
                 if !(sb != 0) { break; }
             }
         } else {
-            *p++ = 64 | cast(u8, cast(u16, v) >> 8);
+            *p++ = 0x40 | cast(u8, cast(u16, v) >> 8);
         }
     }
     *p++ = cast(u8, v);
     return p;
 }
+
 void ptls_cipher_init(ptls_cipher_context_t* ctx, void* iv) {
     ctx.do_init(ctx, iv);
 }
+
 void ptls_cipher_encrypt(ptls_cipher_context_t* ctx, void* output, void* input, u64 len) {
     ctx.do_transform(ctx, output, input, len);
 }
+
 void ptls_aead_get_iv(ptls_aead_context_t* ctx, void* iv) {
     ctx.do_get_iv(ctx, iv);
 }
+
 void ptls_aead_set_iv(ptls_aead_context_t* ctx, void* iv) {
     ctx.do_set_iv(ctx, iv);
 }
+
 u64 ptls_aead_encrypt(ptls_aead_context_t* ctx, void* output, void* input, u64 inlen, u64 seq, void* aad, u64 aadlen) {
     ctx.do_encrypt(ctx, output, input, inlen, seq, aad, aadlen, null);
     return inlen + ctx.algo.tag_size;
 }
+
 void ptls_aead_encrypt_s(ptls_aead_context_t* ctx, void* output, void* input, u64 inlen, u64 seq, void* aad, u64 aadlen, ptls_aead_supplementary_encryption_t* supp) {
     ctx.do_encrypt(ctx, output, input, inlen, seq, aad, aadlen, supp);
 }
+
 void ptls_aead_encrypt_v(ptls_aead_context_t* ctx, void* output, ptls_iovec_t* input, u64 incnt, u64 seq, void* aad, u64 aadlen) {
     ctx.do_encrypt_v(ctx, output, input, incnt, seq, aad, aadlen);
 }
+
 void ptls_aead_encrypt_init(ptls_aead_context_t* ctx, u64 seq, void* aad, u64 aadlen) {
     ctx.do_encrypt_init(ctx, seq, aad, aadlen);
 }
+
 u64 ptls_aead_encrypt_update(ptls_aead_context_t* ctx, void* output, void* input, u64 inlen) {
     return ctx.do_encrypt_update(ctx, output, input, inlen);
 }
+
 u64 ptls_aead_encrypt_final(ptls_aead_context_t* ctx, void* output) {
     return ctx.do_encrypt_final(ctx, output);
 }
+
 void ptls_aead__do_encrypt(ptls_aead_context_t* ctx, void* output, void* input, u64 inlen, u64 seq, void* aad, u64 aadlen, ptls_aead_supplementary_encryption_t* supp) {
     ptls_iovec_t invec = ptls_iovec_init(input, inlen);
     ctx.do_encrypt_v(ctx, output, &invec, 1, seq, aad, aadlen);
@@ -1995,6 +1632,7 @@ void ptls_aead__do_encrypt(ptls_aead_context_t* ctx, void* output, void* input, 
         ptls_cipher_encrypt(supp.ctx, supp.output, supp.output, cast(u64, sizeof(supp.output)));
     }
 }
+
 void ptls_aead__do_encrypt_v(ptls_aead_context_t* ctx, void* _output, ptls_iovec_t* input, u64 incnt, u64 seq, void* aad, u64 aadlen) {
     var output = cast(u8*, _output);
     ctx.do_encrypt_init(ctx, seq, aad, aadlen);
@@ -2003,19 +1641,27 @@ void ptls_aead__do_encrypt_v(ptls_aead_context_t* ctx, void* _output, ptls_iovec
     }
     ctx.do_encrypt_final(ctx, output);
 }
+
 u64 ptls_aead_decrypt(ptls_aead_context_t* ctx, void* output, void* input, u64 inlen, u64 seq, void* aad, u64 aadlen) {
     return ctx.do_decrypt(ctx, output, input, inlen, seq, aad, aadlen);
 }
+
 void ptls_hash_clone_memcpy(void* dst, void* src, u64 size) {
     memcpy(dst, src, size);
 }
-private { u8[8] ech_info_prefix = {116, 108, 115, 32, 101, 99, 104, 0}; }
+private {
+u8[8] ech_info_prefix = {116, 108, 115, 32, 101, 99, 104, 0};
 /**
  * list of supported versions in the preferred order
  */
-private { u16[1] supported_versions = {772}; }
-private { u8[32] hello_retry_random = {207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140, 2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226, 200, 168, 51, 156}; }
-private { u8[64] zeroes_of_max_digest_size; }
+u16[1] supported_versions = {0x0304};
+u8[32] hello_retry_random = {
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
+u8[64] zeroes_of_max_digest_size;
+}
+
 private {
 i32 is_supported_version(u16 v) {
     u64 i;
@@ -2026,8 +1672,7 @@ i32 is_supported_version(u16 v) {
     }
     return 0;
 }
-}
-private {
+
 i32 extension_bitmap_testandset(st_ptls_extension_bitmap_t* bitmap, i32 hstype, u16 extid) {
     u64 allowed_hs_bits;
     u64 ext_bitmap_mask = 1;
@@ -2253,7 +1898,7 @@ i32 extension_bitmap_testandset(st_ptls_extension_bitmap_t* bitmap, i32 hstype, 
         if !(0 != 0) { break; }
     }
     while true {
-        if extid == 65037 {
+        if extid == 0xfe0d {
             allowed_hs_bits = extension_bitmap_testandset__CH + extension_bitmap_testandset__HRR + extension_bitmap_testandset__EE;
             {
                 if (allowed_hs_bits & cast(u64, 1) << cast(u64, hstype + 1)) == 0 {
@@ -2270,7 +1915,7 @@ i32 extension_bitmap_testandset(st_ptls_extension_bitmap_t* bitmap, i32 hstype, 
         if !(0 != 0) { break; }
     }
     while true {
-        if extid == 64768 {
+        if extid == 0xfd00 {
             allowed_hs_bits = 0;
             {
                 if (allowed_hs_bits & cast(u64, 1) << cast(u64, hstype + 1)) == 0 {
@@ -2288,35 +1933,29 @@ i32 extension_bitmap_testandset(st_ptls_extension_bitmap_t* bitmap, i32 hstype, 
     }
     return 1;
 }
-}
-private {
+
 u16 ntoh16(u8* src) {
     return cast(u16, cast(u16, src[0]) << 8 | src[1]);
 }
-}
-private {
+
 u32 ntoh24(u8* src) {
     return cast(u32, src[0]) << 16 | cast(u32, src[1]) << 8 | src[2];
 }
-}
-private {
+
 u32 ntoh32(u8* src) {
     return cast(u32, src[0]) << 24 | cast(u32, src[1]) << 16 | cast(u32, src[2]) << 8 | src[3];
 }
-}
-private {
+
 u64 ntoh64(u8* src) {
     return cast(u64, src[0]) << 56 | cast(u64, src[1]) << 48 | cast(u64, src[2]) << 40 | cast(u64, src[3]) << 32 | cast(u64, src[4]) << 24 | cast(u64, src[5]) << 16 | cast(u64, src[6]) << 8 | src[7];
 }
-}
-private {
+
 void encode64(u8* dst, u64 v) {
     for u64 i = 0; i < 8; ++i {
         dst[i] = cast(u8, v >> 56 - 8 * i);
     }
 }
-}
-private {
+
 u8* duplicate_as_str(void* src, u64 len) {
     u8* dst;
     dst = alloc(cast(i64, len + 1));
@@ -2328,12 +1967,13 @@ u8* duplicate_as_str(void* src, u64 len) {
     return dst;
 }
 }
+
 void ptls_buffer__release_memory(ptls_buffer_t* buf) {
     ptls_clear_memory(buf.base, buf.off);
     if buf.is_allocated != 0 {
         when os(windows) {
             if buf.align_bits != 0 {
-                _aligned_free(buf.base);
+                _picotls_aligned_free(buf.base);
             } else {
                 free(buf.base);
             }
@@ -2342,12 +1982,14 @@ void ptls_buffer__release_memory(ptls_buffer_t* buf) {
         }
     }
 }
+
 i32 ptls_buffer_reserve(ptls_buffer_t* buf, u64 delta) {
     return ptls_buffer_reserve_aligned(buf, delta, 0);
 }
+
 i32 ptls_buffer_reserve_aligned(ptls_buffer_t* buf, u64 delta, u8 align_bits) {
     if buf.base == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     if 0 || buf.capacity < buf.off + delta || buf.align_bits < align_bits && (cast(u64, buf.base) & (cast(u64, 1) << cast(u64, align_bits)) - 1) != 0 {
         void* newp;
@@ -2360,19 +2002,19 @@ i32 ptls_buffer_reserve_aligned(ptls_buffer_t* buf, u64 delta, u8 align_bits) {
         }
         if align_bits != 0 {
             when os(windows) {
-                newp = _aligned_malloc(new_capacity, cast(u64, 1) << cast(u64, align_bits));
+                newp = _picotls_aligned_malloc(new_capacity, cast(u64, 1) << cast(u64, align_bits));
                 if newp == null {
-                    return 512 + 1;
+                    return 0x200 + 1;
                 }
             } else {
-                if posix_memalign(&newp, 1 << cast(i32, align_bits), new_capacity) != 0 {
-                    return 512 + 1;
+                if _picotls_posix_memalign(&newp, 1 << cast(i32, align_bits), new_capacity) != 0 {
+                    return 0x200 + 1;
                 }
             }
         } else {
             newp = alloc(cast(i64, new_capacity));
             if newp == null {
-                return 512 + 1;
+                return 0x200 + 1;
             }
         }
         memcpy(newp, buf.base, buf.off);
@@ -2384,6 +2026,7 @@ i32 ptls_buffer_reserve_aligned(ptls_buffer_t* buf, u64 delta, u8 align_bits) {
     }
     return 0;
 }
+
 i32 ptls_buffer__do_pushv(ptls_buffer_t* buf, void* src, u64 len) {
     i32 ret;
     if len == 0 {
@@ -2397,6 +2040,7 @@ i32 ptls_buffer__do_pushv(ptls_buffer_t* buf, void* src, u64 len) {
     buf.off += len;
     return 0;
 }
+
 i32 ptls_buffer__adjust_quic_blocksize(ptls_buffer_t* buf, u64 body_size) {
     noinit u8[8] sizebuf;
     var sizelen = cast(u64, ptls_encode_quicint(sizebuf, body_size) - sizebuf);
@@ -2412,11 +2056,13 @@ i32 ptls_buffer__adjust_quic_blocksize(ptls_buffer_t* buf, u64 body_size) {
     memcpy(buf.base + buf.off - body_size - sizelen, sizebuf, sizelen);
     return 0;
 }
+
 i32 ptls_buffer__adjust_asn1_blocksize(ptls_buffer_t* buf, u64 body_size) {
     fprintf(c_stderr, "unimplemented\n");
     abort();
-    return 0;   // LOCAL (tsmc): unreachable; abort() does not return
+    return 0;  // unreachable: abort() does not return
 }
+
 i32 ptls_buffer_push_asn1_ubigint(ptls_buffer_t* buf, void* bignum, u64 size) {
     u8* p = bignum;
     u8* end = p + size;
@@ -2437,8 +2083,8 @@ i32 ptls_buffer_push_asn1_ubigint(ptls_buffer_t* buf, void* bignum, u64 size) {
     }
     while true {
         while true {
-            u8[1] __compound_lit_3 = {255};
-            u8[1] __compound_lit_4 = {255};
+            u8[1] __compound_lit_3 = {0xff};
+            u8[1] __compound_lit_4 = {0xff};
             ret = ptls_buffer__do_pushv(buf, __compound_lit_3, cast(u64, sizeof(__compound_lit_4)));
             if ret != 0 {
                 return ret;
@@ -2448,7 +2094,7 @@ i32 ptls_buffer_push_asn1_ubigint(ptls_buffer_t* buf, void* bignum, u64 size) {
         u64 body_start = buf.off;
         while true {
             {
-                if *p >= 128 {
+                if *p >= 0x80 {
                     while true {
                         u8[1] __compound_lit_5 = {0};
                         u8[1] __compound_lit_6 = {0};
@@ -2493,6 +2139,7 @@ i32 ptls_buffer_push_asn1_ubigint(ptls_buffer_t* buf, void* bignum, u64 size) {
     ret = 0;
     return ret;
 }
+
 private {
 void build_aad(u8* aad, u64 reclen) {
     aad[0] = 23;
@@ -2501,8 +2148,7 @@ void build_aad(u8* aad, u64 reclen) {
     aad[3] = cast(u8, reclen >> 8);
     aad[4] = cast(u8, reclen);
 }
-}
-private {
+
 u64 aead_encrypt(st_ptls_traffic_protection_t* ctx, void* output, void* input, u64 inlen, u8 content_type) {
     ptls_iovec_t[2] invec = {ptls_iovec_init(input, inlen), ptls_iovec_init(&content_type, 1)};
     noinit u8[5] aad;
@@ -2510,8 +2156,7 @@ u64 aead_encrypt(st_ptls_traffic_protection_t* ctx, void* output, void* input, u
     ptls_aead_encrypt_v(ctx.aead, output, invec, cast(u64, 1 * sizeof(invec) / sizeof(invec[0])), ctx.seq++, aad, cast(u64, sizeof(aad)));
     return inlen + 1 + ctx.aead.algo.tag_size;
 }
-}
-private {
+
 i32 aead_decrypt(st_ptls_traffic_protection_t* ctx, void* output, u64* outlen, void* input, u64 inlen) {
     noinit u8[5] aad;
     build_aad(aad, inlen);
@@ -2522,8 +2167,7 @@ i32 aead_decrypt(st_ptls_traffic_protection_t* ctx, void* output, u64* outlen, v
     ++ctx.seq;
     return 0;
 }
-}
-private {
+
 void build_tls12_aad(u8* aad, u8 type, u64 seq, u16 length) {
     for u64 i = 0; i < 8; ++i {
         aad[i] = cast(u8, seq >> 56 - i * 8);
@@ -2534,8 +2178,7 @@ void build_tls12_aad(u8* aad, u8 type, u64 seq, u16 length) {
     aad[11] = cast(u8, cast(i32, length) >> 8);
     aad[12] = cast(u8, length);
 }
-}
-private {
+
 i32 buffer_push_encrypted_records(ptls_buffer_t* buf, u8 type, u8* src, u64 len, st_ptls_traffic_protection_t* enc) {
     i32 ret = 0;
     while len != 0 {
@@ -2589,7 +2232,7 @@ i32 buffer_push_encrypted_records(ptls_buffer_t* buf, u8 type, u8* src, u64 len,
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -2639,7 +2282,7 @@ i32 buffer_push_encrypted_records(ptls_buffer_t* buf, u8 type, u8* src, u64 len,
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -2661,8 +2304,7 @@ i32 buffer_push_encrypted_records(ptls_buffer_t* buf, u8 type, u8* src, u64 len,
     }
     return ret;
 }
-}
-private {
+
 i32 buffer_encrypt_record(ptls_buffer_t* buf, u64 rec_start, st_ptls_traffic_protection_t* enc) {
     u64 bodylen = 0;
     u8* tmpbuf = null;
@@ -2683,31 +2325,29 @@ i32 buffer_encrypt_record(ptls_buffer_t* buf, u64 rec_start, st_ptls_traffic_pro
         ret = ptls_buffer_reserve_aligned(buf, overhead, enc.aead.algo.align_bits);
         if ret != 0 {
             _keep = true;
-            _keep = true;
             return ret;
         }
         u64 encrypted_len = aead_encrypt(enc, buf.base + rec_start + 5, buf.base + rec_start + 5, bodylen, type);
         assert(encrypted_len == bodylen + overhead);
         buf.off += overhead;
         buf.base[rec_start] = 23;
-        buf.base[rec_start + 3] = cast(u8, encrypted_len >> 8 & 255);
-        buf.base[rec_start + 4] = cast(u8, encrypted_len & 255);
+        buf.base[rec_start + 3] = cast(u8, encrypted_len >> 8 & 0xff);
+        buf.base[rec_start + 4] = cast(u8, encrypted_len & 0xff);
         _keep = true;
         return 0;
     }
     tmpbuf = alloc(cast(i64, bodylen));
     if tmpbuf == null {
-        ret = 512 + 1;
+        ret = 0x200 + 1;
         return ret;
     }
     memcpy(tmpbuf, buf.base + rec_start + 5, bodylen);
     ptls_clear_memory(buf.base + rec_start, bodylen + 5);
     buf.off = rec_start;
     ret = buffer_push_encrypted_records(buf, type, tmpbuf, bodylen, enc);
-    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
+    return ret;
 }
-}
-private {
+
 i32 begin_record_message(ptls_message_emitter_t* _self) {
     var self = cast(st_ptls_record_message_emitter_t*, _self);
     i32 ret;
@@ -2724,8 +2364,7 @@ i32 begin_record_message(ptls_message_emitter_t* _self) {
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 commit_record_message(ptls_message_emitter_t* _self) {
     var self = cast(st_ptls_record_message_emitter_t*, _self);
     i32 ret;
@@ -2741,6 +2380,7 @@ i32 commit_record_message(ptls_message_emitter_t* _self) {
     return ret;
 }
 }
+
 i32 ptls_decode8(u8* value, u8** src, u8* end) {
     if *src == end {
         return 50;
@@ -2748,6 +2388,7 @@ i32 ptls_decode8(u8* value, u8** src, u8* end) {
     *value = *(*src)++;
     return 0;
 }
+
 i32 ptls_decode16(u16* value, u8** src, u8* end) {
     if cast(i64, end - *src) < 2 {
         return 50;
@@ -2756,6 +2397,7 @@ i32 ptls_decode16(u16* value, u8** src, u8* end) {
     *src += 2;
     return 0;
 }
+
 i32 ptls_decode24(u32* value, u8** src, u8* end) {
     if cast(i64, end - *src) < 3 {
         return 50;
@@ -2764,6 +2406,7 @@ i32 ptls_decode24(u32* value, u8** src, u8* end) {
     *src += 3;
     return 0;
 }
+
 i32 ptls_decode32(u32* value, u8** src, u8* end) {
     if cast(i64, end - *src) < 4 {
         return 50;
@@ -2772,6 +2415,7 @@ i32 ptls_decode32(u32* value, u8** src, u8* end) {
     *src += 4;
     return 0;
 }
+
 i32 ptls_decode64(u64* value, u8** src, u8* end) {
     if cast(i64, end - *src) < 8 {
         return 50;
@@ -2780,15 +2424,16 @@ i32 ptls_decode64(u64* value, u8** src, u8* end) {
     *src += 8;
     return 0;
 }
+
 u64 ptls_decode_quicint(u8** src, u8* end) {
     if *src == end {
         return UINT64_MAX;
     }
     u8 b = *(*src)++;
-    if b <= 63 {
+    if b <= 0x3f {
         return b;
     }
-    u64 v = b & 63;
+    u64 v = b & 0x3f;
     var bytes_left = cast(u32, (1 << (cast(i32, b) >> 6)) - 1);
     if cast(u64, cast(i64, end - *src)) < bytes_left {
         return UINT64_MAX;
@@ -2799,10 +2444,11 @@ u64 ptls_decode_quicint(u8** src, u8* end) {
     }
     return v;
 }
+
 private {
 void log_secret(ptls_t* tls, u8* type, ptls_iovec_t secret) {
-    noinit u8[129] hexbuf;
-        while true {
+    noinit u8[64 * 2 + 1] hexbuf;
+    while true {
         u32 active = ptls_log_point_maybe_active(&log_secret__logpoint);
         if active == 0 {
             break;
@@ -2813,17 +2459,16 @@ void log_secret(ptls_t* tls, u8* type, ptls_iovec_t secret) {
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     if tls.ctx.log_event != null {
         tls.ctx.log_event.cb(tls.ctx.log_event, tls, type, "%s", ptls_hexdump(hexbuf, secret.base, secret.len));
     }
 }
-}
+
 /**
  * This function preserves the flags and  modes (e.g., `offered`, `accepted`, `cipher`), they can be used afterwards.
  */
-private {
 void clear_ech(st_ptls_ech_t* ech, i32 is_server) {
     if ech.aead != null {
         ptls_aead_free(ech.aead);
@@ -2841,12 +2486,11 @@ void clear_ech(st_ptls_ech_t* ech, i32 is_server) {
         ech.client.first_ech = ptls_iovec_init(null, 0);
     }
 }
-}
+
 /**
  * Decodes one ECHConfigContents (tls-esni-15 section 4). `decoded->kem` and `cipher` may be NULL even when the function returns
  * zero, if the corresponding entries are not found.
  */
-private {
 i32 decode_one_ech_config(ptls_hpke_kem_t** kems, ptls_hpke_cipher_suite_t** ciphers, st_decoded_ech_config_t* decoded, u8** src, u8* end) {
     u8* public_name_buf = null;
     defer {
@@ -3025,7 +2669,7 @@ i32 decode_one_ech_config(ptls_hpke_kem_t** kems, ptls_hpke_cipher_suite_t** cip
                     }
                     public_name_buf = duplicate_as_str(*src, cast(u64, cast(i64, end - *src)));
                     if public_name_buf == null {
-                        ret = 512 + 1;
+                        ret = 0x200 + 1;
                         return ret;
                     }
                     if ptls_server_name_is_ipaddr(public_name_buf) != 0 {
@@ -3132,7 +2776,7 @@ i32 decode_one_ech_config(ptls_hpke_kem_t** kems, ptls_hpke_cipher_suite_t** cip
                                 }
                                 if !(0 != 0) { break; }
                             }
-                            if (type & 32768) != 0 {
+                            if (type & 0x8000) != 0 {
                                 while true {
                                     decoded.kem = null;
                                     decoded.cipher = null;
@@ -3158,12 +2802,11 @@ i32 decode_one_ech_config(ptls_hpke_kem_t** kems, ptls_hpke_cipher_suite_t** cip
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return ret;
 }
-}
-private {
+
 i32 client_decode_ech_config_list(ptls_context_t* ctx, st_decoded_ech_config_t* decoded, ptls_iovec_t config_list) {
     i32 ret = 0;
     defer {
@@ -3247,8 +2890,8 @@ i32 client_decode_ech_config_list(ptls_context_t* ctx, st_decoded_ech_config_t* 
                                     u8* end = src + _block_size;
                                     while true {
                                         {
-                                            if version == 65037 {
-                                                st_decoded_ech_config_t thisconf;
+                                            if version == 0xfe0d {
+                                                noinit st_decoded_ech_config_t thisconf;
                                                 ret = decode_one_ech_config(ctx.ech.client.kems, ctx.ech.client.ciphers, &thisconf, &src, end);
                                                 if ret != 0 {
                                                     return ret;
@@ -3292,13 +2935,12 @@ i32 client_decode_ech_config_list(ptls_context_t* ctx, st_decoded_ech_config_t* 
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 client_setup_ech(st_ptls_ech_t* ech, st_decoded_ech_config_t* decoded, fn(void*, u64): void random_bytes) {
     i32 ret = 0;
     defer {
@@ -3306,7 +2948,7 @@ i32 client_setup_ech(st_ptls_ech_t* ech, st_decoded_ech_config_t* decoded, fn(vo
             clear_ech(ech, 0);
         }
     }
-    ptls_buffer_t infobuf;
+    noinit ptls_buffer_t infobuf;
     noinit u8[256] infobuf_smallbuf;
     ptls_buffer_init(&infobuf, infobuf_smallbuf, cast(u64, sizeof(infobuf_smallbuf)));
     while true {
@@ -3334,15 +2976,14 @@ i32 client_setup_ech(st_ptls_ech_t* ech, st_decoded_ech_config_t* decoded, fn(vo
     ech.client.max_name_length = decoded.max_name_length;
     ech.client.public_name = duplicate_as_str(decoded.public_name.base, decoded.public_name.len);
     if ech.client.public_name == null {
-        ret = 512 + 1;
+        ret = 0x200 + 1;
         return ret;
     }
     return ret;
 }
-}
-private {
+
 void client_setup_ech_grease(st_ptls_ech_t* ech, fn(void*, u64): void random_bytes, ptls_hpke_kem_t** kems, ptls_hpke_cipher_suite_t** ciphers, u8* sni_name) {
-    noinit u8[32] random_secret;
+    noinit u8[16 + 16] random_secret;
     for u64 i = 0; kems[i] != null; ++i {
         if kems[i].id == 32 {
             ech.kem = kems[i];
@@ -3377,8 +3018,7 @@ void client_setup_ech_grease(st_ptls_ech_t* ech, fn(void*, u64): void random_byt
     }
     return;
 }
-}
-private {
+
 i32 ech_calc_confirmation(ptls_key_schedule_t* sched, void* dst, u8* inner_random, u8* label, ptls_iovec_t message) {
     ptls_hash_context_t* hash = null;
     u8[64] secret;
@@ -3394,7 +3034,7 @@ i32 ech_calc_confirmation(ptls_key_schedule_t* sched, void* dst, u8* inner_rando
     i32 ret;
     hash = (*(&sched.hashes[0] + 0)).ctx.clone_((*(&sched.hashes[0] + 0)).ctx);
     if hash == null {
-        ret = 512 + 1;
+        ret = 0x200 + 1;
         return ret;
     }
     hash.update(hash, message.base, message.len);
@@ -3410,8 +3050,7 @@ i32 ech_calc_confirmation(ptls_key_schedule_t* sched, void* dst, u8* inner_rando
     }
     return ret;
 }
-}
-private {
+
 void key_schedule_free(ptls_key_schedule_t* sched) {
     u64 i;
     ptls_clear_memory(sched.secret, sizeof(sched.secret));
@@ -3423,8 +3062,7 @@ void key_schedule_free(ptls_key_schedule_t* sched) {
     }
     free(sched);
 }
-}
-private {
+
 ptls_key_schedule_t* key_schedule_new(ptls_cipher_suite_t* preferred, ptls_cipher_suite_t** offered, i32 use_outer) {
     ptls_key_schedule_t* sched;
     {
@@ -3531,8 +3169,7 @@ ptls_key_schedule_t* key_schedule_new(ptls_cipher_suite_t* preferred, ptls_ciphe
     }
     return sched;
 }
-}
-private {
+
 i32 key_schedule_extract(ptls_key_schedule_t* sched, ptls_iovec_t ikm) {
     i32 ret;
     if ikm.base == null {
@@ -3546,10 +3183,9 @@ i32 key_schedule_extract(ptls_key_schedule_t* sched, ptls_iovec_t ikm) {
     }
     ++sched.generation;
     ret = ptls_hkdf_extract((*(&sched.hashes[0] + 0)).algo, sched.secret, ptls_iovec_init(sched.secret, (*(&sched.hashes[0] + 0)).algo.digest_size), ikm);
-        return ret;
+    return ret;
 }
-}
-private {
+
 i32 key_schedule_select_cipher(ptls_key_schedule_t* sched, ptls_cipher_suite_t* cs, i32 reset, ptls_iovec_t reset_ikm) {
     u64 found_slot = SIZE_MAX;
     u64 i;
@@ -3566,6 +3202,7 @@ i32 key_schedule_select_cipher(ptls_key_schedule_t* sched, ptls_cipher_suite_t* 
             }
         }
     }
+    assert(found_slot != SIZE_MAX);
     if found_slot != 0 {
         *(&sched.hashes[0] + 0) = *(&sched.hashes[0] + found_slot);
         reset = 1;
@@ -3582,8 +3219,7 @@ i32 key_schedule_select_cipher(ptls_key_schedule_t* sched, ptls_cipher_suite_t* 
     ret = 0;
     return ret;
 }
-}
-private {
+
 void key_schedule_select_outer(ptls_key_schedule_t* sched) {
     assert(sched.generation == 1);
     assert(sched.num_hashes == 1);
@@ -3593,29 +3229,31 @@ void key_schedule_select_outer(ptls_key_schedule_t* sched) {
     (*(&sched.hashes[0] + 0)).ctx_outer = null;
 }
 }
+
 void ptls__key_schedule_update_hash(ptls_key_schedule_t* sched, u8* msg, u64 msglen, i32 use_outer) {
     u64 i;
-        for i = 0; i != sched.num_hashes; ++i {
+    for i = 0; i != sched.num_hashes; ++i {
         ptls_hash_context_t* ctx = use_outer != 0 ? (*(&sched.hashes[0] + i)).ctx_outer : (*(&sched.hashes[0] + i)).ctx;
         ctx.update(ctx, msg, msglen);
     }
 }
+
 private {
 void key_schedule_update_ch1hash_prefix(ptls_key_schedule_t* sched) {
     u8[4] prefix = {254, 0, 0, cast(u8, (*(&sched.hashes[0] + 0)).algo.digest_size)};
     ptls__key_schedule_update_hash(sched, prefix, cast(u64, sizeof(prefix)), 0);
 }
-}
-private {
+
 void key_schedule_extract_ch1hash(ptls_key_schedule_t* sched, u8* hash) {
     assert((*(&sched.hashes[0] + 0)).ctx_outer == null);
     (*(&sched.hashes[0] + 0)).ctx.final((*(&sched.hashes[0] + 0)).ctx, hash, PTLS_HASH_FINAL_MODE_RESET);
 }
-}
-private {
+
 void key_schedule_transform_post_ch1hash(ptls_key_schedule_t* sched) {
     u64 digest_size = (*(&sched.hashes[0] + 0)).algo.digest_size;
-    ptls_hash_context_t*[3] hashes = {(*(&sched.hashes[0] + 0)).ctx, (*(&sched.hashes[0] + 0)).ctx_outer, null};
+    ptls_hash_context_t*[3] hashes = {
+        (*(&sched.hashes[0] + 0)).ctx, (*(&sched.hashes[0] + 0)).ctx_outer, null,
+    };
     noinit u8[64] ch1hash;
     u8[4] prefix = {254, 0, 0, cast(u8, digest_size)};
     for u64 i = 0; hashes[i] != null; ++i {
@@ -3625,14 +3263,12 @@ void key_schedule_transform_post_ch1hash(ptls_key_schedule_t* sched) {
     }
     ptls_clear_memory(ch1hash, sizeof(ch1hash));
 }
-}
-private {
+
 i32 derive_secret_with_hash(ptls_key_schedule_t* sched, void* secret, u8* label, u8* hash) {
     i32 ret = ptls_hkdf_expand_label((*(&sched.hashes[0] + 0)).algo, secret, (*(&sched.hashes[0] + 0)).algo.digest_size, ptls_iovec_init(sched.secret, (*(&sched.hashes[0] + 0)).algo.digest_size), label, ptls_iovec_init(hash, (*(&sched.hashes[0] + 0)).algo.digest_size), null);
-        return ret;
+    return ret;
 }
-}
-private {
+
 i32 derive_secret(ptls_key_schedule_t* sched, void* secret, u8* label) {
     noinit u8[64] hash_value;
     (*(&sched.hashes[0] + 0)).ctx.final((*(&sched.hashes[0] + 0)).ctx, hash_value, PTLS_HASH_FINAL_MODE_SNAPSHOT);
@@ -3640,13 +3276,11 @@ i32 derive_secret(ptls_key_schedule_t* sched, void* secret, u8* label) {
     ptls_clear_memory(hash_value, sizeof(hash_value));
     return ret;
 }
-}
-private {
+
 i32 derive_secret_with_empty_digest(ptls_key_schedule_t* sched, void* secret, u8* label) {
     return derive_secret_with_hash(sched, secret, label, (*(&sched.hashes[0] + 0)).algo.empty_digest);
 }
-}
-private {
+
 i32 derive_exporter_secret(ptls_t* tls, i32 is_early) {
     i32 ret;
     if tls.ctx.use_exporter == 0 {
@@ -3656,7 +3290,7 @@ i32 derive_exporter_secret(ptls_t* tls, i32 is_early) {
     assert(*slot == null);
     *slot = alloc(cast(i64, (*(&tls.key_schedule.hashes[0] + 0)).algo.digest_size));
     if *slot == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     ret = derive_secret(tls.key_schedule, *slot, is_early != 0 ? "e exp master" : "exp master");
     if ret != 0 {
@@ -3665,8 +3299,7 @@ i32 derive_exporter_secret(ptls_t* tls, i32 is_early) {
     log_secret(tls, is_early != 0 ? "EARLY_EXPORTER_SECRET" : "EXPORTER_SECRET", ptls_iovec_init(*slot, (*(&tls.key_schedule.hashes[0] + 0)).algo.digest_size));
     return 0;
 }
-}
-private {
+
 void free_exporter_master_secret(ptls_t* tls, i32 is_early) {
     u8* slot = is_early != 0 ? tls.exporter_master_secret.early : tls.exporter_master_secret.one_rtt;
     if slot == null {
@@ -3676,8 +3309,7 @@ void free_exporter_master_secret(ptls_t* tls, i32 is_early) {
     ptls_clear_memory(slot, (*(&tls.key_schedule.hashes[0] + 0)).algo.digest_size);
     free(slot);
 }
-}
-private {
+
 i32 derive_resumption_secret(ptls_key_schedule_t* sched, u8* secret, ptls_iovec_t nonce) {
     i32 ret = 0;
     defer {
@@ -3695,9 +3327,8 @@ i32 derive_resumption_secret(ptls_key_schedule_t* sched, u8* secret, ptls_iovec_
     }
     return ret;
 }
-}
-private {
-i32 decode_new_session_ticket(ptls_t* tls, u32* lifetime, u32* age_add, ptls_iovec_t* nonce, ptls_iovec_t* ticket, u32* max_early_data_size, u8* src, u8* end) {
+
+i32 decode_new_session_ticket(ptls_t* tls, u32* lifetime, u32* age_add, ptls_iovec_t* nonce, ptls_iovec_t* ticket, i32* early_data, u32* max_early_data_size, u8* src, u8* end) {
     u16 exttype;
     i32 ret;
     ret = ptls_decode32(lifetime, &src, end);
@@ -3802,6 +3433,7 @@ i32 decode_new_session_ticket(ptls_t* tls, u32* lifetime, u32* age_add, ptls_iov
         }
         if !(0 != 0) { break; }
     }
+    *early_data = 0;
     *max_early_data_size = 0;
     while true {
         while true {
@@ -3887,6 +3519,7 @@ i32 decode_new_session_ticket(ptls_t* tls, u32* lifetime, u32* age_add, ptls_iov
                                                 }
                                                 switch exttype {
                                                     case 42: {
+                                                        *early_data = 1;
                                                         ret = ptls_decode32(max_early_data_size, &src, end);
                                                         if ret != 0 {
                                                             return ret;
@@ -3928,13 +3561,12 @@ i32 decode_new_session_ticket(ptls_t* tls, u32* lifetime, u32* age_add, ptls_iov
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** key_share, ptls_cipher_suite_t** cs, ptls_iovec_t* secret, u32* obfuscated_ticket_age, ptls_iovec_t* ticket, u32* max_early_data_size, u8* src, u8* end) {
     u16 kxid;
     u16 csid;
@@ -3942,7 +3574,8 @@ i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** ke
     u32 age_add;
     u64 obtained_at;
     u64 now;
-    ptls_iovec_t nonce;
+    noinit ptls_iovec_t nonce;
+    i32 early_data;
     i32 ret;
     ret = ptls_decode64(&obtained_at, &src, end);
     if ret != 0 {
@@ -3988,7 +3621,7 @@ i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** ke
             u8* end = src + _block_size;
             while true {
                 {
-                    ret = decode_new_session_ticket(tls, &lifetime, &age_add, &nonce, ticket, max_early_data_size, src, end);
+                    ret = decode_new_session_ticket(tls, &lifetime, &age_add, &nonce, ticket, &early_data, max_early_data_size, src, end);
                     if ret != 0 {
                         return ret;
                     }
@@ -4057,7 +3690,7 @@ i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** ke
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     {
         ptls_key_exchange_algorithm_t** cand;
@@ -4067,7 +3700,7 @@ i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** ke
             }
         }
         if *cand == null {
-            ret = 512 + 3;
+            ret = 0x200 + 3;
             return ret;
         }
         *key_share = *cand;
@@ -4080,27 +3713,25 @@ i32 decode_stored_session_ticket(ptls_t* tls, ptls_key_exchange_algorithm_t** ke
             }
         }
         if *cand == null {
-            ret = 512 + 3;
+            ret = 0x200 + 3;
             return ret;
         }
         *cs = *cand;
     }
     now = tls.ctx.get_time.cb(tls.ctx.get_time);
     if (obtained_at <= now && now - obtained_at < cast(u64, 7 * 86400 * 1000)) == 0 {
-        ret = 512 + 3;
+        ret = 0x200 + 3;
         return ret;
     }
     *obfuscated_ticket_age = cast(u32, now - obtained_at) + age_add;
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 get_traffic_key(ptls_hash_algorithm_t* algo, void* key, u64 key_size, i32 is_iv, void* secret, ptls_iovec_t hash_value, u8* label_prefix) {
     return ptls_hkdf_expand_label(algo, key, key_size, ptls_iovec_init(secret, algo.digest_size), is_iv != 0 ? "iv" : "key", hash_value, label_prefix);
 }
-}
-private {
+
 i32 get_traffic_keys(ptls_aead_algorithm_t* aead, ptls_hash_algorithm_t* hash, void* key, void* iv, void* secret, ptls_iovec_t hash_value, u8* label_prefix) {
     i32 ret;
     ret = get_traffic_key(hash, key, aead.key_size, 0, secret, hash_value, label_prefix);
@@ -4111,8 +3742,7 @@ i32 get_traffic_keys(ptls_aead_algorithm_t* aead, ptls_hash_algorithm_t* hash, v
     }
     return ret;
 }
-}
-private {
+
 i32 setup_traffic_protection(ptls_t* tls, i32 is_enc, u8* secret_label, u64 epoch, u64 seq, i32 skip_notify) {
     st_ptls_traffic_protection_t* ctx = is_enc != 0 ? &tls.traffic_protection.enc : &tls.traffic_protection.dec;
     if secret_label != null {
@@ -4135,13 +3765,12 @@ i32 setup_traffic_protection(ptls_t* tls, i32 is_enc, u8* secret_label, u64 epoc
     }
     ctx.aead = ptls_aead_new(tls.cipher_suite.aead, tls.cipher_suite.hash, is_enc, ctx.secret, tls.ctx.hkdf_label_prefix__obsolete);
     if ctx.aead == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     ctx.seq = seq;
     return 0;
 }
-}
-private {
+
 i32 commission_handshake_secret(ptls_t* tls) {
     i32 is_enc = !ptls_is_server(tls);
     assert(tls.pending_handshake_secret != null);
@@ -4151,10 +3780,9 @@ i32 commission_handshake_secret(ptls_t* tls) {
     tls.pending_handshake_secret = null;
     return setup_traffic_protection(tls, is_enc, null, 2, 0, 1);
 }
-}
-private {
+
 void log_client_random(ptls_t* tls) {
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&log_client_random__logpoint);
         if active == 0 {
             break;
@@ -4165,11 +3793,10 @@ void log_client_random(ptls_t* tls) {
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
 }
-}
-private {
+
 i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticket_age_add, ptls_iovec_t ticket_nonce, ptls_key_schedule_t* sched, u8* server_name, u16 key_exchange_id, u16 csid, u8* negotiated_protocol) {
     i32 ret = 0;
     while true {
@@ -4194,8 +3821,16 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
                 while true {
                     u64 _v = ctx.get_time.cb(ctx.get_time);
                     while true {
-                        u8[8] __compound_lit_13 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                        u8[8] __compound_lit_14 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                        u8[8] __compound_lit_13 = {
+                            cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40),
+                            cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16),
+                            cast(u8, _v >> 8), cast(u8, _v),
+                        };
+                        u8[8] __compound_lit_14 = {
+                            cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40),
+                            cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16),
+                            cast(u8, _v >> 8), cast(u8, _v),
+                        };
                         ret = ptls_buffer__do_pushv(buf, __compound_lit_13, cast(u64, sizeof(__compound_lit_14)));
                         if ret != 0 {
                             return ret;
@@ -4231,7 +3866,7 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -4274,8 +3909,12 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
                 while true {
                     u32 _v = ticket_age_add;
                     while true {
-                        u8[4] __compound_lit_19 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                        u8[4] __compound_lit_20 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                        u8[4] __compound_lit_19 = {
+                            cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v),
+                        };
+                        u8[4] __compound_lit_20 = {
+                            cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v),
+                        };
                         ret = ptls_buffer__do_pushv(buf, __compound_lit_19, cast(u64, sizeof(__compound_lit_20)));
                         if ret != 0 {
                             return ret;
@@ -4319,7 +3958,7 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -4360,7 +3999,7 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -4380,7 +4019,7 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -4397,6 +4036,7 @@ i32 encode_session_identifier(ptls_context_t* ctx, ptls_buffer_t* buf, u32 ticke
     return ret;
 }
 }
+
 i32 decode_session_identifier(u64* issued_at, ptls_iovec_t* psk, u32* ticket_age_add, ptls_iovec_t* ticket_ctx, u16* key_exchange_id, u16* csid, ptls_iovec_t* negotiated_protocol, u8* src, u8* end) {
     i32 ret = 0;
     while true {
@@ -4606,10 +4246,11 @@ i32 decode_session_identifier(u64* issued_at, ptls_iovec_t* psk, u32* ticket_age
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return ret;
 }
+
 private {
 u64 build_certificate_verify_signdata(u8* data, ptls_key_schedule_t* sched, u8* context_string) {
     u64 datalen = 0;
@@ -4622,8 +4263,7 @@ u64 build_certificate_verify_signdata(u8* data, ptls_key_schedule_t* sched, u8* 
     assert(datalen <= cast(u64, 64 + sizeof("TLS 1.3, server CertificateVerify") + 64 * 2));
     return datalen;
 }
-}
-private {
+
 i32 calc_verify_data(void* output, ptls_key_schedule_t* sched, void* secret) {
     ptls_hash_context_t* hmac;
     noinit u8[64] digest;
@@ -4635,16 +4275,15 @@ i32 calc_verify_data(void* output, ptls_key_schedule_t* sched, void* secret) {
     hmac = ptls_hmac_create((*(&sched.hashes[0] + 0)).algo, digest, (*(&sched.hashes[0] + 0)).algo.digest_size);
     if hmac == null {
         ptls_clear_memory(digest, sizeof(digest));
-        return 512 + 1;
+        return 0x200 + 1;
     }
     (*(&sched.hashes[0] + 0)).ctx.final((*(&sched.hashes[0] + 0)).ctx, digest, PTLS_HASH_FINAL_MODE_SNAPSHOT);
-        hmac.update(hmac, digest, (*(&sched.hashes[0] + 0)).algo.digest_size);
+    hmac.update(hmac, digest, (*(&sched.hashes[0] + 0)).algo.digest_size);
     ptls_clear_memory(digest, sizeof(digest));
     hmac.final(hmac, output, PTLS_HASH_FINAL_MODE_FREE);
     return 0;
 }
-}
-private {
+
 i32 verify_finished(ptls_t* tls, ptls_iovec_t message) {
     u8[64] verify_data;
     defer {
@@ -4665,8 +4304,7 @@ i32 verify_finished(ptls_t* tls, ptls_iovec_t message) {
     }
     return ret;
 }
-}
-private {
+
 i32 send_finished(ptls_t* tls, ptls_message_emitter_t* emitter) {
     i32 ret;
     while true {
@@ -4715,7 +4353,7 @@ i32 send_finished(ptls_t* tls, ptls_message_emitter_t* emitter) {
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -4742,8 +4380,7 @@ i32 send_finished(ptls_t* tls, ptls_message_emitter_t* emitter) {
     }
     return ret;
 }
-}
-private {
+
 i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
     ptls_hash_context_t* msghash_backup = null;
     ptls_buffer_t session_id;
@@ -4794,7 +4431,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                     u64 body_size = _buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -4855,7 +4492,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -4917,8 +4554,14 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                         while true {
                             u32 _v = tls.ctx.ticket_lifetime;
                             while true {
-                                u8[4] __compound_lit_29 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                u8[4] __compound_lit_30 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                u8[4] __compound_lit_29 = {
+                                    cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8),
+                                    cast(u8, _v),
+                                };
+                                u8[4] __compound_lit_30 = {
+                                    cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8),
+                                    cast(u8, _v),
+                                };
                                 ret = ptls_buffer__do_pushv(emitter.buf, __compound_lit_29, cast(u64, sizeof(__compound_lit_30)));
                                 if ret != 0 {
                                     return ret;
@@ -4930,8 +4573,14 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                         while true {
                             u32 _v = ticket_age_add;
                             while true {
-                                u8[4] __compound_lit_31 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                u8[4] __compound_lit_32 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                u8[4] __compound_lit_31 = {
+                                    cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8),
+                                    cast(u8, _v),
+                                };
+                                u8[4] __compound_lit_32 = {
+                                    cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8),
+                                    cast(u8, _v),
+                                };
                                 ret = ptls_buffer__do_pushv(emitter.buf, __compound_lit_31, cast(u64, sizeof(__compound_lit_32)));
                                 if ret != 0 {
                                     return ret;
@@ -4958,7 +4607,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                             u64 body_size = emitter.buf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -4994,7 +4643,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                             u64 body_size = emitter.buf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -5050,8 +4699,16 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                                                         while true {
                                                             u32 _v = tls.ctx.max_early_data_size;
                                                             while true {
-                                                                u8[4] __compound_lit_35 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                                                u8[4] __compound_lit_36 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                                                u8[4] __compound_lit_35 = {
+                                                                    cast(u8, _v >> 24),
+                                                                    cast(u8, _v >> 16),
+                                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                                };
+                                                                u8[4] __compound_lit_36 = {
+                                                                    cast(u8, _v >> 24),
+                                                                    cast(u8, _v >> 16),
+                                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                                };
                                                                 ret = ptls_buffer__do_pushv(emitter.buf, __compound_lit_35, cast(u64, sizeof(__compound_lit_36)));
                                                                 if ret != 0 {
                                                                     return ret;
@@ -5066,7 +4723,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                                                 u64 body_size = emitter.buf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -5083,13 +4740,13 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                                             if !(0 != 0) { break; }
                                         }
                                     }
-                                                                    }
+                                }
                                 if !(0 != 0) { break; }
                             }
                             u64 body_size = emitter.buf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -5109,7 +4766,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -5136,8 +4793,7 @@ i32 send_session_ticket(ptls_t* tls, ptls_message_emitter_t* emitter) {
     }
     return ret;
 }
-}
-private {
+
 i32 push_change_cipher_spec(ptls_t* tls, ptls_message_emitter_t* emitter) {
     i32 ret;
     if tls.send_change_cipher_spec == 0 {
@@ -5185,7 +4841,7 @@ i32 push_change_cipher_spec(ptls_t* tls, ptls_message_emitter_t* emitter) {
             u64 body_size = emitter.buf.off - body_start;
             if capacity != cast(u64, -1) {
                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                    ret = 512 + 12;
+                    ret = 0x200 + 12;
                     return ret;
                 }
                 for ; capacity != 0; --capacity {
@@ -5205,8 +4861,7 @@ i32 push_change_cipher_spec(ptls_t* tls, ptls_message_emitter_t* emitter) {
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 push_additional_extensions(ptls_handshake_properties_t* properties, ptls_buffer_t* sendbuf) {
     i32 ret;
     if properties != null && properties.additional_extensions != null {
@@ -5251,7 +4906,7 @@ i32 push_additional_extensions(ptls_handshake_properties_t* properties, ptls_buf
                     u64 body_size = sendbuf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -5267,13 +4922,12 @@ i32 push_additional_extensions(ptls_handshake_properties_t* properties, ptls_buf
                 }
                 if !(0 != 0) { break; }
             }
-                    }
+        }
     }
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 push_signature_algorithms(ptls_verify_certificate_t* vc, ptls_buffer_t* sendbuf) {
     i32 ret;
     while true {
@@ -5309,7 +4963,7 @@ i32 push_signature_algorithms(ptls_verify_certificate_t* vc, ptls_buffer_t* send
         u64 body_size = sendbuf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -5326,8 +4980,7 @@ i32 push_signature_algorithms(ptls_verify_certificate_t* vc, ptls_buffer_t* send
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 decode_signature_algorithms(st_ptls_signature_algorithms_t* sa, u8** src, u8* end) {
     i32 ret;
     while true {
@@ -5392,16 +5045,15 @@ i32 decode_signature_algorithms(st_ptls_signature_algorithms_t* sa, u8** src, u8
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = 0;
     return ret;
 }
-}
+
 /**
  * @param hash optional argument for restricting the underlying hash algorithm
  */
-private {
 i32 select_cipher(ptls_cipher_suite_t** selected, ptls_cipher_suite_t** candidates, u8* src, u8* end, i32 server_preference, i32 server_chacha_priority, ptls_hash_algorithm_t* hash) {
     u64 found_index = SIZE_MAX;
     i32 ret;
@@ -5413,7 +5065,7 @@ i32 select_cipher(ptls_cipher_suite_t** selected, ptls_cipher_suite_t** candidat
         }
         for u64 i = 0; candidates[i] != null; ++i {
             if candidates[i].id == id && (hash == null || candidates[i].hash == hash) {
-                if server_preference && !(server_chacha_priority && id == 4867) {
+                if server_preference && !(server_chacha_priority && id == 0x1303) {
                     if i < found_index {
                         found_index = i;
                         break;
@@ -5437,8 +5089,7 @@ i32 select_cipher(ptls_cipher_suite_t** selected, ptls_cipher_suite_t** candidat
     }
     return ret;
 }
-}
-private {
+
 i32 push_key_share_entry(ptls_buffer_t* buf, u16 group, ptls_iovec_t pubkey) {
     i32 ret;
     while true {
@@ -5479,7 +5130,7 @@ i32 push_key_share_entry(ptls_buffer_t* buf, u16 group, ptls_iovec_t pubkey) {
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -5496,8 +5147,7 @@ i32 push_key_share_entry(ptls_buffer_t* buf, u16 group, ptls_iovec_t pubkey) {
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 decode_key_share_entry(u16* group, ptls_iovec_t* key_exchange, u8** src, u8* end) {
     i32 ret;
     ret = ptls_decode16(group, src, end);
@@ -5551,8 +5201,7 @@ i32 decode_key_share_entry(u16* group, ptls_iovec_t* key_exchange, u8** src, u8*
     }
     return ret;
 }
-}
-private {
+
 i32 select_key_share(ptls_key_exchange_algorithm_t** selected, ptls_iovec_t* peer_key, ptls_key_exchange_algorithm_t** candidates, u8** src, u8* end, i32 expect_one) {
     i32 ret;
     *selected = null;
@@ -5562,7 +5211,7 @@ i32 select_key_share(ptls_key_exchange_algorithm_t** selected, ptls_iovec_t* pee
     }
     while *src != end {
         u16 group;
-        ptls_iovec_t key;
+        noinit ptls_iovec_t key;
         ret = decode_key_share_entry(&group, &key, src, end);
         if ret != 0 {
             return ret;
@@ -5582,8 +5231,7 @@ i32 select_key_share(ptls_key_exchange_algorithm_t** selected, ptls_iovec_t* pee
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 emit_server_name_extension(ptls_buffer_t* buf, u8* server_name) {
     i32 ret;
     while true {
@@ -5632,7 +5280,7 @@ i32 emit_server_name_extension(ptls_buffer_t* buf, u8* server_name) {
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -5652,7 +5300,7 @@ i32 emit_server_name_extension(ptls_buffer_t* buf, u8* server_name) {
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -5669,16 +5317,14 @@ i32 emit_server_name_extension(ptls_buffer_t* buf, u8* server_name) {
     ret = 0;
     return ret;
 }
-}
+
 /**
  * Within the outer ECH extension, returns the number of bytes that preceeds the AEAD-encrypted payload.
  */
-private {
 u64 outer_ech_header_size(u64 enc_size) {
     return 10 + enc_size;
 }
-}
-private {
+
 i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_mode mode, i32 is_second_flight, ptls_handshake_properties_t* properties, void* client_random, ptls_key_exchange_context_t* key_share_ctx, u8* sni_name, ptls_iovec_t legacy_session_id, st_ptls_ech_t* ech, u64* ech_size_offset, ptls_iovec_t ech_replay, ptls_iovec_t psk_secret, ptls_iovec_t psk_identity, u32 obfuscated_ticket_age, u64 psk_binder_size, ptls_iovec_t* cookie, i32 using_early_data) {
     i32 ret;
     assert(mode == ENCODE_CH_MODE_INNER || ech != null);
@@ -5708,7 +5354,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
             while true {
                 {
                     while true {
-                        u16 _v = 771;
+                        u16 _v = 0x0303;
                         while true {
                             u8[2] __compound_lit_51 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                             u8[2] __compound_lit_52 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -5754,7 +5400,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                         u64 body_size = sendbuf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -5802,7 +5448,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                         u64 body_size = sendbuf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -5843,7 +5489,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                         u64 body_size = sendbuf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -5872,7 +5518,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                 if mode == ENCODE_CH_MODE_OUTER {
                                     while true {
                                         while true {
-                                            u16 _v = 65037;
+                                            u16 _v = 0xfe0d;
                                             while true {
                                                 u8[2] __compound_lit_57 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                 u8[2] __compound_lit_58 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -5968,7 +5614,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6008,7 +5654,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6028,7 +5674,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6044,10 +5690,10 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    } else if ech.aead != null {
+                                } else if ech.aead != null {
                                     while true {
                                         while true {
-                                            u16 _v = 65037;
+                                            u16 _v = 0xfe0d;
                                             while true {
                                                 u8[2] __compound_lit_67 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                 u8[2] __compound_lit_68 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -6086,7 +5732,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6102,10 +5748,10 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    } else if ech_replay.base != null {
+                                } else if ech_replay.base != null {
                                     while true {
                                         while true {
-                                            u16 _v = 65037;
+                                            u16 _v = 0xfe0d;
                                             while true {
                                                 u8[2] __compound_lit_71 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                 u8[2] __compound_lit_72 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -6142,7 +5788,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6158,11 +5804,11 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if mode == ENCODE_CH_MODE_ENCODED_INNER {
                                     while true {
                                         while true {
-                                            u16 _v = 64768;
+                                            u16 _v = 0xfd00;
                                             while true {
                                                 u8[2] __compound_lit_73 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                 u8[2] __compound_lit_74 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -6217,7 +5863,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6237,7 +5883,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6253,7 +5899,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    } else {
+                                } else {
                                     while true {
                                         while true {
                                             u16 _v = 51;
@@ -6304,7 +5950,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6324,7 +5970,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6340,7 +5986,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if sni_name != null {
                                     while true {
                                         while true {
@@ -6378,7 +6024,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6394,7 +6040,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if properties != null && properties.client.negotiated_protocols.count != 0 {
                                     while true {
                                         while true {
@@ -6462,7 +6108,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                                         u64 body_size = sendbuf.off - body_start;
                                                                         if capacity != cast(u64, -1) {
                                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                ret = 512 + 12;
+                                                                                ret = 0x200 + 12;
                                                                                 return ret;
                                                                             }
                                                                             for ; capacity != 0; --capacity {
@@ -6483,7 +6129,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6503,7 +6149,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6519,7 +6165,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if ctx.decompress_certificate != null {
                                     while true {
                                         while true {
@@ -6582,7 +6228,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6602,7 +6248,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6618,7 +6264,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 while true {
                                     while true {
                                         u16 _v = 43;
@@ -6679,7 +6325,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                     u64 body_size = sendbuf.off - body_start;
                                                     if capacity != cast(u64, -1) {
                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                            ret = 512 + 12;
+                                                            ret = 0x200 + 12;
                                                             return ret;
                                                         }
                                                         for ; capacity != 0; --capacity {
@@ -6699,7 +6345,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         u64 body_size = sendbuf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -6715,7 +6361,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                     }
                                     if !(0 != 0) { break; }
                                 }
-                                                                while true {
+                                while true {
                                     while true {
                                         u16 _v = 13;
                                         while true {
@@ -6751,7 +6397,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         u64 body_size = sendbuf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -6767,7 +6413,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                     }
                                     if !(0 != 0) { break; }
                                 }
-                                                                if ctx.key_exchanges != null {
+                                if ctx.key_exchanges != null {
                                     while true {
                                         while true {
                                             u16 _v = 10;
@@ -6828,7 +6474,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6848,7 +6494,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6864,7 +6510,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if cookie != null && cookie.base != null {
                                     while true {
                                         while true {
@@ -6917,7 +6563,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -6937,7 +6583,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -6953,7 +6599,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if ctx.use_raw_public_keys != 0 {
                                     while true {
                                         while true {
@@ -7008,7 +6654,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -7028,7 +6674,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -7044,7 +6690,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if ctx.save_ticket != null && (ctx.ticket_requests.client.new_session_count != 0 || ctx.ticket_requests.client.resumption_count != 0) {
                                     while true {
                                         while true {
@@ -7073,8 +6719,14 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             while true {
                                                 {
                                                     while true {
-                                                        u8[2] __compound_lit_105 = {ctx.ticket_requests.client.new_session_count, ctx.ticket_requests.client.resumption_count};
-                                                        u8[2] __compound_lit_106 = {ctx.ticket_requests.client.new_session_count, ctx.ticket_requests.client.resumption_count};
+                                                        u8[2] __compound_lit_105 = {
+                                                            ctx.ticket_requests.client.new_session_count,
+                                                            ctx.ticket_requests.client.resumption_count,
+                                                        };
+                                                        u8[2] __compound_lit_106 = {
+                                                            ctx.ticket_requests.client.new_session_count,
+                                                            ctx.ticket_requests.client.resumption_count,
+                                                        };
                                                         ret = ptls_buffer__do_pushv(sendbuf, __compound_lit_105, cast(u64, sizeof(__compound_lit_106)));
                                                         if ret != 0 {
                                                             return ret;
@@ -7087,7 +6739,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -7103,7 +6755,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 ret = push_additional_extensions(properties, sendbuf);
                                 if ret != 0 {
                                     return ret;
@@ -7173,7 +6825,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -7193,7 +6845,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -7209,7 +6861,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                                 if psk_secret.base != null {
                                     if using_early_data && !is_second_flight {
                                         while true {
@@ -7244,7 +6896,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -7261,7 +6913,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             if !(0 != 0) { break; }
                                         }
                                     }
-                                                                        while true {
+                                    while true {
                                         while true {
                                             u16 _v = 41;
                                             while true {
@@ -7333,7 +6985,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                                     u64 body_size = sendbuf.off - body_start;
                                                                     if capacity != cast(u64, -1) {
                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                            ret = 512 + 12;
+                                                                            ret = 0x200 + 12;
                                                                             return ret;
                                                                         }
                                                                         for ; capacity != 0; --capacity {
@@ -7356,8 +7008,18 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                                 while true {
                                                                     u32 _v = age;
                                                                     while true {
-                                                                        u8[4] __compound_lit_117 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                                                        u8[4] __compound_lit_118 = {cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                                                        u8[4] __compound_lit_117 = {
+                                                                            cast(u8, _v >> 24),
+                                                                            cast(u8, _v >> 16),
+                                                                            cast(u8, _v >> 8),
+                                                                            cast(u8, _v),
+                                                                        };
+                                                                        u8[4] __compound_lit_118 = {
+                                                                            cast(u8, _v >> 24),
+                                                                            cast(u8, _v >> 16),
+                                                                            cast(u8, _v >> 8),
+                                                                            cast(u8, _v),
+                                                                        };
                                                                         ret = ptls_buffer__do_pushv(sendbuf, __compound_lit_117, cast(u64, sizeof(__compound_lit_118)));
                                                                         if ret != 0 {
                                                                             return ret;
@@ -7372,7 +7034,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -7422,7 +7084,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                                     u64 body_size = sendbuf.off - body_start;
                                                                     if capacity != cast(u64, -1) {
                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                            ret = 512 + 12;
+                                                                            ret = 0x200 + 12;
                                                                             return ret;
                                                                         }
                                                                         for ; capacity != 0; --capacity {
@@ -7442,7 +7104,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -7462,7 +7124,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                             u64 body_size = sendbuf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -7478,14 +7140,14 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                             }
                             if !(0 != 0) { break; }
                         }
                         u64 body_size = sendbuf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -7505,7 +7167,7 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
             u64 body_size = _buf.off - body_start;
             if capacity != cast(u64, -1) {
                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                    ret = 512 + 12;
+                    ret = 0x200 + 12;
                     return ret;
                 }
                 for ; capacity != 0; --capacity {
@@ -7526,12 +7188,11 @@ i32 encode_client_hello(ptls_context_t* ctx, ptls_buffer_t* sendbuf, encode_ch_m
     }
     return ret;
 }
-}
+
 /**
  * Feeds the CH message into the hash, computing the PSK binder if necessary. `binder_key` must be derived before calling this
  * function.
  */
-private {
 i32 update_ch_hash_and_binder(ptls_key_schedule_t* ks, u8* ch, u64 ch_start, u64 ch_end, i32 has_psk, u8* binder_key, i32 is_outer) {
     i32 ret = 0;
     u64 hash_off = ch_start;
@@ -7547,8 +7208,7 @@ i32 update_ch_hash_and_binder(ptls_key_schedule_t* ks, u8* ch, u64 ch_start, u64
     ptls__key_schedule_update_hash(ks, ch + hash_off, ch_end - hash_off, is_outer);
     return ret;
 }
-}
-private {
+
 i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handshake_properties_t* properties, ptls_iovec_t* cookie) {
     u8[64] binder_key;
     ptls_buffer_t encoded_ch_inner;
@@ -7556,7 +7216,7 @@ i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handsha
         ptls_buffer_dispose(&encoded_ch_inner);
         ptls_clear_memory(binder_key, sizeof(binder_key));
     }
-    __anon_picotls_struct_44 psk;
+    psk_t psk;
     u32 obfuscated_ticket_age = 0;
     u8* sni_name = null;
     u64 mess_start;
@@ -7569,7 +7229,7 @@ i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handsha
     if properties != null {
         if !is_second_flight && sni_name != null && tls.ctx.ech.client.ciphers != null {
             if properties.client.ech.configs.len != 0 {
-                st_decoded_ech_config_t decoded;
+                noinit st_decoded_ech_config_t decoded;
                 client_decode_ech_config_list(tls.ctx, &decoded, properties.client.ech.configs);
                 if decoded.kem != null && decoded.cipher != null {
                     ret = client_setup_ech(&tls.ech, &decoded, tls.ctx.random_bytes);
@@ -7646,7 +7306,7 @@ i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handsha
     if is_second_flight == 0 {
         tls.key_schedule = key_schedule_new(tls.cipher_suite, tls.ctx.cipher_suites, tls.ech.aead != null);
         if tls.key_schedule == null {
-            ret = 512 + 1;
+            ret = 0x200 + 1;
             return ret;
         }
         ret = key_schedule_extract(tls.key_schedule, psk.secret);
@@ -7715,7 +7375,7 @@ i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handsha
             u64 len = outer_ech_header_size(tls.ech.client.enc.len) + ech_payload_size;
             tls.ech.client.first_ech.base = alloc(cast(i64, len));
             if tls.ech.client.first_ech.base == null {
-                ret = 512 + 1;
+                ret = 0x200 + 1;
                 return ret;
             }
             memcpy(tls.ech.client.first_ech.base, emitter.buf.base + ech_size_offset - outer_ech_header_size(tls.ech.client.enc.len), len);
@@ -7762,19 +7422,21 @@ i32 send_client_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_handsha
         }
     }
     tls.state = cookie == null ? PTLS_STATE_CLIENT_EXPECT_SERVER_HELLO : PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO;
-    ret = 512 + 2;
+    ret = 0x200 + 2;
     return ret;
 }
 }
+
 ptls_cipher_suite_t* ptls_find_cipher_suite(ptls_cipher_suite_t** cipher_suites, u16 id) {
     ptls_cipher_suite_t** cs;
     if cipher_suites == null {
         return null;
     }
     for cs = cipher_suites; *cs != null && (*cs).id != id; ++cs {
-            }
+    }
     return *cs;
 }
+
 private {
 i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* end) {
     i32 ret;
@@ -7790,6 +7452,10 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
     }
     sh.is_retry_request = memcmp(src, hello_retry_random, cast(u64, 32)) == 0;
     src += 32;
+    if sh.is_retry_request && tls.state == PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO {
+        ret = 10;
+        return ret;
+    }
     while true {
         u64 _capacity = 1;
         u64 _block_size;
@@ -7845,10 +7511,18 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
         if ret != 0 {
             return ret;
         }
-        tls.cipher_suite = ptls_find_cipher_suite(tls.ctx.cipher_suites, csid);
-        if tls.cipher_suite == null {
-            ret = 47;
-            return ret;
+        if tls.state == PTLS_STATE_CLIENT_EXPECT_SERVER_HELLO {
+            tls.cipher_suite = ptls_find_cipher_suite(tls.ctx.cipher_suites, csid);
+            if tls.cipher_suite == null {
+                ret = 47;
+                return ret;
+            }
+        } else {
+            assert(tls.state == PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO);
+            if tls.cipher_suite.id != csid {
+                ret = 47;
+                return ret;
+            }
         }
     }
     {
@@ -8042,7 +7716,7 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 41: {
@@ -8052,7 +7726,7 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
                                                             return ret;
                                                         }
                                                     }
-                                                    case 65037: {
+                                                    case 0xfe0d: {
                                                         assert(cast(i64, sh.is_retry_request));
                                                         if tls.ech.state == PTLS_ECH_STATE_NONE {
                                                             ret = 110;
@@ -8101,7 +7775,7 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     if is_supported_version(found_version) == 0 {
         ret = 47;
@@ -8127,8 +7801,7 @@ i32 decode_server_hello(ptls_t* tls, st_ptls_server_hello_t* sh, u8* src, u8* en
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 handle_hello_retry_request(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptls_server_hello_t* sh, ptls_iovec_t message, ptls_handshake_properties_t* properties) {
     i32 ret;
     if tls.client.key_share_ctx != null {
@@ -8154,6 +7827,10 @@ i32 handle_hello_retry_request(ptls_t* tls, ptls_message_emitter_t* emitter, st_
             ret = 47;
             return ret;
         }
+        if tls.key_share != null && sh.retry_request.selected_group == tls.key_share.id {
+            ret = 47;
+            return ret;
+        }
         tls.key_share = *cand;
     } else if tls.key_share != null {
     } else {
@@ -8163,12 +7840,11 @@ i32 handle_hello_retry_request(ptls_t* tls, ptls_message_emitter_t* emitter, st_
     ret = send_client_hello(tls, emitter, properties, &sh.retry_request.cookie);
     return ret;
 }
-}
-private {
+
 i32 client_ech_select_hello(ptls_t* tls, ptls_iovec_t message, u64 confirm_hash_off, u8* label) {
     u8[8] confirm_hash_expected;
     defer {
-                while true {
+        while true {
             u32 active = ptls_log_point_maybe_active(&client_ech_select_hello__logpoint);
             if active == 0 {
                 break;
@@ -8179,7 +7855,7 @@ i32 client_ech_select_hello(ptls_t* tls, ptls_iovec_t message, u64 confirm_hash_
             if active == 0 {
                 break;
             }
-                        if !(0 != 0) { break; }
+            if !(0 != 0) { break; }
         }
         ptls_clear_memory(confirm_hash_expected, sizeof(confirm_hash_expected));
     }
@@ -8207,8 +7883,7 @@ i32 client_ech_select_hello(ptls_t* tls, ptls_iovec_t message, u64 confirm_hash_
     key_schedule_select_outer(tls.key_schedule);
     return ret;
 }
-}
-private {
+
 i32 client_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message, ptls_handshake_properties_t* properties) {
     ptls_iovec_t ecdh_secret;
     bool _keep = false;
@@ -8220,7 +7895,7 @@ i32 client_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
             }
         }
     }
-    st_ptls_server_hello_t sh;
+    noinit st_ptls_server_hello_t sh;
     i32 ret;
     ret = decode_server_hello(tls, &sh, message.base + 4, message.base + message.len);
     if ret != 0 {
@@ -8294,7 +7969,7 @@ i32 client_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
     if tls.client.using_early_data != 0 {
         tls.pending_handshake_secret = alloc(64);
         if tls.pending_handshake_secret == null {
-            ret = 512 + 1;
+            ret = 0x200 + 1;
             return ret;
         }
         ret = derive_secret(tls.key_schedule, tls.pending_handshake_secret, "c hs traffic");
@@ -8314,16 +7989,14 @@ i32 client_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
         }
     }
     tls.state = PTLS_STATE_CLIENT_EXPECT_ENCRYPTED_EXTENSIONS;
-    ret = 512 + 2;
-    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
+    ret = 0x200 + 2;
+    return ret;
 }
-}
-private {
+
 i32 should_collect_unknown_extension(ptls_t* tls, ptls_handshake_properties_t* properties, u16 type) {
     return properties != null && properties.collect_extension != null && properties.collect_extension(tls, properties, type);
 }
-}
-private {
+
 i32 collect_unknown_extension(ptls_t* tls, u16 type, u8* src, u8* end, ptls_raw_extension_t* slots) {
     u64 i;
     for i = 0; slots[i].type != UINT16_MAX; ++i {
@@ -8339,8 +8012,7 @@ i32 collect_unknown_extension(ptls_t* tls, u16 type, u8* src, u8* end, ptls_raw_
     }
     return 0;
 }
-}
-private {
+
 i32 report_unknown_extensions(ptls_t* tls, ptls_handshake_properties_t* properties, ptls_raw_extension_t* slots) {
     if properties != null && properties.collect_extension != null {
         assert(properties.collected_extensions != null);
@@ -8349,8 +8021,7 @@ i32 report_unknown_extensions(ptls_t* tls, ptls_handshake_properties_t* properti
         return 0;
     }
 }
-}
-private {
+
 i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_handshake_properties_t* properties) {
     ptls_raw_extension_t* unknown_extensions = null;
     defer {
@@ -8566,7 +8237,7 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 42: {
@@ -8584,13 +8255,13 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
                                                         server_offered_cert_type = *src;
                                                         src = end;
                                                     }
-                                                    case 65037: {
+                                                    case 0xfe0d: {
                                                         {
                                                             if (tls.ech.state == PTLS_ECH_STATE_OFFERED || tls.ech.state == PTLS_ECH_STATE_GREASE) == 0 {
                                                                 ret = 110;
                                                                 return ret;
                                                             }
-                                                            st_decoded_ech_config_t decoded;
+                                                            noinit st_decoded_ech_config_t decoded;
                                                             ret = client_decode_ech_config_list(tls.ctx, &decoded, ptls_iovec_init(src, cast(u64, cast(i64, end - src))));
                                                             if ret != 0 {
                                                                 return ret;
@@ -8599,7 +8270,7 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
                                                             } else if decoded.kem != null && decoded.cipher != null && properties != null && properties.client.ech.retry_configs != null {
                                                                 properties.client.ech.retry_configs.base = alloc(cast(i64, end - src));
                                                                 if properties.client.ech.retry_configs.base == null {
-                                                                    ret = 512 + 1;
+                                                                    ret = 0x200 + 1;
                                                                     return ret;
                                                                 }
                                                                 memcpy(properties.client.ech.retry_configs.base, src, cast(u64, cast(i64, end - src)));
@@ -8613,7 +8284,7 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
                                                             if unknown_extensions == &client_handle_encrypted_extensions__no_unknown_extensions {
                                                                 unknown_extensions = alloc(sizeof(*unknown_extensions) * (16 + 1));
                                                                 if unknown_extensions == null {
-                                                                    ret = 512 + 1;
+                                                                    ret = 0x200 + 1;
                                                                     return ret;
                                                                 }
                                                                 unknown_extensions[0].type = UINT16_MAX;
@@ -8658,7 +8329,7 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     if cast(i32, server_offered_cert_type) != (tls.ctx.use_raw_public_keys != 0 ? 2 : 0) {
         ret = 43;
@@ -8678,11 +8349,10 @@ i32 client_handle_encrypted_extensions(ptls_t* tls, ptls_iovec_t message, ptls_h
     }
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
     tls.state = tls.is_psk_handshake != 0 ? PTLS_STATE_CLIENT_EXPECT_FINISHED : PTLS_STATE_CLIENT_EXPECT_CERTIFICATE_REQUEST_OR_CERTIFICATE;
-    ret = 512 + 2;
+    ret = 0x200 + 2;
     return ret;
 }
-}
-private {
+
 i32 decode_certificate_request(ptls_t* tls, st_ptls_certificate_request_t* cr, u8* src, u8* end) {
     i32 ret;
     u16 exttype = 0;
@@ -8725,7 +8395,7 @@ i32 decode_certificate_request(ptls_t* tls, st_ptls_certificate_request_t* cr, u
                     }
                     cr.context.base = alloc(cast(i64, len != 0 ? len : 1));
                     if cr.context.base == null {
-                        ret = 512 + 1;
+                        ret = 0x200 + 1;
                         return ret;
                     }
                     cr.context.len = len;
@@ -8865,7 +8535,7 @@ i32 decode_certificate_request(ptls_t* tls, st_ptls_certificate_request_t* cr, u
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     if cr.signature_algorithms.count == 0 {
         ret = 109;
@@ -8875,6 +8545,7 @@ i32 decode_certificate_request(ptls_t* tls, st_ptls_certificate_request_t* cr, u
     return ret;
 }
 }
+
 i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptls_iovec_t* certificates, u64 num_certificates, ptls_iovec_t ocsp_status) {
     i32 ret;
     while true {
@@ -8902,7 +8573,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -8955,7 +8626,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
                         u64 body_size = buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -9042,7 +8713,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
                                                         u64 body_size = buf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -9062,7 +8733,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
                                             u64 body_size = buf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -9078,14 +8749,14 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
                                         }
                                         if !(0 != 0) { break; }
                                     }
-                                                                    }
+                                }
                             }
                             if !(0 != 0) { break; }
                         }
                         u64 body_size = buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -9106,7 +8777,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -9123,6 +8794,7 @@ i32 ptls_build_certificate_message(ptls_buffer_t* buf, ptls_iovec_t context, ptl
     ret = 0;
     return ret;
 }
+
 private {
 i32 default_emit_certificate_cb(ptls_emit_certificate_t* _self, ptls_t* tls, ptls_message_emitter_t* emitter, ptls_key_schedule_t* key_sched, ptls_iovec_t context, i32 push_status_request, u16* compress_algos, u64 num_compress_algos) {
     i32 ret;
@@ -9167,7 +8839,7 @@ i32 default_emit_certificate_cb(ptls_emit_certificate_t* _self, ptls_t* tls, ptl
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -9195,8 +8867,7 @@ i32 default_emit_certificate_cb(ptls_emit_certificate_t* _self, ptls_t* tls, ptl
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 send_certificate(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptls_signature_algorithms_t* signature_algorithms, ptls_iovec_t context, i32 push_status_request, u16* compress_algos, u64 num_compress_algos) {
     i32 ret;
     if signature_algorithms.count == 0 {
@@ -9208,7 +8879,7 @@ i32 send_certificate(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptls_signa
         while true {
             ret = emit_certificate.cb(emit_certificate, tls, emitter, tls.key_schedule, context, push_status_request, compress_algos, num_compress_algos);
             if ret != 0 {
-                if ret == 512 + 10 {
+                if ret == 0x200 + 10 {
                     assert(emit_certificate != &send_certificate__default_emit_certificate);
                     emit_certificate = &send_certificate__default_emit_certificate;
                     continue;
@@ -9220,8 +8891,7 @@ i32 send_certificate(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptls_signa
     }
     return ret;
 }
-}
-private {
+
 i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptls_signature_algorithms_t* signature_algorithms, u8* context_string) {
     bool _keep = false;
     defer {
@@ -9231,7 +8901,6 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
     u64 start_off = emitter.buf.off;
     i32 ret;
     if tls.ctx.sign_certificate == null {
-        _keep = true;
         _keep = true;
         return 0;
     }
@@ -9297,7 +8966,7 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
                                     noinit u8[64 + sizeof("TLS 1.3, server CertificateVerify") + 64 * 2] data;
                                     u64 datalen = build_certificate_verify_signdata(data, tls.key_schedule, context_string);
                                     ret = tls.ctx.sign_certificate.cb(tls.ctx.sign_certificate, tls, tls.is_server != 0 ? &tls.server.async_job : null, &algo, sendbuf, ptls_iovec_init(data, datalen), signature_algorithms != null ? signature_algorithms.list : null, signature_algorithms != null ? signature_algorithms.count : 0);
-                                    if ret == 512 + 11 {
+                                    if ret == 0x200 + 11 {
                                         assert(tls.is_server || !"async operation only supported on the server-side");
                                         assert(tls.server.async_job != null);
                                         emitter.buf.off = start_off;
@@ -9315,7 +8984,7 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
                             u64 body_size = sendbuf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -9335,7 +9004,7 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -9360,10 +9029,9 @@ i32 send_certificate_verify(ptls_t* tls, ptls_message_emitter_t* emitter, st_ptl
         }
         if !(0 != 0) { break; }
     }
-    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
+    return ret;
 }
-}
-private {
+
 i32 client_handle_certificate_request(ptls_t* tls, ptls_iovec_t message, ptls_handshake_properties_t* properties) {
     u8* src = message.base + 4;
     u8* end = message.base + message.len;
@@ -9378,10 +9046,9 @@ i32 client_handle_certificate_request(ptls_t* tls, ptls_iovec_t message, ptls_ha
     }
     tls.state = PTLS_STATE_CLIENT_EXPECT_CERTIFICATE;
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
-    return 512 + 2;
+    return 0x200 + 2;
 }
-}
-private {
+
 i32 handle_certificate(ptls_t* tls, u8* src, u8* end, i32* got_certs) {
     noinit ptls_iovec_t[16] certs;
     u64 num_certs = 0;
@@ -9641,7 +9308,7 @@ i32 handle_certificate(ptls_t* tls, u8* src, u8* end, i32* got_certs) {
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     if tls.ctx.verify_certificate != null {
         u8* server_name = null;
@@ -9660,8 +9327,7 @@ i32 handle_certificate(ptls_t* tls, u8* src, u8* end, i32* got_certs) {
     *got_certs = num_certs != 0;
     return ret;
 }
-}
-private {
+
 i32 client_do_handle_certificate(ptls_t* tls, u8* src, u8* end) {
     i32 got_certs;
     i32 ret;
@@ -9674,8 +9340,7 @@ i32 client_do_handle_certificate(ptls_t* tls, u8* src, u8* end) {
     }
     return 0;
 }
-}
-private {
+
 i32 client_handle_certificate(ptls_t* tls, ptls_iovec_t message) {
     i32 ret;
     ret = client_do_handle_certificate(tls, message.base + 4, message.base + message.len);
@@ -9684,10 +9349,9 @@ i32 client_handle_certificate(ptls_t* tls, ptls_iovec_t message) {
     }
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
     tls.state = PTLS_STATE_CLIENT_EXPECT_CERTIFICATE_VERIFY;
-    return 512 + 2;
+    return 0x200 + 2;
 }
-}
-private {
+
 i32 client_handle_compressed_certificate(ptls_t* tls, ptls_iovec_t message) {
     u8* uncompressed = null;
     defer {
@@ -9717,7 +9381,7 @@ i32 client_handle_compressed_certificate(ptls_t* tls, ptls_iovec_t message) {
     }
     uncompressed = alloc(cast(i64, uncompressed_size));
     if uncompressed == null {
-        ret = 512 + 1;
+        ret = 0x200 + 1;
         return ret;
     }
     while true {
@@ -9776,7 +9440,7 @@ i32 client_handle_compressed_certificate(ptls_t* tls, ptls_iovec_t message) {
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = client_do_handle_certificate(tls, uncompressed, uncompressed + uncompressed_size);
     if ret != 0 {
@@ -9784,11 +9448,10 @@ i32 client_handle_compressed_certificate(ptls_t* tls, ptls_iovec_t message) {
     }
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
     tls.state = PTLS_STATE_CLIENT_EXPECT_CERTIFICATE_VERIFY;
-    ret = 512 + 2;
+    ret = 0x200 + 2;
     return ret;
 }
-}
-private {
+
 i32 server_handle_certificate(ptls_t* tls, ptls_iovec_t message) {
     i32 got_certs;
     i32 ret;
@@ -9802,15 +9465,14 @@ i32 server_handle_certificate(ptls_t* tls, ptls_iovec_t message) {
     } else {
         tls.state = PTLS_STATE_SERVER_EXPECT_FINISHED;
     }
-    return 512 + 2;
+    return 0x200 + 2;
 }
-}
-private {
+
 i32 handle_certificate_verify(ptls_t* tls, ptls_iovec_t message, u8* context_string) {
     u8* src = message.base + 4;
     u8* end = message.base + message.len;
     u16 algo;
-    ptls_iovec_t signature;
+    noinit ptls_iovec_t signature;
     noinit u8[64 + sizeof("TLS 1.3, server CertificateVerify") + 64 * 2] signdata;
     u64 signdata_size;
     i32 ret;
@@ -9871,7 +9533,7 @@ i32 handle_certificate_verify(ptls_t* tls, ptls_iovec_t message, u8* context_str
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     signdata_size = build_certificate_verify_signdata(signdata, tls.key_schedule, context_string);
     if tls.certificate_verify.cb != null {
@@ -9887,28 +9549,25 @@ i32 handle_certificate_verify(ptls_t* tls, ptls_iovec_t message, u8* context_str
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
     return ret;
 }
-}
-private {
+
 i32 client_handle_certificate_verify(ptls_t* tls, ptls_iovec_t message) {
     i32 ret = handle_certificate_verify(tls, message, "TLS 1.3, server CertificateVerify");
     if ret == 0 {
         tls.state = PTLS_STATE_CLIENT_EXPECT_FINISHED;
-        ret = 512 + 2;
+        ret = 0x200 + 2;
     }
     return ret;
 }
-}
-private {
+
 i32 server_handle_certificate_verify(ptls_t* tls, ptls_iovec_t message) {
     i32 ret = handle_certificate_verify(tls, message, "TLS 1.3, client CertificateVerify");
     if ret == 0 {
         tls.state = PTLS_STATE_SERVER_EXPECT_FINISHED;
-        ret = 512 + 2;
+        ret = 0x200 + 2;
     }
     return ret;
 }
-}
-private {
+
 i32 client_handle_finished(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message) {
     u8[64] send_secret;
     defer {
@@ -9977,7 +9636,7 @@ i32 client_handle_finished(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_io
                         u64 body_size = _buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -10036,19 +9695,19 @@ i32 client_handle_finished(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_io
     }
     return ret;
 }
-}
-private {
+
 i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
     u8* src = message.base + 4;
     u8* end = message.base + message.len;
-    ptls_iovec_t ticket_nonce;
+    noinit ptls_iovec_t ticket_nonce;
+    u32 ticket_lifetime;
+    u32 max_early_data_size;
+    i32 early_data;
     i32 ret;
     {
-        u32 ticket_lifetime;
         u32 ticket_age_add;
-        u32 max_early_data_size;
-        ptls_iovec_t ticket;
-        ret = decode_new_session_ticket(tls, &ticket_lifetime, &ticket_age_add, &ticket_nonce, &ticket, &max_early_data_size, src, end);
+        noinit ptls_iovec_t ticket;
+        ret = decode_new_session_ticket(tls, &ticket_lifetime, &ticket_age_add, &ticket_nonce, &ticket, &early_data, &max_early_data_size, src, end);
         if ret != 0 {
             return ret;
         }
@@ -10056,13 +9715,19 @@ i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
     if tls.ctx.save_ticket == null {
         return 0;
     }
-    ptls_buffer_t ticket_buf;
+    noinit ptls_buffer_t ticket_buf;
     ptls_buffer_init(&ticket_buf, "", 0);
     while true {
         u64 _v = tls.ctx.get_time.cb(tls.ctx.get_time);
         while true {
-            u8[8] __compound_lit_131 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-            u8[8] __compound_lit_132 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+            u8[8] __compound_lit_131 = {
+                cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32),
+                cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v),
+            };
+            u8[8] __compound_lit_132 = {
+                cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32),
+                cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v),
+            };
             ret = ptls_buffer__do_pushv(&ticket_buf, __compound_lit_131, cast(u64, sizeof(__compound_lit_132)));
             if ret != 0 {
                 ptls_buffer_dispose(&ticket_buf);
@@ -10127,7 +9792,7 @@ i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
         u64 body_size = ticket_buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 {
                     ptls_buffer_dispose(&ticket_buf);
                     return ret;
@@ -10175,7 +9840,7 @@ i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
         u64 body_size = ticket_buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 {
                     ptls_buffer_dispose(&ticket_buf);
                     return ret;
@@ -10193,7 +9858,12 @@ i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
         }
         if !(0 != 0) { break; }
     }
-    ret = tls.ctx.save_ticket.cb(tls.ctx.save_ticket, tls, ptls_iovec_init(ticket_buf.base, ticket_buf.off));
+    var properties = ptls_save_ticket_properties_t{
+        .lifetime = ticket_lifetime,
+        .early_data = cast(u32, early_data),
+        .max_early_data_size = max_early_data_size,
+    };
+    ret = tls.ctx.save_ticket.cb(tls.ctx.save_ticket, tls, ptls_iovec_init(ticket_buf.base, ticket_buf.off), &properties);
     if ret != 0 {
         ptls_buffer_dispose(&ticket_buf);
         return ret;
@@ -10202,8 +9872,7 @@ i32 client_handle_new_session_ticket(ptls_t* tls, ptls_iovec_t message) {
     ptls_buffer_dispose(&ticket_buf);
     return ret;
 }
-}
-private {
+
 i32 client_hello_decode_server_name(ptls_iovec_t* name, u8** src, u8* end) {
     i32 ret = 0;
     while true {
@@ -10278,6 +9947,10 @@ i32 client_hello_decode_server_name(ptls_iovec_t* name, u8** src, u8* end) {
                                     {
                                         switch type {
                                             case 0: {
+                                                if cast(i64, end - *src) == 0 {
+                                                    ret = 50;
+                                                    return ret;
+                                                }
                                                 if memchr(*src, 0, cast(i64, end - *src)) != null {
                                                     ret = 47;
                                                     return ret;
@@ -10314,8 +9987,7 @@ i32 client_hello_decode_server_name(ptls_iovec_t* name, u8** src, u8* end) {
     }
     return ret;
 }
-}
-private {
+
 i32 select_negotiated_group(ptls_key_exchange_algorithm_t** selected, ptls_key_exchange_algorithm_t** candidates, u8* src, u8* end) {
     bool _keep = false;
     defer {
@@ -10389,13 +10061,12 @@ i32 select_negotiated_group(ptls_key_exchange_algorithm_t** selected, ptls_key_e
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = 40;
-    return ret;   // LOCAL (tsmc): transminc omits the C epilogue `Exit: return ret;`
+    return ret;
 }
-}
-private {
+
 i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src, u8* end, ptls_handshake_properties_t* properties, ptls_t* tls_cbarg) {
     u8* start = src;
     u16 exttype = 0;
@@ -10404,7 +10075,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
     if ret != 0 {
         return ret;
     }
-    if ch.legacy_version < 769 {
+    if ch.legacy_version < 0x0301 {
         ret = 70;
         return ret;
     }
@@ -10767,7 +10438,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 20: {
@@ -10834,7 +10505,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 27: {
@@ -10900,7 +10571,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 10: {
@@ -10986,7 +10657,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 44: {
@@ -11188,7 +10859,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                                     }
                                                                                     if !(0 != 0) { break; }
                                                                                 }
-                                                                                                                                                                if !(0 != 0) { break; }
+                                                                                if !(0 != 0) { break; }
                                                                             }
                                                                         }
                                                                         if !(0 != 0) { break; }
@@ -11208,7 +10879,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 41: {
@@ -11426,7 +11097,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                     }
                                                                     if !(0 != 0) { break; }
                                                                 }
-                                                                                                                                if !(0 != 0) { break; }
+                                                                if !(0 != 0) { break; }
                                                             }
                                                             ch.psk.is_last_extension = 1;
                                                         }
@@ -11494,7 +11165,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                        if !(0 != 0) { break; }
+                                                            if !(0 != 0) { break; }
                                                         }
                                                     }
                                                     case 42: {
@@ -11511,7 +11182,7 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
                                                         ch.ticket_request.new_session_count = *src++;
                                                         ch.ticket_request.resumption_count = *src++;
                                                     }
-                                                    case 65037: {
+                                                    case 0xfe0d: {
                                                         ret = ptls_decode8(&ch.ech.type, &src, end);
                                                         if ret != 0 {
                                                             return ret;
@@ -11678,13 +11349,12 @@ i32 decode_client_hello(ptls_context_t* ctx, st_ptls_client_hello_t* ch, u8* src
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ret = 0;
     return ret;
 }
-}
-private {
+
 i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer_ext, u8* outer_ext_end) {
     i32 ret;
     while true {
@@ -11769,7 +11439,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                             u8* end = *src + _block_size;
                                             while true {
                                                 {
-                                                    if exttype == 64768 {
+                                                    if exttype == 0xfd00 {
                                                         while true {
                                                             u64 _capacity = 1;
                                                             u64 _block_size;
@@ -11810,7 +11480,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                                                             if ret != 0 {
                                                                                 return ret;
                                                                             }
-                                                                            if reftype == 65037 {
+                                                                            if reftype == 0xfe0d {
                                                                                 ret = 47;
                                                                                 return ret;
                                                                             }
@@ -11865,7 +11535,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                                                                     u64 body_size = buf.off - body_start;
                                                                                     if capacity != cast(u64, -1) {
                                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                            ret = 512 + 12;
+                                                                                            ret = 0x200 + 12;
                                                                                             return ret;
                                                                                         }
                                                                                         for ; capacity != 0; --capacity {
@@ -11881,7 +11551,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                                                                 }
                                                                                 if !(0 != 0) { break; }
                                                                             }
-                                                                                                                                                        if !(*src != end) { break; }
+                                                                            if !(*src != end) { break; }
                                                                         }
                                                                     }
                                                                     if !(0 != 0) { break; }
@@ -11935,7 +11605,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                                                 u64 body_size = buf.off - body_start;
                                                                 if capacity != cast(u64, -1) {
                                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                        ret = 512 + 12;
+                                                                        ret = 0x200 + 12;
                                                                         return ret;
                                                                     }
                                                                     for ; capacity != 0; --capacity {
@@ -11951,7 +11621,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
                                                             }
                                                             if !(0 != 0) { break; }
                                                         }
-                                                                                                            }
+                                                    }
                                                 }
                                                 if !(0 != 0) { break; }
                                             }
@@ -11981,7 +11651,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -11997,8 +11667,7 @@ i32 rebuild_ch_inner_extensions(ptls_buffer_t* buf, u8** src, u8* end, u8* outer
     }
     return ret;
 }
-}
-private {
+
 i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_t* outer_ch, u8* outer_ext, u8* outer_ext_end) {
     i32 ret;
     while true {
@@ -12130,7 +11799,7 @@ i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_
                         u64 body_size = buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -12202,7 +11871,7 @@ i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_
                                             u64 body_size = buf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -12288,7 +11957,7 @@ i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_
                                             u64 body_size = buf.off - body_start;
                                             if capacity != cast(u64, -1) {
                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                    ret = 512 + 12;
+                                                    ret = 0x200 + 12;
                                                     return ret;
                                                 }
                                                 for ; capacity != 0; --capacity {
@@ -12326,7 +11995,7 @@ i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_
             u64 body_size = _buf.off - body_start;
             if capacity != cast(u64, -1) {
                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                    ret = 512 + 12;
+                    ret = 0x200 + 12;
                     return ret;
                 }
                 for ; capacity != 0; --capacity {
@@ -12353,19 +12022,27 @@ i32 rebuild_ch_inner(ptls_buffer_t* buf, u8* src, u8* end, st_ptls_client_hello_
     }
     return ret;
 }
-}
+
 /* Wrapper function for invoking the on_client_hello callback, taking an exhaustive list of parameters as arguments. The intention
  * is to not miss setting them as we add new parameters to the struct. */
-private {
 i32 call_on_client_hello_cb(ptls_t* tls, ptls_iovec_t server_name, ptls_iovec_t raw_message, ptls_iovec_t cipher_suites, ptls_iovec_t* alpns, u64 num_alpns, u16* sig_algos, u64 num_sig_algos, u16* cert_comp_algos, u64 num_cert_comp_algos, u8* server_cert_types, u64 num_server_cert_types, ptls_client_hello_psk_identity_t* psk_identities, u64 num_psk_identities, i32 incompatible_version) {
     if tls.ctx.on_client_hello == null {
         return 0;
     }
-    var params = ptls_on_client_hello_parameters_t{server_name, raw_message, cipher_suites, {alpns, num_alpns}, {sig_algos, num_sig_algos}, {cert_comp_algos, num_cert_comp_algos}, {server_cert_types, num_server_cert_types}, {psk_identities, num_psk_identities}, incompatible_version};
+    var params = ptls_on_client_hello_parameters_t{
+        server_name,
+        raw_message,
+        cipher_suites,
+        {alpns, num_alpns},
+        {sig_algos, num_sig_algos},
+        {cert_comp_algos, num_cert_comp_algos},
+        {server_cert_types, num_server_cert_types},
+        {psk_identities, num_psk_identities},
+        incompatible_version,
+    };
     return tls.ctx.on_client_hello.cb(tls.ctx.on_client_hello, tls, &params);
 }
-}
-private {
+
 i32 check_client_hello_constraints(ptls_context_t* ctx, st_ptls_client_hello_t* ch, void* prev_random, i32 ech_is_inner_ch, ptls_iovec_t raw_message, ptls_t* tls_cbarg) {
     i32 is_second_flight = prev_random != null;
     if is_second_flight && !ptls_mem_equal(ch.random_bytes, prev_random, 32) {
@@ -12384,7 +12061,7 @@ i32 check_client_hello_constraints(ptls_context_t* ctx, st_ptls_client_hello_t* 
         }
         return 70;
     }
-    if ch.legacy_version <= 768 {
+    if ch.legacy_version <= 0x0300 {
         return 70;
     }
     if (ch.compression_methods.count == 1 && ch.compression_methods.ids[0] == 0) == 0 {
@@ -12407,22 +12084,20 @@ i32 check_client_hello_constraints(ptls_context_t* ctx, st_ptls_client_hello_t* 
     }
     return 0;
 }
-}
-private {
+
 i32 vec_is_string(ptls_iovec_t x, u8* y) {
     return strncmp(cast(u8*, x.base), y, x.len) == 0 && y[x.len] == 0;
 }
-}
+
 /**
  * Looks for a PSK identity that can be used, and if found, updates the handshake state and returns the necessary variables. If
  * `ptls_context_t::pre_shared_key` is set, only tries handshake using those keys provided. Otherwise, tries resumption.
  */
-private {
 i32 try_psk_handshake(ptls_t* tls, u64* psk_index, i32* accept_early_data, st_ptls_client_hello_t* ch, ptls_iovec_t ch_trunc, i32 is_second_flight) {
-    ptls_buffer_t decbuf;
-    ptls_iovec_t secret;
-    ptls_iovec_t ticket_ctx;
-    ptls_iovec_t ticket_negotiated_protocol;
+    noinit ptls_buffer_t decbuf;
+    noinit ptls_iovec_t secret;
+    noinit ptls_iovec_t ticket_ctx;
+    noinit ptls_iovec_t ticket_negotiated_protocol;
     u64 issue_at;
     u64 now = tls.ctx.get_time.cb(tls.ctx.get_time);
     u32 age_add;
@@ -12484,7 +12159,7 @@ i32 try_psk_handshake(ptls_t* tls, u64* psk_index, i32* accept_early_data, st_pt
         switch tls.ctx.encrypt_ticket.cb(tls.ctx.encrypt_ticket, tls, 0, &decbuf, identity.identity) {
             case 0: {
             }
-            case 512 + 9: {
+            case 0x200 + 9: {
                 can_accept_early_data = 0;
             }
             default: {
@@ -12531,7 +12206,7 @@ i32 try_psk_handshake(ptls_t* tls, u64* psk_index, i32* accept_early_data, st_pt
         {
             ptls_key_exchange_algorithm_t** a;
             for a = tls.ctx.key_exchanges; *a != null && (*a).id != ticket_key_exchange_id; ++a {
-                            }
+            }
             if *a == null {
                 continue;
             }
@@ -12600,14 +12275,13 @@ i32 try_psk_handshake(ptls_t* tls, u64* psk_index, i32* accept_early_data, st_pt
         return ret;
     }
 }
-}
-private {
+
 i32 calc_cookie_signature(ptls_t* tls, ptls_handshake_properties_t* properties, ptls_key_exchange_algorithm_t* negotiated_group, ptls_iovec_t tbs, u8* sig) {
     ptls_hash_algorithm_t* algo = tls.ctx.cipher_suites[0].hash;
     ptls_hash_context_t* hctx;
     hctx = ptls_hmac_create(algo, properties.server.cookie.key, algo.digest_size);
     if hctx == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     while true {
         var len = cast(u64, sizeof(tls.client_random));
@@ -12627,13 +12301,13 @@ i32 calc_cookie_signature(ptls_t* tls, ptls_handshake_properties_t* properties, 
     }
     while true {
         u16 v = tls.cipher_suite.id;
-        u8[2] b = {cast(u8, cast(i32, v) >> 8), cast(u8, v & 255)};
+        u8[2] b = {cast(u8, cast(i32, v) >> 8), cast(u8, v & 0xff)};
         hctx.update(hctx, b, 2);
         if !(0 != 0) { break; }
     }
     while true {
         u16 v = negotiated_group != null ? negotiated_group.id : 0;
-        u8[2] b = {cast(u8, cast(i32, v) >> 8), cast(u8, v & 255)};
+        u8[2] b = {cast(u8, cast(i32, v) >> 8), cast(u8, v & 0xff)};
         hctx.update(hctx, b, 2);
         if !(0 != 0) { break; }
     }
@@ -12656,8 +12330,7 @@ i32 calc_cookie_signature(ptls_t* tls, ptls_handshake_properties_t* properties, 
     hctx.final(hctx, sig, PTLS_HASH_FINAL_MODE_FREE);
     return 0;
 }
-}
-private {
+
 i32 certificate_type_exists(u8* list, u64 count, u8 desired_type) {
     if desired_type == 0 && count == 0 {
         return 1;
@@ -12669,11 +12342,10 @@ i32 certificate_type_exists(u8* list, u64 count, u8 desired_type) {
     }
     return 0;
 }
-}
-private {
+
 i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message, ptls_handshake_properties_t* properties) {
     st_ptls_client_hello_t* ch = null;
-    __anon_picotls_struct_46 ech;
+    ech_t ech;
     ptls_iovec_t pubkey;
     ptls_iovec_t ecdh_secret;
     defer {
@@ -12687,7 +12359,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
         ptls_buffer_dispose(&ech.ch_inner);
         free(ch);
     }
-    __anon_picotls_struct_45 key_share;
+    key_share_t key_share;
     i32 mode;
     u64 psk_index = SIZE_MAX;
     i32 accept_early_data = 0;
@@ -12696,10 +12368,30 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
     ptls_buffer_init(&ech.ch_inner, "", 0);
     ch = alloc(cast(i64, sizeof(*ch)));
     if ch == null {
-        ret = 512 + 1;
+        ret = 0x200 + 1;
         return ret;
     }
-    *ch = st_ptls_client_hello_t{.unknown_extensions = {ptls_raw_extension_t{.type = UINT16_MAX}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}}};
+    *ch = st_ptls_client_hello_t{
+        .unknown_extensions = {
+            ptls_raw_extension_t{.type = UINT16_MAX},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+            ptls_raw_extension_t{},
+        },
+    };
     ret = decode_client_hello(tls.ctx, ch, message.base + 4, message.base + message.len, properties, tls);
     if ret != 0 {
         return ret;
@@ -12738,7 +12430,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
             }
         }
         if is_second_flight == 0 {
-                        while true {
+            while true {
                 u32 active = ptls_log_point_maybe_active(&server_handle_hello__logpoint);
                 if active == 0 {
                     break;
@@ -12749,14 +12441,18 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                 if active == 0 {
                     break;
                 }
-                                if !(0 != 0) { break; }
+                if !(0 != 0) { break; }
             }
         }
         if tls.ech.aead != null {
+            if ch.ech.payload.len <= tls.ech.aead.algo.tag_size {
+                ret = 50;
+                return ret;
+            }
             ech.encoded_ch_inner = alloc(cast(i64, ch.ech.payload.len - tls.ech.aead.algo.tag_size));
             ech.ch_outer_aad = alloc(cast(i64, message.len - 4));
             if ech.encoded_ch_inner == null || ech.ch_outer_aad == null {
-                ret = 512 + 1;
+                ret = 0x200 + 1;
                 return ret;
             }
             memcpy(ech.ch_outer_aad, message.base + 4, message.len - 4);
@@ -12768,7 +12464,27 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                     return ret;
                 }
                 message = ptls_iovec_init(ech.ch_inner.base, ech.ch_inner.off);
-                *ch = st_ptls_client_hello_t{.unknown_extensions = {ptls_raw_extension_t{.type = UINT16_MAX}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}, ptls_raw_extension_t{}}};
+                *ch = st_ptls_client_hello_t{
+                    .unknown_extensions = {
+                        ptls_raw_extension_t{.type = UINT16_MAX},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                        ptls_raw_extension_t{},
+                    },
+                };
                 ret = decode_client_hello(tls.ctx, ch, ech.ch_inner.base + 4, ech.ch_inner.base + ech.ch_inner.off, properties, tls);
                 if ret != 0 {
                     return ret;
@@ -12835,7 +12551,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
             tls.cipher_suite = cs;
             tls.key_schedule = key_schedule_new(cs, null, 0);
             if tls.key_schedule == null {
-                ret = 512 + 1;
+                ret = 0x200 + 1;
                 return ret;
             }
         } else {
@@ -12903,7 +12619,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                 }
                 if !(0 != 0) { break; }
             }
-                        if !(0 != 0) { break; }
+            if !(0 != 0) { break; }
         }
     }
     if is_second_flight == 0 {
@@ -12959,7 +12675,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                 {
                                     sh_start_off = emitter.buf.off - 4;
                                     while true {
-                                        u16 _v = 771;
+                                        u16 _v = 0x0303;
                                         while true {
                                             u8[2] __compound_lit_147 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                             u8[2] __compound_lit_148 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -13007,7 +12723,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                         u64 body_size = emitter.buf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -13100,7 +12816,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                         u64 body_size = emitter.buf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -13116,7 +12832,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                     }
                                                     if !(0 != 0) { break; }
                                                 }
-                                                                                                while true {
+                                                while true {
                                                     {
                                                         ptls_key_exchange_algorithm_t* _negotiated_group = ch.cookie.sent_key_share != 0 ? key_share.algorithm : null;
                                                         if _negotiated_group != null {
@@ -13165,7 +12881,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                     u64 body_size = emitter.buf.off - body_start;
                                                                     if capacity != cast(u64, -1) {
                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                            ret = 512 + 12;
+                                                                            ret = 0x200 + 12;
                                                                             return ret;
                                                                         }
                                                                         for ; capacity != 0; --capacity {
@@ -13181,7 +12897,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                    }
+                                                        }
                                                         while true {
                                                             {
                                                                 while true {
@@ -13223,7 +12939,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                         u64 body_size = emitter.buf.off - body_start;
                                                                         if capacity != cast(u64, -1) {
                                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                ret = 512 + 12;
+                                                                                ret = 0x200 + 12;
                                                                                 return ret;
                                                                             }
                                                                             for ; capacity != 0; --capacity {
@@ -13239,7 +12955,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                     }
                                                                     if !(0 != 0) { break; }
                                                                 }
-                                                                                                                            }
+                                                            }
                                                             if !(0 != 0) { break; }
                                                         }
                                                     }
@@ -13251,7 +12967,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                         u64 body_size = emitter.buf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -13271,7 +12987,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                             u64 body_size = _buf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -13359,7 +13075,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                 {
                                     sh_start_off = emitter.buf.off - 4;
                                     while true {
-                                        u16 _v = 771;
+                                        u16 _v = 0x0303;
                                         while true {
                                             u8[2] __compound_lit_165 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                             u8[2] __compound_lit_166 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -13407,7 +13123,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                         u64 body_size = emitter.buf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -13500,7 +13216,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                         u64 body_size = emitter.buf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -13516,7 +13232,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                     }
                                                     if !(0 != 0) { break; }
                                                 }
-                                                                                                while true {
+                                                while true {
                                                     {
                                                         ptls_key_exchange_algorithm_t* _negotiated_group = key_share.algorithm != null ? null : negotiated_group;
                                                         if _negotiated_group != null {
@@ -13565,7 +13281,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                     u64 body_size = emitter.buf.off - body_start;
                                                                     if capacity != cast(u64, -1) {
                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                            ret = 512 + 12;
+                                                                            ret = 0x200 + 12;
                                                                             return ret;
                                                                         }
                                                                         for ; capacity != 0; --capacity {
@@ -13581,14 +13297,14 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                 }
                                                                 if !(0 != 0) { break; }
                                                             }
-                                                                                                                    }
+                                                        }
                                                         while true {
                                                             {
                                                                 ptls_buffer_t* sendbuf = emitter.buf;
                                                                 if ptls_is_ech_handshake(tls, null, null, null) != 0 {
                                                                     while true {
                                                                         while true {
-                                                                            u16 _v = 65037;
+                                                                            u16 _v = 0xfe0d;
                                                                             while true {
                                                                                 u8[2] __compound_lit_179 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                                                 u8[2] __compound_lit_180 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -13625,7 +13341,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                             u64 body_size = sendbuf.off - body_start;
                                                                             if capacity != cast(u64, -1) {
                                                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                    ret = 512 + 12;
+                                                                                    ret = 0x200 + 12;
                                                                                     return ret;
                                                                                 }
                                                                                 for ; capacity != 0; --capacity {
@@ -13641,7 +13357,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                         }
                                                                         if !(0 != 0) { break; }
                                                                     }
-                                                                                                                                    }
+                                                                }
                                                                 if retry_uses_cookie != 0 {
                                                                     while true {
                                                                         while true {
@@ -13719,7 +13435,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                                                                 u64 body_size = sendbuf.off - body_start;
                                                                                                                 if capacity != cast(u64, -1) {
                                                                                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                                                        ret = 512 + 12;
+                                                                                                                        ret = 0x200 + 12;
                                                                                                                         return ret;
                                                                                                                     }
                                                                                                                     for ; capacity != 0; --capacity {
@@ -13748,7 +13464,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                                                     u64 body_size = sendbuf.off - body_start;
                                                                                                     if capacity != cast(u64, -1) {
                                                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                                            ret = 512 + 12;
+                                                                                                            ret = 0x200 + 12;
                                                                                                             return ret;
                                                                                                         }
                                                                                                         for ; capacity != 0; --capacity {
@@ -13791,7 +13507,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                                                     u64 body_size = sendbuf.off - body_start;
                                                                                                     if capacity != cast(u64, -1) {
                                                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                                            ret = 512 + 12;
+                                                                                                            ret = 0x200 + 12;
                                                                                                             return ret;
                                                                                                         }
                                                                                                         for ; capacity != 0; --capacity {
@@ -13811,7 +13527,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                                         u64 body_size = sendbuf.off - body_start;
                                                                                         if capacity != cast(u64, -1) {
                                                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                                ret = 512 + 12;
+                                                                                                ret = 0x200 + 12;
                                                                                                 return ret;
                                                                                             }
                                                                                             for ; capacity != 0; --capacity {
@@ -13831,7 +13547,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                             u64 body_size = sendbuf.off - body_start;
                                                                             if capacity != cast(u64, -1) {
                                                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                    ret = 512 + 12;
+                                                                                    ret = 0x200 + 12;
                                                                                     return ret;
                                                                                 }
                                                                                 for ; capacity != 0; --capacity {
@@ -13847,7 +13563,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                         }
                                                                         if !(0 != 0) { break; }
                                                                     }
-                                                                                                                                    }
+                                                                }
                                                             }
                                                             if !(0 != 0) { break; }
                                                         }
@@ -13860,7 +13576,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                         u64 body_size = emitter.buf.off - body_start;
                                         if capacity != cast(u64, -1) {
                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                ret = 512 + 12;
+                                                ret = 0x200 + 12;
                                                 return ret;
                                             }
                                             for ; capacity != 0; --capacity {
@@ -13880,7 +13596,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                             u64 body_size = _buf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -13924,13 +13640,13 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                 if ret != 0 {
                     return ret;
                 }
-                ret = 512 + 6;
+                ret = 0x200 + 6;
             } else {
                 tls.state = PTLS_STATE_SERVER_EXPECT_SECOND_CLIENT_HELLO;
                 if ch.psk.early_data_indication != 0 {
                     tls.server.early_data_skipped_bytes = 0;
                 }
-                ret = 512 + 2;
+                ret = 0x200 + 2;
             }
             return ret;
         }
@@ -13993,7 +13709,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
     if accept_early_data && tls.ctx.max_early_data_size != 0 && psk_index == 0 {
         tls.pending_handshake_secret = alloc(64);
         if tls.pending_handshake_secret == null {
-            ret = 512 + 1;
+            ret = 0x200 + 1;
             return ret;
         }
         ret = derive_exporter_secret(tls, 1);
@@ -14055,7 +13771,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                             {
                                 sh_start_off = emitter.buf.off - 4;
                                 while true {
-                                    u16 _v = 771;
+                                    u16 _v = 0x0303;
                                     while true {
                                         u8[2] __compound_lit_187 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                         u8[2] __compound_lit_188 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -14107,7 +13823,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                     u64 body_size = emitter.buf.off - body_start;
                                     if capacity != cast(u64, -1) {
                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                            ret = 512 + 12;
+                                            ret = 0x200 + 12;
                                             return ret;
                                         }
                                         for ; capacity != 0; --capacity {
@@ -14200,7 +13916,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                     u64 body_size = emitter.buf.off - body_start;
                                                     if capacity != cast(u64, -1) {
                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                            ret = 512 + 12;
+                                                            ret = 0x200 + 12;
                                                             return ret;
                                                         }
                                                         for ; capacity != 0; --capacity {
@@ -14216,7 +13932,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 }
                                                 if !(0 != 0) { break; }
                                             }
-                                                                                        while true {
+                                            while true {
                                                 {
                                                     ptls_buffer_t* sendbuf = emitter.buf;
                                                     if mode != HANDSHAKE_MODE_PSK {
@@ -14284,7 +14000,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                             u64 body_size = sendbuf.off - body_start;
                                                                             if capacity != cast(u64, -1) {
                                                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                    ret = 512 + 12;
+                                                                                    ret = 0x200 + 12;
                                                                                     return ret;
                                                                                 }
                                                                                 for ; capacity != 0; --capacity {
@@ -14304,7 +14020,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                 u64 body_size = sendbuf.off - body_start;
                                                                 if capacity != cast(u64, -1) {
                                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                        ret = 512 + 12;
+                                                                        ret = 0x200 + 12;
                                                                         return ret;
                                                                     }
                                                                     for ; capacity != 0; --capacity {
@@ -14320,7 +14036,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                             }
                                                             if !(0 != 0) { break; }
                                                         }
-                                                                                                            }
+                                                    }
                                                     if mode != HANDSHAKE_MODE_FULL {
                                                         while true {
                                                             while true {
@@ -14367,7 +14083,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                 u64 body_size = sendbuf.off - body_start;
                                                                 if capacity != cast(u64, -1) {
                                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                        ret = 512 + 12;
+                                                                        ret = 0x200 + 12;
                                                                         return ret;
                                                                     }
                                                                     for ; capacity != 0; --capacity {
@@ -14383,7 +14099,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                             }
                                                             if !(0 != 0) { break; }
                                                         }
-                                                                                                            }
+                                                    }
                                                 }
                                                 if !(0 != 0) { break; }
                                             }
@@ -14393,7 +14109,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                     u64 body_size = emitter.buf.off - body_start;
                                     if capacity != cast(u64, -1) {
                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                            ret = 512 + 12;
+                                            ret = 0x200 + 12;
                                             return ret;
                                         }
                                         for ; capacity != 0; --capacity {
@@ -14413,7 +14129,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                         u64 body_size = _buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -14561,7 +14277,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14577,7 +14293,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             }
                                             if !(0 != 0) { break; }
                                         }
-                                                                            }
+                                    }
                                     if tls.ctx.use_raw_public_keys != 0 {
                                         while true {
                                             while true {
@@ -14620,7 +14336,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14636,7 +14352,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             }
                                             if !(0 != 0) { break; }
                                         }
-                                                                            }
+                                    }
                                     if tls.negotiated_protocol != null {
                                         while true {
                                             while true {
@@ -14701,7 +14417,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                         u64 body_size = sendbuf.off - body_start;
                                                                         if capacity != cast(u64, -1) {
                                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                ret = 512 + 12;
+                                                                                ret = 0x200 + 12;
                                                                                 return ret;
                                                                             }
                                                                             for ; capacity != 0; --capacity {
@@ -14721,7 +14437,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                             u64 body_size = sendbuf.off - body_start;
                                                             if capacity != cast(u64, -1) {
                                                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                    ret = 512 + 12;
+                                                                    ret = 0x200 + 12;
                                                                     return ret;
                                                                 }
                                                                 for ; capacity != 0; --capacity {
@@ -14741,7 +14457,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14757,7 +14473,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             }
                                             if !(0 != 0) { break; }
                                         }
-                                                                            }
+                                    }
                                     if tls.pending_handshake_secret != null {
                                         while true {
                                             while true {
@@ -14791,7 +14507,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14808,10 +14524,10 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             if !(0 != 0) { break; }
                                         }
                                     }
-                                                                        if tls.ech.state == PTLS_ECH_STATE_OFFERED && tls.ctx.ech.server.create_opener != null && tls.ctx.ech.server.retry_configs.len != 0 {
+                                    if tls.ech.state == PTLS_ECH_STATE_OFFERED && tls.ctx.ech.server.create_opener != null && tls.ctx.ech.server.retry_configs.len != 0 {
                                         while true {
                                             while true {
-                                                u16 _v = 65037;
+                                                u16 _v = 0xfe0d;
                                                 while true {
                                                     u8[2] __compound_lit_217 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                                     u8[2] __compound_lit_218 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -14848,7 +14564,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14865,7 +14581,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             if !(0 != 0) { break; }
                                         }
                                     }
-                                                                        if ch.ticket_request.new_session_count != 0 && tls.server.num_tickets_to_send != 0 {
+                                    if ch.ticket_request.new_session_count != 0 && tls.server.num_tickets_to_send != 0 {
                                         while true {
                                             while true {
                                                 u16 _v = 58;
@@ -14907,7 +14623,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 u64 body_size = sendbuf.off - body_start;
                                                 if capacity != cast(u64, -1) {
                                                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                        ret = 512 + 12;
+                                                        ret = 0x200 + 12;
                                                         return ret;
                                                     }
                                                     for ; capacity != 0; --capacity {
@@ -14924,7 +14640,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                             if !(0 != 0) { break; }
                                         }
                                     }
-                                                                        ret = push_additional_extensions(properties, sendbuf);
+                                    ret = push_additional_extensions(properties, sendbuf);
                                     if ret != 0 {
                                         return ret;
                                     }
@@ -14934,7 +14650,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                             u64 body_size = sendbuf.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -14954,7 +14670,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -15070,7 +14786,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                     u64 body_size = sendbuf.off - body_start;
                                                     if capacity != cast(u64, -1) {
                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                            ret = 512 + 12;
+                                                            ret = 0x200 + 12;
                                                             return ret;
                                                         }
                                                         for ; capacity != 0; --capacity {
@@ -15086,7 +14802,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                 }
                                                 if !(0 != 0) { break; }
                                             }
-                                                                                        if tls.ctx.client_ca_names.count > 0 {
+                                            if tls.ctx.client_ca_names.count > 0 {
                                                 while true {
                                                     while true {
                                                         u16 _v = 47;
@@ -15152,7 +14868,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                                     u64 body_size = sendbuf.off - body_start;
                                                                                     if capacity != cast(u64, -1) {
                                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                                            ret = 512 + 12;
+                                                                                            ret = 0x200 + 12;
                                                                                             return ret;
                                                                                         }
                                                                                         for ; capacity != 0; --capacity {
@@ -15173,7 +14889,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                                     u64 body_size = sendbuf.off - body_start;
                                                                     if capacity != cast(u64, -1) {
                                                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                            ret = 512 + 12;
+                                                                            ret = 0x200 + 12;
                                                                             return ret;
                                                                         }
                                                                         for ; capacity != 0; --capacity {
@@ -15193,7 +14909,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                         u64 body_size = sendbuf.off - body_start;
                                                         if capacity != cast(u64, -1) {
                                                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                                                ret = 512 + 12;
+                                                                ret = 0x200 + 12;
                                                                 return ret;
                                                             }
                                                             for ; capacity != 0; --capacity {
@@ -15209,14 +14925,14 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                                                     }
                                                     if !(0 != 0) { break; }
                                                 }
-                                                                                            }
+                                            }
                                         }
                                         if !(0 != 0) { break; }
                                     }
                                     u64 body_size = sendbuf.off - body_start;
                                     if capacity != cast(u64, -1) {
                                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                            ret = 512 + 12;
+                                            ret = 0x200 + 12;
                                             return ret;
                                         }
                                         for ; capacity != 0; --capacity {
@@ -15236,7 +14952,7 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
                         u64 body_size = _buf.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -15281,14 +14997,13 @@ i32 server_handle_hello(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec
     }
     return ret;
 }
-}
-private {
+
 i32 server_finish_handshake(ptls_t* tls, ptls_message_emitter_t* emitter, i32 send_cert_verify, st_ptls_signature_algorithms_t* signature_algorithms) {
     i32 ret;
     if send_cert_verify != 0 {
         ret = send_certificate_verify(tls, emitter, signature_algorithms, "TLS 1.3, server CertificateVerify");
         if ret != 0 {
-            if ret == 512 + 11 {
+            if ret == 0x200 + 11 {
                 tls.state = PTLS_STATE_SERVER_GENERATING_CERTIFICATE_VERIFY;
             }
             return ret;
@@ -15340,14 +15055,13 @@ i32 server_finish_handshake(ptls_t* tls, ptls_message_emitter_t* emitter, i32 se
         }
     }
     if tls.ctx.require_client_authentication != 0 {
-        ret = 512 + 2;
+        ret = 0x200 + 2;
     } else {
         ret = 0;
     }
     return ret;
 }
-}
-private {
+
 i32 server_handle_end_of_early_data(ptls_t* tls, ptls_iovec_t message) {
     i32 ret;
     ret = commission_handshake_secret(tls);
@@ -15356,11 +15070,10 @@ i32 server_handle_end_of_early_data(ptls_t* tls, ptls_iovec_t message) {
     }
     ptls__key_schedule_update_hash(tls.key_schedule, message.base, message.len, 0);
     tls.state = PTLS_STATE_SERVER_EXPECT_FINISHED;
-    ret = 512 + 2;
+    ret = 0x200 + 2;
     return ret;
 }
-}
-private {
+
 i32 server_handle_finished(ptls_t* tls, ptls_iovec_t message) {
     i32 ret;
     ret = verify_finished(tls, message);
@@ -15377,8 +15090,7 @@ i32 server_handle_finished(ptls_t* tls, ptls_iovec_t message) {
     tls.state = PTLS_STATE_SERVER_POST_HANDSHAKE;
     return 0;
 }
-}
-private {
+
 i32 update_traffic_key(ptls_t* tls, i32 is_enc) {
     u8[64] secret;
     defer {
@@ -15395,12 +15107,14 @@ i32 update_traffic_key(ptls_t* tls, i32 is_enc) {
     ret = setup_traffic_protection(tls, is_enc, null, 3, 0, 1);
     return ret;
 }
-}
-private {
+
 i32 handle_key_update(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message) {
+    i32 ret;
+    if tls.ctx.update_traffic_key != null {
+        return 10;
+    }
     u8* src = message.base + 4;
     u8* end = message.base + message.len;
-    i32 ret;
     if cast(i64, end - src) != 1 || *src > 1 {
         return 50;
     }
@@ -15409,15 +15123,11 @@ i32 handle_key_update(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t
         return ret;
     }
     if *src != 0 {
-        if tls.ctx.update_traffic_key != null {
-            return 10;
-        }
         tls.needs_key_update = 1;
     }
     return 0;
 }
-}
-private {
+
 i32 parse_record_header(st_ptls_record_t* rec, u8* src) {
     rec.type = src[0];
     rec.version = ntoh16(src + 1);
@@ -15427,8 +15137,7 @@ i32 parse_record_header(st_ptls_record_t* rec, u8* src) {
     }
     return 0;
 }
-}
-private {
+
 i32 parse_record(ptls_t* tls, st_ptls_record_t* rec, u8* src, u64* len) {
     i32 ret;
     assert(*len != 0);
@@ -15464,7 +15173,7 @@ i32 parse_record(ptls_t* tls, st_ptls_record_t* rec, u8* src, u64* len) {
     }
     while tls.recvbuf.rec.off < 5 {
         if src == end {
-            return 512 + 2;
+            return 0x200 + 2;
         }
         tls.recvbuf.rec.base[tls.recvbuf.rec.off++] = *src++;
     }
@@ -15491,20 +15200,18 @@ i32 parse_record(ptls_t* tls, st_ptls_record_t* rec, u8* src, u64* len) {
         rec.fragment = tls.recvbuf.rec.base + 5;
         ret = 0;
     } else {
-        ret = 512 + 2;
+        ret = 0x200 + 2;
     }
     *len -= cast(u64, cast(i64, end - src));
     return ret;
 }
-}
-private {
+
 void update_open_count(ptls_context_t* ctx, i64 delta) {
     if ctx.update_open_count != null {
         ctx.update_open_count.cb(ctx.update_open_count, delta);
     }
 }
-}
-private {
+
 ptls_t* new_instance(ptls_context_t* ctx, i32 is_server) {
     ptls_t* tls;
     assert(ctx.get_time != null && "please set ctx->get_time to `&ptls_get_time`; see #92");
@@ -15524,6 +15231,7 @@ ptls_t* new_instance(ptls_context_t* ctx, i32 is_server) {
     return tls;
 }
 }
+
 ptls_t* ptls_client_new(ptls_context_t* ctx) {
     ptls_t* tls = new_instance(ctx, 0);
     tls.state = PTLS_STATE_CLIENT_HANDSHAKE_START;
@@ -15533,7 +15241,7 @@ ptls_t* ptls_client_new(ptls_context_t* ctx) {
         tls.client.legacy_session_id = ptls_iovec_init(tls.client.legacy_session_id_buf, cast(u64, sizeof(tls.client.legacy_session_id_buf)));
         tls.ctx.random_bytes(tls.client.legacy_session_id.base, tls.client.legacy_session_id.len);
     }
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&ptls_client_new__logpoint);
         if active == 0 {
             break;
@@ -15544,15 +15252,16 @@ ptls_t* ptls_client_new(ptls_context_t* ctx) {
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return tls;
 }
+
 ptls_t* ptls_server_new(ptls_context_t* ctx) {
     ptls_t* tls = new_instance(ctx, 1);
     tls.state = PTLS_STATE_SERVER_EXPECT_CLIENT_HELLO;
     tls.server.early_data_skipped_bytes = UINT32_MAX;
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&ptls_server_new__logpoint);
         if active == 0 {
             break;
@@ -15563,10 +15272,11 @@ ptls_t* ptls_server_new(ptls_context_t* ctx) {
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return tls;
 }
+
 private {
 i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused, ptls_cipher_suite_t* cipher, void* client_random, u8* server_name, ptls_iovec_t negotiated_protocol, void* enc_key, void* enc_iv, u64 enc_seq, u64 enc_record_iv, void* dec_key, void* dec_iv, u64 dec_seq) {
     i32 ret;
@@ -15604,7 +15314,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                         if !(0 != 0) { break; }
                     }
                     while true {
-                        u16 _v = 771;
+                        u16 _v = 0x0303;
                         while true {
                             u8[2] __compound_lit_235 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                             u8[2] __compound_lit_236 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -15662,7 +15372,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                         u64 body_size = output.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -15701,7 +15411,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                         u64 body_size = output.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -15745,8 +15455,18 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                                     while true {
                                         u64 _v = enc_seq;
                                         while true {
-                                            u8[8] __compound_lit_239 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                            u8[8] __compound_lit_240 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                            u8[8] __compound_lit_239 = {
+                                                cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                cast(u8, _v >> 8), cast(u8, _v),
+                                            };
+                                            u8[8] __compound_lit_240 = {
+                                                cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                cast(u8, _v >> 8), cast(u8, _v),
+                                            };
                                             ret = ptls_buffer__do_pushv(output, __compound_lit_239, cast(u64, sizeof(__compound_lit_240)));
                                             if ret != 0 {
                                                 return ret;
@@ -15759,8 +15479,18 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                                         while true {
                                             u64 _v = enc_record_iv;
                                             while true {
-                                                u8[8] __compound_lit_241 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                                u8[8] __compound_lit_242 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                                u8[8] __compound_lit_241 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
+                                                u8[8] __compound_lit_242 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
                                                 ret = ptls_buffer__do_pushv(output, __compound_lit_241, cast(u64, sizeof(__compound_lit_242)));
                                                 if ret != 0 {
                                                     return ret;
@@ -15787,8 +15517,18 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                                     while true {
                                         u64 _v = dec_seq;
                                         while true {
-                                            u8[8] __compound_lit_243 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                            u8[8] __compound_lit_244 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                            u8[8] __compound_lit_243 = {
+                                                cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                cast(u8, _v >> 8), cast(u8, _v),
+                                            };
+                                            u8[8] __compound_lit_244 = {
+                                                cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                cast(u8, _v >> 8), cast(u8, _v),
+                                            };
                                             ret = ptls_buffer__do_pushv(output, __compound_lit_243, cast(u64, sizeof(__compound_lit_244)));
                                             if ret != 0 {
                                                 return ret;
@@ -15804,7 +15544,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                         u64 body_size = output.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -15836,7 +15576,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
                         u64 body_size = output.off - body_start;
                         if capacity != cast(u64, -1) {
                             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                ret = 512 + 12;
+                                ret = 0x200 + 12;
                                 return ret;
                             }
                             for ; capacity != 0; --capacity {
@@ -15856,7 +15596,7 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
             u64 body_size = output.off - body_start;
             if capacity != cast(u64, -1) {
                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                    ret = 512 + 12;
+                    ret = 0x200 + 12;
                     return ret;
                 }
                 for ; capacity != 0; --capacity {
@@ -15876,8 +15616,9 @@ i32 export_tls12_params(ptls_buffer_t* output, i32 is_server, i32 session_reused
     return ret;
 }
 }
+
 i32 ptls_build_tls12_export_params(ptls_context_t* ctx, ptls_buffer_t* output, i32 is_server, i32 session_reused, ptls_cipher_suite_t* cipher, void* master_secret, void* hello_randoms, u64 next_send_record_iv, u8* server_name, ptls_iovec_t negotiated_protocol) {
-    u8[128] key_block;
+    u8[(32 + 32) * 2] key_block;
     defer {
         ptls_clear_memory(key_block, sizeof(key_block));
     }
@@ -15889,10 +15630,10 @@ i32 ptls_build_tls12_export_params(ptls_context_t* ctx, ptls_buffer_t* output, i
     if ret != 0 {
         return ret;
     }
-    __anon_picotls_struct_47 client_secret;
-    __anon_picotls_struct_47 server_secret;
-    __anon_picotls_struct_47* enc_secret = is_server != 0 ? &server_secret : &client_secret;
-    __anon_picotls_struct_47* dec_secret = is_server != 0 ? &client_secret : &server_secret;
+    noinit client_secret_t client_secret;
+    noinit client_secret_t server_secret;
+    client_secret_t* enc_secret = is_server != 0 ? &server_secret : &client_secret;
+    client_secret_t* dec_secret = is_server != 0 ? &client_secret : &server_secret;
     client_secret.key = key_block;
     server_secret.key = key_block + cipher.aead.key_size;
     client_secret.iv = key_block + cipher.aead.key_size * 2;
@@ -15900,14 +15641,15 @@ i32 ptls_build_tls12_export_params(ptls_context_t* ctx, ptls_buffer_t* output, i
     ret = export_tls12_params(output, is_server, session_reused, cipher, cast(u8*, hello_randoms) + 32, server_name, negotiated_protocol, enc_secret.key, enc_secret.iv, 1, next_send_record_iv, dec_secret.key, dec_secret.iv, 1);
     return ret;
 }
+
 i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
     ptls_iovec_t negotiated_protocol = ptls_iovec_init(tls.negotiated_protocol, tls.negotiated_protocol != null ? strlen(tls.negotiated_protocol) : 0);
     i32 ret;
     if tls.state != PTLS_STATE_SERVER_POST_HANDSHAKE {
-        ret = 512 + 3;
+        ret = 0x200 + 3;
         return ret;
     }
-    if ptls_get_protocol_version(tls) == 772 {
+    if ptls_get_protocol_version(tls) == 0x0304 {
         while true {
             u8* _server_name = tls.server_name;
             ptls_iovec_t _negotiated_protocol = negotiated_protocol;
@@ -15942,7 +15684,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                             if !(0 != 0) { break; }
                         }
                         while true {
-                            u16 _v = 772;
+                            u16 _v = 0x0304;
                             while true {
                                 u8[2] __compound_lit_249 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
                                 u8[2] __compound_lit_250 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -16000,7 +15742,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                             u64 body_size = output.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -16039,7 +15781,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                             u64 body_size = output.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -16076,8 +15818,18 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                                         while true {
                                             u64 _v = tls.traffic_protection.enc.seq;
                                             while true {
-                                                u8[8] __compound_lit_253 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                                u8[8] __compound_lit_254 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                                u8[8] __compound_lit_253 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
+                                                u8[8] __compound_lit_254 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
                                                 ret = ptls_buffer__do_pushv(output, __compound_lit_253, cast(u64, sizeof(__compound_lit_254)));
                                                 if ret != 0 {
                                                     return ret;
@@ -16096,8 +15848,18 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                                         while true {
                                             u64 _v = tls.traffic_protection.dec.seq;
                                             while true {
-                                                u8[8] __compound_lit_255 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
-                                                u8[8] __compound_lit_256 = {cast(u8, _v >> 56), cast(u8, _v >> 48), cast(u8, _v >> 40), cast(u8, _v >> 32), cast(u8, _v >> 24), cast(u8, _v >> 16), cast(u8, _v >> 8), cast(u8, _v)};
+                                                u8[8] __compound_lit_255 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
+                                                u8[8] __compound_lit_256 = {
+                                                    cast(u8, _v >> 56), cast(u8, _v >> 48),
+                                                    cast(u8, _v >> 40), cast(u8, _v >> 32),
+                                                    cast(u8, _v >> 24), cast(u8, _v >> 16),
+                                                    cast(u8, _v >> 8), cast(u8, _v),
+                                                };
                                                 ret = ptls_buffer__do_pushv(output, __compound_lit_255, cast(u64, sizeof(__compound_lit_256)));
                                                 if ret != 0 {
                                                     return ret;
@@ -16113,7 +15875,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                             u64 body_size = output.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -16145,7 +15907,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                             u64 body_size = output.off - body_start;
                             if capacity != cast(u64, -1) {
                                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                                    ret = 512 + 12;
+                                    ret = 0x200 + 12;
                                     return ret;
                                 }
                                 for ; capacity != 0; --capacity {
@@ -16165,7 +15927,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
                 u64 body_size = output.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -16190,6 +15952,7 @@ i32 ptls_export(ptls_t* tls, ptls_buffer_t* output) {
     }
     return ret;
 }
+
 private {
 i32 import_tls12_traffic_protection(ptls_t* tls, i32 is_enc, u8** src, u8* end) {
     st_ptls_traffic_protection_t* tp = is_enc != 0 ? &tls.traffic_protection.enc : &tls.traffic_protection.dec;
@@ -16211,12 +15974,11 @@ i32 import_tls12_traffic_protection(ptls_t* tls, i32 is_enc, u8** src, u8* end) 
     tp.tls12 = 1;
     tp.aead = ptls_aead_new_direct(tls.cipher_suite.aead, is_enc, tp.secret, tp.secret + 32);
     if tp.aead == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     return 0;
 }
-}
-private {
+
 i32 import_tls13_traffic_protection(ptls_t* tls, i32 is_enc, u8** src, u8* end) {
     st_ptls_traffic_protection_t* tp = is_enc != 0 ? &tls.traffic_protection.enc : &tls.traffic_protection.dec;
     memcpy(tp.secret, *src, tls.cipher_suite.hash.digest_size);
@@ -16225,11 +15987,12 @@ i32 import_tls13_traffic_protection(ptls_t* tls, i32 is_enc, u8** src, u8* end) 
         return 50;
     }
     if setup_traffic_protection(tls, is_enc, null, 3, tp.seq, 0) != 0 {
-        return 512 + 4;
+        return 0x200 + 4;
     }
     return 0;
 }
 }
+
 i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
     i32 ret = 0;
     defer {
@@ -16284,7 +16047,7 @@ i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
                         }
                         *tls = new_instance(ctx, cast(i32, *src++));
                         if *tls == null {
-                            ret = 512 + 1;
+                            ret = 0x200 + 1;
                             return ret;
                         }
                         (*tls).is_psk_handshake = *src++;
@@ -16435,7 +16198,7 @@ i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
                                 while true {
                                     {
                                         switch protocol_version {
-                                            case 771: {
+                                            case 0x0303: {
                                                 (*tls).cipher_suite = ptls_find_cipher_suite(ctx.tls12_cipher_suites, csid);
                                                 if (*tls).cipher_suite == null {
                                                     ret = 40;
@@ -16450,7 +16213,7 @@ i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
                                                     return ret;
                                                 }
                                             }
-                                            case 772: {
+                                            case 0x0304: {
                                                 (*tls).cipher_suite = ptls_find_cipher_suite(ctx.cipher_suites, csid);
                                                 if (*tls).cipher_suite == null {
                                                     ret = 40;
@@ -16458,7 +16221,7 @@ i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
                                                 }
                                                 (*tls).key_schedule = key_schedule_new((*tls).cipher_suite, null, (*tls).ech.aead != null);
                                                 if (*tls).key_schedule == null {
-                                                    ret = 512 + 1;
+                                                    ret = 0x200 + 1;
                                                     return ret;
                                                 }
                                                 ret = import_tls13_traffic_protection(*tls, 1, &src, end);
@@ -16548,13 +16311,14 @@ i32 ptls_import(ptls_context_t* ctx, ptls_t** tls, ptls_iovec_t params) {
             }
             if !(0 != 0) { break; }
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     (*tls).state = ptls_is_server(*tls) != 0 ? PTLS_STATE_SERVER_POST_HANDSHAKE : PTLS_STATE_CLIENT_POST_HANDSHAKE;
     return ret;
 }
+
 void ptls_free(ptls_t* tls) {
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&ptls_free__logpoint);
         if active == 0 {
             break;
@@ -16565,7 +16329,7 @@ void ptls_free(ptls_t* tls) {
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     ptls_buffer_dispose(&tls.recvbuf.rec);
     ptls_buffer_dispose(&tls.recvbuf.mess);
@@ -16606,29 +16370,36 @@ void ptls_free(ptls_t* tls) {
     ptls_clear_memory(tls, sizeof(*tls));
     free(tls);
 }
+
 ptls_context_t* ptls_get_context(ptls_t* tls) {
     return tls.ctx;
 }
+
 void ptls_set_context(ptls_t* tls, ptls_context_t* ctx) {
     update_open_count(ctx, 1);
     update_open_count(tls.ctx, -1);
     tls.ctx = ctx;
 }
+
 ptls_async_job_t* ptls_get_async_job(ptls_t* tls) {
     return tls.server.async_job;
 }
+
 ptls_iovec_t ptls_get_client_random(ptls_t* tls) {
     return ptls_iovec_init(tls.client_random, 32);
 }
+
 ptls_cipher_suite_t* ptls_get_cipher(ptls_t* tls) {
     return tls.cipher_suite;
 }
+
 u16 ptls_get_protocol_version(ptls_t* tls) {
     if tls.traffic_protection.enc.tls12 != 0 {
-        return 771;
+        return 0x0303;
     }
-    return 772;
+    return 0x0304;
 }
+
 i32 ptls_get_traffic_keys(ptls_t* tls, i32 is_enc, u8* key, u8* iv, u64* seq) {
     st_ptls_traffic_protection_t* ctx = is_enc != 0 ? &tls.traffic_protection.enc : &tls.traffic_protection.dec;
     i32 ret;
@@ -16639,42 +16410,49 @@ i32 ptls_get_traffic_keys(ptls_t* tls, i32 is_enc, u8* key, u8* iv, u64* seq) {
     *seq = ctx.seq;
     return 0;
 }
+
 u8* ptls_get_server_name(ptls_t* tls) {
     return tls.server_name;
 }
+
 i32 ptls_set_server_name(ptls_t* tls, u8* server_name, u64 server_name_len) {
     u8* duped = null;
     if server_name != null {
         duped = duplicate_as_str(server_name, server_name_len != 0 ? server_name_len : strlen(server_name));
         if duped == null {
-            return 512 + 1;
+            return 0x200 + 1;
         }
     }
     free(tls.server_name);
     tls.server_name = duped;
     return 0;
 }
+
 u8* ptls_get_negotiated_protocol(ptls_t* tls) {
     return tls.negotiated_protocol;
 }
+
 i32 ptls_set_negotiated_protocol(ptls_t* tls, u8* protocol, u64 protocol_len) {
     u8* duped = null;
     if protocol != null {
         duped = duplicate_as_str(protocol, protocol_len != 0 ? protocol_len : strlen(protocol));
         if duped == null {
-            return 512 + 1;
+            return 0x200 + 1;
         }
     }
     free(tls.negotiated_protocol);
     tls.negotiated_protocol = duped;
     return 0;
 }
+
 i32 ptls_handshake_is_complete(ptls_t* tls) {
     return tls.state >= PTLS_STATE_POST_HANDSHAKE_MIN;
 }
+
 i32 ptls_is_psk_handshake(ptls_t* tls) {
     return cast(i32, tls.is_psk_handshake);
 }
+
 i32 ptls_is_ech_handshake(ptls_t* tls, u8* config_id, ptls_hpke_kem_t** kem, ptls_hpke_cipher_suite_t** cipher) {
     if tls.ech.state == PTLS_ECH_STATE_ACCEPTED {
         if config_id != null {
@@ -16690,12 +16468,15 @@ i32 ptls_is_ech_handshake(ptls_t* tls, u8* config_id, ptls_hpke_kem_t** kem, ptl
     }
     return 0;
 }
+
 void** ptls_get_data_ptr(ptls_t* tls) {
     return &tls.data_ptr;
 }
+
 ptls_log_conn_state_t* ptls_get_log_state(ptls_t* tls) {
     return &ptls_log.dummy_conn_state;
 }
+
 private {
 i32 handle_client_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message, i32 is_end_of_record, ptls_handshake_properties_t* properties) {
     u8 type = message.base[0];
@@ -16767,7 +16548,7 @@ i32 handle_client_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter
             ret = 80;
         }
     }
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&handle_client_handshake_message__logpoint);
         if active == 0 {
             break;
@@ -16778,12 +16559,11 @@ i32 handle_client_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return ret;
 }
-}
-private {
+
 i32 handle_server_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_iovec_t message, i32 is_end_of_record, ptls_handshake_properties_t* properties) {
     u8 type = message.base[0];
     i32 ret;
@@ -16839,7 +16619,7 @@ i32 handle_server_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter
             ret = 80;
         }
     }
-        while true {
+    while true {
         u32 active = ptls_log_point_maybe_active(&handle_server_handshake_message__logpoint);
         if active == 0 {
             break;
@@ -16850,21 +16630,19 @@ i32 handle_server_handshake_message(ptls_t* tls, ptls_message_emitter_t* emitter
         if active == 0 {
             break;
         }
-                if !(0 != 0) { break; }
+        if !(0 != 0) { break; }
     }
     return ret;
 }
-}
-private {
+
 i32 handle_alert(ptls_t* tls, u8* src, u64 len) {
     if len != 2 {
         return 50;
     }
     u8 desc = src[1];
-    return cast(i32, desc) + 256;
+    return cast(i32, desc) + 0x100;
 }
-}
-private {
+
 i32 message_buffer_is_overflow(ptls_context_t* ctx, u64 size) {
     if ctx.max_buffer_size == 0 {
         return 0;
@@ -16874,8 +16652,7 @@ i32 message_buffer_is_overflow(ptls_context_t* ctx, u64 size) {
     }
     return 1;
 }
-}
-private {
+
 i32 handle_handshake_record(ptls_t* tls, fn(ptls_t*, ptls_message_emitter_t*, ptls_iovec_t, i32, ptls_handshake_properties_t*): i32 cb, ptls_message_emitter_t* emitter, st_ptls_record_t* rec, ptls_handshake_properties_t* properties) {
     i32 ret;
     if rec.type != 22 {
@@ -16899,7 +16676,7 @@ i32 handle_handshake_record(ptls_t* tls, fn(ptls_t*, ptls_message_emitter_t*, pt
         src = tls.recvbuf.mess.base;
         src_end = src + tls.recvbuf.mess.off;
     }
-    ret = 512 + 2;
+    ret = 0x200 + 2;
     while cast(i64, src_end - src) >= 4 {
         u64 mess_len = 4 + ntoh24(src + 1);
         if cast(i64, src_end - src) < cast(i32, mess_len) {
@@ -16907,7 +16684,7 @@ i32 handle_handshake_record(ptls_t* tls, fn(ptls_t*, ptls_message_emitter_t*, pt
         }
         ret = cb(tls, emitter, ptls_iovec_init(src, mess_len), cast(u64, cast(i64, src_end - src)) == mess_len, properties);
         switch ret {
-            case 0, 512 + 11, 512 + 2: {
+            case 0, 0x200 + 11, 0x200 + 2: {
             }
             default: {
                 ptls_buffer_dispose(&tls.recvbuf.mess);
@@ -16932,16 +16709,15 @@ i32 handle_handshake_record(ptls_t* tls, fn(ptls_t*, ptls_message_emitter_t*, pt
             memmove(tls.recvbuf.mess.base, src, new_size);
         }
         tls.recvbuf.mess.off = new_size;
-        ret = 512 + 2;
+        ret = 0x200 + 2;
     } else {
         ptls_buffer_dispose(&tls.recvbuf.mess);
     }
     return ret;
 }
-}
-private {
+
 i32 handle_input(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_buffer_t* decryptbuf, void* input, u64* inlen, ptls_handshake_properties_t* properties) {
-    st_ptls_record_t rec;
+    noinit st_ptls_record_t rec;
     i32 ret;
     ret = parse_record(tls, &rec, input, inlen);
     if ret != 0 {
@@ -16950,13 +16726,13 @@ i32 handle_input(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_buffer_t* de
     assert(rec.fragment != null);
     if rec.type == 20 {
         if tls.state < PTLS_STATE_POST_HANDSHAKE_MIN {
-            if (rec.length == 1 && rec.fragment[0] == 1) == 0 {
+            if (rec.length == 1 && rec.fragment[0] == 0x01) == 0 {
                 return 10;
             }
         } else {
             return 10;
         }
-        ret = 512 + 2;
+        ret = 0x200 + 2;
         {
             ptls_buffer_dispose(&tls.recvbuf.rec);
             return ret;
@@ -16978,7 +16754,7 @@ i32 handle_input(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_buffer_t* de
                 if tls.server.early_data_skipped_bytes > 65536 {
                     return 40;
                 }
-                ret = 512 + 2;
+                ret = 0x200 + 2;
                 ptls_buffer_dispose(&tls.recvbuf.rec);
                 return ret;
             }
@@ -16995,13 +16771,16 @@ i32 handle_input(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_buffer_t* de
             return 10;
         }
         rec.type = rec.fragment[--rec.length];
+        if rec.length == 0 && (rec.type == 21 || rec.type == 22) {
+            return 10;
+        }
     } else if rec.type == 23 && tls.is_server && tls.server.early_data_skipped_bytes != UINT32_MAX {
         {
             tls.server.early_data_skipped_bytes += cast(u32, rec.length);
             if tls.server.early_data_skipped_bytes > 65536 {
                 return 40;
             }
-            ret = 512 + 2;
+            ret = 0x200 + 2;
             ptls_buffer_dispose(&tls.recvbuf.rec);
             return ret;
         }
@@ -17034,10 +16813,9 @@ i32 handle_input(ptls_t* tls, ptls_message_emitter_t* emitter, ptls_buffer_t* de
     ptls_buffer_dispose(&tls.recvbuf.rec);
     return ret;
 }
-}
-private {
+
 i32 handle_input_tls12(ptls_t* tls, ptls_buffer_t* decryptbuf, void* input, u64* inlen) {
-    st_ptls_record_t rec;
+    noinit st_ptls_record_t rec;
     i32 ret;
     ret = parse_record(tls, &rec, input, inlen);
     if ret != 0 {
@@ -17100,14 +16878,18 @@ i32 handle_input_tls12(ptls_t* tls, ptls_buffer_t* decryptbuf, void* input, u64*
     ptls_clear_memory(aad, sizeof(aad));
     return ret;
 }
-}
-private {
+
 void init_record_message_emitter(ptls_t* tls, st_ptls_record_message_emitter_t* emitter, ptls_buffer_t* sendbuf) {
-    *emitter = st_ptls_record_message_emitter_t{.super = ptls_message_emitter_t{sendbuf, &tls.traffic_protection.enc, 5, begin_record_message, commit_record_message}};
+    *emitter = st_ptls_record_message_emitter_t{
+        .super = ptls_message_emitter_t{
+            sendbuf, &tls.traffic_protection.enc, 5, begin_record_message, commit_record_message,
+        },
+    };
 }
 }
+
 i32 ptls_handshake(ptls_t* tls, ptls_buffer_t* _sendbuf, void* input, u64* inlen, ptls_handshake_properties_t* properties) {
-    st_ptls_record_message_emitter_t emitter;
+    noinit st_ptls_record_message_emitter_t emitter;
     i32 ret;
     assert(tls.state < PTLS_STATE_POST_HANDSHAKE_MIN);
     init_record_message_emitter(tls, &emitter, _sendbuf);
@@ -17127,10 +16909,10 @@ i32 ptls_handshake(ptls_t* tls, ptls_buffer_t* _sendbuf, void* input, u64* inlen
     }
     u8* src = input;
     u8* src_end = src + *inlen;
-    ptls_buffer_t decryptbuf;
+    noinit ptls_buffer_t decryptbuf;
     ptls_buffer_init(&decryptbuf, "", 0);
-    ret = 512 + 2;
-    while ret == 512 + 2 && src != src_end {
+    ret = 0x200 + 2;
+    while ret == 0x200 + 2 && src != src_end {
         var consumed = cast(u64, cast(i64, src_end - src));
         ret = handle_input(tls, &emitter.super, &decryptbuf, src, &consumed, properties);
         src += consumed;
@@ -17138,15 +16920,15 @@ i32 ptls_handshake(ptls_t* tls, ptls_buffer_t* _sendbuf, void* input, u64* inlen
     }
     ptls_buffer_dispose(&decryptbuf);
     switch ret {
-        case 0, 512 + 2, 512 + 6, 512 + 11: {
+        case 0, 0x200 + 2, 0x200 + 6, 0x200 + 11: {
         }
         default: {
             if ret != 121 {
                 ptls_clear_memory(emitter.super.buf.base + sendbuf_orig_off, emitter.super.buf.off - sendbuf_orig_off);
                 emitter.super.buf.off = sendbuf_orig_off;
             }
-            if (ret & ~255) != 256 {
-                if ptls_send_alert(tls, emitter.super.buf, 2, cast(u8, (ret & ~255) == 0 ? ret : 80)) != 0 {
+            if (ret & ~0xff) != 0x100 {
+                if ptls_send_alert(tls, emitter.super.buf, 2, cast(u8, (ret & ~0xff) == 0 ? ret : 80)) != 0 {
                     emitter.super.buf.off = sendbuf_orig_off;
                 }
             }
@@ -17155,6 +16937,7 @@ i32 ptls_handshake(ptls_t* tls, ptls_buffer_t* _sendbuf, void* input, u64* inlen
     *inlen -= cast(u64, cast(i64, src_end - src));
     return ret;
 }
+
 i32 ptls_receive(ptls_t* tls, ptls_buffer_t* decryptbuf, void* _input, u64* inlen) {
     var input = cast(u8*, _input);
     u8* end = input + *inlen;
@@ -17172,13 +16955,13 @@ i32 ptls_receive(ptls_t* tls, ptls_buffer_t* decryptbuf, void* _input, u64* inle
         switch ret {
             case 0: {
             }
-            case 512 + 2: {
+            case 0x200 + 2: {
                 ret = 0;
             }
-            case 256 + 0: {
+            case 0x100 + 0: {
             }
             default: {
-                if (ret & ~255) == 0 {
+                if (ret & ~0xff) == 0 {
                 }
             }
         }
@@ -17186,6 +16969,7 @@ i32 ptls_receive(ptls_t* tls, ptls_buffer_t* decryptbuf, void* _input, u64* inle
     *inlen -= cast(u64, cast(i64, end - input));
     return ret;
 }
+
 private {
 i32 update_send_key(ptls_t* tls, ptls_buffer_t* _sendbuf, i32 request_update) {
     st_ptls_record_message_emitter_t emitter;
@@ -17244,7 +17028,7 @@ i32 update_send_key(ptls_t* tls, ptls_buffer_t* _sendbuf, i32 request_update) {
                 u64 body_size = _buf.off - body_start;
                 if capacity != cast(u64, -1) {
                     if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                        ret = 512 + 12;
+                        ret = 0x200 + 12;
                         return ret;
                     }
                     for ; capacity != 0; --capacity {
@@ -17277,8 +17061,11 @@ i32 update_send_key(ptls_t* tls, ptls_buffer_t* _sendbuf, i32 request_update) {
     return ret;
 }
 }
+
 i32 ptls_send(ptls_t* tls, ptls_buffer_t* sendbuf, void* input, u64 inlen) {
-    assert(tls.traffic_protection.enc.aead != null);
+    if (tls.traffic_protection.enc.aead != null && (tls.traffic_protection.enc.tls12 || tls.traffic_protection.enc.epoch == 1 || tls.traffic_protection.enc.epoch == 3)) == 0 {
+        return 0x200 + 2;
+    }
     if tls.traffic_protection.enc.seq >= 16777216 && tls.key_schedule != null {
         tls.needs_key_update = 1;
     }
@@ -17293,12 +17080,14 @@ i32 ptls_send(ptls_t* tls, ptls_buffer_t* sendbuf, void* input, u64 inlen) {
     }
     return buffer_push_encrypted_records(sendbuf, 23, input, inlen, &tls.traffic_protection.enc);
 }
+
 i32 ptls_update_key(ptls_t* tls, i32 request_update) {
     assert(tls.ctx.update_traffic_key == null);
     tls.needs_key_update = 1;
     tls.key_update_send_request = cast(u32, request_update);
     return 0;
 }
+
 u64 ptls_get_record_overhead(ptls_t* tls) {
     ptls_aead_algorithm_t* algo = tls.traffic_protection.enc.aead.algo;
     if tls.traffic_protection.enc.tls12 != 0 {
@@ -17307,6 +17096,7 @@ u64 ptls_get_record_overhead(ptls_t* tls) {
         return 6 + algo.tag_size;
     }
 }
+
 i32 ptls_send_alert(ptls_t* tls, ptls_buffer_t* sendbuf, u8 level, u8 description) {
     u64 rec_start = sendbuf.off;
     i32 ret = 0;
@@ -17347,7 +17137,7 @@ i32 ptls_send_alert(ptls_t* tls, ptls_buffer_t* sendbuf, u8 level, u8 descriptio
             u64 body_size = sendbuf.off - body_start;
             if capacity != cast(u64, -1) {
                 if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                    ret = 512 + 12;
+                    ret = 0x200 + 12;
                     return ret;
                 }
                 for ; capacity != 0; --capacity {
@@ -17371,6 +17161,7 @@ i32 ptls_send_alert(ptls_t* tls, ptls_buffer_t* sendbuf, u8 level, u8 descriptio
     }
     return ret;
 }
+
 i32 ptls_export_secret(ptls_t* tls, void* output, u64 outlen, u8* label, ptls_iovec_t context_value, i32 is_early) {
     ptls_hash_algorithm_t* algo = (*(&tls.key_schedule.hashes[0] + 0)).algo;
     u8* master_secret = is_early != 0 ? tls.exporter_master_secret.early : tls.exporter_master_secret.one_rtt;
@@ -17381,14 +17172,14 @@ i32 ptls_export_secret(ptls_t* tls, void* output, u64 outlen, u8* label, ptls_io
         if is_early != 0 {
             switch tls.state {
                 case PTLS_STATE_CLIENT_HANDSHAKE_START, PTLS_STATE_SERVER_EXPECT_CLIENT_HELLO: {
-                    ret = 512 + 2;
+                    ret = 0x200 + 2;
                 }
                 default: {
-                    ret = 512 + 7;
+                    ret = 0x200 + 7;
                 }
             }
         } else {
-            ret = 512 + 2;
+            ret = 0x200 + 2;
         }
         return ret;
     }
@@ -17407,13 +17198,13 @@ i32 ptls_export_secret(ptls_t* tls, void* output, u64 outlen, u8* label, ptls_io
     ptls_clear_memory(context_value_hash, sizeof(context_value_hash));
     return ret;
 }
+
 private {
 void hmac_update(ptls_hash_context_t* _ctx, void* src, u64 len) {
     var ctx = cast(st_picotls_hmac_context_t*, _ctx);
     ctx.hash.update(ctx.hash, src, len);
 }
-}
-private {
+
 void hmac_apply_key(st_picotls_hmac_context_t* ctx, u8 pad) {
     u64 i;
     for i = 0; i != ctx.algo.block_size; ++i {
@@ -17424,14 +17215,13 @@ void hmac_apply_key(st_picotls_hmac_context_t* ctx, u8 pad) {
         *(&ctx.key[0] + i) ^= pad;
     }
 }
-}
-private {
+
 void hmac_final(ptls_hash_context_t* _ctx, void* md, ptls_hash_final_mode_t mode) {
     var ctx = cast(st_picotls_hmac_context_t*, _ctx);
     assert(mode != PTLS_HASH_FINAL_MODE_SNAPSHOT || !"not supported");
     if md != null {
         ctx.hash.final(ctx.hash, md, PTLS_HASH_FINAL_MODE_RESET);
-        hmac_apply_key(ctx, 92);
+        hmac_apply_key(ctx, 0x5c);
         ctx.hash.update(ctx.hash, md, ctx.algo.digest_size);
     }
     ctx.hash.final(ctx.hash, md, mode);
@@ -17441,7 +17231,7 @@ void hmac_final(ptls_hash_context_t* _ctx, void* md, ptls_hash_final_mode_t mode
             free(ctx);
         }
         case PTLS_HASH_FINAL_MODE_RESET: {
-            hmac_apply_key(ctx, 54);
+            hmac_apply_key(ctx, 0x36);
         }
         default: {
             assert(cast(i64, !"FIXME"));
@@ -17449,16 +17239,18 @@ void hmac_final(ptls_hash_context_t* _ctx, void* md, ptls_hash_final_mode_t mode
     }
 }
 }
+
 i32 ptls_calc_hash(ptls_hash_algorithm_t* algo, void* output, void* src, u64 len) {
     ptls_hash_context_t* ctx;
     ctx = algo.create();
     if ctx == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     ctx.update(ctx, src, len);
     ctx.final(ctx, output, PTLS_HASH_FINAL_MODE_FREE);
     return 0;
 }
+
 ptls_hash_context_t* ptls_hmac_create(ptls_hash_algorithm_t* algo, void* key, u64 key_size) {
     st_picotls_hmac_context_t* ctx;
     assert(key_size <= algo.block_size);
@@ -17466,7 +17258,10 @@ ptls_hash_context_t* ptls_hmac_create(ptls_hash_algorithm_t* algo, void* key, u6
     if ctx == null {
         return null;
     }
-    *ctx = st_picotls_hmac_context_t{.super = ptls_hash_context_t{.update = hmac_update, .final = hmac_final}, .algo = algo};
+    *ctx = st_picotls_hmac_context_t{
+        .super = ptls_hash_context_t{.update = hmac_update, .final = hmac_final},
+        .algo = algo,
+    };
     ctx.hash = algo.create();
     if ctx.hash == null {
         free(ctx);
@@ -17474,9 +17269,10 @@ ptls_hash_context_t* ptls_hmac_create(ptls_hash_algorithm_t* algo, void* key, u6
     }
     memset(ctx.key, 0, algo.block_size);
     memcpy(ctx.key, key, key_size);
-    hmac_apply_key(ctx, 54);
+    hmac_apply_key(ctx, 0x36);
     return &ctx.super;
 }
+
 i32 ptls_hkdf_extract(ptls_hash_algorithm_t* algo, void* output, ptls_iovec_t salt, ptls_iovec_t ikm) {
     ptls_hash_context_t* hash;
     if salt.len == 0 {
@@ -17484,12 +17280,13 @@ i32 ptls_hkdf_extract(ptls_hash_algorithm_t* algo, void* output, ptls_iovec_t sa
     }
     hash = ptls_hmac_create(algo, salt.base, salt.len);
     if hash == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     hash.update(hash, ikm.base, ikm.len);
     hash.final(hash, output, PTLS_HASH_FINAL_MODE_FREE);
     return 0;
 }
+
 i32 ptls_hkdf_expand(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls_iovec_t prk, ptls_iovec_t info) {
     ptls_hash_context_t* hmac = null;
     u64 i;
@@ -17498,7 +17295,7 @@ i32 ptls_hkdf_expand(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls
         if hmac == null {
             hmac = ptls_hmac_create(algo, prk.base, prk.len);
             if hmac == null {
-                return 512 + 1;
+                return 0x200 + 1;
             }
         } else {
             hmac.update(hmac, digest, algo.digest_size);
@@ -17520,6 +17317,7 @@ i32 ptls_hkdf_expand(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls
     ptls_clear_memory(digest, algo.digest_size);
     return 0;
 }
+
 i32 ptls_hkdf_expand_label(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls_iovec_t secret, u8* label, ptls_iovec_t hash_value, u8* label_prefix) {
     ptls_buffer_t hkdf_label;
     defer {
@@ -17576,7 +17374,7 @@ i32 ptls_hkdf_expand_label(ptls_hash_algorithm_t* algo, void* output, u64 outlen
         u64 body_size = hkdf_label.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -17615,7 +17413,7 @@ i32 ptls_hkdf_expand_label(ptls_hash_algorithm_t* algo, void* output, u64 outlen
         u64 body_size = hkdf_label.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -17632,13 +17430,14 @@ i32 ptls_hkdf_expand_label(ptls_hash_algorithm_t* algo, void* output, u64 outlen
     ret = ptls_hkdf_expand(algo, output, outlen, secret, ptls_iovec_init(hkdf_label.base, hkdf_label.off));
     return ret;
 }
+
 i32 ptls_tls12_phash(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls_iovec_t secret, u8* label, ptls_iovec_t seed) {
     ptls_hash_context_t* hmac;
     noinit u8[64] An;
     u64 output_off = 0;
     hmac = ptls_hmac_create(algo, secret.base, secret.len);
     if hmac == null {
-        return 512 + 1;
+        return 0x200 + 1;
     }
     if label != null {
         hmac.update(hmac, label, strlen(label));
@@ -17664,6 +17463,7 @@ i32 ptls_tls12_phash(ptls_hash_algorithm_t* algo, void* output, u64 outlen, ptls
     ptls_clear_memory(An, algo.digest_size);
     return 0;
 }
+
 ptls_cipher_context_t* ptls_cipher_new(ptls_cipher_algorithm_t* algo, i32 is_enc, void* key) {
     ptls_cipher_context_t* ctx;
     ctx = cast(ptls_cipher_context_t*, alloc(cast(i64, algo.context_size)));
@@ -17677,12 +17477,14 @@ ptls_cipher_context_t* ptls_cipher_new(ptls_cipher_algorithm_t* algo, i32 is_enc
     }
     return ctx;
 }
+
 void ptls_cipher_free(ptls_cipher_context_t* ctx) {
     ctx.do_dispose(ctx);
     free(ctx);
 }
+
 ptls_aead_context_t* new_aead(ptls_aead_algorithm_t* aead, ptls_hash_algorithm_t* hash, i32 is_enc, void* secret, ptls_iovec_t hash_value, u8* label_prefix) {
-    __anon_picotls_struct_48 key_iv;
+    key_iv_t key_iv;
     defer {
         ptls_clear_memory(&key_iv, sizeof(key_iv));
     }
@@ -17695,9 +17497,11 @@ ptls_aead_context_t* new_aead(ptls_aead_algorithm_t* aead, ptls_hash_algorithm_t
     ctx = ptls_aead_new_direct(aead, is_enc, key_iv.key, key_iv.iv);
     return ctx;
 }
+
 ptls_aead_context_t* ptls_aead_new(ptls_aead_algorithm_t* aead, ptls_hash_algorithm_t* hash, i32 is_enc, void* secret, u8* label_prefix) {
     return new_aead(aead, hash, is_enc, secret, ptls_iovec_init(null, 0), label_prefix);
 }
+
 ptls_aead_context_t* ptls_aead_new_direct(ptls_aead_algorithm_t* aead, i32 is_enc, void* key, void* iv) {
     ptls_aead_context_t* ctx;
     ctx = cast(ptls_aead_context_t*, alloc(cast(i64, aead.context_size)));
@@ -17711,10 +17515,12 @@ ptls_aead_context_t* ptls_aead_new_direct(ptls_aead_algorithm_t* aead, i32 is_en
     }
     return ctx;
 }
+
 void ptls_aead_free(ptls_aead_context_t* ctx) {
     ctx.dispose_crypto(ctx);
     free(ctx);
 }
+
 void ptls_aead_xor_iv(ptls_aead_context_t* ctx, void* _bytes, u64 len) {
     u8* bytes = _bytes;
     noinit u8[32] iv;
@@ -17724,6 +17530,7 @@ void ptls_aead_xor_iv(ptls_aead_context_t* ctx, void* _bytes, u64 len) {
     }
     ptls_aead_set_iv(ctx, iv);
 }
+
 void ptls_aead__build_iv(ptls_aead_algorithm_t* algo, u8* iv, u8* static_iv, u64 seq) {
     u64 iv_size = algo.iv_size;
     u64 i;
@@ -17739,6 +17546,7 @@ void ptls_aead__build_iv(ptls_aead_algorithm_t* algo, u8* iv, u8* static_iv, u64
         if !(i != 0) { break; }
     }
 }
+
 private {
 void clear_memory(void* p, u64 len) {
     if len != 0 {
@@ -17747,6 +17555,7 @@ void clear_memory(void* p, u64 len) {
 }
 }
 fn(void*, u64): void ptls_clear_memory = clear_memory;
+
 private {
 i32 mem_equal(void* _x, void* _y, u64 len) {
     u8* x = _x;
@@ -17759,6 +17568,7 @@ i32 mem_equal(void* _x, void* _y, u64 len) {
 }
 }
 fn(void*, void*, u64): i32 ptls_mem_equal = mem_equal;
+
 private {
 u64 get_time(ptls_get_time_t* self) {
     timeval tv;
@@ -17767,17 +17577,18 @@ u64 get_time(ptls_get_time_t* self) {
 }
 }
 ptls_get_time_t ptls_get_time = ptls_get_time_t{get_time};
+
 i32 ptls_is_server(ptls_t* tls) {
     return cast(i32, tls.is_server);
 }
+
 private {
 i32 begin_raw_message(ptls_message_emitter_t* _self) {
     var self = cast(st_ptls_raw_message_emitter_t*, _self);
     self.start_off = self.super.buf.off;
     return 0;
 }
-}
-private {
+
 i32 commit_raw_message(ptls_message_emitter_t* _self) {
     var self = cast(st_ptls_raw_message_emitter_t*, _self);
     u64 epoch;
@@ -17793,6 +17604,7 @@ i32 commit_raw_message(ptls_message_emitter_t* _self) {
     return 0;
 }
 }
+
 u64 ptls_get_read_epoch(ptls_t* tls) {
     switch tls.state {
         case PTLS_STATE_CLIENT_HANDSHAKE_START, PTLS_STATE_CLIENT_EXPECT_SERVER_HELLO, PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO, PTLS_STATE_SERVER_EXPECT_CLIENT_HELLO, PTLS_STATE_SERVER_EXPECT_SECOND_CLIENT_HELLO: {
@@ -17814,12 +17626,20 @@ u64 ptls_get_read_epoch(ptls_t* tls) {
         }
     }
 }
+
 i32 ptls_handle_message(ptls_t* tls, ptls_buffer_t* sendbuf, u64* epoch_offsets, u64 in_epoch, void* input, u64 inlen, ptls_handshake_properties_t* properties) {
     return tls.is_server != 0 ? ptls_server_handle_message(tls, sendbuf, epoch_offsets, in_epoch, input, inlen, properties) : ptls_client_handle_message(tls, sendbuf, epoch_offsets, in_epoch, input, inlen, properties);
 }
+
 i32 ptls_client_handle_message(ptls_t* tls, ptls_buffer_t* sendbuf, u64* epoch_offsets, u64 in_epoch, void* input, u64 inlen, ptls_handshake_properties_t* properties) {
     assert(cast(i64, !tls.is_server));
-    var emitter = st_ptls_raw_message_emitter_t{ptls_message_emitter_t{sendbuf, &tls.traffic_protection.enc, 0, begin_raw_message, commit_raw_message}, SIZE_MAX, epoch_offsets};
+    var emitter = st_ptls_raw_message_emitter_t{
+        ptls_message_emitter_t{
+            sendbuf, &tls.traffic_protection.enc, 0, begin_raw_message, commit_raw_message,
+        },
+        SIZE_MAX,
+        epoch_offsets,
+    };
     var rec = st_ptls_record_t{22, 0, inlen, input};
     if input == null {
         return send_client_hello(tls, &emitter.super, properties, null);
@@ -17829,9 +17649,16 @@ i32 ptls_client_handle_message(ptls_t* tls, ptls_buffer_t* sendbuf, u64* epoch_o
     }
     return handle_handshake_record(tls, cast(fn(ptls_t*, ptls_message_emitter_t*, ptls_iovec_t, i32, ptls_handshake_properties_t*): i32, handle_client_handshake_message), &emitter.super, &rec, properties);
 }
+
 i32 ptls_server_handle_message(ptls_t* tls, ptls_buffer_t* sendbuf, u64* epoch_offsets, u64 in_epoch, void* input, u64 inlen, ptls_handshake_properties_t* properties) {
     assert(cast(i64, tls.is_server));
-    var emitter = st_ptls_raw_message_emitter_t{ptls_message_emitter_t{sendbuf, &tls.traffic_protection.enc, 0, begin_raw_message, commit_raw_message}, SIZE_MAX, epoch_offsets};
+    var emitter = st_ptls_raw_message_emitter_t{
+        ptls_message_emitter_t{
+            sendbuf, &tls.traffic_protection.enc, 0, begin_raw_message, commit_raw_message,
+        },
+        SIZE_MAX,
+        epoch_offsets,
+    };
     var rec = st_ptls_record_t{22, 0, inlen, input};
     if tls.state == PTLS_STATE_SERVER_GENERATING_CERTIFICATE_VERIFY {
         assert(input == null || inlen == 0);
@@ -17843,16 +17670,18 @@ i32 ptls_server_handle_message(ptls_t* tls, ptls_buffer_t* sendbuf, u64* epoch_o
     }
     return handle_handshake_record(tls, cast(fn(ptls_t*, ptls_message_emitter_t*, ptls_iovec_t, i32, ptls_handshake_properties_t*): i32, handle_server_handshake_message), &emitter.super, &rec, properties);
 }
+
 /**
  * checks if given name looks like an IP address
  */
 i32 ptls_server_name_is_ipaddr(u8* name) {
     return 0;
 }
+
 i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* kem, ptls_iovec_t public_key, ptls_hpke_cipher_suite_t** ciphers, u8 max_name_length, u8* public_name) {
     i32 ret;
     while true {
-        u16 _v = 65037;
+        u16 _v = 0xfe0d;
         while true {
             u8[2] __compound_lit_267 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
             u8[2] __compound_lit_268 = {cast(u8, cast(i32, _v) >> 8), cast(u8, _v)};
@@ -17923,7 +17752,7 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -17983,7 +17812,7 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -18031,7 +17860,7 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -18063,7 +17892,7 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
                     u64 body_size = buf.off - body_start;
                     if capacity != cast(u64, -1) {
                         if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                            ret = 512 + 12;
+                            ret = 0x200 + 12;
                             return ret;
                         }
                         for ; capacity != 0; --capacity {
@@ -18083,7 +17912,7 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
         u64 body_size = buf.off - body_start;
         if capacity != cast(u64, -1) {
             if capacity < cast(u64, sizeof(u64)) && body_size >= cast(u64, 1) << capacity * 8 {
-                ret = 512 + 12;
+                ret = 0x200 + 12;
                 return ret;
             }
             for ; capacity != 0; --capacity {
@@ -18099,13 +17928,15 @@ i32 ptls_ech_encode_config(ptls_buffer_t* buf, u8 config_id, ptls_hpke_kem_t* ke
     }
     return ret;
 }
+
 private {
 u8* byte_to_hex(u8* dst, u8 v) {
     *dst++ = "0123456789abcdef"[cast(i32, v) >> 4];
-    *dst++ = "0123456789abcdef"[v & 15];
+    *dst++ = "0123456789abcdef"[v & 0xf];
     return dst;
 }
 }
+
 u8* ptls_hexdump(u8* dst, void* _src, u64 len) {
     u8* buf = dst;
     u8* src = _src;
@@ -18115,6 +17946,7 @@ u8* ptls_hexdump(u8* dst, void* _src, u64 len) {
     *dst = 0;
     return buf;
 }
+
 u8* ptls_jsonescape(u8* buf, u8* unsafe_str, u64 len) {
     u8* dst = buf;
     var src = cast(u8*, unsafe_str);
@@ -18154,7 +17986,7 @@ u8* ptls_jsonescape(u8* buf, u8* unsafe_str, u64 len) {
                 dst += sizeof("\\t") - 1;
             }
             default: {
-                if *src < 32 || *src == 127 {
+                if *src < 0x20 || *src == 0x7f {
                     *dst++ = 92;
                     *dst++ = 117;
                     *dst++ = 48;
@@ -18169,23 +18001,38 @@ u8* ptls_jsonescape(u8* buf, u8* unsafe_str, u64 len) {
     *dst = 0;
     return dst;
 }
+
 void ptls_build_v4_mapped_v6_address(void* v6, void* v4) {
     memset(v6, 0, cast(u64, 10));
-    memset(cast(u8*, v6) + 10, 255, cast(u64, 2));
+    memset(cast(u8*, v6) + 10, 0xff, cast(u64, 2));
     memcpy(cast(u8*, v6) + 12, v4, cast(u64, 4));
 }
-st_ptls_log_t ptls_log = st_ptls_log_t{.dummy_conn_state = ptls_log_conn_state_t{.random_ = 1}, ._generation = 1};
+st_ptls_log_t ptls_log = st_ptls_log_t{
+    .dummy_conn_state = ptls_log_conn_state_t{.random_ = 1},
+    ._generation = 1,
+};
 ptls_log_conn_state_t* ptls_log_conn_state_override = null;
-void ptls_log_init_conn_state(ptls_log_conn_state_t* state, fn(void*, u64): void random_bytes) {
+
+void ptls_log_init_conn_state(ptls_log_conn_state_t* state, fn(void*, u64): void random_bytes, u64 conn_id, void* _peeraddr) {
     u32 r;
     random_bytes(&r, sizeof(r));
-    *state = ptls_log_conn_state_t{.random_ = cast(f32, r) / cast(f32, cast(u64, UINT32_MAX) + 1)};
+    *state = ptls_log_conn_state_t{
+        .random_ = cast(f32, r) / cast(f32, cast(u64, UINT32_MAX) + 1),
+        .conn_id = conn_id,
+    };
+    when defined(AF_INET) {
+        // TODO transminc: untranslatable platform branch
+    } else {
+        ignore _peeraddr;
+    }
 }
+
 u64 ptls_log_num_lost() {
     return 0;
 }
+
 i32 ptls_log_add_fd(i32 fd, f32 sample_ratio, u8* _points, u8* _snis, u8* _addresses, i32 appdata) {
-    return 512 + 7;
+    return 0x200 + 7;
 }
 /* .. c:var:: cf_sha224
  * Abstract interface to SHA224.  See :c:type:`cf_chash` for more information.
@@ -18212,8 +18059,7 @@ i32 ptls_log_add_fd(i32 fd, f32 sample_ratio, u8* _points, u8* _snis, u8* _addre
  * along with this software. If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-when os(windows) {
-}
+
 /* Assorted bitwise and common operations used in ciphers. */
 /** Circularly rotate right x by n bits.
  *  0 > n > 32. */
@@ -18221,149 +18067,132 @@ private {
 u32 rotr32(u32 x, u32 n) {
     return x >> n | x << 32 - n;
 }
-}
+
 /** Circularly rotate left x by n bits.
  *  0 > n > 32. */
-private {
 u32 rotl32(u32 x, u32 n) {
     return x << n | x >> 32 - n;
 }
-}
+
 /** Circularly rotate right x by n bits.
  *  0 > n > 64. */
-private {
 u64 rotr64(u64 x, u32 n) {
     return x >> n | x << 64 - n;
 }
-}
+
 /** Circularly rotate left x by n bits.
  *  0 > n > 64. */
-private {
 u64 rotl64(u64 x, u32 n) {
     return x << n | x >> 64 - n;
 }
-}
+
 /** Read 4 bytes from buf, as a 32-bit big endian quantity. */
-private {
 u32 read32_be(u8* buf) {
     return cast(u32, buf[0]) << 24 | cast(u32, buf[1]) << 16 | cast(u32, buf[2]) << 8 | cast(u32, buf[3]);
 }
-}
+
 /** Read 4 bytes from buf, as a 32-bit little endian quantity. */
-private {
 u32 read32_le(u8* buf) {
     return cast(u32, buf[3]) << 24 | cast(u32, buf[2]) << 16 | cast(u32, buf[1]) << 8 | cast(u32, buf[0]);
 }
-}
+
 /** Read 8 bytes from buf, as a 64-bit big endian quantity. */
-private {
 u64 read64_be(u8* buf) {
     u32 hi = read32_be(buf);
     u32 lo = read32_be(buf + 4);
     return cast(u64, hi) << 32 | lo;
 }
-}
+
 /** Read 8 bytes from buf, as a 64-bit little endian quantity. */
-private {
 u64 read64_le(u8* buf) {
     u32 hi = read32_le(buf + 4);
     u32 lo = read32_le(buf);
     return cast(u64, hi) << 32 | lo;
 }
-}
+
 /** Encode v as a 32-bit big endian quantity into buf. */
-private {
 void write32_be(u32 v, u8* buf) {
-    *buf++ = cast(u8, v >> 24 & 255);
-    *buf++ = cast(u8, v >> 16 & 255);
-    *buf++ = cast(u8, v >> 8 & 255);
-    *buf = cast(u8, v & 255);
+    *buf++ = cast(u8, v >> 24 & 0xff);
+    *buf++ = cast(u8, v >> 16 & 0xff);
+    *buf++ = cast(u8, v >> 8 & 0xff);
+    *buf = cast(u8, v & 0xff);
 }
-}
+
 /** Encode v as a 32-bit little endian quantity into buf. */
-private {
 void write32_le(u32 v, u8* buf) {
-    *buf++ = cast(u8, v & 255);
-    *buf++ = cast(u8, v >> 8 & 255);
-    *buf++ = cast(u8, v >> 16 & 255);
-    *buf = cast(u8, v >> 24 & 255);
+    *buf++ = cast(u8, v & 0xff);
+    *buf++ = cast(u8, v >> 8 & 0xff);
+    *buf++ = cast(u8, v >> 16 & 0xff);
+    *buf = cast(u8, v >> 24 & 0xff);
 }
-}
+
 /** Encode v as a 64-bit big endian quantity into buf. */
-private {
 void write64_be(u64 v, u8* buf) {
-    *buf++ = cast(u8, v >> 56 & 255);
-    *buf++ = cast(u8, v >> 48 & 255);
-    *buf++ = cast(u8, v >> 40 & 255);
-    *buf++ = cast(u8, v >> 32 & 255);
-    *buf++ = cast(u8, v >> 24 & 255);
-    *buf++ = cast(u8, v >> 16 & 255);
-    *buf++ = cast(u8, v >> 8 & 255);
-    *buf = cast(u8, v & 255);
+    *buf++ = cast(u8, v >> 56 & 0xff);
+    *buf++ = cast(u8, v >> 48 & 0xff);
+    *buf++ = cast(u8, v >> 40 & 0xff);
+    *buf++ = cast(u8, v >> 32 & 0xff);
+    *buf++ = cast(u8, v >> 24 & 0xff);
+    *buf++ = cast(u8, v >> 16 & 0xff);
+    *buf++ = cast(u8, v >> 8 & 0xff);
+    *buf = cast(u8, v & 0xff);
 }
-}
+
 /** Encode v as a 64-bit little endian quantity into buf. */
-private {
 void write64_le(u64 v, u8* buf) {
-    *buf++ = cast(u8, v & 255);
-    *buf++ = cast(u8, v >> 8 & 255);
-    *buf++ = cast(u8, v >> 16 & 255);
-    *buf++ = cast(u8, v >> 24 & 255);
-    *buf++ = cast(u8, v >> 32 & 255);
-    *buf++ = cast(u8, v >> 40 & 255);
-    *buf++ = cast(u8, v >> 48 & 255);
-    *buf = cast(u8, v >> 56 & 255);
+    *buf++ = cast(u8, v & 0xff);
+    *buf++ = cast(u8, v >> 8 & 0xff);
+    *buf++ = cast(u8, v >> 16 & 0xff);
+    *buf++ = cast(u8, v >> 24 & 0xff);
+    *buf++ = cast(u8, v >> 32 & 0xff);
+    *buf++ = cast(u8, v >> 40 & 0xff);
+    *buf++ = cast(u8, v >> 48 & 0xff);
+    *buf = cast(u8, v >> 56 & 0xff);
 }
-}
+
 /** out = in ^ b8.
  *  out and in may alias. */
-private {
 void xor_b8(u8* out, u8* in, u8 b8, u64 len) {
     u64 i;
     for i = 0; i < len; i++ {
         out[i] = in[i] ^ b8;
     }
 }
-}
+
 /** out = x ^ y.
  *  out, x and y may alias. */
-private {
 void xor_bb(u8* out, u8* x, u8* y, u64 len) {
     u64 i;
     for i = 0; i < len; i++ {
         out[i] = x[i] ^ y[i];
     }
 }
-}
+
 /* out ^= x
  * out and x may alias. */
-private {
 void xor_words(u32* out, u32* x, u64 nwords) {
     u64 i;
     for i = 0; i < nwords; i++ {
         out[i] ^= x[i];
     }
 }
-}
+
 /** Produce 0xffffffff if x == y, zero otherwise, without branching. */
-private {
 u32 mask_u32(u32 x, u32 y) {
     u32 diff = x ^ y;
     u32 diff_is_zero = ~diff & diff - 1;
     return cast(u32, -cast(i32, diff_is_zero >> 31));
 }
-}
+
 /** Product 0xff if x == y, zero otherwise, without branching. */
-private {
 u8 mask_u8(u32 x, u32 y) {
     u32 diff = x ^ y;
     var diff_is_zero = cast(u8, ~diff & diff - 1);
     return cast(u8, -(cast(i32, diff_is_zero) >> 7));
 }
-}
+
 /** Select the ith entry from the given table of n values, in a side channel-silent
  *  way. */
-private {
 u32 select_u32(u32 i, u32* tab, u32 n) {
     u32 r = 0;
     u32 ii;
@@ -18373,10 +18202,9 @@ u32 select_u32(u32 i, u32* tab, u32 n) {
     }
     return r;
 }
-}
+
 /** Select the ith entry from the given table of n values, in a side channel-silent
  *  way. */
-private {
 u8 select_u8(u32 i, u8* tab, u32 n) {
     u8 r = 0;
     u32 ii;
@@ -18386,10 +18214,9 @@ u8 select_u8(u32 i, u8* tab, u32 n) {
     }
     return r;
 }
-}
+
 /** Select the ath, bth, cth and dth entries from the given table of n values,
  *  placing the results into a, b, c and d. */
-private {
 void select_u8x4(u8* a, u8* b, u8* c, u8* d, u8* tab, u32 n) {
     u8 ra = 0;
     u8 rb = 0;
@@ -18413,9 +18240,8 @@ void select_u8x4(u8* a, u8* b, u8* c, u8* d, u8* tab, u32 n) {
     *c = rc;
     *d = rd;
 }
-}
+
 /** out ^= if0 or if1, depending on the value of bit. */
-private {
 void select_xor128(u32* out, u32* if0, u32* if1, u8 bit) {
     u32 mask1 = mask_u32(bit, 1);
     u32 mask0 = ~mask1;
@@ -18424,10 +18250,9 @@ void select_xor128(u32* out, u32* if0, u32* if1, u8 bit) {
     out[2] ^= if0[2] & mask0 | if1[2] & mask1;
     out[3] ^= if0[3] & mask0 | if1[3] & mask1;
 }
-}
+
 /** Increments the integer stored at v (of non-zero length len)
  *  with the least significant byte first. */
-private {
 void incr_le(u8* v, u64 len) {
     u64 i = 0;
     while 1 != 0 {
@@ -18440,10 +18265,9 @@ void incr_le(u8* v, u64 len) {
         }
     }
 }
-}
+
 /** Increments the integer stored at v (of non-zero length len)
  *  with the most significant byte last. */
-private {
 void incr_be(u8* v, u64 len) {
     len--;
     while 1 != 0 {
@@ -18456,10 +18280,9 @@ void incr_be(u8* v, u64 len) {
         len--;
     }
 }
-}
+
 /** Copies len bytes from in to out, with in shifted left by offset bits
  *  to the right. */
-private {
 void copy_bytes_unaligned(u8* out, u8* in, u64 len, u8 offset) {
     var byte_off = cast(u8, offset / 8);
     u8 bit_off = offset & 7;
@@ -18471,12 +18294,17 @@ void copy_bytes_unaligned(u8* out, u8* in, u64 len, u8 offset) {
         out[i] |= cast(u8, cast(u32, cast(i32, in[i + byte_off + 1])) >> 8 - bit_off & rmask);
     }
 }
-}
-private {
+
 u32 count_trailing_zeroes(u32 x) {
-    return cast(u32, __builtin_ctzl(x));
+    when os(windows) {
+        u32 r = 0;
+        _BitScanReverse(&r, x);
+        return 31 - r;
+    } else {
+        return cast(u32, __builtin_ctzl(x));
+    }
 }
-}
+
 /*
  * Handy CPP defines and C inline functions.
  */
@@ -18495,17 +18323,15 @@ u32 count_trailing_zeroes(u32 x) {
  *  x_err and 'error_type err'. */
 /** Like memset(ptr, 0, len), but not allowed to be removed by
  *  compilers. */
-private {
 void mem_clean(void* v, u64 len) {
     if len != 0 {
         memset(v, 0, len);
         ignore *cast(u8*, v);
     }
 }
-}
+
 /** Returns 1 if len bytes at va equal len bytes at vb, 0 if they do not.
  *  Does not leak length of common prefix through timing. */
-private {
 u32 mem_eq(void* va, void* vb, u64 len) {
     u8* a = va;
     u8* b = vb;
@@ -18535,32 +18361,43 @@ u32 mem_eq(void* va, void* vb, u64 len) {
  * This is an assert(3) definition which doesn't include any
  * strings, but just branches to abort(3) on failure.
  */
-when !(defined(FULL_FAT_ASSERT)) {
-} else {
+private {
+u32[64] sha256__K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
 }
-private { u32[64] sha256__K = {1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298}; }
+
 void cf_sha256_init(cf_sha256_context* ctx) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
-    ctx.H[0] = 1779033703;
-    ctx.H[1] = 3144134277;
-    ctx.H[2] = 1013904242;
-    ctx.H[3] = 2773480762;
-    ctx.H[4] = 1359893119;
-    ctx.H[5] = 2600822924;
-    ctx.H[6] = 528734635;
-    ctx.H[7] = 1541459225;
+    ctx.H[0] = 0x6a09e667;
+    ctx.H[1] = 0xbb67ae85;
+    ctx.H[2] = 0x3c6ef372;
+    ctx.H[3] = 0xa54ff53a;
+    ctx.H[4] = 0x510e527f;
+    ctx.H[5] = 0x9b05688c;
+    ctx.H[6] = 0x1f83d9ab;
+    ctx.H[7] = 0x5be0cd19;
 }
+
 void cf_sha224_init(cf_sha256_context* ctx) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
-    ctx.H[0] = 3238371032;
-    ctx.H[1] = 914150663;
-    ctx.H[2] = 812702999;
-    ctx.H[3] = 4144912697;
-    ctx.H[4] = 4290775857;
-    ctx.H[5] = 1750603025;
-    ctx.H[6] = 1694076839;
-    ctx.H[7] = 3204075428;
+    ctx.H[0] = 0xc1059ed8;
+    ctx.H[1] = 0x367cd507;
+    ctx.H[2] = 0x3070dd17;
+    ctx.H[3] = 0xf70e5939;
+    ctx.H[4] = 0xffc00b31;
+    ctx.H[5] = 0x68581511;
+    ctx.H[6] = 0x64f98fa7;
+    ctx.H[7] = 0xbefa4fa4;
 }
+
 private {
 void sha256_update_block(void* vctx, u8* inp) {
     cf_sha256_context* ctx = vctx;
@@ -18606,22 +18443,26 @@ void sha256_update_block(void* vctx, u8* inp) {
     ctx.blocks++;
 }
 }
+
 void cf_sha256_update(cf_sha256_context* ctx, void* data, u64 nbytes) {
     cf_blockwise_accumulate(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), data, nbytes, sha256_update_block, ctx);
 }
+
 void cf_sha224_update(cf_sha256_context* ctx, void* data, u64 nbytes) {
     cf_sha256_update(ctx, data, nbytes);
 }
+
 void cf_sha256_digest(cf_sha256_context* ctx, u8* hash) {
     cf_sha256_context ours = *ctx;
     cf_sha256_digest_final(&ours, hash);
 }
+
 void cf_sha256_digest_final(cf_sha256_context* ctx, u8* hash) {
     u64 digested_bytes = ctx.blocks;
     digested_bytes = digested_bytes * 64 + ctx.npartial;
     u64 digested_bits = digested_bytes * 8;
     u64 padbytes = 64 - (digested_bytes + 8) % 64;
-    cf_blockwise_acc_pad(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), 128, 0, 0, padbytes, sha256_update_block, ctx);
+    cf_blockwise_acc_pad(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), 0x80, 0x00, 0x00, padbytes, sha256_update_block, ctx);
     noinit u8[8] buf;
     write64_be(digested_bits, buf);
     cf_sha256_update(ctx, buf, 8);
@@ -18641,106 +18482,81 @@ void cf_sha256_digest_final(cf_sha256_context* ctx, u8* hash) {
     write32_be(ctx.H[7], hash + 28);
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
 }
+
 void cf_sha224_digest(cf_sha256_context* ctx, u8* hash) {
     noinit u8[32] full;
     cf_sha256_digest(ctx, full);
     memcpy(hash, full, cast(u64, 28));
 }
+
 void cf_sha224_digest_final(cf_sha256_context* ctx, u8* hash) {
     noinit u8[32] full;
     cf_sha256_digest_final(ctx, full);
     memcpy(hash, full, cast(u64, 28));
 }
-cf_chash cf_sha224 = cf_chash{.hashsz = 28, .blocksz = 64, .init = cast(cf_chash_init, cf_sha224_init), .update = cast(cf_chash_update, cf_sha224_update), .digest = cast(cf_chash_digest, cf_sha224_digest)};
-cf_chash cf_sha256 = cf_chash{.hashsz = 32, .blocksz = 64, .init = cast(cf_chash_init, cf_sha256_init), .update = cast(cf_chash_update, cf_sha256_update), .digest = cast(cf_chash_digest, cf_sha256_digest)};
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-private { u64[80] sha512__K = {4794697086780616226, 8158064640168781261, -5349999486874862801, -1606136188198331460, 4131703408338449720, 6480981068601479193, -7908458776815382629, -6116909921290321640, -2880145864133508542, 1334009975649890238, 2608012711638119052, 6128411473006802146, 8268148722764581231, -9160688886553864527, -7215885187991268811, -4495734319001033068, -1973867731355612462, -1171420211273849373, 1135362057144423861, 2597628984639134821, 3308224258029322869, 5365058923640841347, 6679025012923562964, 8573033837759648693, -7476448914759557205, -6327057829258317296, -5763719355590565569, -4658551843659510044, -4116276920077217854, -3051310485924567259, 489312712824947311, 1452737877330783856, 2861767655752347644, 3322285676063803686, 5560940570517711597, 5996557281743188959, 7280758554555802590, 8532644243296465576, -9096487096722542874, -7894198246740708037, -6719396339535248540, -6333637450476146687, -4446306890439682159, -4076793802049405392, -3345356375505022440, -2983346525034927856, -860691631967231958, 1182934255886127544, 1847814050463011016, 2177327727835720531, 2830643537854262169, 3796741975233480872, 4115178125766777443, 5681478168544905931, 6601373596472566643, 7507060721942968483, 8399075790359081724, 8693463985226723168, -8878714635349349518, -8302665154208450068, -8016688836872298968, -6606660893046293015, -4685533653050689259, -4147400797238176981, -3880063495543823972, -3348786107499101689, -1523767162380948706, -757361751448694408, 500013540394364858, 748580250866718886, 1242879168328830382, 1977374033974150939, 2944078676154940804, 3659926193048069267, 4368137639120453308, 4836135668995329356, 5532061633213252278, 6448918945643986474, 6902733635092675308, 7801388544844847127}; }
+cf_chash cf_sha224 = cf_chash{
+    .hashsz = 28,
+    .blocksz = 64,
+    .init = cast(cf_chash_init, cf_sha224_init),
+    .update = cast(cf_chash_update, cf_sha224_update),
+    .digest = cast(cf_chash_digest, cf_sha224_digest),
+};
+cf_chash cf_sha256 = cf_chash{
+    .hashsz = 32,
+    .blocksz = 64,
+    .init = cast(cf_chash_init, cf_sha256_init),
+    .update = cast(cf_chash_update, cf_sha256_update),
+    .digest = cast(cf_chash_digest, cf_sha256_digest),
+};
+private {
+u64[80] sha512__K = {
+    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+};
+}
+
 void cf_sha512_init(cf_sha512_context* ctx) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
-    ctx.H[0] = 7640891576956012808;
-    ctx.H[1] = -4942790177534073029;
-    ctx.H[2] = 4354685564936845355;
-    ctx.H[3] = -6534734903238641935;
-    ctx.H[4] = 5840696475078001361;
-    ctx.H[5] = -7276294671716946913;
-    ctx.H[6] = 2270897969802886507;
-    ctx.H[7] = 6620516959819538809;
+    ctx.H[0] = 0x6a09e667f3bcc908;
+    ctx.H[1] = 0xbb67ae8584caa73b;
+    ctx.H[2] = 0x3c6ef372fe94f82b;
+    ctx.H[3] = 0xa54ff53a5f1d36f1;
+    ctx.H[4] = 0x510e527fade682d1;
+    ctx.H[5] = 0x9b05688c2b3e6c1f;
+    ctx.H[6] = 0x1f83d9abfb41bd6b;
+    ctx.H[7] = 0x5be0cd19137e2179;
 }
+
 void cf_sha384_init(cf_sha512_context* ctx) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
-    ctx.H[0] = -3766243637369397544;
-    ctx.H[1] = 7105036623409894663;
-    ctx.H[2] = -7973340178411365097;
-    ctx.H[3] = 1526699215303891257;
-    ctx.H[4] = 7436329637833083697;
-    ctx.H[5] = -8163818279084223215;
-    ctx.H[6] = -2662702644619276377;
-    ctx.H[7] = 5167115440072839076;
+    ctx.H[0] = 0xcbbb9d5dc1059ed8;
+    ctx.H[1] = 0x629a292a367cd507;
+    ctx.H[2] = 0x9159015a3070dd17;
+    ctx.H[3] = 0x152fecd8f70e5939;
+    ctx.H[4] = 0x67332667ffc00b31;
+    ctx.H[5] = 0x8eb44a8768581511;
+    ctx.H[6] = 0xdb0c2e0d64f98fa7;
+    ctx.H[7] = 0x47b5481dbefa4fa4;
 }
+
 private {
 void sha512_update_block(void* vctx, u8* inp) {
     cf_sha512_context* ctx = vctx;
@@ -18786,22 +18602,26 @@ void sha512_update_block(void* vctx, u8* inp) {
     ctx.blocks++;
 }
 }
+
 void cf_sha512_update(cf_sha512_context* ctx, void* data, u64 nbytes) {
     cf_blockwise_accumulate(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), data, nbytes, sha512_update_block, ctx);
 }
+
 void cf_sha384_update(cf_sha512_context* ctx, void* data, u64 nbytes) {
     cf_sha512_update(ctx, data, nbytes);
 }
+
 void cf_sha512_digest(cf_sha512_context* ctx, u8* hash) {
     cf_sha512_context ours = *ctx;
     cf_sha512_digest_final(&ours, hash);
 }
+
 void cf_sha512_digest_final(cf_sha512_context* ctx, u8* hash) {
     u64 digested_bytes = ctx.blocks;
     digested_bytes = digested_bytes * 128 + ctx.npartial;
     u64 digested_bits = digested_bytes * 8;
     u64 padbytes = 128 - (digested_bytes + 16) % 128;
-    cf_blockwise_acc_pad(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), 128, 0, 0, padbytes, sha512_update_block, ctx);
+    cf_blockwise_acc_pad(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), 0x80, 0x00, 0x00, padbytes, sha512_update_block, ctx);
     noinit u8[8] buf;
     write64_be(0, buf);
     cf_sha512_update(ctx, buf, 8);
@@ -18823,83 +18643,88 @@ void cf_sha512_digest_final(cf_sha512_context* ctx, u8* hash) {
     write64_be(ctx.H[7], hash + 56);
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
 }
+
 void cf_sha384_digest(cf_sha512_context* ctx, u8* hash) {
     noinit u8[64] full;
     cf_sha512_digest(ctx, full);
     memcpy(hash, full, cast(u64, 48));
 }
+
 void cf_sha384_digest_final(cf_sha512_context* ctx, u8* hash) {
     noinit u8[64] full;
     cf_sha512_digest_final(ctx, full);
     memcpy(hash, full, cast(u64, 48));
 }
-cf_chash cf_sha384 = cf_chash{.hashsz = 48, .blocksz = 128, .init = cast(cf_chash_init, cf_sha384_init), .update = cast(cf_chash_update, cf_sha384_update), .digest = cast(cf_chash_digest, cf_sha384_digest)};
-cf_chash cf_sha512 = cf_chash{.hashsz = 64, .blocksz = 128, .init = cast(cf_chash_init, cf_sha512_init), .update = cast(cf_chash_update, cf_sha512_update), .digest = cast(cf_chash_digest, cf_sha512_digest)};
+cf_chash cf_sha384 = cf_chash{
+    .hashsz = 48,
+    .blocksz = 128,
+    .init = cast(cf_chash_init, cf_sha384_init),
+    .update = cast(cf_chash_update, cf_sha384_update),
+    .digest = cast(cf_chash_digest, cf_sha384_digest),
+};
+cf_chash cf_sha512 = cf_chash{
+    .hashsz = 64,
+    .blocksz = 128,
+    .init = cast(cf_chash_init, cf_sha512_init),
+    .update = cast(cf_chash_update, cf_sha512_update),
+    .digest = cast(cf_chash_digest, cf_sha512_digest),
+};
 /* .. c:var:: const cf_prp cf_aes
  * Abstract interface to AES.  See :c:type:`cf_prp` for
  * more information. */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-private { u8[256] S = {99, 124, 119, 123, 242, 107, 111, 197, 48, 1, 103, 43, 254, 215, 171, 118, 202, 130, 201, 125, 250, 89, 71, 240, 173, 212, 162, 175, 156, 164, 114, 192, 183, 253, 147, 38, 54, 63, 247, 204, 52, 165, 229, 241, 113, 216, 49, 21, 4, 199, 35, 195, 24, 150, 5, 154, 7, 18, 128, 226, 235, 39, 178, 117, 9, 131, 44, 26, 27, 110, 90, 160, 82, 59, 214, 179, 41, 227, 47, 132, 83, 209, 0, 237, 32, 252, 177, 91, 106, 203, 190, 57, 74, 76, 88, 207, 208, 239, 170, 251, 67, 77, 51, 133, 69, 249, 2, 127, 80, 60, 159, 168, 81, 163, 64, 143, 146, 157, 56, 245, 188, 182, 218, 33, 16, 255, 243, 210, 205, 12, 19, 236, 95, 151, 68, 23, 196, 167, 126, 61, 100, 93, 25, 115, 96, 129, 79, 220, 34, 42, 144, 136, 70, 238, 184, 20, 222, 94, 11, 219, 224, 50, 58, 10, 73, 6, 36, 92, 194, 211, 172, 98, 145, 149, 228, 121, 231, 200, 55, 109, 141, 213, 78, 169, 108, 86, 244, 234, 101, 122, 174, 8, 186, 120, 37, 46, 28, 166, 180, 198, 232, 221, 116, 31, 75, 189, 139, 138, 112, 62, 181, 102, 72, 3, 246, 14, 97, 53, 87, 185, 134, 193, 29, 158, 225, 248, 152, 17, 105, 217, 142, 148, 155, 30, 135, 233, 206, 85, 40, 223, 140, 161, 137, 13, 191, 230, 66, 104, 65, 153, 45, 15, 176, 84, 187, 22}; }
-private { u8[11] Rcon = {141, 1, 2, 4, 8, 16, 32, 64, 128, 27, 54}; }
+private {
+u8[256] S = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
+u8[11] Rcon = {0x8d, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36};
+}
 when defined(INLINE_FUNCS) {
+
 private {
 u32 word4(u8 b0, u8 b1, u8 b2, u8 b3) {
-        return cast(u32, cast(i32, b0) << 24 | cast(i32, b1) << 16 | cast(i32, b2) << 8 | b3);
-    }
+    return cast(u32, cast(i32, b0) << 24 | cast(i32, b1) << 16 | cast(i32, b2) << 8 | b3);
 }
-private {
+
 u8 byte(u32 w, u32 x) {
-        x = 3 - x;
-        return cast(u8, w >> x * 8 & 255);
-    }
+    x = 3 - x;
+    return cast(u8, w >> x * 8 & 0xff);
 }
-private {
+
 u32 round_constant(u32 i) {
-        return cast(u32, cast(i32, Rcon[i]) << 24);
-    }
+    return cast(u32, cast(i32, Rcon[i]) << 24);
 }
-private {
+
 u32 rot_word(u32 w) {
-        return rotl32(w, 8);
-    }
+    return rotl32(w, 8);
 }
 }
+}
+
 private {
 u32 sub_word(u32 w, u8* sbox) {
-    var a = cast(u8, w >> cast(u32, 3 - 0 << 3) & 255);
-    var b = cast(u8, w >> cast(u32, 3 - 1 << 3) & 255);
-    var c = cast(u8, w >> cast(u32, 3 - 2 << 3) & 255);
-    var d = cast(u8, w >> cast(u32, 3 - 3 << 3) & 255);
+    var a = cast(u8, w >> cast(u32, 3 - 0 << 3) & 0xff);
+    var b = cast(u8, w >> cast(u32, 3 - 1 << 3) & 0xff);
+    var c = cast(u8, w >> cast(u32, 3 - 2 << 3) & 0xff);
+    var d = cast(u8, w >> cast(u32, 3 - 3 << 3) & 0xff);
     select_u8x4(&a, &b, &c, &d, sbox, 256);
     return cast(u32, a) << 24 | cast(u32, b) << 16 | cast(u32, c) << 8 | d;
 }
-}
-private {
+
 void aes_schedule(cf_aes_context* ctx, u8* key, u64 nkey) {
     u64 i;
     var nb = cast(u64, 16 / 4);
@@ -18927,6 +18752,7 @@ void aes_schedule(cf_aes_context* ctx, u8* key, u64 nkey) {
     }
 }
 }
+
 void cf_aes_init(cf_aes_context* ctx, u8* key, u64 nkey) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
     switch nkey {
@@ -18947,6 +18773,7 @@ void cf_aes_init(cf_aes_context* ctx, u8* key, u64 nkey) {
         }
     }
 }
+
 private {
 void add_round_key(u32* state, u32* rk) {
     state[0] ^= rk[0];
@@ -18954,43 +18781,38 @@ void add_round_key(u32* state, u32* rk) {
     state[2] ^= rk[2];
     state[3] ^= rk[3];
 }
-}
-private {
+
 void sub_block(u32* state) {
     state[0] = sub_word(state[0], S);
     state[1] = sub_word(state[1], S);
     state[2] = sub_word(state[2], S);
     state[3] = sub_word(state[3], S);
 }
-}
-private {
+
 void shift_rows(u32* state) {
     u32 u;
     u32 v;
     u32 x;
     u32 y;
-    u = (state[0] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[1] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[2] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[3] >> cast(u32, 3 - 3 << 3) & 255;
-    v = (state[1] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[2] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[3] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[0] >> cast(u32, 3 - 3 << 3) & 255;
-    x = (state[2] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[3] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[0] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[1] >> cast(u32, 3 - 3 << 3) & 255;
-    y = (state[3] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[0] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[1] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[2] >> cast(u32, 3 - 3 << 3) & 255;
+    u = (state[0] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[1] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[2] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[3] >> cast(u32, 3 - 3 << 3) & 0xff;
+    v = (state[1] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[2] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[3] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[0] >> cast(u32, 3 - 3 << 3) & 0xff;
+    x = (state[2] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[3] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[0] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[1] >> cast(u32, 3 - 3 << 3) & 0xff;
+    y = (state[3] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[0] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[1] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[2] >> cast(u32, 3 - 3 << 3) & 0xff;
     state[0] = u;
     state[1] = v;
     state[2] = x;
     state[3] = y;
 }
-}
-private {
+
 u32 gf_poly_mul2(u32 x) {
-    return (x & 2139062143) << 1 ^ ((x & 2155905152) >> 7) * 27;
+    return (x & 0x7f7f7f7f) << 1 ^ ((x & 0x80808080) >> 7) * 0x1b;
 }
-}
-private {
+
 u32 mix_column(u32 x) {
     u32 x2 = gf_poly_mul2(x);
     return x2 ^ rotr32(x ^ x2, 24) ^ rotr32(x, 16) ^ rotr32(x, 8);
 }
-}
-private {
+
 void mix_columns(u32* state) {
     state[0] = mix_column(state[0]);
     state[1] = mix_column(state[1]);
@@ -18998,6 +18820,7 @@ void mix_columns(u32* state) {
     state[3] = mix_column(state[3]);
 }
 }
+
 void cf_aes_encrypt(cf_aes_context* ctx, u8* in, u8* out) {
     while true {
         if (ctx.rounds == 10 || ctx.rounds == 12 || ctx.rounds == 14) == 0 {
@@ -19025,32 +18848,48 @@ void cf_aes_encrypt(cf_aes_context* ctx, u8* in, u8* out) {
     write32_be(state[2], out + 8);
     write32_be(state[3], out + 12);
 }
-private { u8[256] S_inv = {82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251, 124, 227, 57, 130, 155, 47, 255, 135, 52, 142, 67, 68, 196, 222, 233, 203, 84, 123, 148, 50, 166, 194, 35, 61, 238, 76, 149, 11, 66, 250, 195, 78, 8, 46, 161, 102, 40, 217, 36, 178, 118, 91, 162, 73, 109, 139, 209, 37, 114, 248, 246, 100, 134, 104, 152, 22, 212, 164, 92, 204, 93, 101, 182, 146, 108, 112, 72, 80, 253, 237, 185, 218, 94, 21, 70, 87, 167, 141, 157, 132, 144, 216, 171, 0, 140, 188, 211, 10, 247, 228, 88, 5, 184, 179, 69, 6, 208, 44, 30, 143, 202, 63, 15, 2, 193, 175, 189, 3, 1, 19, 138, 107, 58, 145, 17, 65, 79, 103, 220, 234, 151, 242, 207, 206, 240, 180, 230, 115, 150, 172, 116, 34, 231, 173, 53, 133, 226, 249, 55, 232, 28, 117, 223, 110, 71, 241, 26, 113, 29, 41, 197, 137, 111, 183, 98, 14, 170, 24, 190, 27, 252, 86, 62, 75, 198, 210, 121, 32, 154, 219, 192, 254, 120, 205, 90, 244, 31, 221, 168, 51, 136, 7, 199, 49, 177, 18, 16, 89, 39, 128, 236, 95, 96, 81, 127, 169, 25, 181, 74, 13, 45, 229, 122, 159, 147, 201, 156, 239, 160, 224, 59, 77, 174, 42, 245, 176, 200, 235, 187, 60, 131, 83, 153, 97, 23, 43, 4, 126, 186, 119, 214, 38, 225, 105, 20, 99, 85, 33, 12, 125}; }
 private {
+u8[256] S_inv = {
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+};
+
 void inv_sub_block(u32* state) {
     state[0] = sub_word(state[0], S_inv);
     state[1] = sub_word(state[1], S_inv);
     state[2] = sub_word(state[2], S_inv);
     state[3] = sub_word(state[3], S_inv);
 }
-}
-private {
+
 void inv_shift_rows(u32* state) {
     u32 u;
     u32 v;
     u32 x;
     u32 y;
-    u = (state[0] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[3] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[2] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[1] >> cast(u32, 3 - 3 << 3) & 255;
-    v = (state[1] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[0] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[3] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[2] >> cast(u32, 3 - 3 << 3) & 255;
-    x = (state[2] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[1] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[0] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[3] >> cast(u32, 3 - 3 << 3) & 255;
-    y = (state[3] >> cast(u32, 3 - 0 << 3) & 255) << 24 | (state[2] >> cast(u32, 3 - 1 << 3) & 255) << 16 | (state[1] >> cast(u32, 3 - 2 << 3) & 255) << 8 | state[0] >> cast(u32, 3 - 3 << 3) & 255;
+    u = (state[0] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[3] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[2] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[1] >> cast(u32, 3 - 3 << 3) & 0xff;
+    v = (state[1] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[0] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[3] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[2] >> cast(u32, 3 - 3 << 3) & 0xff;
+    x = (state[2] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[1] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[0] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[3] >> cast(u32, 3 - 3 << 3) & 0xff;
+    y = (state[3] >> cast(u32, 3 - 0 << 3) & 0xff) << 24 | (state[2] >> cast(u32, 3 - 1 << 3) & 0xff) << 16 | (state[1] >> cast(u32, 3 - 2 << 3) & 0xff) << 8 | state[0] >> cast(u32, 3 - 3 << 3) & 0xff;
     state[0] = u;
     state[1] = v;
     state[2] = x;
     state[3] = y;
 }
-}
-private {
+
 u32 inv_mix_column(u32 x) {
     u32 x2 = gf_poly_mul2(x);
     u32 x4 = gf_poly_mul2(x2);
@@ -19059,8 +18898,7 @@ u32 inv_mix_column(u32 x) {
     u32 x13 = x4 ^ x9;
     return x ^ x2 ^ x13 ^ rotr32(x11, 24) ^ rotr32(x13, 16) ^ rotr32(x9, 8);
 }
-}
-private {
+
 void inv_mix_columns(u32* state) {
     state[0] = inv_mix_column(state[0]);
     state[1] = inv_mix_column(state[1]);
@@ -19068,6 +18906,7 @@ void inv_mix_columns(u32* state) {
     state[3] = inv_mix_column(state[3]);
 }
 }
+
 void cf_aes_decrypt(cf_aes_context* ctx, u8* in, u8* out) {
     while true {
         if (ctx.rounds == 10 || ctx.rounds == 12 || ctx.rounds == 14) == 0 {
@@ -19095,55 +18934,23 @@ void cf_aes_decrypt(cf_aes_context* ctx, u8* in, u8* out) {
     write32_be(state[2], out + 8);
     write32_be(state[3], out + 12);
 }
+
 void cf_aes_finish(cf_aes_context* ctx) {
     mem_clean(ctx, cast(u64, sizeof(*ctx)));
 }
-cf_prp cf_aes = cf_prp{.blocksz = 16, .encrypt = cast(cf_prp_block, cf_aes_encrypt), .decrypt = cast(cf_prp_block, cf_aes_decrypt)};
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+cf_prp cf_aes = cf_prp{
+    .blocksz = 16,
+    .encrypt = cast(cf_prp_block, cf_aes_encrypt),
+    .decrypt = cast(cf_prp_block, cf_aes_decrypt),
+};
+
 /* CBC */
 void cf_cbc_init(cf_cbc* ctx, cf_prp* prp, void* prpctx, u8* iv) {
     ctx.prp = prp;
     ctx.prpctx = prpctx;
     memcpy(ctx.block, iv, prp.blocksz);
 }
+
 void cf_cbc_encrypt(cf_cbc* ctx, u8* input, u8* output, u64 blocks) {
     noinit u8[16] buf;
     u64 nblk = ctx.prp.blocksz;
@@ -19155,6 +18962,7 @@ void cf_cbc_encrypt(cf_cbc* ctx, u8* input, u8* output, u64 blocks) {
         output += nblk;
     }
 }
+
 void cf_cbc_decrypt(cf_cbc* ctx, u8* input, u8* output, u64 blocks) {
     noinit u8[16] buf;
     u64 nblk = ctx.prp.blocksz;
@@ -19166,6 +18974,7 @@ void cf_cbc_decrypt(cf_cbc* ctx, u8* input, u8* output, u64 blocks) {
         output += nblk;
     }
 }
+
 /* CTR */
 void cf_ctr_init(cf_ctr* ctx, cf_prp* prp, void* prpctx, u8* nonce) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
@@ -19176,6 +18985,7 @@ void cf_ctr_init(cf_ctr* ctx, cf_prp* prp, void* prpctx, u8* nonce) {
     ctx.nkeymat = 0;
     memcpy(ctx.nonce, nonce, prp.blocksz);
 }
+
 void cf_ctr_custom_counter(cf_ctr* ctx, u64 offset, u64 width) {
     while true {
         if ctx.prp.blocksz <= offset + width == 0 {
@@ -19186,6 +18996,7 @@ void cf_ctr_custom_counter(cf_ctr* ctx, u64 offset, u64 width) {
     ctx.counter_offset = offset;
     ctx.counter_width = width;
 }
+
 private {
 void ctr_next_block(void* vctx, u8* out) {
     cf_ctr* ctx = vctx;
@@ -19193,111 +19004,22 @@ void ctr_next_block(void* vctx, u8* out) {
     incr_be(ctx.nonce + ctx.counter_offset, ctx.counter_width);
 }
 }
+
 void cf_ctr_cipher(cf_ctr* ctx, u8* input, u8* output, u64 bytes) {
     cf_blockwise_xor(ctx.keymat, &ctx.nkeymat, ctx.prp.blocksz, input, output, bytes, ctr_next_block, ctx);
 }
+
 void cf_ctr_discard_block(cf_ctr* ctx) {
     ctx.nkeymat = 0;
 }
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 private {
 void ghash_init(ghash_ctx* ctx, u8* H) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
     cf_gf128_frombytes_be(H, ctx.H);
     ctx.state = 1;
 }
-}
-private {
+
 void ghash_block(void* vctx, u8* data) {
     ghash_ctx* ctx = vctx;
     noinit cf_gf128 gfdata;
@@ -19305,13 +19027,11 @@ void ghash_block(void* vctx, u8* data) {
     cf_gf128_add(gfdata, ctx.Y, ctx.Y);
     cf_gf128_mul(ctx.Y, ctx.H, ctx.Y);
 }
-}
-private {
+
 void ghash_add(ghash_ctx* ctx, u8* buf, u64 n) {
     cf_blockwise_accumulate(ctx.buffer, &ctx.buffer_used, cast(u64, sizeof(ctx.buffer)), buf, n, ghash_block, ctx);
 }
-}
-private {
+
 void ghash_add_pad(ghash_ctx* ctx) {
     if ctx.buffer_used == 0 {
         return;
@@ -19320,8 +19040,7 @@ void ghash_add_pad(ghash_ctx* ctx) {
     ghash_block(ctx, ctx.buffer);
     ctx.buffer_used = 0;
 }
-}
-private {
+
 void ghash_add_aad(ghash_ctx* ctx, u8* buf, u64 n) {
     while true {
         if ctx.state == 1 == 0 {
@@ -19332,8 +19051,7 @@ void ghash_add_aad(ghash_ctx* ctx, u8* buf, u64 n) {
     ctx.len_aad += n;
     ghash_add(ctx, buf, n);
 }
-}
-private {
+
 void ghash_add_cipher(ghash_ctx* ctx, u8* buf, u64 n) {
     if ctx.state == 1 {
         ghash_add_pad(ctx);
@@ -19348,8 +19066,7 @@ void ghash_add_cipher(ghash_ctx* ctx, u8* buf, u64 n) {
     ctx.len_cipher += n;
     ghash_add(ctx, buf, n);
 }
-}
-private {
+
 void ghash_final(ghash_ctx* ctx, u8* out) {
     noinit u8[8] lenbuf;
     if ctx.state == 1 || ctx.state == 2 {
@@ -19369,15 +19086,16 @@ void ghash_final(ghash_ctx* ctx, u8* out) {
     cf_gf128_tobytes_be(ctx.Y, out);
 }
 }
+
 void cf_gcm_encrypt_init(cf_prp* prp, void* prpctx, cf_gcm_ctx* gcmctx, u8* header, u64 nheader, u8* nonce, u64 nnonce) {
     u8[16] H;
     prp.encrypt(prpctx, H, H);
     if nnonce == 12 {
         memcpy(gcmctx.Y0, nonce, nnonce);
-        gcmctx.Y0[14] = 0;
+        gcmctx.Y0[14] = 0x00;
         gcmctx.Y0[13] = gcmctx.Y0[14];
         gcmctx.Y0[12] = gcmctx.Y0[13];
-        gcmctx.Y0[15] = 1;
+        gcmctx.Y0[15] = 0x01;
     } else {
         ghash_init(&gcmctx.gh, H);
         ghash_add_cipher(&gcmctx.gh, nonce, nnonce);
@@ -19391,10 +19109,12 @@ void cf_gcm_encrypt_init(cf_prp* prp, void* prpctx, cf_gcm_ctx* gcmctx, u8* head
     cf_ctr_cipher(&gcmctx.ctr, gcmctx.e_Y0, gcmctx.e_Y0, cast(u64, sizeof(gcmctx.e_Y0)));
     mem_clean(H, cast(u64, sizeof(H)));
 }
+
 void cf_gcm_encrypt_update(cf_gcm_ctx* gcmctx, u8* plain, u64 nplain, u8* cipher) {
     cf_ctr_cipher(&gcmctx.ctr, plain, cipher, nplain);
     ghash_add_cipher(&gcmctx.gh, cipher, nplain);
 }
+
 void cf_gcm_encrypt_final(cf_gcm_ctx* gcmctx, u8* tag, u64 ntag) {
     u8[16] full_tag;
     ghash_final(&gcmctx.gh, full_tag);
@@ -19408,12 +19128,14 @@ void cf_gcm_encrypt_final(cf_gcm_ctx* gcmctx, u8* tag, u64 ntag) {
     mem_clean(full_tag, cast(u64, sizeof(full_tag)));
     mem_clean(gcmctx, cast(u64, sizeof(*gcmctx)));
 }
+
 void cf_gcm_encrypt(cf_prp* prp, void* prpctx, u8* plain, u64 nplain, u8* header, u64 nheader, u8* nonce, u64 nnonce, u8* cipher, u8* tag, u64 ntag) {
-    cf_gcm_ctx gcmctx;
+    noinit cf_gcm_ctx gcmctx;
     cf_gcm_encrypt_init(prp, prpctx, &gcmctx, header, nheader, nonce, nnonce);
     cf_gcm_encrypt_update(&gcmctx, plain, nplain, cipher);
     cf_gcm_encrypt_final(&gcmctx, tag, ntag);
 }
+
 i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* header, u64 nheader, u8* nonce, u64 nnonce, u8* tag, u64 ntag, u8* plain) {
     u8[16] H;
     u8[16] Y0;
@@ -19432,12 +19154,12 @@ i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* heade
     prp.encrypt(prpctx, H, H);
     if nnonce == 12 {
         memcpy(Y0, nonce, nnonce);
-        Y0[14] = 0;
+        Y0[14] = 0x00;
         Y0[13] = Y0[14];
         Y0[12] = Y0[13];
-        Y0[15] = 1;
+        Y0[15] = 0x01;
     } else {
-        ghash_ctx gh;
+        noinit ghash_ctx gh;
         ghash_init(&gh, H);
         ghash_add_cipher(&gh, nonce, nnonce);
         ghash_final(&gh, Y0);
@@ -19464,73 +19186,24 @@ i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* heade
     err = 0;
     return err;
 }
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 void cf_gf128_tobytes_be(u32* in, u8* out) {
     write32_be(in[0], out + 0);
     write32_be(in[1], out + 4);
     write32_be(in[2], out + 8);
     write32_be(in[3], out + 12);
 }
+
 void cf_gf128_frombytes_be(u8* in, u32* out) {
     out[0] = read32_be(in + 0);
     out[1] = read32_be(in + 4);
     out[2] = read32_be(in + 8);
     out[3] = read32_be(in + 12);
 }
+
 /* out = 2 * in.  Arguments may alias. */
 void cf_gf128_double(u32* in, u32* out) {
-    u8[2] table = {0, 135};
+    u8[2] table = {0x00, 0x87};
     u32 borrow = 0;
     u32 inword;
     inword = in[3];
@@ -19547,9 +19220,10 @@ void cf_gf128_double(u32* in, u32* out) {
     borrow = inword >> 31;
     out[3] ^= select_u8(borrow, table, 2);
 }
+
 /* out = 2 * in.  Arguments may alias. */
 void cf_gf128_double_le(u32* in, u32* out) {
-    u8[2] table = {0, 225};
+    u8[2] table = {0x00, 0xe1};
     u32 borrow = 0;
     u32 inword;
     inword = in[0];
@@ -19566,6 +19240,7 @@ void cf_gf128_double_le(u32* in, u32* out) {
     borrow = inword & 1;
     out[0] ^= cast(u32, select_u8(borrow, table, 2)) << 24;
 }
+
 /* out = x + y.  Arguments may alias. */
 void cf_gf128_add(u32* x, u32* y, u32* out) {
     out[0] = x[0] ^ y[0];
@@ -19573,6 +19248,7 @@ void cf_gf128_add(u32* x, u32* y, u32* out) {
     out[2] = x[2] ^ y[2];
     out[3] = x[3] ^ y[3];
 }
+
 /* out = xy.  Arguments may alias. */
 void cf_gf128_mul(u32* x, u32* y, u32* out) {
     cf_gf128 zero;
@@ -19611,32 +19287,7 @@ void cf_gf128_mul(u32* x, u32* y, u32* out) {
  * Number of bytes at end of `block` that can be used as key stream.
  *
  */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
     u32 z0;
     u32 z1;
@@ -19696,7 +19347,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zc = rotl32(zc ^ z0, 8);
         z8 += zc;
         z4 = rotl32(z4 ^ z8, 7);
-                z1 += z5;
+        z1 += z5;
         zd = rotl32(zd ^ z1, 16);
         z9 += zd;
         z5 = rotl32(z5 ^ z9, 12);
@@ -19704,7 +19355,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zd = rotl32(zd ^ z1, 8);
         z9 += zd;
         z5 = rotl32(z5 ^ z9, 7);
-                z2 += z6;
+        z2 += z6;
         ze = rotl32(ze ^ z2, 16);
         za += ze;
         z6 = rotl32(z6 ^ za, 12);
@@ -19712,7 +19363,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         ze = rotl32(ze ^ z2, 8);
         za += ze;
         z6 = rotl32(z6 ^ za, 7);
-                z3 += z7;
+        z3 += z7;
         zf = rotl32(zf ^ z3, 16);
         zb += zf;
         z7 = rotl32(z7 ^ zb, 12);
@@ -19720,7 +19371,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zf = rotl32(zf ^ z3, 8);
         zb += zf;
         z7 = rotl32(z7 ^ zb, 7);
-                z0 += z5;
+        z0 += z5;
         zf = rotl32(zf ^ z0, 16);
         za += zf;
         z5 = rotl32(z5 ^ za, 12);
@@ -19728,7 +19379,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zf = rotl32(zf ^ z0, 8);
         za += zf;
         z5 = rotl32(z5 ^ za, 7);
-                z1 += z6;
+        z1 += z6;
         zc = rotl32(zc ^ z1, 16);
         zb += zc;
         z6 = rotl32(z6 ^ zb, 12);
@@ -19736,7 +19387,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zc = rotl32(zc ^ z1, 8);
         zb += zc;
         z6 = rotl32(z6 ^ zb, 7);
-                z2 += z7;
+        z2 += z7;
         zd = rotl32(zd ^ z2, 16);
         z8 += zd;
         z7 = rotl32(z7 ^ z8, 12);
@@ -19744,7 +19395,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         zd = rotl32(zd ^ z2, 8);
         z8 += zd;
         z7 = rotl32(z7 ^ z8, 7);
-                z3 += z4;
+        z3 += z4;
         ze = rotl32(ze ^ z3, 16);
         z9 += ze;
         z4 = rotl32(z4 ^ z9, 12);
@@ -19752,7 +19403,7 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
         ze = rotl32(ze ^ z3, 8);
         z9 += ze;
         z4 = rotl32(z4 ^ z9, 7);
-            }
+    }
     x0 += z0;
     x1 += z1;
     x2 += z2;
@@ -19786,9 +19437,10 @@ void cf_chacha20_core(u8* key0, u8* key1, u8* nonce, u8* constant, u8* out) {
     write32_le(xe, out + 56);
     write32_le(xf, out + 60);
 }
-private { u8* chacha20_tau = cast(u8*, "expand 16-byte k"); }
-private { u8* chacha20_sigma = cast(u8*, "expand 32-byte k"); }
 private {
+u8* chacha20_tau = cast(u8*, "expand 16-byte k");
+u8* chacha20_sigma = cast(u8*, "expand 32-byte k");
+
 void set_key(cf_chacha20_ctx* ctx, u8* key, u64 nkey) {
     switch nkey {
         case 16: {
@@ -19807,6 +19459,7 @@ void set_key(cf_chacha20_ctx* ctx, u8* key, u64 nkey) {
     }
 }
 }
+
 void cf_chacha20_init(cf_chacha20_ctx* ctx, u8* key, u64 nkey, u8* nonce) {
     set_key(ctx, key, nkey);
     memset(ctx.nonce, 0, cast(u64, sizeof(ctx.nonce)));
@@ -19814,6 +19467,7 @@ void cf_chacha20_init(cf_chacha20_ctx* ctx, u8* key, u64 nkey, u8* nonce) {
     ctx.nblock = 0;
     ctx.ncounter = 8;
 }
+
 void cf_chacha20_init_custom(cf_chacha20_ctx* ctx, u8* key, u64 nkey, u8* nonce, u64 ncounter) {
     while true {
         if ncounter > 0 == 0 {
@@ -19826,6 +19480,7 @@ void cf_chacha20_init_custom(cf_chacha20_ctx* ctx, u8* key, u64 nkey, u8* nonce,
     ctx.nblock = 0;
     ctx.ncounter = ncounter;
 }
+
 private {
 void cf_chacha20_next_block(void* vctx, u8* out) {
     cf_chacha20_ctx* ctx = vctx;
@@ -19833,91 +19488,66 @@ void cf_chacha20_next_block(void* vctx, u8* out) {
     incr_le(ctx.nonce, ctx.ncounter);
 }
 }
+
 void cf_chacha20_cipher(cf_chacha20_ctx* ctx, u8* input, u8* output, u64 bytes) {
     cf_blockwise_xor(ctx.block, &ctx.nblock, 64, input, output, bytes, cf_chacha20_next_block, ctx);
 }
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 void cf_poly1305_init(cf_poly1305* ctx, u8* r, u8* s) {
     memset(ctx, 0, cast(u64, sizeof(*ctx)));
     ctx.r[0] = r[0];
     ctx.r[1] = r[1];
     ctx.r[2] = r[2];
-    ctx.r[3] = r[3] & 15;
-    ctx.r[4] = r[4] & 252;
+    ctx.r[3] = r[3] & 0x0f;
+    ctx.r[4] = r[4] & 0xfc;
     ctx.r[5] = r[5];
     ctx.r[6] = r[6];
-    ctx.r[7] = r[7] & 15;
-    ctx.r[8] = r[8] & 252;
+    ctx.r[7] = r[7] & 0x0f;
+    ctx.r[8] = r[8] & 0xfc;
     ctx.r[9] = r[9];
     ctx.r[10] = r[10];
-    ctx.r[11] = r[11] & 15;
-    ctx.r[12] = r[12] & 252;
+    ctx.r[11] = r[11] & 0x0f;
+    ctx.r[12] = r[12] & 0xfc;
     ctx.r[13] = r[13];
     ctx.r[14] = r[14];
-    ctx.r[15] = r[15] & 15;
+    ctx.r[15] = r[15] & 0x0f;
     ctx.r[16] = 0;
     memcpy(ctx.s, s, cast(u64, 16));
 }
+
 private {
 void poly1305_add(u32* h, u32* x) {
     u32 carry = 0;
     i32 i;
     for i = 0; i < 17; i++ {
         carry += h[i] + x[i];
-        h[i] = carry & 255;
+        h[i] = carry & 0xff;
         carry >>= 8;
     }
 }
-}
+
 /* Minimal reduction/carry chain. */
-private {
 void poly1305_min_reduce(u32* x) {
     u32 carry = 0;
     i32 i;
     for i = 0; i < 16; i++ {
         carry += x[i];
-        x[i] = carry & 255;
+        x[i] = carry & 0xff;
         carry >>= 8;
     }
     carry += x[16];
-    x[16] = carry & 3;
+    x[16] = carry & 0x03;
     carry = 5 * (carry >> 2);
     for i = 0; i < 16; i++ {
         carry += x[i];
-        x[i] = carry & 255;
+        x[i] = carry & 0xff;
         carry >>= 8;
     }
     x[16] += carry;
 }
-}
 /* This is - 2 ** 130 - 5 in twos complement. */
-private { u32[17] negative_1305 = {5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 252}; }
-private {
+u32[17] negative_1305 = {0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfc};
+
 void poly1305_full_reduce(u32* x) {
     noinit u32[17] xsub;
     u64 i;
@@ -19925,14 +19555,13 @@ void poly1305_full_reduce(u32* x) {
         xsub[i] = x[i];
     }
     poly1305_add(xsub, negative_1305);
-    u32 negative_mask = mask_u32(xsub[16] & 128, 128);
-    u32 positive_mask = negative_mask ^ 4294967295;
+    u32 negative_mask = mask_u32(xsub[16] & 0x80, 0x80);
+    u32 positive_mask = negative_mask ^ 0xffffffff;
     for i = 0; i < 17; i++ {
         x[i] = x[i] & negative_mask | xsub[i] & positive_mask;
     }
 }
-}
-private {
+
 void poly1305_mul(u32* x, u32* y) {
     noinit u32[17] r;
     i32 i;
@@ -19952,14 +19581,12 @@ void poly1305_mul(u32* x, u32* y) {
         x[i] = r[i];
     }
 }
-}
-private {
+
 void poly1305_block(cf_poly1305* ctx, u32* c) {
     poly1305_add(ctx.h, c);
     poly1305_mul(ctx.h, ctx.r);
 }
-}
-private {
+
 void poly1305_whole_block(void* vctx, u8* buf) {
     cf_poly1305* ctx = vctx;
     noinit u32[17] c;
@@ -19970,8 +19597,7 @@ void poly1305_whole_block(void* vctx, u8* buf) {
     c[16] = 1;
     poly1305_block(ctx, c);
 }
-}
-private {
+
 void poly1305_last_block(cf_poly1305* ctx) {
     u32[17] c;
     u64 i;
@@ -19982,9 +19608,11 @@ void poly1305_last_block(cf_poly1305* ctx) {
     poly1305_block(ctx, c);
 }
 }
+
 void cf_poly1305_update(cf_poly1305* ctx, u8* buf, u64 nbytes) {
     cf_blockwise_accumulate(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), buf, nbytes, poly1305_whole_block, ctx);
 }
+
 void cf_poly1305_finish(cf_poly1305* ctx, u8* out) {
     if ctx.npartial != 0 {
         poly1305_last_block(ctx);
@@ -20002,68 +19630,30 @@ void cf_poly1305_finish(cf_poly1305* ctx, u8* out) {
     }
     mem_clean(ctx, cast(u64, sizeof(*ctx)));
 }
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 private {
 i32 process(u8* key, u8* nonce, u8* header, u64 nheader, u8* input, u64 nbytes, u8* output, i32 mode, u8* tag) {
     u8[16] fullnonce;
     memcpy(fullnonce + 4, nonce, cast(u64, 12));
     u8[32] polykey;
-    cf_chacha20_ctx chacha;
+    noinit cf_chacha20_ctx chacha;
     cf_chacha20_init_custom(&chacha, key, 32, fullnonce, 4);
     cf_chacha20_cipher(&chacha, polykey, polykey, cast(u64, sizeof(polykey)));
-    cf_poly1305 poly;
+    noinit cf_poly1305 poly;
     cf_poly1305_init(&poly, polykey, polykey + 16);
     mem_clean(polykey, cast(u64, sizeof(polykey)));
     cf_chacha20_cipher(&chacha, polykey, polykey, cast(u64, sizeof(polykey)));
     mem_clean(polykey, cast(u64, sizeof(polykey)));
     u8[16] padbuf;
     cf_poly1305_update(&poly, header, nheader);
-    cf_poly1305_update(&poly, padbuf, 16 - (nheader & 15));
+    cf_poly1305_update(&poly, padbuf, 16 - (nheader & 0xf));
     if mode == 1 {
         cf_chacha20_cipher(&chacha, input, output, nbytes);
         cf_poly1305_update(&poly, output, nbytes);
     } else {
         cf_poly1305_update(&poly, input, nbytes);
     }
-    cf_poly1305_update(&poly, padbuf, 16 - (nbytes & 15));
+    cf_poly1305_update(&poly, padbuf, 16 - (nbytes & 0xf));
     write64_le(nheader, padbuf);
     write64_le(nbytes, padbuf + 8);
     cf_poly1305_update(&poly, padbuf, cast(u64, sizeof(padbuf)));
@@ -20087,69 +19677,21 @@ i32 process(u8* key, u8* nonce, u8* header, u64 nheader, u8* input, u64 nbytes, 
     }
 }
 }
+
 void cf_chacha20poly1305_encrypt(u8* key, u8* nonce, u8* header, u64 nheader, u8* plaintext, u64 nbytes, u8* ciphertext, u8* tag) {
     process(key, nonce, header, nheader, plaintext, nbytes, ciphertext, 1, tag);
 }
+
 i32 cf_chacha20poly1305_decrypt(u8* key, u8* nonce, u8* header, u64 nheader, u8* ciphertext, u64 nbytes, u8* tag, u8* plaintext) {
     noinit u8[16] ourtag;
     memcpy(ourtag, tag, cast(u64, sizeof(ourtag)));
     return process(key, nonce, header, nheader, ciphertext, nbytes, plaintext, 0, ourtag);
 }
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
-/*
- * cifra - embedded cryptography library
- * Written in 2014 by Joseph Birr-Pixton <jpixton@gmail.com>
- *
- * To the extent possible under law, the author(s) have dedicated all
- * copyright and related and neighboring rights to this software to the
- * public domain worldwide. This software is distributed without any
- * warranty.
- *
- * You should have received a copy of the CC0 Public Domain Dedication
- * along with this software. If not, see
- * <http://creativecommons.org/publicdomain/zero/1.0/>.
- */
+
 void cf_blockwise_accumulate(u8* partial, u64* npartial, u64 nblock, void* inp, u64 nbytes, cf_blockwise_in_fn process, void* ctx) {
     cf_blockwise_accumulate_final(partial, npartial, nblock, inp, nbytes, process, process, ctx);
 }
+
 void cf_blockwise_accumulate_final(u8* partial, u64* npartial, u64 nblock, void* inp, u64 nbytes, cf_blockwise_in_fn process, cf_blockwise_in_fn process_final, void* ctx) {
     u8* bufin = inp;
     while true {
@@ -20216,6 +19758,7 @@ void cf_blockwise_accumulate_final(u8* partial, u64* npartial, u64 nblock, void*
         }
     }
 }
+
 void cf_blockwise_xor(u8* partial, u64* npartial, u64 nblock, void* inp, void* outp, u64 nbytes, cf_blockwise_out_fn process, void* ctx) {
     u8* inb = inp;
     u8* outb = outp;
@@ -20251,6 +19794,7 @@ void cf_blockwise_xor(u8* partial, u64* npartial, u64 nblock, void* inp, void* o
         inb += taken;
     }
 }
+
 void cf_blockwise_acc_byte(u8* partial, u64* npartial, u64 nblock, u8 byte, u64 nbytes, cf_blockwise_in_fn process, void* ctx) {
     i32 filled = 0;
     while nbytes != 0 {
@@ -20271,6 +19815,7 @@ void cf_blockwise_acc_byte(u8* partial, u64* npartial, u64 nblock, u8 byte, u64 
         nbytes -= count;
     }
 }
+
 void cf_blockwise_acc_pad(u8* partial, u64* npartial, u64 nblock, u8 fbyte, u8 mbyte, u8 lbyte, u64 nbytes, cf_blockwise_in_fn process, void* ctx) {
     switch nbytes {
         case 0: {
@@ -20294,34 +19839,37 @@ void cf_blockwise_acc_pad(u8* partial, u64* npartial, u64 nblock, u8 fbyte, u8 m
         }
     }
 }
-private { u64 extension_bitmap_testandset__CH = cast(u64, 1) << cast(u64, 1 + 1); }
-private { u64 extension_bitmap_testandset__SH = cast(u64, 1) << cast(u64, 2 + 1); }
-private { u64 extension_bitmap_testandset__HRR = cast(u64, 1) << cast(u64, -1 + 1); }
-private { u64 extension_bitmap_testandset__EE = cast(u64, 1) << cast(u64, 8 + 1); }
-private { u64 extension_bitmap_testandset__CR = cast(u64, 1) << cast(u64, 13 + 1); }
-private { u64 extension_bitmap_testandset__CT = cast(u64, 1) << cast(u64, 11 + 1); }
-private { u64 extension_bitmap_testandset__NST = cast(u64, 1) << cast(u64, 4 + 1); }
-private { st_ptls_log_point_t log_secret__logpoint = st_ptls_log_point_t{.name = "picotls:new_secret"}; }
-private { u64 client_setup_ech_grease__x25519_key_size = 32; }
-private { __arr_void_4[2] setup_traffic_protection__log_labels = {{null, "CLIENT_EARLY_TRAFFIC_SECRET", "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0"}, {null, null, "SERVER_HANDSHAKE_TRAFFIC_SECRET", "SERVER_TRAFFIC_SECRET_0"}}; }
-private { st_ptls_log_point_t log_client_random__logpoint = st_ptls_log_point_t{.name = "picotls:client_random"}; }
-private { u16[7] push_signature_algorithms__default_algos = {2053, 2052, 1283, 1027, 1025, 513, UINT16_MAX}; }
-private { st_ptls_log_point_t client_ech_select_hello__logpoint = st_ptls_log_point_t{.name = "picotls:ech_selection"}; }
-private { ptls_raw_extension_t client_handle_encrypted_extensions__no_unknown_extensions = ptls_raw_extension_t{.type = UINT16_MAX}; }
-private { ptls_emit_certificate_t send_certificate__default_emit_certificate = ptls_emit_certificate_t{default_emit_certificate_cb}; }
-private { st_ptls_log_point_t server_handle_hello__logpoint = st_ptls_log_point_t{.name = "picotls:ech_selection"}; }
-private { st_ptls_log_point_t ptls_client_new__logpoint = st_ptls_log_point_t{.name = "picotls:new"}; }
-private { st_ptls_log_point_t ptls_server_new__logpoint = st_ptls_log_point_t{.name = "picotls:new"}; }
-private { st_ptls_log_point_t ptls_free__logpoint = st_ptls_log_point_t{.name = "picotls:free"}; }
-private { st_ptls_log_point_t handle_client_handshake_message__logpoint = st_ptls_log_point_t{.name = "picotls:receive_message"}; }
-private { st_ptls_log_point_t handle_server_handshake_message__logpoint = st_ptls_log_point_t{.name = "picotls:receive_message"}; }
-
-// transminc: C #define values surfaced as compile-time configuration
-@define "CRYPTO_ARGON2_D" 0
-@define "CRYPTO_ARGON2_I" 1
-@define "CRYPTO_ARGON2_ID" 2
-@define "P_W_WIDTH" 3
-@define "B_W_WIDTH" 5
+private {
+u64 extension_bitmap_testandset__CH = cast(u64, 1) << cast(u64, 1 + 1);
+u64 extension_bitmap_testandset__SH = cast(u64, 1) << cast(u64, 2 + 1);
+u64 extension_bitmap_testandset__HRR = cast(u64, 1) << cast(u64, -1 + 1);
+u64 extension_bitmap_testandset__EE = cast(u64, 1) << cast(u64, 8 + 1);
+u64 extension_bitmap_testandset__CR = cast(u64, 1) << cast(u64, 13 + 1);
+u64 extension_bitmap_testandset__CT = cast(u64, 1) << cast(u64, 11 + 1);
+u64 extension_bitmap_testandset__NST = cast(u64, 1) << cast(u64, 4 + 1);
+st_ptls_log_point_t log_secret__logpoint = st_ptls_log_point_t{.name = "picotls:new_secret"};
+u64 client_setup_ech_grease__x25519_key_size = 32;
+u8*:[2][4] setup_traffic_protection__log_labels = {
+    {
+        null, "CLIENT_EARLY_TRAFFIC_SECRET", "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+    },
+    {null, null, "SERVER_HANDSHAKE_TRAFFIC_SECRET", "SERVER_TRAFFIC_SECRET_0"},
+};
+st_ptls_log_point_t log_client_random__logpoint = st_ptls_log_point_t{.name = "picotls:client_random"};
+u16[7] push_signature_algorithms__default_algos = {
+    0x0805, 0x0804, 0x0503, 0x0403, 0x0401, 0x0201, UINT16_MAX,
+};
+st_ptls_log_point_t client_ech_select_hello__logpoint = st_ptls_log_point_t{.name = "picotls:ech_selection"};
+ptls_raw_extension_t client_handle_encrypted_extensions__no_unknown_extensions = ptls_raw_extension_t{.type = UINT16_MAX};
+ptls_emit_certificate_t send_certificate__default_emit_certificate = ptls_emit_certificate_t{default_emit_certificate_cb};
+st_ptls_log_point_t server_handle_hello__logpoint = st_ptls_log_point_t{.name = "picotls:ech_selection"};
+st_ptls_log_point_t ptls_client_new__logpoint = st_ptls_log_point_t{.name = "picotls:new"};
+st_ptls_log_point_t ptls_server_new__logpoint = st_ptls_log_point_t{.name = "picotls:new"};
+st_ptls_log_point_t ptls_free__logpoint = st_ptls_log_point_t{.name = "picotls:free"};
+st_ptls_log_point_t handle_client_handshake_message__logpoint = st_ptls_log_point_t{.name = "picotls:receive_message"};
+st_ptls_log_point_t handle_server_handshake_message__logpoint = st_ptls_log_point_t{.name = "picotls:receive_message"};
+}
 
 ////////////////////////////////////
 /// Arithmetic modulo 2^255 - 19 ///
@@ -20330,7 +19878,6 @@ private { st_ptls_log_point_t handle_server_handshake_message__logpoint = st_ptl
 //  A bit bigger than TweetNaCl, over 4 times faster.
 // field element
 type fe = i32[10];
-type __arr_u8_16 = u8[16];
 // Authenticated stream
 // --------------------
 struct crypto_aead_ctx {
@@ -20425,120 +19972,111 @@ struct slide_ctx {
     u8 next_check;
 }
 
-private { u8[128] mc_zero; }
+private {
+u8[128] mc_zero;
+
 // returns the smallest positive integer y such that
 // (x + y) % pow_2  == 0
 // Basically, y is the "gap" missing to align x.
 // Only works when pow_2 is a power of 2.
 // Note: we use ~x+1 instead of -x to avoid compiler warnings
-private {
 u64 mc_gap(u64 x, u64 pow_2) {
     return ~x + 1 & pow_2 - 1;
 }
-}
-private {
+
 u32 mc_load24_le(u8* s) {
     return cast(u32, s[0]) << 0 | cast(u32, s[1]) << 8 | cast(u32, s[2]) << 16;
 }
-}
-private {
+
 u32 mc_load32_le(u8* s) {
     return cast(u32, s[0]) << 0 | cast(u32, s[1]) << 8 | cast(u32, s[2]) << 16 | cast(u32, s[3]) << 24;
 }
-}
-private {
+
 u64 mc_load64_le(u8* s) {
     return mc_load32_le(s) | cast(u64, mc_load32_le(s + 4)) << 32;
 }
-}
-private {
+
 void mc_store32_le(u8* out, u32 in) {
-    out[0] = cast(u8, in & 255);
-    out[1] = cast(u8, in >> 8 & 255);
-    out[2] = cast(u8, in >> 16 & 255);
-    out[3] = cast(u8, in >> 24 & 255);
+    out[0] = cast(u8, in & 0xff);
+    out[1] = cast(u8, in >> 8 & 0xff);
+    out[2] = cast(u8, in >> 16 & 0xff);
+    out[3] = cast(u8, in >> 24 & 0xff);
 }
-}
-private {
+
 void mc_store64_le(u8* out, u64 in) {
     mc_store32_le(out, cast(u32, in));
     mc_store32_le(out + 4, cast(u32, in >> 32));
 }
-}
-private {
+
 void mc_load32_le_buf(u32* dst, u8* src, u64 size) {
     for u64 i = 0; i < size; i++ {
         dst[i] = mc_load32_le(src + i * 4);
     }
 }
-}
-private {
+
 void mc_load64_le_buf(u64* dst, u8* src, u64 size) {
     for u64 i = 0; i < size; i++ {
         dst[i] = mc_load64_le(src + i * 8);
     }
 }
-}
-private {
+
 void mc_store32_le_buf(u8* dst, u32* src, u64 size) {
     for u64 i = 0; i < size; i++ {
         mc_store32_le(dst + i * 4, src[i]);
     }
 }
-}
-private {
+
 void mc_store64_le_buf(u8* dst, u64* src, u64 size) {
     for u64 i = 0; i < size; i++ {
         mc_store64_le(dst + i * 8, src[i]);
     }
 }
-}
-private {
+
 u64 mc_rotr64(u64 x, u64 n) {
     return x >> n ^ x << 64 - n;
 }
-}
-private {
+
 u32 mc_rotl32(u32 x, u32 n) {
     return x << n ^ x >> 32 - n;
 }
-}
-private {
+
 i32 mc_neq0(u64 diff) {
     u64 half = diff >> 32 | cast(u32, diff);
     return cast(i32, (1 & half - 1 >> 32) - 1);
 }
-}
-private {
+
 u64 mc_x16(u8* a, u8* b) {
     return mc_load64_le(a + 0) ^ mc_load64_le(b + 0) | mc_load64_le(a + 8) ^ mc_load64_le(b + 8);
 }
-}
-private {
+
 u64 mc_x32(u8* a, u8* b) {
     return mc_x16(a, b) | mc_x16(a + 16, b + 16);
 }
-}
-private {
+
 u64 mc_x64(u8* a, u8* b) {
     return mc_x32(a, b) | mc_x32(a + 32, b + 32);
 }
 }
+
 i32 crypto_verify16(u8* a, u8* b) {
     return mc_neq0(mc_x16(a, b));
 }
+
 i32 crypto_verify32(u8* a, u8* b) {
     return mc_neq0(mc_x32(a, b));
 }
+
 i32 crypto_verify64(u8* a, u8* b) {
     return mc_neq0(mc_x64(a, b));
 }
+
 void crypto_wipe(void* secret, u64 size) {
     var v_secret = cast(u8*, secret);
     for u64 _i_ = 0; _i_ < size; _i_++ {
         v_secret[_i_] = 0;
     }
 }
+
 /////////////////
 /// Chacha 20 ///
 /////////////////
@@ -20643,8 +20181,9 @@ void mc_chacha20_rounds(u32* out, u32* in) {
     out[14] = t14;
     out[15] = t15;
 }
+u8* mc_chacha20_constant = cast(u8*, "expand 32-byte k");
 }
-private { u8* mc_chacha20_constant = cast(u8*, "expand 32-byte k"); }
+
 // 16 bytes
 void crypto_chacha20_h(u8* out, u8* key, u8* in) {
     noinit u32[16] block;
@@ -20656,6 +20195,7 @@ void crypto_chacha20_h(u8* out, u8* key, u8* in) {
     mc_store32_le_buf(out + 16, block + 12, 4);
     crypto_wipe(block, cast(u64, sizeof(block)));
 }
+
 u64 crypto_chacha20_djb(u8* cipher_text, u8* plain_text, u64 text_size, u8* key, u8* nonce, u64 ctr) {
     noinit u32[16] input;
     mc_load32_le_buf(input, mc_chacha20_constant, 4);
@@ -20706,10 +20246,12 @@ u64 crypto_chacha20_djb(u8* cipher_text, u8* plain_text, u64 text_size, u8* key,
     crypto_wipe(input, cast(u64, sizeof(input)));
     return ctr;
 }
+
 u32 crypto_chacha20_ietf(u8* cipher_text, u8* plain_text, u64 text_size, u8* key, u8* nonce, u32 ctr) {
     u64 big_ctr = ctr + (cast(u64, mc_load32_le(nonce)) << 32);
     return cast(u32, crypto_chacha20_djb(cipher_text, plain_text, text_size, key, nonce + 4, big_ctr));
 }
+
 u64 crypto_chacha20_x(u8* cipher_text, u8* plain_text, u64 text_size, u8* key, u8* nonce, u64 ctr) {
     noinit u8[32] sub_key;
     crypto_chacha20_h(sub_key, key, nonce);
@@ -20717,6 +20259,7 @@ u64 crypto_chacha20_x(u8* cipher_text, u8* plain_text, u64 text_size, u8* key, u
     crypto_wipe(sub_key, cast(u64, sizeof(sub_key)));
     return ctr;
 }
+
 /////////////////
 /// Poly 1305 ///
 /////////////////
@@ -20759,15 +20302,15 @@ void mc_poly_blocks(crypto_poly1305_ctx* ctx, u8* in, u64 nb_blocks, u32 end) {
         u64 x3 = s0 * r3 + s1 * r2 + s2 * r1 + s3 * r0 + s4 * rr3;
         u32 x4 = s4 * rr4;
         var u5 = cast(u32, x4 + (x3 >> 32));
-        u64 u0 = (u5 >> 2) * 5 + (x0 & 4294967295);
-        u64 u1 = (u0 >> 32) + (x1 & 4294967295) + (x0 >> 32);
-        u64 u2 = (u1 >> 32) + (x2 & 4294967295) + (x1 >> 32);
-        u64 u3 = (u2 >> 32) + (x3 & 4294967295) + (x2 >> 32);
+        u64 u0 = (u5 >> 2) * 5 + (x0 & 0xffffffff);
+        u64 u1 = (u0 >> 32) + (x1 & 0xffffffff) + (x0 >> 32);
+        u64 u2 = (u1 >> 32) + (x2 & 0xffffffff) + (x1 >> 32);
+        u64 u3 = (u2 >> 32) + (x3 & 0xffffffff) + (x2 >> 32);
         var u4 = cast(u32, (u3 >> 32) + (u5 & 3));
-        h0 = cast(u32, u0 & 4294967295);
-        h1 = cast(u32, u1 & 4294967295);
-        h2 = cast(u32, u2 & 4294967295);
-        h3 = cast(u32, u3 & 4294967295);
+        h0 = cast(u32, u0 & 0xffffffff);
+        h1 = cast(u32, u1 & 0xffffffff);
+        h2 = cast(u32, u2 & 0xffffffff);
+        h3 = cast(u32, u3 & 0xffffffff);
         h4 = u4;
     }
     ctx.h[0] = h0;
@@ -20777,6 +20320,7 @@ void mc_poly_blocks(crypto_poly1305_ctx* ctx, u8* in, u64 nb_blocks, u32 end) {
     ctx.h[4] = h4;
 }
 }
+
 void crypto_poly1305_init(crypto_poly1305_ctx* ctx, u8* key) {
     for u64 _i_ = 0; _i_ < 5; _i_++ {
         ctx.h[_i_] = 0;
@@ -20785,12 +20329,13 @@ void crypto_poly1305_init(crypto_poly1305_ctx* ctx, u8* key) {
     mc_load32_le_buf(ctx.r, key, 4);
     mc_load32_le_buf(ctx.pad, key + 16, 4);
     for u64 i = 0; i < 1; i++ {
-        ctx.r[i] &= 268435455;
+        ctx.r[i] &= 0x0fffffff;
     }
     for u64 i = 1; i < 4; i++ {
-        ctx.r[i] &= 268435452;
+        ctx.r[i] &= 0x0ffffffc;
     }
 }
+
 void crypto_poly1305_update(crypto_poly1305_ctx* ctx, u8* message, u64 message_size) {
     if message_size == 0 {
         return;
@@ -20815,6 +20360,7 @@ void crypto_poly1305_update(crypto_poly1305_ctx* ctx, u8* message, u64 message_s
         ctx.c_idx++;
     }
 }
+
 void crypto_poly1305_final(crypto_poly1305_ctx* ctx, u8* mac) {
     if ctx.c_idx != 0 {
         for u64 _i_ = 0; _i_ < 16 - ctx.c_idx; _i_++ {
@@ -20837,8 +20383,9 @@ void crypto_poly1305_final(crypto_poly1305_ctx* ctx, u8* mac) {
     }
     crypto_wipe(ctx, cast(u64, sizeof(*ctx)));
 }
+
 void crypto_poly1305(u8* mac, u8* message, u64 message_size, u8* key) {
-    crypto_poly1305_ctx ctx;
+    noinit crypto_poly1305_ctx ctx;
     crypto_poly1305_init(&ctx, key);
     crypto_poly1305_update(&ctx, message, message_size);
     crypto_poly1305_final(&ctx, mac);
@@ -20846,8 +20393,12 @@ void crypto_poly1305(u8* mac, u8* message, u64 message_size, u8* key) {
 ////////////////
 /// BLAKE2 b ///
 ////////////////
-private { u64[8] mc_iv = {7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809}; }
 private {
+u64[8] mc_iv = {
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+};
+
 void mc_blake2b_compress(crypto_blake2b_ctx* ctx, i32 is_last_block) {
     u64* x = ctx.input_offset;
     u64 y = ctx.input_idx;
@@ -21719,11 +21270,12 @@ void mc_blake2b_compress(crypto_blake2b_ctx* ctx, i32 is_last_block) {
     ctx.hash[7] ^= v7 ^ v15;
 }
 }
+
 void crypto_blake2b_keyed_init(crypto_blake2b_ctx* ctx, u64 hash_size, u8* key, u64 key_size) {
     for u64 _i_ = 0; _i_ < 8; _i_++ {
         ctx.hash[_i_] = mc_iv[_i_];
     }
-    ctx.hash[0] ^= 16842752 ^ key_size << 8 ^ hash_size;
+    ctx.hash[0] ^= 0x01010000 ^ key_size << 8 ^ hash_size;
     ctx.input_offset[0] = 0;
     ctx.input_offset[1] = 0;
     ctx.hash_size = hash_size;
@@ -21740,9 +21292,11 @@ void crypto_blake2b_keyed_init(crypto_blake2b_ctx* ctx, u64 hash_size, u8* key, 
         ctx.input_idx = 128;
     }
 }
+
 void crypto_blake2b_init(crypto_blake2b_ctx* ctx, u64 hash_size) {
     crypto_blake2b_keyed_init(ctx, hash_size, null, 0);
 }
+
 void crypto_blake2b_update(crypto_blake2b_ctx* ctx, u8* message, u64 message_size) {
     if message_size == 0 {
         return;
@@ -21798,25 +21352,29 @@ void crypto_blake2b_update(crypto_blake2b_ctx* ctx, u8* message, u64 message_siz
         }
     }
 }
+
 void crypto_blake2b_final(crypto_blake2b_ctx* ctx, u8* hash) {
     mc_blake2b_compress(ctx, 1);
     u64 hash_size = ctx.hash_size <= 64 ? ctx.hash_size : 64;
     u64 nb_words = hash_size >> 3;
     mc_store64_le_buf(hash, ctx.hash, nb_words);
     for u64 i = nb_words << 3; i < hash_size; i++ {
-        hash[i] = cast(u8, ctx.hash[i >> 3] >> 8 * (i & 7) & 255);
+        hash[i] = cast(u8, ctx.hash[i >> 3] >> 8 * (i & 7) & 0xff);
     }
     crypto_wipe(ctx, cast(u64, sizeof(*ctx)));
 }
+
 void crypto_blake2b_keyed(u8* hash, u64 hash_size, u8* key, u64 key_size, u8* message, u64 message_size) {
-    crypto_blake2b_ctx ctx;
+    noinit crypto_blake2b_ctx ctx;
     crypto_blake2b_keyed_init(&ctx, hash_size, key, key_size);
     crypto_blake2b_update(&ctx, message, message_size);
     crypto_blake2b_final(&ctx, hash);
 }
+
 void crypto_blake2b(u8* hash, u64 hash_size, u8* msg, u64 msg_size) {
     crypto_blake2b_keyed(hash, hash_size, null, 0, msg, msg_size);
 }
+
 // updates a BLAKE2 hash with a 32 bit word, little endian.
 private {
 void mc_blake_update_32(crypto_blake2b_ctx* ctx, u32 input) {
@@ -21825,35 +21383,31 @@ void mc_blake_update_32(crypto_blake2b_ctx* ctx, u32 input) {
     crypto_blake2b_update(ctx, buf, 4);
     crypto_wipe(buf, cast(u64, sizeof(buf)));
 }
-}
-private {
+
 void mc_blake_update_32_buf(crypto_blake2b_ctx* ctx, u8* buf, u32 size) {
     mc_blake_update_32(ctx, size);
     crypto_blake2b_update(ctx, buf, cast(u64, size));
 }
-}
-private {
+
 void mc_copy_block(blk* o, blk* in) {
     for u64 i = 0; i < 128; i++ {
         o.a[i] = in.a[i];
     }
 }
-}
-private {
+
 void mc_xor_block(blk* o, blk* in) {
     for u64 i = 0; i < 128; i++ {
         o.a[i] ^= in.a[i];
     }
 }
-}
+
 // Hash with a virtually unlimited digest size.
 // Doesn't extract more entropy than the base hash function.
 // Mainly used for filling a whole kilobyte block with pseudo-random bytes.
 // (One could use a stream cipher with a seed hash as the key, but
 //  this would introduce another dependency —and point of failure.)
-private {
 void mc_extended_hash(u8* digest, u32 digest_size, u8* input, u32 input_size) {
-    crypto_blake2b_ctx ctx;
+    noinit crypto_blake2b_ctx ctx;
     crypto_blake2b_init(&ctx, cast(u64, digest_size <= 64 ? digest_size : 64));
     mc_blake_update_32(&ctx, digest_size);
     crypto_blake2b_update(&ctx, input, cast(u64, input_size));
@@ -21872,9 +21426,8 @@ void mc_extended_hash(u8* digest, u32 digest_size, u8* input, u32 input_size) {
         crypto_blake2b(digest + out, cast(u64, digest_size - 32 * r), digest + in, 64);
     }
 }
-}
+
 // Core of the compression function G.  Computes Z from R in place.
-private {
 void mc_g_rounds(blk* b) {
     for i32 i = 0; i < 128; i += 16 {
         b.a[i] += b.a[i + 4] + (cast(u64, cast(u32, b.a[i])) * cast(u64, cast(u32, b.a[i + 4])) << 1);
@@ -22075,6 +21628,7 @@ void mc_g_rounds(blk* b) {
 }
 }
 crypto_argon2_extras crypto_argon2_no_extras;
+
 void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_config config, crypto_argon2_inputs inputs, crypto_argon2_extras extras) {
     u32 segment_size = config.nb_blocks / config.nb_lanes / 4;
     u32 lane_size = segment_size * 4;
@@ -22082,13 +21636,13 @@ void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_confi
     var blocks = cast(blk*, work_area);
     {
         noinit u8[72] initial_hash;
-        crypto_blake2b_ctx ctx;
+        noinit crypto_blake2b_ctx ctx;
         crypto_blake2b_init(&ctx, 64);
         mc_blake_update_32(&ctx, config.nb_lanes);
         mc_blake_update_32(&ctx, hash_size);
         mc_blake_update_32(&ctx, config.nb_blocks);
         mc_blake_update_32(&ctx, config.nb_passes);
-        mc_blake_update_32(&ctx, 19);
+        mc_blake_update_32(&ctx, 0x13);
         mc_blake_update_32(&ctx, config.algorithm);
         mc_blake_update_32_buf(&ctx, inputs.pass, inputs.pass_size);
         mc_blake_update_32_buf(&ctx, inputs.salt, inputs.salt_size);
@@ -22108,7 +21662,7 @@ void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_confi
         crypto_wipe(hash_area, cast(u64, sizeof(hash_area)));
     }
     i32 constant_time = config.algorithm != 0;
-    blk tmp;
+    noinit blk tmp;
     for u32 pass = 0; pass < config.nb_passes; pass++ {
         for u32 slice = 0; slice < 4; slice++ {
             var pass_offset = cast(u32, pass == 0 && slice == 0 ? 2 : 0);
@@ -22117,7 +21671,7 @@ void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_confi
                 constant_time = 0;
             }
             for u32 segment = 0; segment < config.nb_lanes; segment++ {
-                blk index_block;
+                noinit blk index_block;
                 u32 index_ctr = 1;
                 for u32 block = pass_offset; block < segment_size; block++ {
                     u32 lane_offset = segment * lane_size;
@@ -22154,7 +21708,7 @@ void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_confi
                     u32 nb_segments = pass == 0 ? slice : 3;
                     u64 lane = pass == 0 && slice == 0 ? segment : (index_seed >> 32) % config.nb_lanes;
                     u32 window_size = nb_segments * segment_size + (lane == segment ? block - 1 : block == 0 ? cast(u32, -1) : 0);
-                    u64 j1 = index_seed & 4294967295;
+                    u64 j1 = index_seed & 0xffffffff;
                     u64 x = j1 * j1 >> 32;
                     u64 y = window_size * x >> 32;
                     u64 z = window_size - 1 - y;
@@ -22202,58 +21756,70 @@ void crypto_argon2(u8* hash, u32 hash_size, void* work_area, crypto_argon2_confi
 // lop_x, lop_y: low order point in Edwards coordinates
 // ufactor     : -sqrt(-1) * 2
 // A2          : 486662^2  (A squared)
-private { fe mc_fe_one = fe{1, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
-private { fe mc_sqrtm1 = fe{-32595792, -7943725, 9377950, 3500415, 12389472, -272473, -25146209, -2005654, 326686, 11406482}; }
-private { fe mc_d = fe{-10913610, 13857413, -15372611, 6949391, 114729, -8787816, -6275908, -3247719, -18696448, -12055116}; }
-private { fe mc_D2 = fe{-21827239, -5839606, -30745221, 13898782, 229458, 15978800, -12551817, -6495438, 29715968, 9444199}; }
-private { fe mc_lop_x = fe{21352778, 5345713, 4660180, -8347857, 24143090, 14568123, 30185756, -12247770, -33528939, 8345319}; }
-private { fe mc_lop_y = fe{-6952922, -1265500, 6862341, -7057498, -4037696, -5447722, 31680899, -15325402, -19365852, 1569102}; }
-private { fe mc_ufactor = fe{-1917299, 15887451, -18755900, -7000830, -24778944, 544946, -16816446, 4011309, -653372, 10741468}; }
-private { fe mc_A2 = fe{12721188, 3529, 0, 0, 0, 0, 0, 0, 0, 0}; }
 private {
+fe mc_fe_one = fe{1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+fe mc_sqrtm1 = fe{
+    -32595792, -7943725, 9377950, 3500415, 12389472, -272473, -25146209, -2005654, 326686, 11406482,
+};
+fe mc_d = fe{
+    -10913610, 13857413, -15372611, 6949391, 114729, -8787816, -6275908, -3247719, -18696448,
+    -12055116,
+};
+fe mc_D2 = fe{
+    -21827239, -5839606, -30745221, 13898782, 229458, 15978800, -12551817, -6495438, 29715968,
+    9444199,
+};
+fe mc_lop_x = fe{
+    21352778, 5345713, 4660180, -8347857, 24143090, 14568123, 30185756, -12247770, -33528939,
+    8345319,
+};
+fe mc_lop_y = fe{
+    -6952922, -1265500, 6862341, -7057498, -4037696, -5447722, 31680899, -15325402, -19365852,
+    1569102,
+};
+fe mc_ufactor = fe{
+    -1917299, 15887451, -18755900, -7000830, -24778944, 544946, -16816446, 4011309, -653372,
+    10741468,
+};
+fe mc_A2 = fe{12721188, 3529, 0, 0, 0, 0, 0, 0, 0, 0};
+
 void mc_fe_0(i32* h) {
     for u64 _i_ = 0; _i_ < 10; _i_++ {
         h[_i_] = 0;
     }
 }
-}
-private {
+
 void mc_fe_1(i32* h) {
     h[0] = 1;
     for u64 _i_ = 0; _i_ < 9; _i_++ {
         (h + 1)[_i_] = 0;
     }
 }
-}
-private {
+
 void mc_fe_copy(i32* h, i32* f) {
     for u64 i = 0; i < 10; i++ {
         h[i] = f[i];
     }
 }
-}
-private {
+
 void mc_fe_neg(i32* h, i32* f) {
     for u64 i = 0; i < 10; i++ {
         h[i] = -f[i];
     }
 }
-}
-private {
+
 void mc_fe_add(i32* h, i32* f, i32* g) {
     for u64 i = 0; i < 10; i++ {
         h[i] = f[i] + g[i];
     }
 }
-}
-private {
+
 void mc_fe_sub(i32* h, i32* f, i32* g) {
     for u64 i = 0; i < 10; i++ {
         h[i] = f[i] - g[i];
     }
 }
-}
-private {
+
 void mc_fe_cswap(i32* f, i32* g, i32 b) {
     i32 mask = -b;
     for u64 i = 0; i < 10; i++ {
@@ -22262,8 +21828,7 @@ void mc_fe_cswap(i32* f, i32* g, i32 b) {
         g[i] = g[i] ^ x;
     }
 }
-}
-private {
+
 void mc_fe_ccopy(i32* f, i32* g, i32 b) {
     i32 mask = -b;
     for u64 i = 0; i < 10; i++ {
@@ -22271,7 +21836,7 @@ void mc_fe_ccopy(i32* f, i32* g, i32 b) {
         f[i] = f[i] ^ x;
     }
 }
-}
+
 // Signed carry propagation
 // ------------------------
 //
@@ -22386,9 +21951,8 @@ void mc_fe_ccopy(i32* f, i32* g, i32 b) {
 // which uses that bit to denote the sign of x.
 // Elligator however uses positive representatives,
 // which means ignoring 2 bits instead.
-private {
 void mc_fe_frombytes_mask(i32* h, u8* s, u32 nb_mask) {
-    u32 mask = 16777215 >> nb_mask;
+    u32 mask = 0xffffff >> nb_mask;
     var t0 = cast(i64, mc_load32_le(s));
     var t1 = cast(i64, mc_load24_le(s + 4) << 6);
     var t2 = cast(i64, mc_load24_le(s + 7) << 5);
@@ -22447,12 +22011,11 @@ void mc_fe_frombytes_mask(i32* h, u8* s, u32 nb_mask) {
     h[8] = cast(i32, t8);
     h[9] = cast(i32, t9);
 }
-}
-private {
+
 void mc_fe_frombytes(i32* h, u8* s) {
     mc_fe_frombytes_mask(h, s, 1);
 }
-}
+
 // Precondition
 //   |h[0]|, |h[2]|, |h[4]|, |h[6]|, |h[8]|  <  1.1 * 2^25
 //   |h[1]|, |h[3]|, |h[5]|, |h[7]|, |h[9]|  <  1.1 * 2^24
@@ -22464,7 +22027,6 @@ void mc_fe_frombytes(i32* h, u8* s) {
 //   limbs down to their tight positive range.
 // - If h is negative, we also need to add 2^255-19 to it.
 //   Or just remove 19 and chop off any excess bit.
-private {
 void mc_fe_tobytes(u8* s, i32* h) {
     noinit i32[10] t;
     for u64 _i_ = 0; _i_ < 10; _i_++ {
@@ -22496,7 +22058,7 @@ void mc_fe_tobytes(u8* s, i32* h) {
     mc_store32_le(s + 28, cast(u32, t[8]) >> 20 | cast(u32, t[9]) << 6);
     crypto_wipe(t, cast(u64, sizeof(t)));
 }
-}
+
 // Precondition
 // -------------
 //   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
@@ -22504,7 +22066,6 @@ void mc_fe_tobytes(u8* s, i32* h) {
 //
 //   |g0|, |g2|, |g4|, |g6|, |g8|  <  1.65 * 2^26
 //   |g1|, |g3|, |g5|, |g7|, |g9|  <  1.65 * 2^25
-private {
 void mc_fe_mul_small(i32* h, i32* f, i32 g) {
     i64 t0 = f[0] * cast(i64, g);
     i64 t1 = f[1] * cast(i64, g);
@@ -22564,7 +22125,7 @@ void mc_fe_mul_small(i32* h, i32* f, i32 g) {
     h[8] = cast(i32, t8);
     h[9] = cast(i32, t9);
 }
-}
+
 // Precondition
 // -------------
 //   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
@@ -22572,7 +22133,6 @@ void mc_fe_mul_small(i32* h, i32* f, i32 g) {
 //
 //   |g0|, |g2|, |g4|, |g6|, |g8|  <  1.65 * 2^26
 //   |g1|, |g3|, |g5|, |g7|, |g9|  <  1.65 * 2^25
-private {
 void mc_fe_mul(i32* h, i32* f, i32* g) {
     i32 f0 = f[0];
     i32 f1 = f[1];
@@ -22666,14 +22226,13 @@ void mc_fe_mul(i32* h, i32* f, i32* g) {
     h[8] = cast(i32, t8);
     h[9] = cast(i32, t9);
 }
-}
+
 // Precondition
 // -------------
 //   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
 //   |f1|, |f3|, |f5|, |f7|, |f9|  <  1.65 * 2^25
 //
 // Note: we could use fe_mul() for this, but this is significantly faster
-private {
 void mc_fe_sq(i32* h, i32* f) {
     i32 f0 = f[0];
     i32 f1 = f[1];
@@ -22756,9 +22315,8 @@ void mc_fe_sq(i32* h, i32* f) {
     h[8] = cast(i32, t8);
     h[9] = cast(i32, t9);
 }
-}
+
 //  Parity check.  Returns 0 if even, 1 if odd
-private {
 i32 mc_fe_isodd(i32* f) {
     noinit u8[32] s;
     mc_fe_tobytes(s, f);
@@ -22766,9 +22324,8 @@ i32 mc_fe_isodd(i32* f) {
     crypto_wipe(s, cast(u64, sizeof(s)));
     return cast(i32, isodd);
 }
-}
+
 // Returns 1 if equal, 0 if not equal
-private {
 i32 mc_fe_isequal(i32* f, i32* g) {
     noinit u8[32] fs;
     noinit u8[32] gs;
@@ -22779,7 +22336,7 @@ i32 mc_fe_isequal(i32* f, i32* g) {
     crypto_wipe(gs, cast(u64, sizeof(gs)));
     return 1 + isdifferent;
 }
-}
+
 // Inverse square root.
 // Returns true if x is a square, false otherwise.
 // After the call:
@@ -22837,7 +22394,6 @@ i32 mc_fe_isequal(i32* f, i32* g) {
 //      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * sqrt(-1)^2
 //      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * -1
 //      x^((p-5)/8) * sqrt(-1) = -sqrt(sqrt(-1)/x) or sqrt(sqrt(-1)/x)
-private {
 i32 mc_invsqrt(i32* isr, i32* x) {
     noinit fe t0;
     noinit fe t1;
@@ -22908,7 +22464,7 @@ i32 mc_invsqrt(i32* isr, i32* x) {
     crypto_wipe(t2, cast(u64, sizeof(t2)));
     return p1 | m1 | z0;
 }
-}
+
 // Inverse in terms of inverse square root.
 // Requires two additional squarings to get rid of the sign.
 //
@@ -22917,7 +22473,6 @@ i32 mc_invsqrt(i32* isr, i32* x) {
 //
 // A fully optimised exponentiation by p-1 would save 6 field
 // multiplications, but it would require more code.
-private {
 void mc_fe_invert(i32* out, i32* x) {
     noinit fe tmp;
     mc_fe_sq(tmp, x);
@@ -22927,6 +22482,7 @@ void mc_fe_invert(i32* out, i32* x) {
     crypto_wipe(tmp, cast(u64, sizeof(tmp)));
 }
 }
+
 // trim a scalar for scalar multiplication
 void crypto_eddsa_trim_scalar(u8* out, u8* in) {
     for u64 _i_ = 0; _i_ < 32; _i_++ {
@@ -22936,6 +22492,7 @@ void crypto_eddsa_trim_scalar(u8* out, u8* in) {
     out[31] &= 127;
     out[31] |= 64;
 }
+
 // get bit from scalar at position i
 private {
 i32 mc_scalar_bit(u8* s, i32 i) {
@@ -22944,11 +22501,10 @@ i32 mc_scalar_bit(u8* s, i32 i) {
     }
     return cast(i32, s[i >> 3]) >> (i & 7) & 1;
 }
-}
+
 ///////////////
 /// X-25519 /// Taken from SUPERCOP's ref10 implementation.
 ///////////////
-private {
 void mc_scalarmult(u8* q, u8* scalar, u8* p, i32 nb_bits) {
     noinit fe x1;
     mc_fe_frombytes(x1, p);
@@ -23002,21 +22558,26 @@ void mc_scalarmult(u8* q, u8* scalar, u8* p, i32 nb_bits) {
     crypto_wipe(t1, cast(u64, sizeof(t1)));
 }
 }
+
 void crypto_x25519(u8* raw_shared_secret, u8* your_secret_key, u8* their_public_key) {
     noinit u8[32] e;
     crypto_eddsa_trim_scalar(e, your_secret_key);
     mc_scalarmult(raw_shared_secret, e, their_public_key, 255);
     crypto_wipe(e, cast(u64, sizeof(e)));
 }
+
 void crypto_x25519_public_key(u8* public_key, u8* secret_key) {
     crypto_x25519(public_key, secret_key, mc_crypto_x25519_public_key__base_point);
 }
 ///////////////////////////
 /// Arithmetic modulo L ///
 ///////////////////////////
-private { u32[8] mc_L = {1559614445, 1477600026, 2734136534, 350157278, 0, 0, 0, 268435456}; }
-//  p = a*b + p
 private {
+u32[8] mc_L = {
+    0x5cf5d3ed, 0x5812631a, 0xa2f79cd6, 0x14def9de, 0x00000000, 0x00000000, 0x00000000, 0x10000000,
+};
+
+//  p = a*b + p
 void mc_multiply(u32* p, u32* a, u32* b) {
     for u64 i = 0; i < 8; i++ {
         u64 carry = 0;
@@ -23028,22 +22589,20 @@ void mc_multiply(u32* p, u32* a, u32* b) {
         p[i + 8] = cast(u32, carry);
     }
 }
-}
-private {
+
 i32 mc_is_above_l(u32* x) {
     u64 carry = 1;
     for u64 i = 0; i < 8; i++ {
-        carry += cast(u64, x[i]) + (~mc_L[i] & 4294967295);
+        carry += cast(u64, x[i]) + (~mc_L[i] & 0xffffffff);
         carry >>= 32;
     }
     return cast(i32, carry);
 }
-}
+
 // Final reduction modulo L, by conditionally removing L.
 // if x < l     , then r = x
 // if l <= x 2*l, then r = x-l
 // otherwise the result will be wrong
-private {
 void mc_remove_l(u32* r, u32* x) {
     var carry = cast(u64, mc_is_above_l(x));
     u32 mask = ~cast(u32, carry) + 1;
@@ -23053,9 +22612,8 @@ void mc_remove_l(u32* r, u32* x) {
         carry >>= 32;
     }
 }
-}
+
 // Full reduction modulo L (Barrett reduction)
-private {
 void mc_mod_l(u8* reduced, u32* x) {
     u32[25] xr;
     for u64 i = 0; i < 9; i++ {
@@ -23080,7 +22638,7 @@ void mc_mod_l(u8* reduced, u32* x) {
     }
     u64 carry = 1;
     for u64 i = 0; i < 8; i++ {
-        carry += cast(u64, x[i]) + (~xr[i] & 4294967295);
+        carry += cast(u64, x[i]) + (~xr[i] & 0xffffffff);
         xr[i] = cast(u32, carry);
         carry >>= 32;
     }
@@ -23089,12 +22647,14 @@ void mc_mod_l(u8* reduced, u32* x) {
     crypto_wipe(xr, cast(u64, sizeof(xr)));
 }
 }
+
 void crypto_eddsa_reduce(u8* reduced, u8* expanded) {
     noinit u32[16] x;
     mc_load32_le_buf(x, expanded, 16);
     mc_mod_l(reduced, x);
     crypto_wipe(x, cast(u64, sizeof(x)));
 }
+
 // r = (a * b) + c
 void crypto_eddsa_mul_add(u8* r, u8* a, u8* b, u8* c) {
     noinit u32[8] mc_A;
@@ -23112,6 +22672,7 @@ void crypto_eddsa_mul_add(u8* r, u8* a, u8* b, u8* c) {
     crypto_wipe(mc_A, cast(u64, sizeof(mc_A)));
     crypto_wipe(B, cast(u64, sizeof(B)));
 }
+
 private {
 void mc_ge_zero(ge* p) {
     mc_fe_0(p.X);
@@ -23119,8 +22680,7 @@ void mc_ge_zero(ge* p) {
     mc_fe_1(p.Z);
     mc_fe_0(p.T);
 }
-}
-private {
+
 void mc_ge_tobytes(u8* s, ge* h) {
     noinit fe recip;
     noinit fe x;
@@ -23134,7 +22694,7 @@ void mc_ge_tobytes(u8* s, ge* h) {
     crypto_wipe(x, cast(u64, sizeof(x)));
     crypto_wipe(y, cast(u64, sizeof(y)));
 }
-}
+
 // h = -s, where s is a point encoded in 32 bytes
 //
 // Variable time!  Inputs must not be secret!
@@ -23162,7 +22722,6 @@ void mc_ge_tobytes(u8* s, ge* h) {
 //   isr = invsqrt(num * den)  // abort if not square
 //   x   = num * isr
 // Finally, negate x if its sign is not as specified.
-private {
 i32 mc_ge_frombytes_neg_vartime(ge* h, u8* s) {
     mc_fe_frombytes(h.Y, s);
     mc_fe_1(h.Z);
@@ -23182,18 +22741,16 @@ i32 mc_ge_frombytes_neg_vartime(ge* h, u8* s) {
     mc_fe_mul(h.T, h.X, h.Y);
     return 0;
 }
-}
-private {
+
 void mc_ge_cache(ge_cached* c, ge* p) {
     mc_fe_add(c.Yp, p.Y, p.X);
     mc_fe_sub(c.Ym, p.Y, p.X);
     mc_fe_copy(c.Z, p.Z);
     mc_fe_mul(c.T2, p.T, mc_D2);
 }
-}
+
 // Internal buffers are not wiped! Inputs must not be secret!
 // => Use only to *check* signatures.
-private {
 void mc_ge_add(ge* s, ge* p, ge_cached* q) {
     noinit fe a;
     noinit fe b;
@@ -23213,20 +22770,18 @@ void mc_ge_add(ge* s, ge* p, ge_cached* q) {
     mc_fe_mul(s.Y, s.Y, a);
     mc_fe_mul(s.Z, a, b);
 }
-}
+
 // Internal buffers are not wiped! Inputs must not be secret!
 // => Use only to *check* signatures.
-private {
 void mc_ge_sub(ge* s, ge* p, ge_cached* q) {
-    ge_cached neg;
+    noinit ge_cached neg;
     mc_fe_copy(neg.Ym, q.Yp);
     mc_fe_copy(neg.Yp, q.Ym);
     mc_fe_copy(neg.Z, q.Z);
     mc_fe_neg(neg.T2, q.T2);
     mc_ge_add(s, p, &neg);
 }
-}
-private {
+
 void mc_ge_madd(ge* s, ge* p, ge_precomp* q, i32* a, i32* b) {
     mc_fe_add(a, p.Y, p.X);
     mc_fe_sub(b, p.Y, p.X);
@@ -23243,19 +22798,17 @@ void mc_ge_madd(ge* s, ge* p, ge_precomp* q, i32* a, i32* b) {
     mc_fe_mul(s.Y, s.Y, a);
     mc_fe_mul(s.Z, a, b);
 }
-}
+
 // Internal buffers are not wiped! Inputs must not be secret!
 // => Use only to *check* signatures.
-private {
 void mc_ge_msub(ge* s, ge* p, ge_precomp* q, i32* a, i32* b) {
-    ge_precomp neg;
+    noinit ge_precomp neg;
     mc_fe_copy(neg.Ym, q.Yp);
     mc_fe_copy(neg.Yp, q.Ym);
     mc_fe_neg(neg.T2, q.T2);
     mc_ge_madd(s, p, &neg, a, b);
 }
-}
-private {
+
 void mc_ge_double(ge* s, ge* p, ge* q) {
     mc_fe_sq(q.X, p.X);
     mc_fe_sq(q.Y, p.Y);
@@ -23272,10 +22825,122 @@ void mc_ge_double(ge* s, ge* p, ge* q) {
     mc_fe_mul(s.Z, q.Y, q.Z);
     mc_fe_mul(s.T, q.X, q.T);
 }
-}
 // 5-bit signed window in cached format (Niels coordinates, Z=1)
-private { ge_precomp[8] mc_b_window = {ge_precomp{fe{25967493, -14356035, 29566456, 3660896, -12694345, 4014787, 27544626, -11754271, -6079156, 2047605}, fe{-12545711, 934262, -2722910, 3049990, -727428, 9406986, 12720692, 5043384, 19500929, -15469378}, fe{-8738181, 4489570, 9688441, -14785194, 10184609, -12363380, 29287919, 11864899, -24514362, -4438546}}, ge_precomp{fe{15636291, -9688557, 24204773, -7912398, 616977, -16685262, 27787600, -14772189, 28944400, -1550024}, fe{16568933, 4717097, -11556148, -1102322, 15682896, -11807043, 16354577, -11775962, 7689662, 11199574}, fe{30464156, -5976125, -11779434, -15670865, 23220365, 15915852, 7512774, 10017326, -17749093, -9920357}}, ge_precomp{fe{10861363, 11473154, 27284546, 1981175, -30064349, 12577861, 32867885, 14515107, -15438304, 10819380}, fe{4708026, 6336745, 20377586, 9066809, -11272109, 6594696, -25653668, 12483688, -12668491, 5581306}, fe{19563160, 16186464, -29386857, 4097519, 10237984, -4348115, 28542350, 13850243, -23678021, -15815942}}, ge_precomp{fe{5153746, 9909285, 1723747, -2777874, 30523605, 5516873, 19480852, 5230134, -23952439, -15175766}, fe{-30269007, -3463509, 7665486, 10083793, 28475525, 1649722, 20654025, 16520125, 30598449, 7715701}, fe{28881845, 14381568, 9657904, 3680757, -20181635, 7843316, -31400660, 1370708, 29794553, -1409300}}, ge_precomp{fe{-22518993, -6692182, 14201702, -8745502, -23510406, 8844726, 18474211, -1361450, -13062696, 13821877}, fe{-6455177, -7839871, 3374702, -4740862, -27098617, -10571707, 31655028, -7212327, 18853322, -14220951}, fe{4566830, -12963868, -28974889, -12240689, -7602672, -2830569, -8514358, -10431137, 2207753, -3209784}}, ge_precomp{fe{-25154831, -4185821, 29681144, 7868801, -6854661, -9423865, -12437364, -663000, -31111463, -16132436}, fe{25576264, -2703214, 7349804, -11814844, 16472782, 9300885, 3844789, 15725684, 171356, 6466918}, fe{23103977, 13316479, 9739013, -16149481, 817875, -15038942, 8965339, -14088058, -30714912, 16193877}}, ge_precomp{fe{-33521811, 3180713, -2394130, 14003687, -16903474, -16270840, 17238398, 4729455, -18074513, 9256800}, fe{-25182317, -4174131, 32336398, 5036987, -21236817, 11360617, 22616405, 9761698, -19827198, 630305}, fe{-13720693, 2639453, -24237460, -7406481, 9494427, -5774029, -6554551, -15960994, -2449256, -14291300}}, ge_precomp{fe{-3151181, -5046075, 9282714, 6866145, -31907062, -863023, -18940575, 15033784, 25105118, -7894876}, fe{-24326370, 15950226, -31801215, -14592823, -11662737, -5090925, 1573892, -2625887, 2198790, -15804619}, fe{-3099351, 10324967, -2241613, 7453183, -5446979, -2735503, -13812022, -16236442, -32461234, -12290683}}}; }
-private {
+ge_precomp[8] mc_b_window = {
+    ge_precomp{
+        fe{
+            25967493, -14356035, 29566456, 3660896, -12694345, 4014787, 27544626, -11754271,
+            -6079156, 2047605,
+        },
+        fe{
+            -12545711, 934262, -2722910, 3049990, -727428, 9406986, 12720692, 5043384, 19500929,
+            -15469378,
+        },
+        fe{
+            -8738181, 4489570, 9688441, -14785194, 10184609, -12363380, 29287919, 11864899,
+            -24514362, -4438546,
+        },
+    },
+    ge_precomp{
+        fe{
+            15636291, -9688557, 24204773, -7912398, 616977, -16685262, 27787600, -14772189,
+            28944400, -1550024,
+        },
+        fe{
+            16568933, 4717097, -11556148, -1102322, 15682896, -11807043, 16354577, -11775962,
+            7689662, 11199574,
+        },
+        fe{
+            30464156, -5976125, -11779434, -15670865, 23220365, 15915852, 7512774, 10017326,
+            -17749093, -9920357,
+        },
+    },
+    ge_precomp{
+        fe{
+            10861363, 11473154, 27284546, 1981175, -30064349, 12577861, 32867885, 14515107,
+            -15438304, 10819380,
+        },
+        fe{
+            4708026, 6336745, 20377586, 9066809, -11272109, 6594696, -25653668, 12483688, -12668491,
+            5581306,
+        },
+        fe{
+            19563160, 16186464, -29386857, 4097519, 10237984, -4348115, 28542350, 13850243,
+            -23678021, -15815942,
+        },
+    },
+    ge_precomp{
+        fe{
+            5153746, 9909285, 1723747, -2777874, 30523605, 5516873, 19480852, 5230134, -23952439,
+            -15175766,
+        },
+        fe{
+            -30269007, -3463509, 7665486, 10083793, 28475525, 1649722, 20654025, 16520125, 30598449,
+            7715701,
+        },
+        fe{
+            28881845, 14381568, 9657904, 3680757, -20181635, 7843316, -31400660, 1370708, 29794553,
+            -1409300,
+        },
+    },
+    ge_precomp{
+        fe{
+            -22518993, -6692182, 14201702, -8745502, -23510406, 8844726, 18474211, -1361450,
+            -13062696, 13821877,
+        },
+        fe{
+            -6455177, -7839871, 3374702, -4740862, -27098617, -10571707, 31655028, -7212327,
+            18853322, -14220951,
+        },
+        fe{
+            4566830, -12963868, -28974889, -12240689, -7602672, -2830569, -8514358, -10431137,
+            2207753, -3209784,
+        },
+    },
+    ge_precomp{
+        fe{
+            -25154831, -4185821, 29681144, 7868801, -6854661, -9423865, -12437364, -663000,
+            -31111463, -16132436,
+        },
+        fe{
+            25576264, -2703214, 7349804, -11814844, 16472782, 9300885, 3844789, 15725684, 171356,
+            6466918,
+        },
+        fe{
+            23103977, 13316479, 9739013, -16149481, 817875, -15038942, 8965339, -14088058,
+            -30714912, 16193877,
+        },
+    },
+    ge_precomp{
+        fe{
+            -33521811, 3180713, -2394130, 14003687, -16903474, -16270840, 17238398, 4729455,
+            -18074513, 9256800,
+        },
+        fe{
+            -25182317, -4174131, 32336398, 5036987, -21236817, 11360617, 22616405, 9761698,
+            -19827198, 630305,
+        },
+        fe{
+            -13720693, 2639453, -24237460, -7406481, 9494427, -5774029, -6554551, -15960994,
+            -2449256, -14291300,
+        },
+    },
+    ge_precomp{
+        fe{
+            -3151181, -5046075, 9282714, 6866145, -31907062, -863023, -18940575, 15033784, 25105118,
+            -7894876,
+        },
+        fe{
+            -24326370, 15950226, -31801215, -14592823, -11662737, -5090925, 1573892, -2625887,
+            2198790, -15804619,
+        },
+        fe{
+            -3099351, 10324967, -2241613, 7453183, -5446979, -2735503, -13812022, -16236442,
+            -32461234, -12290683,
+        },
+    },
+};
+
 void mc_slide_init(slide_ctx* ctx, u8* scalar) {
     i32 i = 252;
     while i > 0 && mc_scalar_bit(scalar, i) == 0 {
@@ -23285,8 +22950,7 @@ void mc_slide_init(slide_ctx* ctx, u8* scalar) {
     ctx.next_index = cast(i16, -1);
     ctx.next_digit = cast(i8, -1);
 }
-}
-private {
+
 i32 mc_slide_step(slide_ctx* ctx, i32 width, i32 i, u8* scalar) {
     if i == cast(i32, ctx.next_check) {
         if mc_scalar_bit(scalar, i) == mc_scalar_bit(scalar, i - 1) {
@@ -23299,7 +22963,7 @@ i32 mc_slide_step(slide_ctx* ctx, i32 width, i32 i, u8* scalar) {
             }
             v += mc_scalar_bit(scalar, i - w);
             i32 lsb = v & ~v + 1;
-            i32 s = cast(i32, (lsb & 170) != 0) << 0 | cast(i32, (lsb & 204) != 0) << 1 | cast(i32, (lsb & 240) != 0) << 2;
+            i32 s = cast(i32, (lsb & 0xAA) != 0) << 0 | cast(i32, (lsb & 0xCC) != 0) << 1 | cast(i32, (lsb & 0xF0) != 0) << 2;
             ctx.next_index = cast(i16, i - (w - 1) + s);
             ctx.next_digit = cast(i8, v >> s);
             ctx.next_check -= cast(u8, w);
@@ -23308,9 +22972,10 @@ i32 mc_slide_step(slide_ctx* ctx, i32 width, i32 i, u8* scalar) {
     return i == ctx.next_index ? ctx.next_digit : 0;
 }
 }
+
 i32 crypto_eddsa_check_equation(u8* signature, u8* public_key, u8* h) {
-    ge minus_A;
-    ge minus_R;
+    noinit ge minus_A;
+    noinit ge minus_R;
     u8* s = signature + 32;
     {
         noinit u32[8] s32;
@@ -23319,10 +22984,10 @@ i32 crypto_eddsa_check_equation(u8* signature, u8* public_key, u8* h) {
             return -1;
         }
     }
-    noinit ge_cached[2] lutA;
+    noinit ge_cached[1 << 3 - 2] lutA;
     {
-        ge minus_A2;
-        ge tmp;
+        noinit ge minus_A2;
+        noinit ge tmp;
         mc_ge_double(&minus_A2, &minus_A, &tmp);
         mc_ge_cache(&lutA[0], &minus_A);
         for u64 i = 1; i < cast(u64, 1 << 3 - 2); i++ {
@@ -23330,15 +22995,15 @@ i32 crypto_eddsa_check_equation(u8* signature, u8* public_key, u8* h) {
             mc_ge_cache(&lutA[i], &tmp);
         }
     }
-    slide_ctx h_slide;
+    noinit slide_ctx h_slide;
     mc_slide_init(&h_slide, h);
-    slide_ctx s_slide;
+    noinit slide_ctx s_slide;
     mc_slide_init(&s_slide, s);
     var i = cast(i32, h_slide.next_check >= s_slide.next_check ? h_slide.next_check : s_slide.next_check);
     ge* sum = &minus_A;
     mc_ge_zero(sum);
     while i >= 0 {
-        ge tmp;
+        noinit ge tmp;
         mc_ge_double(sum, sum, &tmp);
         i32 h_digit = mc_slide_step(&h_slide, 3, i, h);
         i32 s_digit = mc_slide_step(&s_slide, 5, i, s);
@@ -23358,7 +23023,7 @@ i32 crypto_eddsa_check_equation(u8* signature, u8* public_key, u8* h) {
         }
         i--;
     }
-    ge_cached cached;
+    noinit ge_cached cached;
     noinit u8[32] check;
     mc_ge_cache(&cached, &minus_R);
     mc_ge_add(sum, sum, &cached);
@@ -23369,9 +23034,236 @@ i32 crypto_eddsa_check_equation(u8* signature, u8* public_key, u8* h) {
     return crypto_verify32(check, mc_crypto_eddsa_check_equation__zero_point);
 }
 // 5-bit signed comb in cached format (Niels coordinates, Z=1)
-private { ge_precomp[8] mc_b_comb_low = {ge_precomp{fe{-6816601, -2324159, -22559413, 124364, 18015490, 8373481, 19993724, 1979872, -18549925, 9085059}, fe{10306321, 403248, 14839893, 9633706, 8463310, -8354981, -14305673, 14668847, 26301366, 2818560}, fe{-22701500, -3210264, -13831292, -2927732, -16326337, -14016360, 12940910, 177905, 12165515, -2397893}}, ge_precomp{fe{-12282262, -7022066, 9920413, -3064358, -32147467, 2927790, 22392436, -14852487, 2719975, 16402117}, fe{-7236961, -4729776, 2685954, -6525055, -24242706, -15940211, -6238521, 14082855, 10047669, 12228189}, fe{-30495588, -12893761, -11161261, 3539405, -11502464, 16491580, -27286798, -15030530, -7272871, -15934455}}, ge_precomp{fe{17650926, 582297, -860412, -187745, -12072900, -10683391, -20352381, 15557840, -31072141, -5019061}, fe{-6283632, -2259834, -4674247, -4598977, -4089240, 12435688, -31278303, 1060251, 6256175, 10480726}, fe{-13871026, 2026300, -21928428, -2741605, -2406664, -8034988, 7355518, 15733500, -23379862, 7489131}}, ge_precomp{fe{6883359, 695140, 23196907, 9644202, -33430614, 11354760, -20134606, 6388313, -8263585, -8491918}, fe{-7716174, -13605463, -13646110, 14757414, -19430591, -14967316, 10359532, -11059670, -21935259, 12082603}, fe{-11253345, -15943946, 10046784, 5414629, 24840771, 8086951, -6694742, 9868723, 15842692, -16224787}}, ge_precomp{fe{9639399, 11810955, -24007778, -9320054, 3912937, -9856959, 996125, -8727907, -8919186, -14097242}, fe{7248867, 14468564, 25228636, -8795035, 14346339, 8224790, 6388427, -7181107, 6468218, -8720783}, fe{15513115, 15439095, 7342322, -10157390, 18005294, -7265713, 2186239, 4884640, 10826567, 7135781}}, ge_precomp{fe{-14204238, 5297536, -5862318, -6004934, 28095835, 4236101, -14203318, 1958636, -16816875, 3837147}, fe{-5511166, -13176782, -29588215, 12339465, 15325758, -15945770, -8813185, 11075932, -19608050, -3776283}, fe{11728032, 9603156, -4637821, -5304487, -7827751, 2724948, 31236191, -16760175, -7268616, 14799772}}, ge_precomp{fe{-28842672, 4840636, -12047946, -9101456, -1445464, 381905, -30977094, -16523389, 1290540, 12798615}, fe{27246947, -10320914, 14792098, -14518944, 5302070, -8746152, -3403974, -4149637, -27061213, 10749585}, fe{25572375, -6270368, -15353037, 16037944, 1146292, 32198, 23487090, 9585613, 24714571, -1418265}}, ge_precomp{fe{19844825, 282124, -17583147, 11004019, -32004269, -2716035, 6105106, -1711007, -21010044, 14338445}, fe{8027505, 8191102, -18504907, -12335737, 25173494, -5923905, 15446145, 7483684, -30440441, 10009108}, fe{-14134701, -4174411, 10246585, -14677495, 33553567, -14012935, 23366126, 15080531, -7969992, 7663473}}}; }
-private { ge_precomp[8] mc_b_comb_high = {ge_precomp{fe{33055887, -4431773, -521787, 6654165, 951411, -6266464, -5158124, 6995613, -5397442, -6985227}, fe{4014062, 6967095, -11977872, 3960002, 8001989, 5130302, -2154812, -1899602, -31954493, -16173976}, fe{16271757, -9212948, 23792794, 731486, -25808309, -3546396, 6964344, -4767590, 10976593, 10050757}}, ge_precomp{fe{2533007, -4288439, -24467768, -12387405, -13450051, 14542280, 12876301, 13893535, 15067764, 8594792}, fe{20073501, -11623621, 3165391, -13119866, 13188608, -11540496, -10751437, -13482671, 29588810, 2197295}, fe{-1084082, 11831693, 6031797, 14062724, 14748428, -8159962, -20721760, 11742548, 31368706, 13161200}}, ge_precomp{fe{2050412, -6457589, 15321215, 5273360, 25484180, 124590, -18187548, -7097255, -6691621, -14604792}, fe{9938196, 2162889, -6158074, -1711248, 4278932, -2598531, -22865792, -7168500, -24323168, 11746309}, fe{-22691768, -14268164, 5965485, 9383325, 20443693, 5854192, 28250679, -1381811, -10837134, 13717818}}, ge_precomp{fe{-8495530, 16382250, 9548884, -4971523, -4491811, -3902147, 6182256, -12832479, 26628081, 10395408}, fe{27329048, -15853735, 7715764, 8717446, -9215518, -14633480, 28982250, -5668414, 4227628, 242148}, fe{-13279943, -7986904, -7100016, 8764468, -27276630, 3096719, 29678419, -9141299, 3906709, 11265498}}, ge_precomp{fe{11918285, 15686328, -17757323, -11217300, -27548967, 4853165, -27168827, 6807359, 6871949, -1075745}, fe{-29002610, 13984323, -27111812, -2713442, 28107359, -13266203, 6155126, 15104658, 3538727, -7513788}, fe{14103158, 11233913, -33165269, 9279850, 31014152, 4335090, -1827936, 4590951, 13960841, 12787712}}, ge_precomp{fe{1469134, -16738009, 33411928, 13942824, 8092558, -8778224, -11165065, 1437842, 22521552, -2792954}, fe{31352705, -4807352, -25327300, 3962447, 12541566, -9399651, -27425693, 7964818, -23829869, 5541287}, fe{-25732021, -6864887, 23848984, 3039395, -9147354, 6022816, -27421653, 10590137, 25309915, -1584678}}, ge_precomp{fe{-22951376, 5048948, 31139401, -190316, -19542447, -626310, -17486305, -16511925, -18851313, -12985140}, fe{-9684890, 14681754, 30487568, 7717771, -10829709, 9630497, 30290549, -10531496, -27798994, -13812825}, fe{5827835, 16097107, -24501327, 12094619, 7413972, 11447087, 28057551, -1793987, -14056981, 4359312}}, ge_precomp{fe{26323183, 2342588, -21887793, -1623758, -6062284, 2107090, -28724907, 9036464, -19618351, -13055189}, fe{-29697200, 14829398, -4596333, 14220089, -30022969, 2955645, 12094100, -13693652, -5941445, 7047569}, fe{-3201977, 14413268, -12058324, -16417589, -9035655, -7224648, 9258160, 1399236, 30397584, -5684634}}}; }
 private {
+ge_precomp[8] mc_b_comb_low = {
+    ge_precomp{
+        fe{
+            -6816601, -2324159, -22559413, 124364, 18015490, 8373481, 19993724, 1979872, -18549925,
+            9085059,
+        },
+        fe{
+            10306321, 403248, 14839893, 9633706, 8463310, -8354981, -14305673, 14668847, 26301366,
+            2818560,
+        },
+        fe{
+            -22701500, -3210264, -13831292, -2927732, -16326337, -14016360, 12940910, 177905,
+            12165515, -2397893,
+        },
+    },
+    ge_precomp{
+        fe{
+            -12282262, -7022066, 9920413, -3064358, -32147467, 2927790, 22392436, -14852487,
+            2719975, 16402117,
+        },
+        fe{
+            -7236961, -4729776, 2685954, -6525055, -24242706, -15940211, -6238521, 14082855,
+            10047669, 12228189,
+        },
+        fe{
+            -30495588, -12893761, -11161261, 3539405, -11502464, 16491580, -27286798, -15030530,
+            -7272871, -15934455,
+        },
+    },
+    ge_precomp{
+        fe{
+            17650926, 582297, -860412, -187745, -12072900, -10683391, -20352381, 15557840,
+            -31072141, -5019061,
+        },
+        fe{
+            -6283632, -2259834, -4674247, -4598977, -4089240, 12435688, -31278303, 1060251, 6256175,
+            10480726,
+        },
+        fe{
+            -13871026, 2026300, -21928428, -2741605, -2406664, -8034988, 7355518, 15733500,
+            -23379862, 7489131,
+        },
+    },
+    ge_precomp{
+        fe{
+            6883359, 695140, 23196907, 9644202, -33430614, 11354760, -20134606, 6388313, -8263585,
+            -8491918,
+        },
+        fe{
+            -7716174, -13605463, -13646110, 14757414, -19430591, -14967316, 10359532, -11059670,
+            -21935259, 12082603,
+        },
+        fe{
+            -11253345, -15943946, 10046784, 5414629, 24840771, 8086951, -6694742, 9868723, 15842692,
+            -16224787,
+        },
+    },
+    ge_precomp{
+        fe{
+            9639399, 11810955, -24007778, -9320054, 3912937, -9856959, 996125, -8727907, -8919186,
+            -14097242,
+        },
+        fe{
+            7248867, 14468564, 25228636, -8795035, 14346339, 8224790, 6388427, -7181107, 6468218,
+            -8720783,
+        },
+        fe{
+            15513115, 15439095, 7342322, -10157390, 18005294, -7265713, 2186239, 4884640, 10826567,
+            7135781,
+        },
+    },
+    ge_precomp{
+        fe{
+            -14204238, 5297536, -5862318, -6004934, 28095835, 4236101, -14203318, 1958636,
+            -16816875, 3837147,
+        },
+        fe{
+            -5511166, -13176782, -29588215, 12339465, 15325758, -15945770, -8813185, 11075932,
+            -19608050, -3776283,
+        },
+        fe{
+            11728032, 9603156, -4637821, -5304487, -7827751, 2724948, 31236191, -16760175, -7268616,
+            14799772,
+        },
+    },
+    ge_precomp{
+        fe{
+            -28842672, 4840636, -12047946, -9101456, -1445464, 381905, -30977094, -16523389,
+            1290540, 12798615,
+        },
+        fe{
+            27246947, -10320914, 14792098, -14518944, 5302070, -8746152, -3403974, -4149637,
+            -27061213, 10749585,
+        },
+        fe{
+            25572375, -6270368, -15353037, 16037944, 1146292, 32198, 23487090, 9585613, 24714571,
+            -1418265,
+        },
+    },
+    ge_precomp{
+        fe{
+            19844825, 282124, -17583147, 11004019, -32004269, -2716035, 6105106, -1711007,
+            -21010044, 14338445,
+        },
+        fe{
+            8027505, 8191102, -18504907, -12335737, 25173494, -5923905, 15446145, 7483684,
+            -30440441, 10009108,
+        },
+        fe{
+            -14134701, -4174411, 10246585, -14677495, 33553567, -14012935, 23366126, 15080531,
+            -7969992, 7663473,
+        },
+    },
+};
+ge_precomp[8] mc_b_comb_high = {
+    ge_precomp{
+        fe{
+            33055887, -4431773, -521787, 6654165, 951411, -6266464, -5158124, 6995613, -5397442,
+            -6985227,
+        },
+        fe{
+            4014062, 6967095, -11977872, 3960002, 8001989, 5130302, -2154812, -1899602, -31954493,
+            -16173976,
+        },
+        fe{
+            16271757, -9212948, 23792794, 731486, -25808309, -3546396, 6964344, -4767590, 10976593,
+            10050757,
+        },
+    },
+    ge_precomp{
+        fe{
+            2533007, -4288439, -24467768, -12387405, -13450051, 14542280, 12876301, 13893535,
+            15067764, 8594792,
+        },
+        fe{
+            20073501, -11623621, 3165391, -13119866, 13188608, -11540496, -10751437, -13482671,
+            29588810, 2197295,
+        },
+        fe{
+            -1084082, 11831693, 6031797, 14062724, 14748428, -8159962, -20721760, 11742548,
+            31368706, 13161200,
+        },
+    },
+    ge_precomp{
+        fe{
+            2050412, -6457589, 15321215, 5273360, 25484180, 124590, -18187548, -7097255, -6691621,
+            -14604792,
+        },
+        fe{
+            9938196, 2162889, -6158074, -1711248, 4278932, -2598531, -22865792, -7168500, -24323168,
+            11746309,
+        },
+        fe{
+            -22691768, -14268164, 5965485, 9383325, 20443693, 5854192, 28250679, -1381811,
+            -10837134, 13717818,
+        },
+    },
+    ge_precomp{
+        fe{
+            -8495530, 16382250, 9548884, -4971523, -4491811, -3902147, 6182256, -12832479, 26628081,
+            10395408,
+        },
+        fe{
+            27329048, -15853735, 7715764, 8717446, -9215518, -14633480, 28982250, -5668414, 4227628,
+            242148,
+        },
+        fe{
+            -13279943, -7986904, -7100016, 8764468, -27276630, 3096719, 29678419, -9141299, 3906709,
+            11265498,
+        },
+    },
+    ge_precomp{
+        fe{
+            11918285, 15686328, -17757323, -11217300, -27548967, 4853165, -27168827, 6807359,
+            6871949, -1075745,
+        },
+        fe{
+            -29002610, 13984323, -27111812, -2713442, 28107359, -13266203, 6155126, 15104658,
+            3538727, -7513788,
+        },
+        fe{
+            14103158, 11233913, -33165269, 9279850, 31014152, 4335090, -1827936, 4590951, 13960841,
+            12787712,
+        },
+    },
+    ge_precomp{
+        fe{
+            1469134, -16738009, 33411928, 13942824, 8092558, -8778224, -11165065, 1437842, 22521552,
+            -2792954,
+        },
+        fe{
+            31352705, -4807352, -25327300, 3962447, 12541566, -9399651, -27425693, 7964818,
+            -23829869, 5541287,
+        },
+        fe{
+            -25732021, -6864887, 23848984, 3039395, -9147354, 6022816, -27421653, 10590137,
+            25309915, -1584678,
+        },
+    },
+    ge_precomp{
+        fe{
+            -22951376, 5048948, 31139401, -190316, -19542447, -626310, -17486305, -16511925,
+            -18851313, -12985140,
+        },
+        fe{
+            -9684890, 14681754, 30487568, 7717771, -10829709, 9630497, 30290549, -10531496,
+            -27798994, -13812825,
+        },
+        fe{
+            5827835, 16097107, -24501327, 12094619, 7413972, 11447087, 28057551, -1793987,
+            -14056981, 4359312,
+        },
+    },
+    ge_precomp{
+        fe{
+            26323183, 2342588, -21887793, -1623758, -6062284, 2107090, -28724907, 9036464,
+            -19618351, -13055189,
+        },
+        fe{
+            -29697200, 14829398, -4596333, 14220089, -30022969, 2955645, 12094100, -13693652,
+            -5941445, 7047569,
+        },
+        fe{
+            -3201977, 14413268, -12058324, -16417589, -9035655, -7224648, 9258160, 1399236,
+            30397584, -5684634,
+        },
+    },
+};
+
 void mc_lookup_add(ge* p, ge_precomp* tmp_c, i32* tmp_a, i32* tmp_b, ge_precomp* comb, u8* scalar, i32 i) {
     var teeth = cast(u8, mc_scalar_bit(scalar, i) + (mc_scalar_bit(scalar, i + 32) << 1) + (mc_scalar_bit(scalar, i + 64) << 2) + (mc_scalar_bit(scalar, i + 96) << 3));
     var high = cast(u8, cast(i32, teeth) >> 3);
@@ -23387,16 +23279,15 @@ void mc_lookup_add(ge* p, ge_precomp* tmp_c, i32* tmp_a, i32* tmp_b, ge_precomp*
     mc_fe_cswap(tmp_c.Yp, tmp_c.Ym, cast(i32, high ^ 1));
     mc_ge_madd(p, p, tmp_c, tmp_a, tmp_b);
 }
-}
+
 // p = [scalar]B, where B is the base point
-private {
 void mc_ge_scalarmult_base(ge* p, u8* scalar) {
     noinit u8[32] s_scalar;
     crypto_eddsa_mul_add(s_scalar, scalar, mc_ge_scalarmult_base__half_mod_L, mc_ge_scalarmult_base__half_ones);
     noinit fe tmp_a;
     noinit fe tmp_b;
-    ge_precomp tmp_c;
-    ge tmp_d;
+    noinit ge_precomp tmp_c;
+    noinit ge tmp_d;
     mc_fe_1(tmp_c.Yp);
     mc_fe_1(tmp_c.Ym);
     mc_fe_0(tmp_c.T2);
@@ -23415,12 +23306,14 @@ void mc_ge_scalarmult_base(ge* p, u8* scalar) {
     crypto_wipe(s_scalar, cast(u64, sizeof(s_scalar)));
 }
 }
+
 void crypto_eddsa_scalarbase(u8* point, u8* scalar) {
-    ge P;
+    noinit ge P;
     mc_ge_scalarmult_base(&P, scalar);
     mc_ge_tobytes(point, &P);
     crypto_wipe(&P, cast(u64, sizeof(*&P)));
 }
+
 void crypto_eddsa_key_pair(u8* secret_key, u8* public_key, u8* seed) {
     noinit u8[64] a;
     for u64 _i_ = 0; _i_ < 32; _i_++ {
@@ -23438,10 +23331,11 @@ void crypto_eddsa_key_pair(u8* secret_key, u8* public_key, u8* seed) {
     }
     crypto_wipe(a, cast(u64, sizeof(a)));
 }
+
 private {
 void mc_hash_reduce(u8* h, u8* a, u64 a_size, u8* b, u64 b_size, u8* c, u64 c_size) {
     noinit u8[64] hash;
-    crypto_blake2b_ctx ctx;
+    noinit crypto_blake2b_ctx ctx;
     crypto_blake2b_init(&ctx, 64);
     crypto_blake2b_update(&ctx, a, a_size);
     crypto_blake2b_update(&ctx, b, b_size);
@@ -23450,6 +23344,7 @@ void mc_hash_reduce(u8* h, u8* a, u64 a_size, u8* b, u64 b_size, u8* c, u64 c_si
     crypto_eddsa_reduce(h, hash);
 }
 }
+
 // Digital signature of a message with from a secret key.
 //
 // The secret key comprises two parts:
@@ -23522,6 +23417,7 @@ void crypto_eddsa_sign(u8* signature, u8* secret_key, u8* message, u64 message_s
     crypto_wipe(a, cast(u64, sizeof(a)));
     crypto_wipe(r, cast(u64, sizeof(r)));
 }
+
 // To check the signature R, S of the message M with the public key A,
 // there are 3 steps:
 //
@@ -23535,6 +23431,7 @@ i32 crypto_eddsa_check(u8* signature, u8* public_key, u8* message, u64 message_s
     mc_hash_reduce(h, signature, 32, public_key, 32, message, message_size);
     return crypto_eddsa_check_equation(signature, public_key, h);
 }
+
 /////////////////////////
 /// EdDSA <--> X25519 ///
 /////////////////////////
@@ -23550,6 +23447,7 @@ void crypto_eddsa_to_x25519(u8* x25519, u8* eddsa) {
     crypto_wipe(t1, cast(u64, sizeof(t1)));
     crypto_wipe(t2, cast(u64, sizeof(t2)));
 }
+
 void crypto_x25519_to_eddsa(u8* eddsa, u8* x25519) {
     noinit fe t1;
     noinit fe t2;
@@ -23562,6 +23460,7 @@ void crypto_x25519_to_eddsa(u8* eddsa, u8* x25519) {
     crypto_wipe(t1, cast(u64, sizeof(t1)));
     crypto_wipe(t2, cast(u64, sizeof(t2)));
 }
+
 /////////////////////////////////////////////
 /// Dirty ephemeral public key generation ///
 /////////////////////////////////////////////
@@ -23620,6 +23519,7 @@ void mc_add_xl(u8* s, u8 x) {
     }
 }
 }
+
 // "Small" dirty ephemeral key.
 // Use if you need to shrink the size of the binary, and can afford to
 // slow down by a factor of two (compared to the fast version)
@@ -23640,6 +23540,7 @@ void crypto_x25519_dirty_small(u8* public_key, u8* secret_key) {
     mc_scalarmult(public_key, scalar, mc_crypto_x25519_dirty_small__dirty_base_point, 256);
     crypto_wipe(scalar, cast(u64, sizeof(scalar)));
 }
+
 // Select low order point
 // We're computing the [cofactor]lop scalar multiplication, where:
 //
@@ -23683,6 +23584,7 @@ void mc_select_lop(i32* out, i32* x, i32* k, u8 cofactor) {
     crypto_wipe(tmp, cast(u64, sizeof(tmp)));
 }
 }
+
 // "Fast" dirty ephemeral key
 // We use this one by default.
 //
@@ -23692,14 +23594,14 @@ void mc_select_lop(i32* out, i32* x, i32* k, u8 cofactor) {
 // The cost is a bigger binary for programs that don't also sign messages.
 void crypto_x25519_dirty_fast(u8* public_key, u8* secret_key) {
     noinit u8[32] scalar;
-    ge pk;
+    noinit ge pk;
     crypto_eddsa_trim_scalar(scalar, secret_key);
     mc_ge_scalarmult_base(&pk, scalar);
     noinit fe t1;
     noinit fe t2;
     mc_select_lop(t1, mc_lop_x, mc_sqrtm1, secret_key[0]);
     mc_select_lop(t2, mc_lop_y, mc_fe_one, cast(u8, secret_key[0] + 2));
-    ge_precomp low_order_point;
+    noinit ge_precomp low_order_point;
     mc_fe_add(low_order_point.Yp, t2, t1);
     mc_fe_sub(low_order_point.Ym, t2, t1);
     mc_fe_mul(low_order_point.T2, t2, t1);
@@ -23720,6 +23622,7 @@ void crypto_x25519_dirty_fast(u8* public_key, u8* secret_key) {
 /// Elligator 2 ///
 ///////////////////
 private { fe mc_A = fe{486662, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
+
 // Elligator direct map
 //
 // Computes the point corresponding to a representative, encoded in 32
@@ -23810,6 +23713,7 @@ void crypto_elligator_map(u8* curve, u8* hidden) {
     crypto_wipe(u, cast(u64, sizeof(u)));
     crypto_wipe(t3, cast(u64, sizeof(t3)));
 }
+
 // Elligator inverse map
 //
 // Computes the representative of a point, if possible.  If not, it does
@@ -23857,13 +23761,14 @@ i32 crypto_elligator_rev(u8* hidden, u8* public_key, u8 tweak) {
         mc_fe_neg(t2, t3);
         mc_fe_ccopy(t3, t2, mc_fe_isodd(t1));
         mc_fe_tobytes(hidden, t3);
-        hidden[31] |= tweak & 192;
+        hidden[31] |= tweak & 0xc0;
     }
     crypto_wipe(t1, cast(u64, sizeof(t1)));
     crypto_wipe(t2, cast(u64, sizeof(t2)));
     crypto_wipe(t3, cast(u64, sizeof(t3)));
     return is_square - 1;
 }
+
 void crypto_elligator_key_pair(u8* hidden, u8* secret_key, u8* seed) {
     noinit u8[32] pk;
     noinit u8[64] buf;
@@ -23885,6 +23790,7 @@ void crypto_elligator_key_pair(u8* hidden, u8* secret_key, u8* seed) {
     crypto_wipe(buf, cast(u64, sizeof(buf)));
     crypto_wipe(pk, cast(u64, sizeof(pk)));
 }
+
 ///////////////////////
 /// Scalar division ///
 ///////////////////////
@@ -23924,8 +23830,12 @@ void mc_redc(u32* u, u32* x) {
     crypto_wipe(t, cast(u64, sizeof(t)));
 }
 }
+
 void crypto_x25519_inverse(u8* blind_salt, u8* private_key, u8* curve_point) {
-    u32[8] m_inv = {2375587101, 3605803380, 1937624944, 3337575412, 4294967294, 4294967295, 4294967295, 268435455};
+    u32[8] m_inv = {
+        0x8d98951d, 0xd6ec3174, 0x737dcf70, 0xc6ef5bf4, 0xfffffffe, 0xffffffff, 0xffffffff,
+        0x0fffffff,
+    };
     noinit u8[32] scalar;
     crypto_eddsa_trim_scalar(scalar, private_key);
     noinit u32[8] m_scl;
@@ -23969,6 +23879,7 @@ void crypto_x25519_inverse(u8* blind_salt, u8* private_key, u8* curve_point) {
     crypto_wipe(product, cast(u64, sizeof(product)));
     crypto_wipe(m_inv, cast(u64, sizeof(m_inv)));
 }
+
 ////////////////////////////////
 /// Authenticated encryption ///
 ////////////////////////////////
@@ -23977,7 +23888,7 @@ void mc_lock_auth(u8* mac, u8* auth_key, u8* ad, u64 ad_size, u8* cipher_text, u
     noinit u8[16] sizes;
     mc_store64_le(sizes + 0, ad_size);
     mc_store64_le(sizes + 8, text_size);
-    crypto_poly1305_ctx poly_ctx;
+    noinit crypto_poly1305_ctx poly_ctx;
     crypto_poly1305_init(&poly_ctx, auth_key);
     crypto_poly1305_update(&poly_ctx, ad, ad_size);
     crypto_poly1305_update(&poly_ctx, mc_zero, mc_gap(ad_size, 16));
@@ -23987,6 +23898,7 @@ void mc_lock_auth(u8* mac, u8* auth_key, u8* ad, u64 ad_size, u8* cipher_text, u
     crypto_poly1305_final(&poly_ctx, mac);
 }
 }
+
 void crypto_aead_init_x(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     crypto_chacha20_h(ctx.key, key, nonce);
     for u64 _i_ = 0; _i_ < 8; _i_++ {
@@ -23994,6 +23906,7 @@ void crypto_aead_init_x(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     }
     ctx.counter = 0;
 }
+
 void crypto_aead_init_djb(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     for u64 _i_ = 0; _i_ < 32; _i_++ {
         ctx.key[_i_] = key[_i_];
@@ -24003,6 +23916,7 @@ void crypto_aead_init_djb(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     }
     ctx.counter = 0;
 }
+
 void crypto_aead_init_ietf(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     for u64 _i_ = 0; _i_ < 32; _i_++ {
         ctx.key[_i_] = key[_i_];
@@ -24012,6 +23926,7 @@ void crypto_aead_init_ietf(crypto_aead_ctx* ctx, u8* key, u8* nonce) {
     }
     ctx.counter = cast(u64, mc_load32_le(nonce)) << 32;
 }
+
 void crypto_aead_write(crypto_aead_ctx* ctx, u8* cipher_text, u8* mac, u8* ad, u64 ad_size, u8* plain_text, u64 text_size) {
     noinit u8[64] auth_key;
     crypto_chacha20_djb(auth_key, null, 64, ctx.key, ctx.nonce, ctx.counter);
@@ -24022,6 +23937,7 @@ void crypto_aead_write(crypto_aead_ctx* ctx, u8* cipher_text, u8* mac, u8* ad, u
     }
     crypto_wipe(auth_key, cast(u64, sizeof(auth_key)));
 }
+
 i32 crypto_aead_read(crypto_aead_ctx* ctx, u8* plain_text, u8* mac, u8* ad, u64 ad_size, u8* cipher_text, u64 text_size) {
     noinit u8[64] auth_key;
     noinit u8[16] real_mac;
@@ -24038,68 +23954,66 @@ i32 crypto_aead_read(crypto_aead_ctx* ctx, u8* plain_text, u8* mac, u8* ad, u64 
     crypto_wipe(real_mac, cast(u64, sizeof(real_mac)));
     return mismatch;
 }
+
 void crypto_aead_lock(u8* cipher_text, u8* mac, u8* key, u8* nonce, u8* ad, u64 ad_size, u8* plain_text, u64 text_size) {
-    crypto_aead_ctx ctx;
+    noinit crypto_aead_ctx ctx;
     crypto_aead_init_x(&ctx, key, nonce);
     crypto_aead_write(&ctx, cipher_text, mac, ad, ad_size, plain_text, text_size);
     crypto_wipe(&ctx, cast(u64, sizeof(ctx)));
 }
+
 i32 crypto_aead_unlock(u8* plain_text, u8* mac, u8* key, u8* nonce, u8* ad, u64 ad_size, u8* cipher_text, u64 text_size) {
-    crypto_aead_ctx ctx;
+    noinit crypto_aead_ctx ctx;
     crypto_aead_init_x(&ctx, key, nonce);
     i32 mismatch = crypto_aead_read(&ctx, plain_text, mac, ad, ad_size, cipher_text, text_size);
     crypto_wipe(&ctx, cast(u64, sizeof(ctx)));
     return mismatch;
 }
-private { __arr_u8_16[12] mc_blake2b_compress__sigma = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3}, {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4}, {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8}, {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13}, {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9}, {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11}, {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10}, {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5}, {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3}}; }
-private { u8[32] mc_crypto_x25519_public_key__base_point = {9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
-private { u32[9] mc_mod_l__r = {170660635, 3986482595, 140716455, 554049885, 4294967275, 4294967295, 4294967295, 4294967295, 15}; }
-private { u8[32] mc_crypto_eddsa_check_equation__zero_point = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
-private { u8[32] mc_ge_scalarmult_base__half_mod_L = {247, 233, 122, 46, 141, 49, 9, 44, 107, 206, 123, 81, 239, 124, 111, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8}; }
-private { u8[32] mc_ge_scalarmult_base__half_ones = {142, 74, 204, 70, 186, 24, 118, 107, 184, 231, 190, 57, 250, 173, 119, 99, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 7}; }
-private { u8[32] mc_crypto_x25519_dirty_small__dirty_base_point = {216, 134, 26, 162, 120, 122, 217, 38, 139, 116, 116, 182, 130, 227, 190, 195, 206, 54, 154, 30, 94, 49, 71, 162, 109, 55, 124, 253, 32, 181, 223, 117}; }
-private { u32[8] mc_redc__k = {307527195, 3535084963, 4256859391, 2980185842, 4288900074, 350704696, 1877547062, 2646001394}; }
-private { u8[32] mc_crypto_x25519_inverse__Lm2 = {235, 211, 245, 92, 26, 99, 18, 88, 214, 156, 247, 162, 222, 249, 222, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16}; }
-
-// transminc: C #define values surfaced as compile-time configuration
-@define "uECC_PLATFORM" 2
-@define "uECC_OPTIMIZATION_LEVEL" 2
-@define "uECC_SQUARE_FUNC" 0
-@define "uECC_VLI_NATIVE_LITTLE_ENDIAN" 0
-@define "uECC_SUPPORTS_secp160r1" 0
-@define "uECC_SUPPORTS_secp192r1" 0
-@define "uECC_SUPPORTS_secp224r1" 0
-@define "uECC_SUPPORTS_secp256r1" 1
-@define "uECC_SUPPORTS_secp256k1" 0
-@define "uECC_SUPPORT_COMPRESSED_POINT" 0
-@define "_UECC_PLATFORM_SPECIFIC_H_" 1
-@define "uECC_arch_other" 0
-@define "uECC_x86" 1
-@define "uECC_x86_64" 2
-@define "uECC_arm" 3
-@define "uECC_arm_thumb" 4
-@define "uECC_arm_thumb2" 5
-@define "uECC_arm64" 6
-@define "uECC_avr" 7
-@define "uECC_ARM_USE_UMAAL" 0
-@define "uECC_WORD_SIZE" 8
-@define "SUPPORTS_INT128" 0
-@define "uECC_WORD_BITS" 64
-@define "uECC_WORD_BITS_SHIFT" 6
-@define "uECC_WORD_BITS_MASK" 63
-@define "uECC_ENABLE_VLI_API" 0
-@define "uECC_RNG_MAX_TRIES" 64
-@define "uECC_MAX_WORDS" 4
-@define "num_bytes_secp160r1" 20
-@define "num_bytes_secp192r1" 24
-@define "num_bytes_secp224r1" 28
-@define "num_bytes_secp256r1" 32
-@define "num_bytes_secp256k1" 32
-@define "num_words_secp160r1" 3
-@define "num_words_secp192r1" 3
-@define "num_words_secp224r1" 4
-@define "num_words_secp256r1" 4
-@define "num_words_secp256k1" 4
+private {
+u8:[12][16] mc_blake2b_compress__sigma = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+    {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+    {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+    {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+    {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+    {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+    {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+    {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+    {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0},
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+};
+u8[32] mc_crypto_x25519_public_key__base_point = {
+    9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+u32[9] mc_mod_l__r = {
+    0x0a2c131b, 0xed9ce5a3, 0x086329a7, 0x2106215d, 0xffffffeb, 0xffffffff, 0xffffffff, 0xffffffff,
+    0xf,
+};
+u8[32] mc_crypto_eddsa_check_equation__zero_point = {
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+u8[32] mc_ge_scalarmult_base__half_mod_L = {
+    247, 233, 122, 46, 141, 49, 9, 44, 107, 206, 123, 81, 239, 124, 111, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 8,
+};
+u8[32] mc_ge_scalarmult_base__half_ones = {
+    142, 74, 204, 70, 186, 24, 118, 107, 184, 231, 190, 57, 250, 173, 119, 99, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 7,
+};
+u8[32] mc_crypto_x25519_dirty_small__dirty_base_point = {
+    0xd8, 0x86, 0x1a, 0xa2, 0x78, 0x7a, 0xd9, 0x26, 0x8b, 0x74, 0x74, 0xb6, 0x82, 0xe3, 0xbe, 0xc3,
+    0xce, 0x36, 0x9a, 0x1e, 0x5e, 0x31, 0x47, 0xa2, 0x6d, 0x37, 0x7c, 0xfd, 0x20, 0xb5, 0xdf, 0x75,
+};
+u32[8] mc_redc__k = {
+    0x12547e1b, 0xd2b51da3, 0xfdba84ff, 0xb1a206f2, 0xffa36bea, 0x14e75438, 0x6fe91836, 0x9db6c6f2,
+};
+u8[32] mc_crypto_x25519_inverse__Lm2 = {
+    0xeb, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+};
+}
 
 type uECC_Curve = uECC_Curve_t*;
 /* uECC_RNG_Function type
@@ -24120,13 +24034,10 @@ RNG function; you must provide your own.
 */
 type uECC_RNG_Function = fn(u8*, u32): i32;
 /* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
-/* Copyright 2014, Kenneth MacKay. Licensed under the BSD 2-clause license. */
-/* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
 type wordcount_t = i8;
 type bitcount_t = i16;
 type cmpresult_t = i8;
 type uECC_word_t = u64;
-type __arr_uECC_word_t_4 = uECC_word_t[4];
 /* uECC_HashContext structure.
 This is used to pass in an arbitrary hash function to uECC_sign_deterministic().
 The structure will be used for multiple hash computations; each time a new hash
@@ -24174,16 +24085,13 @@ struct uECC_HashContext {
     u8* tmp;
 }
 
-/* Functions for raw large-integer manipulation. These are only available
-   if uECC.c is compiled with uECC_ENABLE_VLI_API defined to 1. */
-/* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
 struct uECC_Curve_t {
     wordcount_t num_words;
     wordcount_t num_bytes;
     bitcount_t num_n_bits;
     uECC_word_t[4] p;
     uECC_word_t[4] n;
-    uECC_word_t[8] G;
+    uECC_word_t[4 * 2] G;
     uECC_word_t[4] b;
     fn(uECC_word_t*, uECC_word_t*, uECC_word_t*, uECC_Curve): void double_jacobian;
     fn(uECC_word_t*, uECC_word_t*, uECC_Curve): void x_side;
@@ -24191,18 +24099,23 @@ struct uECC_Curve_t {
 }
 
 private { uECC_RNG_Function g_rng_function = null; }
+
 void uECC_set_rng(uECC_RNG_Function rng_function) {
     g_rng_function = rng_function;
 }
+
 uECC_RNG_Function uECC_get_rng() {
     return g_rng_function;
 }
+
 i32 uECC_curve_private_key_size(uECC_Curve curve) {
     return (curve.num_n_bits + 7) / 8;
 }
+
 i32 uECC_curve_public_key_size(uECC_Curve curve) {
     return 2 * curve.num_bytes;
 }
+
 private {
 void uECC_vli_clear(uECC_word_t* vli, wordcount_t num_words) {
     wordcount_t i;
@@ -24210,10 +24123,9 @@ void uECC_vli_clear(uECC_word_t* vli, wordcount_t num_words) {
         vli[i] = 0;
     }
 }
-}
+
 /* Constant-time comparison to zero - secure way to compare long integers */
 /* Returns 1 if vli == 0, 0 otherwise. */
-private {
 uECC_word_t uECC_vli_isZero(uECC_word_t* vli, wordcount_t num_words) {
     uECC_word_t bits = 0;
     wordcount_t i;
@@ -24222,24 +24134,21 @@ uECC_word_t uECC_vli_isZero(uECC_word_t* vli, wordcount_t num_words) {
     }
     return cast(uECC_word_t, bits == 0);
 }
-}
+
 /* Returns nonzero if bit 'bit' of vli is set. */
-private {
 uECC_word_t uECC_vli_testBit(uECC_word_t* vli, bitcount_t bit) {
-    return vli[cast(i32, bit) >> 6] & cast(uECC_word_t, 1) << cast(u64, bit & 63);
+    return vli[cast(i32, bit) >> 6] & cast(uECC_word_t, 1) << cast(u64, bit & 0x03F);
 }
-}
+
 /* Counts the number of words in vli. */
-private {
 wordcount_t vli_numDigits(uECC_word_t* vli, wordcount_t max_words) {
     wordcount_t i;
     for i = cast(i8, max_words - 1); i >= 0 && vli[i] == 0; --i {
     }
     return cast(wordcount_t, i + 1);
 }
-}
+
 /* Counts the number of bits required to represent vli. */
-private {
 bitcount_t uECC_vli_numBits(uECC_word_t* vli, wordcount_t max_words) {
     uECC_word_t i;
     uECC_word_t digit;
@@ -24253,18 +24162,16 @@ bitcount_t uECC_vli_numBits(uECC_word_t* vli, wordcount_t max_words) {
     }
     return cast(bitcount_t, cast(u64, cast(bitcount_t, num_digits - 1) << 6) + i);
 }
-}
+
 /* Sets dest = src. */
-private {
 void uECC_vli_set(uECC_word_t* dest, uECC_word_t* src, wordcount_t num_words) {
     wordcount_t i;
     for i = 0; i < num_words; ++i {
         dest[i] = src[i];
     }
 }
-}
+
 /* Returns sign of left - right. */
-private {
 cmpresult_t uECC_vli_cmp_unsafe(uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
     wordcount_t i;
     for i = cast(i8, num_words - 1); i >= 0; --i {
@@ -24276,10 +24183,9 @@ cmpresult_t uECC_vli_cmp_unsafe(uECC_word_t* left, uECC_word_t* right, wordcount
     }
     return 0;
 }
-}
+
 /* Constant-time comparison function - secure way to compare long integers */
 /* Returns one if left == right, zero otherwise. */
-private {
 uECC_word_t uECC_vli_equal(uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
     uECC_word_t diff = 0;
     wordcount_t i;
@@ -24289,6 +24195,7 @@ uECC_word_t uECC_vli_equal(uECC_word_t* left, uECC_word_t* right, wordcount_t nu
     return cast(uECC_word_t, diff == 0);
 }
 }
+
 /* Returns sign of left - right, in constant time. */
 private {
 cmpresult_t uECC_vli_cmp(uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
@@ -24297,9 +24204,8 @@ cmpresult_t uECC_vli_cmp(uECC_word_t* left, uECC_word_t* right, wordcount_t num_
     uECC_word_t equal = uECC_vli_isZero(tmp, num_words);
     return cast(cmpresult_t, cast(u64, cast(i32, !equal)) - 2 * neg);
 }
-}
+
 /* Computes vli = vli >> 1. */
-private {
 void uECC_vli_rshift1(uECC_word_t* vli, wordcount_t num_words) {
     uECC_word_t* end = vli;
     uECC_word_t carry = 0;
@@ -24310,9 +24216,8 @@ void uECC_vli_rshift1(uECC_word_t* vli, wordcount_t num_words) {
         carry = temp << cast(u64, 64 - 1);
     }
 }
-}
+
 /* Computes result = left + right, returning carry. Can modify in place. */
-private {
 uECC_word_t uECC_vli_add(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
     uECC_word_t carry = 0;
     wordcount_t i;
@@ -24325,9 +24230,8 @@ uECC_word_t uECC_vli_add(uECC_word_t* result, uECC_word_t* left, uECC_word_t* ri
     }
     return carry;
 }
-}
+
 /* Computes result = left - right, returning borrow. Can modify in place. */
-private {
 uECC_word_t uECC_vli_sub(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
     uECC_word_t borrow = 0;
     wordcount_t i;
@@ -24340,12 +24244,11 @@ uECC_word_t uECC_vli_sub(uECC_word_t* result, uECC_word_t* left, uECC_word_t* ri
     }
     return borrow;
 }
-}
-private {
+
 void muladd(uECC_word_t a, uECC_word_t b, uECC_word_t* r0, uECC_word_t* r1, uECC_word_t* r2) {
-    u64 a0 = a & 4294967295;
+    u64 a0 = a & 0xffffffff;
     u64 a1 = a >> 32;
-    u64 b0 = b & 4294967295;
+    u64 b0 = b & 0xffffffff;
     u64 b1 = b >> 32;
     u64 i0 = a0 * b0;
     u64 i1 = a0 * b1;
@@ -24356,16 +24259,15 @@ void muladd(uECC_word_t a, uECC_word_t b, uECC_word_t* r0, uECC_word_t* r1, uECC
     i2 += i0 >> 32;
     i2 += i1;
     if i2 < i1 {
-        i3 += 4294967296;
+        i3 += 0x100000000;
     }
-    p0 = i0 & 4294967295 | i2 << 32;
+    p0 = i0 & 0xffffffff | i2 << 32;
     p1 = i3 + (i2 >> 32);
     *r0 += p0;
     *r1 += p1 + cast(u64, cast(i32, *r0 < p0));
     *r2 += cast(uECC_word_t, *r1 < p1 || *r1 == p1 && *r0 < p0);
 }
-}
-private {
+
 void uECC_vli_mult(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, wordcount_t num_words) {
     uECC_word_t r0 = 0;
     uECC_word_t r1 = 0;
@@ -24392,33 +24294,30 @@ void uECC_vli_mult(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, w
     }
     result[num_words * 2 - 1] = r0;
 }
-}
+
 /* Computes result = (left + right) % mod.
    Assumes that left < mod and right < mod, and that result does not overlap mod. */
-private {
 void uECC_vli_modAdd(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, uECC_word_t* mod, wordcount_t num_words) {
     uECC_word_t carry = uECC_vli_add(result, left, right, num_words);
     if carry || uECC_vli_cmp_unsafe(mod, result, num_words) != 1 {
         uECC_vli_sub(result, result, mod, num_words);
     }
 }
-}
+
 /* Computes result = (left - right) % mod.
    Assumes that left < mod and right < mod, and that result does not overlap mod. */
-private {
 void uECC_vli_modSub(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, uECC_word_t* mod, wordcount_t num_words) {
     uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);
     if l_borrow != 0 {
         uECC_vli_add(result, result, mod, num_words);
     }
 }
-}
+
 /* Computes result = product % mod, where product is 2N words long. */
 /* Currently only designed to work for curve_p or curve_n. */
-private {
 void uECC_vli_mmod(uECC_word_t* result, uECC_word_t* product, uECC_word_t* mod, wordcount_t num_words) {
-    noinit uECC_word_t[8] mod_multiple;
-    noinit uECC_word_t[8] tmp;
+    noinit uECC_word_t[2 * 4] mod_multiple;
+    noinit uECC_word_t[2 * 4] tmp;
     uECC_word_t*[2] v = {tmp, product};
     uECC_word_t index;
     var shift = cast(bitcount_t, num_words * 2 * 64 - uECC_vli_numBits(mod, num_words));
@@ -24451,28 +24350,24 @@ void uECC_vli_mmod(uECC_word_t* result, uECC_word_t* product, uECC_word_t* mod, 
     }
     uECC_vli_set(result, v[index], num_words);
 }
-}
+
 /* Computes result = (left * right) % mod. */
-private {
 void uECC_vli_modMult(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, uECC_word_t* mod, wordcount_t num_words) {
-    noinit uECC_word_t[8] product;
+    noinit uECC_word_t[2 * 4] product;
     uECC_vli_mult(product, left, right, num_words);
     uECC_vli_mmod(result, product, mod, num_words);
 }
-}
-private {
+
 void uECC_vli_modMult_fast(uECC_word_t* result, uECC_word_t* left, uECC_word_t* right, uECC_Curve curve) {
-    noinit uECC_word_t[8] product;
+    noinit uECC_word_t[2 * 4] product;
     uECC_vli_mult(product, left, right, curve.num_words);
     curve.mmod_fast(result, product);
 }
-}
-private {
+
 void uECC_vli_modSquare_fast(uECC_word_t* result, uECC_word_t* left, uECC_Curve curve) {
     uECC_vli_modMult_fast(result, left, left, curve);
 }
-}
-private {
+
 void vli_modInv_update(uECC_word_t* uv, uECC_word_t* mod, wordcount_t num_words) {
     uECC_word_t carry = 0;
     if !(uv[0] & 1) == 0 {
@@ -24483,10 +24378,9 @@ void vli_modInv_update(uECC_word_t* uv, uECC_word_t* mod, wordcount_t num_words)
         uv[num_words - 1] |= cast(u64, 1) << 63;
     }
 }
-}
+
 /* Computes result = (1 / input) % mod. All VLIs are the same size.
    See "From Euclid's GCD to Montgomery Multiplication to the Great Divide" */
-private {
 void uECC_vli_modInv(uECC_word_t* result, uECC_word_t* input, uECC_word_t* mod, wordcount_t num_words) {
     noinit uECC_word_t[4] a;
     noinit uECC_word_t[4] b;
@@ -24533,12 +24427,10 @@ void uECC_vli_modInv(uECC_word_t* result, uECC_word_t* input, uECC_word_t* mod, 
     }
     uECC_vli_set(result, u, num_words);
 }
-}
-/* ------ Point operations ------ */
+
 /* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
 /* BYTES_TO_WORDS_8 macro removed — calls pre-expanded */
 /* BYTES_TO_WORDS_4 macro removed — calls pre-expanded */
-private {
 void double_jacobian_default(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* Z1, uECC_Curve curve) {
     noinit uECC_word_t[4] t4;
     noinit uECC_word_t[4] t5;
@@ -24574,9 +24466,8 @@ void double_jacobian_default(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* Z1, 
     uECC_vli_set(Z1, Y1, num_words);
     uECC_vli_set(Y1, t4, num_words);
 }
-}
+
 /* Computes result = x^3 + ax + b. result must not overlap x. */
-private {
 void x_side_default(uECC_word_t* result, uECC_word_t* x, uECC_Curve curve) {
     uECC_word_t[4] _3 = {3, 0, 0, 0};
     wordcount_t num_words = curve.num_words;
@@ -24586,10 +24477,28 @@ void x_side_default(uECC_word_t* result, uECC_word_t* x, uECC_Curve curve) {
     uECC_vli_modAdd(result, result, curve.b, curve.p, num_words);
 }
 }
-private { uECC_Curve_t curve_secp256r1 = uECC_Curve_t{4, 32, 256, {-1, 4294967295, 0, -4294967295}, {-884452912994769583, -4834901526196019580, -1, -4294967296}, {-819310685055303018, 8575836109218198432, -523289583788211982, 7716867327612699207, -3767753221892779531, 3156516839386865358, -8149286295562117610, 5756518291402817435}, {4309448131093880907, 7285987128567378166, -5482079946633869636, 6540974713487397863}, &double_jacobian_default, &x_side_default, &vli_mmod_fast_secp256r1}; }
+private {
+uECC_Curve_t curve_secp256r1 = uECC_Curve_t{
+    4,
+    32,
+    256,
+    {0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF, 0x0000000000000000, 0xFFFFFFFF00000001},
+    {0xF3B9CAC2FC632551, 0xBCE6FAADA7179E84, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000},
+    {
+        0xF4A13945D898C296, 0x77037D812DEB33A0, 0xF8BCE6E563A440F2, 0x6B17D1F2E12C4247,
+        0xCBB6406837BF51F5, 0x2BCE33576B315ECE, 0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B,
+    },
+    {0x3BCE3C3E27D2604B, 0x651D06B0CC53B0F6, 0xB3EBBD55769886BC, 0x5AC635D8AA3A93E7},
+    &double_jacobian_default,
+    &x_side_default,
+    &vli_mmod_fast_secp256r1,
+};
+}
+
 uECC_Curve uECC_secp256r1() {
     return &curve_secp256r1;
 }
+
 /* Computes result = product % curve_p
    from http://www.nsa.gov/ia/_files/nist-routines.pdf */
 private {
@@ -24598,7 +24507,7 @@ void vli_mmod_fast_secp256r1(u64* result, u64* product) {
     i32 carry;
     uECC_vli_set(result, product, 4);
     tmp[0] = 0;
-    tmp[1] = product[5] & -4294967296;
+    tmp[1] = product[5] & 0xffffffff00000000;
     tmp[2] = product[6];
     tmp[3] = product[7];
     carry = cast(i32, uECC_vli_add(tmp, tmp, tmp, 4));
@@ -24609,24 +24518,24 @@ void vli_mmod_fast_secp256r1(u64* result, u64* product) {
     carry += cast(i32, uECC_vli_add(tmp, tmp, tmp, 4));
     carry += cast(i32, uECC_vli_add(result, result, tmp, 4));
     tmp[0] = product[4];
-    tmp[1] = product[5] & 4294967295;
+    tmp[1] = product[5] & 0xffffffff;
     tmp[2] = 0;
     tmp[3] = product[7];
     carry += cast(i32, uECC_vli_add(result, result, tmp, 4));
     tmp[0] = product[4] >> 32 | product[5] << 32;
-    tmp[1] = product[5] >> 32 | product[6] & -4294967296;
+    tmp[1] = product[5] >> 32 | product[6] & 0xffffffff00000000;
     tmp[2] = product[7];
     tmp[3] = product[6] >> 32 | product[4] << 32;
     carry += cast(i32, uECC_vli_add(result, result, tmp, 4));
     tmp[0] = product[5] >> 32 | product[6] << 32;
     tmp[1] = product[6] >> 32;
     tmp[2] = 0;
-    tmp[3] = product[4] & 4294967295 | product[5] << 32;
+    tmp[3] = product[4] & 0xffffffff | product[5] << 32;
     carry -= cast(i32, uECC_vli_sub(result, result, tmp, 4));
     tmp[0] = product[6];
     tmp[1] = product[7];
     tmp[2] = 0;
-    tmp[3] = product[4] >> 32 | product[5] & -4294967296;
+    tmp[3] = product[4] >> 32 | product[5] & 0xffffffff00000000;
     carry -= cast(i32, uECC_vli_sub(result, result, tmp, 4));
     tmp[0] = product[6] >> 32 | product[7] << 32;
     tmp[1] = product[7] >> 32 | product[4] << 32;
@@ -24634,9 +24543,9 @@ void vli_mmod_fast_secp256r1(u64* result, u64* product) {
     tmp[3] = product[6] << 32;
     carry -= cast(i32, uECC_vli_sub(result, result, tmp, 4));
     tmp[0] = product[7];
-    tmp[1] = product[4] & -4294967296;
+    tmp[1] = product[4] & 0xffffffff00000000;
     tmp[2] = product[5];
-    tmp[3] = product[6] & -4294967296;
+    tmp[3] = product[6] & 0xffffffff00000000;
     carry -= cast(i32, uECC_vli_sub(result, result, tmp, 4));
     if carry < 0 {
         while true {
@@ -24649,13 +24558,12 @@ void vli_mmod_fast_secp256r1(u64* result, u64* product) {
         }
     }
 }
-}
+
 /* Returns 1 if 'point' is the point at infinity, 0 otherwise. */
 /* Point multiplication algorithm using Montgomery's ladder with co-Z coordinates.
 From http://eprint.iacr.org/2011/338.pdf
 */
 /* Modify (x1, y1) => (x1 * z^2, y1 * z^3) */
-private {
 void apply_z(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* Z, uECC_Curve curve) {
     noinit uECC_word_t[4] t1;
     uECC_vli_modSquare_fast(t1, Z, curve);
@@ -24663,9 +24571,8 @@ void apply_z(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* Z, uECC_Curve curve)
     uECC_vli_modMult_fast(t1, t1, Z, curve);
     uECC_vli_modMult_fast(Y1, Y1, t1, curve);
 }
-}
+
 /* P = (x1, y1) => 2P, (x2, y2) => P' */
-private {
 void XYcZ_initial_double(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC_word_t* Y2, uECC_word_t* initial_Z, uECC_Curve curve) {
     noinit uECC_word_t[4] z;
     wordcount_t num_words = curve.num_words;
@@ -24681,13 +24588,12 @@ void XYcZ_initial_double(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC
     curve.double_jacobian(X1, Y1, z, curve);
     apply_z(X2, Y2, z, curve);
 }
-}
+
 /* Input P = (x1, y1, Z), Q = (x2, y2, Z)
    Output P' = (x1', y1', Z3), P + Q = (x3, y3, Z3)
    or P => P', Q => P + Q
    sub = x1' - x3 (used for subsequent call to XYcZ_addC()).
 */
-private {
 void XYcZ_add(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC_word_t* Y2, uECC_word_t* sub, uECC_Curve curve) {
     noinit uECC_word_t[4] t5;
     wordcount_t num_words = curve.num_words;
@@ -24706,12 +24612,11 @@ void XYcZ_add(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC_word_t* Y2
     uECC_vli_modSub(Y2, Y2, Y1, curve.p, num_words);
     uECC_vli_set(X2, t5, num_words);
 }
-}
+
 /* Input P = (x1, y1, Z), Q = (x2, y2, Z), sub = x1 - x2
    Output P - Q = (x3', y3', Z3), P + Q = (x3, y3, Z3)
    or P => P - Q, Q => P + Q
 */
-private {
 void XYcZ_addC(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC_word_t* Y2, uECC_word_t* sub, uECC_Curve curve) {
     noinit uECC_word_t[4] t5;
     noinit uECC_word_t[4] t6;
@@ -24737,12 +24642,11 @@ void XYcZ_addC(uECC_word_t* X1, uECC_word_t* Y1, uECC_word_t* X2, uECC_word_t* Y
     uECC_vli_modSub(Y1, t6, Y1, curve.p, num_words);
     uECC_vli_set(X1, t7, num_words);
 }
-}
+
 /* result may overlap point. */
-private {
 void EccPoint_mult(uECC_word_t* result, uECC_word_t* point, uECC_word_t* scalar, uECC_word_t* initial_Z, bitcount_t num_bits, uECC_Curve curve) {
-    noinit __arr_uECC_word_t_4[2] Rx;
-    noinit __arr_uECC_word_t_4[2] Ry;
+    noinit uECC_word_t:[2][4] Rx;
+    noinit uECC_word_t:[2][4] Ry;
     noinit uECC_word_t[4] z;
     noinit uECC_word_t[4] sub;
     bitcount_t i;
@@ -24770,8 +24674,7 @@ void EccPoint_mult(uECC_word_t* result, uECC_word_t* point, uECC_word_t* scalar,
     uECC_vli_set(result, Rx[0], num_words);
     uECC_vli_set(result + num_words, Ry[0], num_words);
 }
-}
-private {
+
 uECC_word_t regularize_k(uECC_word_t* k, uECC_word_t* k0, uECC_word_t* k1, uECC_Curve curve) {
     var num_n_words = cast(wordcount_t, (curve.num_n_bits + (8 * 8 - 1)) / (8 * 8));
     bitcount_t num_n_bits = curve.num_n_bits;
@@ -24779,10 +24682,9 @@ uECC_word_t regularize_k(uECC_word_t* k, uECC_word_t* k0, uECC_word_t* k1, uECC_
     uECC_vli_add(k1, k0, curve.n, num_n_words);
     return carry;
 }
-}
+
 /* Generates a random integer in the range 0 < random < top.
    Both random and top have num_words words. */
-private {
 i32 uECC_generate_random_int(uECC_word_t* random, uECC_word_t* top, wordcount_t num_words) {
     var mask = cast(uECC_word_t, -1);
     uECC_word_t tries;
@@ -24801,8 +24703,7 @@ i32 uECC_generate_random_int(uECC_word_t* random, uECC_word_t* top, wordcount_t 
     }
     return 0;
 }
-}
-private {
+
 uECC_word_t EccPoint_compute_public_key(uECC_word_t* result, uECC_word_t* private_key, uECC_Curve curve) {
     noinit uECC_word_t[4] tmp1;
     noinit uECC_word_t[4] tmp2;
@@ -24822,8 +24723,7 @@ uECC_word_t EccPoint_compute_public_key(uECC_word_t* result, uECC_word_t* privat
     }
     return 1;
 }
-}
-private {
+
 void uECC_vli_nativeToBytes(u8* bytes, i32 num_bytes, uECC_word_t* native) {
     i32 i;
     for i = 0; i < num_bytes; ++i {
@@ -24831,8 +24731,7 @@ void uECC_vli_nativeToBytes(u8* bytes, i32 num_bytes, uECC_word_t* native) {
         bytes[i] = cast(u8, native[b / 8] >> 8 * (b % 8));
     }
 }
-}
-private {
+
 void uECC_vli_bytesToNative(uECC_word_t* native, u8* bytes, i32 num_bytes) {
     i32 i;
     uECC_vli_clear(native, cast(wordcount_t, (num_bytes + (8 - 1)) / 8));
@@ -24842,9 +24741,10 @@ void uECC_vli_bytesToNative(uECC_word_t* native, u8* bytes, i32 num_bytes) {
     }
 }
 }
+
 i32 uECC_make_key(u8* public_key, u8* private_key, uECC_Curve curve) {
     noinit uECC_word_t[4] _private;
-    noinit uECC_word_t[8] _public;
+    noinit uECC_word_t[4 * 2] _public;
     uECC_word_t tries;
     for tries = 0; tries < 64; ++tries {
         if uECC_generate_random_int(_private, curve.n, cast(wordcount_t, (curve.num_n_bits + (8 * 8 - 1)) / (8 * 8))) == 0 {
@@ -24859,8 +24759,9 @@ i32 uECC_make_key(u8* public_key, u8* private_key, uECC_Curve curve) {
     }
     return 0;
 }
+
 i32 uECC_shared_secret(u8* public_key, u8* private_key, u8* secret, uECC_Curve curve) {
-    noinit uECC_word_t[8] _public;
+    noinit uECC_word_t[4 * 2] _public;
     noinit uECC_word_t[4] _private;
     noinit uECC_word_t[4] tmp;
     uECC_word_t*[2] p2 = {_private, tmp};
@@ -24882,6 +24783,7 @@ i32 uECC_shared_secret(u8* public_key, u8* private_key, u8* secret, uECC_Curve c
     uECC_vli_nativeToBytes(secret, num_bytes, _public);
     return !uECC_vli_isZero(_public, cast(wordcount_t, curve.num_words * 2));
 }
+
 private {
 i32 uECC_valid_point(uECC_word_t* point, uECC_Curve curve) {
     noinit uECC_word_t[4] tmp1;
@@ -24898,15 +24800,17 @@ i32 uECC_valid_point(uECC_word_t* point, uECC_Curve curve) {
     return cast(i32, uECC_vli_equal(tmp1, tmp2, num_words));
 }
 }
+
 i32 uECC_valid_public_key(u8* public_key, uECC_Curve curve) {
-    noinit uECC_word_t[8] _public;
+    noinit uECC_word_t[4 * 2] _public;
     uECC_vli_bytesToNative(_public, public_key, curve.num_bytes);
     uECC_vli_bytesToNative(_public + curve.num_words, public_key + curve.num_bytes, curve.num_bytes);
     return uECC_valid_point(_public, curve);
 }
+
 i32 uECC_compute_public_key(u8* private_key, u8* public_key, uECC_Curve curve) {
     noinit uECC_word_t[4] _private;
-    noinit uECC_word_t[8] _public;
+    noinit uECC_word_t[4 * 2] _public;
     uECC_vli_bytesToNative(_private, private_key, (curve.num_n_bits + 7) / 8);
     if uECC_vli_isZero(_private, cast(wordcount_t, (curve.num_n_bits + (8 * 8 - 1)) / (8 * 8))) != 0 {
         return 0;
@@ -24921,6 +24825,7 @@ i32 uECC_compute_public_key(u8* private_key, u8* public_key, uECC_Curve curve) {
     uECC_vli_nativeToBytes(public_key + curve.num_bytes, curve.num_bytes, _public + curve.num_words);
     return 1;
 }
+
 /* -------- ECDSA code -------- */
 private {
 void bits2int(uECC_word_t* native, u8* bits, u32 bits_size, uECC_Curve curve) {
@@ -24949,14 +24854,13 @@ void bits2int(uECC_word_t* native, u8* bits, u32 bits_size, uECC_Curve curve) {
         uECC_vli_sub(native, native, curve.n, cast(wordcount_t, num_n_words));
     }
 }
-}
-private {
+
 i32 uECC_sign_with_k_internal(u8* private_key, u8* message_hash, u32 hash_size, uECC_word_t* k, u8* signature, uECC_Curve curve) {
     noinit uECC_word_t[4] tmp;
     noinit uECC_word_t[4] s;
     uECC_word_t*[2] k2 = {tmp, s};
     uECC_word_t* initial_Z = null;
-    noinit uECC_word_t[8] p;
+    noinit uECC_word_t[4 * 2] p;
     uECC_word_t carry;
     wordcount_t num_words = curve.num_words;
     var num_n_words = cast(wordcount_t, (curve.num_n_bits + (8 * 8 - 1)) / (8 * 8));
@@ -24999,12 +24903,14 @@ i32 uECC_sign_with_k_internal(u8* private_key, u8* message_hash, u32 hash_size, 
     return 1;
 }
 }
+
 /* For testing - sign with an explicitly specified k value */
 i32 uECC_sign_with_k(u8* private_key, u8* message_hash, u32 hash_size, u8* k, u8* signature, uECC_Curve curve) {
     noinit uECC_word_t[4] k2;
     bits2int(k2, k, cast(u32, (curve.num_n_bits + 7) / 8), curve);
     return uECC_sign_with_k_internal(private_key, message_hash, hash_size, k2, signature, curve);
 }
+
 i32 uECC_sign(u8* private_key, u8* message_hash, u32 hash_size, u8* signature, uECC_Curve curve) {
     noinit uECC_word_t[4] k;
     uECC_word_t tries;
@@ -25018,6 +24924,7 @@ i32 uECC_sign(u8* private_key, u8* message_hash, u32 hash_size, u8* signature, u
     }
     return 0;
 }
+
 /* Compute an HMAC using K as a key (as in RFC 6979). Note that K is always
    the same size as the hash result size. */
 private {
@@ -25025,29 +24932,27 @@ void HMAC_init(uECC_HashContext* hash_context, u8* K) {
     u8* pad = hash_context.tmp + 2 * hash_context.result_size;
     u32 i;
     for i = 0; i < hash_context.result_size; ++i {
-        pad[i] = K[i] ^ 54;
+        pad[i] = K[i] ^ 0x36;
     }
     for ; i < hash_context.block_size; ++i {
-        pad[i] = 54;
+        pad[i] = 0x36;
     }
     hash_context.init_hash(hash_context);
     hash_context.update_hash(hash_context, pad, hash_context.block_size);
 }
-}
-private {
+
 void HMAC_update(uECC_HashContext* hash_context, u8* message, u32 message_size) {
     hash_context.update_hash(hash_context, message, message_size);
 }
-}
-private {
+
 void HMAC_finish(uECC_HashContext* hash_context, u8* K, u8* result) {
     u8* pad = hash_context.tmp + 2 * hash_context.result_size;
     u32 i;
     for i = 0; i < hash_context.result_size; ++i {
-        pad[i] = K[i] ^ 92;
+        pad[i] = K[i] ^ 0x5c;
     }
     for ; i < hash_context.block_size; ++i {
-        pad[i] = 92;
+        pad[i] = 0x5c;
     }
     hash_context.finish_hash(hash_context, result);
     hash_context.init_hash(hash_context);
@@ -25055,15 +24960,15 @@ void HMAC_finish(uECC_HashContext* hash_context, u8* K, u8* result) {
     hash_context.update_hash(hash_context, result, hash_context.result_size);
     hash_context.finish_hash(hash_context, result);
 }
-}
+
 /* V = HMAC_K(V) */
-private {
 void update_V(uECC_HashContext* hash_context, u8* K, u8* V) {
     HMAC_init(hash_context, K);
     HMAC_update(hash_context, V, hash_context.result_size);
     HMAC_finish(hash_context, K, V);
 }
 }
+
 /* Deterministic signing, similar to RFC 6979. Differences are:
     * We just use H(m) directly rather than bits2octets(H(m))
       (it is not reduced modulo curve_n).
@@ -25079,18 +24984,18 @@ i32 uECC_sign_deterministic(u8* private_key, u8* message_hash, u32 hash_size, uE
     uECC_word_t tries;
     u32 i;
     for i = 0; i < hash_context.result_size; ++i {
-        V[i] = 1;
+        V[i] = 0x01;
         K[i] = 0;
     }
     HMAC_init(hash_context, K);
-    V[hash_context.result_size] = 0;
+    V[hash_context.result_size] = 0x00;
     HMAC_update(hash_context, V, hash_context.result_size + 1);
     HMAC_update(hash_context, private_key, cast(u32, num_bytes));
     HMAC_update(hash_context, message_hash, hash_size);
     HMAC_finish(hash_context, K, K);
     update_V(hash_context, K, V);
     HMAC_init(hash_context, K);
-    V[hash_context.result_size] = 1;
+    V[hash_context.result_size] = 0x01;
     HMAC_update(hash_context, V, hash_context.result_size + 1);
     HMAC_update(hash_context, private_key, cast(u32, num_bytes));
     HMAC_update(hash_context, message_hash, hash_size);
@@ -25118,23 +25023,25 @@ i32 uECC_sign_deterministic(u8* private_key, u8* message_hash, u32 hash_size, uE
             return 1;
         }
         HMAC_init(hash_context, K);
-        V[hash_context.result_size] = 0;
+        V[hash_context.result_size] = 0x00;
         HMAC_update(hash_context, V, hash_context.result_size + 1);
         HMAC_finish(hash_context, K, K);
         update_V(hash_context, K, V);
     }
     return 0;
 }
+
 private {
 bitcount_t smax(bitcount_t a, bitcount_t b) {
     return a > b ? a : b;
 }
 }
+
 i32 uECC_verify(u8* public_key, u8* message_hash, u32 hash_size, u8* signature, uECC_Curve curve) {
     noinit uECC_word_t[4] u1;
     noinit uECC_word_t[4] u2;
     noinit uECC_word_t[4] z;
-    noinit uECC_word_t[8] sum;
+    noinit uECC_word_t[4 * 2] sum;
     noinit uECC_word_t[4] rx;
     noinit uECC_word_t[4] ry;
     noinit uECC_word_t[4] tx;
@@ -25144,7 +25051,7 @@ i32 uECC_verify(u8* public_key, u8* message_hash, u32 hash_size, u8* signature, 
     uECC_word_t* point;
     bitcount_t num_bits;
     bitcount_t i;
-    noinit uECC_word_t[8] _public;
+    noinit uECC_word_t[4 * 2] _public;
     noinit uECC_word_t[4] r;
     noinit uECC_word_t[4] s;
     wordcount_t num_words = curve.num_words;
@@ -25206,6 +25113,7 @@ i32 uECC_verify(u8* public_key, u8* message_hash, u32 hash_size, u8* signature, 
     }
     return cast(i32, uECC_vli_equal(rx, r, num_words));
 }
+
 /* Linker stub: uECC's set_rng / sign() paths would call this, but our
    verify-only usage never reaches it. Returning 0 means "RNG failure"
    if it ever were called. */
