@@ -37,6 +37,18 @@ struct UefiHost {
     // The `index`th name in `dir`, written into `buf`. Its length, or -1
     // once the directory is exhausted.
     fn(u8*, i32, u8*, i32): i32 list;
+
+    // Bytes of machine memory, and how many are unused. Null, or 0,
+    // leaves os.totalmem() and os.freemem() reporting 0 rather than
+    // reporting a guess.
+    fn(): i64 mem_total;
+    fn(): i64 mem_free;
+
+    // What this machine is, as JSON, written into `buf`. Its length, or
+    // 0 when the embedder has nothing to say. There is no schema here
+    // on purpose: what is worth reporting is the embedder's business,
+    // and os.machine() hands the text to the caller to parse.
+    fn(u8*, i32): i32 machine;
 }
 
 UefiHost* g_uefi_host = null;
@@ -53,6 +65,21 @@ void tsmc_set_uefi_host(UefiHost* h) { g_uefi_host = h; }
 bool uefi_random_bytes(u8* buf, i32 n) {
     if g_uefi_host == null || g_uefi_host.random_bytes == null { return false; }
     return g_uefi_host.random_bytes(buf, n);
+}
+
+i64 uefi_mem_total() {
+    if g_uefi_host == null || g_uefi_host.mem_total == null { return 0; }
+    return g_uefi_host.mem_total();
+}
+
+i64 uefi_mem_free() {
+    if g_uefi_host == null || g_uefi_host.mem_free == null { return 0; }
+    return g_uefi_host.mem_free();
+}
+
+i32 uefi_machine(u8* buf, i32 n) {
+    if g_uefi_host == null || g_uefi_host.machine == null { return 0; }
+    return g_uefi_host.machine(buf, n);
 }
 
 // Without an embedder clock this falls back to the monotonic counter, so

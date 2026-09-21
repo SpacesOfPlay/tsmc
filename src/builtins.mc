@@ -15258,10 +15258,13 @@ else when os(uefi) {
         return cast(f64, qpc()) / cast(f64, f);
     }
 
-    // There is no allocator-independent view of machine memory here, and
-    // guessing at one would make os.freemem() a number that means
-    // nothing.
-    private f64 os_mem(bool want_free) { return 0.0; }
+    // The runtime cannot see machine memory, but whoever handed it the
+    // machine can. Still 0 when the embedder declines to answer, which
+    // is the honest report rather than a guess.
+    private f64 os_mem(bool want_free) {
+        i64 v = want_free ? uefi_mem_free() : uefi_mem_total();
+        return cast(f64, v);
+    }
 
     private void os_loadavg_into(f64* out) {
         *(out) = 0.0;
@@ -15323,6 +15326,22 @@ private Value nat_os_hostname(void* vmp, Value callee, Value thisv, Value* args,
 }
 private Value nat_os_uptime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return value_number(os_uptime_s());
+}
+
+// os.machine() -- not a Node function. Node has no notion of a program
+// that is the whole machine, so there is nothing to be compatible with:
+// this returns whatever the embedder says it is running on, as a JSON
+// string, or "" where nobody is answering.
+private Value nat_os_machine(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    when os(uefi) {
+        noinit u8[2048] buf;
+        i32 n = uefi_machine(&buf[0], 2048);
+        if n <= 0 { return new_str(vm, ""); }
+        return new_str(vm, str_from(&buf[0], n));
+    } else {
+        return new_str(vm, "");
+    }
 }
 
 private Value nat_os_totalmem(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -15397,6 +15416,7 @@ private JsObject* build_os_module(VM* vm) {
     def_node_export(vm, mod, ns, "cpus", &nat_os_cpus);
     def_node_export(vm, mod, ns, "userInfo", &nat_os_userinfo);
     def_node_export(vm, mod, ns, "uptime", &nat_os_uptime);
+    def_node_export(vm, mod, ns, "machine", &nat_os_machine);
     def_node_export(vm, mod, ns, "totalmem", &nat_os_totalmem);
     def_node_export(vm, mod, ns, "freemem", &nat_os_freemem);
     def_node_export(vm, mod, ns, "loadavg", &nat_os_loadavg);
