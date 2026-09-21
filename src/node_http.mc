@@ -120,6 +120,11 @@ class ServerResponse extends EventEmitter {
     this.finished = false;
     this._headers = {};
     this._body = [];
+    // Set by the server for a request whose connection may be reused. A
+    // response built any other way closes, which is what this did before
+    // there was a choice.
+    this._keepAlive = false;
+    this._onDone = null;
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
   getHeader(k) { return this._headers[k.toLowerCase()]; }
@@ -145,7 +150,14 @@ class ServerResponse extends EventEmitter {
     const body = Buffer.concat(this._body);
     const reason = this.statusMessage || statusText(this.statusCode);
     if (this._headers['content-length'] === undefined) this._headers['content-length'] = body.length;
-    if (this._headers['connection'] === undefined) this._headers['connection'] = 'close';
+    if (this._headers['connection'] === undefined) {
+      this._headers['connection'] = this._keepAlive ? 'keep-alive' : 'close';
+    }
+    // A handler that asked to close outranks the server's willingness to
+    // keep going, and what goes on the wire has to be what happens.
+    const connHdr = String(this._headers['connection']).toLowerCase();
+    const persist = this._keepAlive && connHdr.indexOf('close') < 0;
+    this._keepAlive = persist;
     let head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + CRLF;
     // An array value means one header line per element, not one line holding a
     // comma-joined list: that is how Set-Cookie sends several cookies, and
@@ -168,8 +180,9 @@ class ServerResponse extends EventEmitter {
     const bodyAllowed = this._method !== 'HEAD'
       && this.statusCode !== 204 && this.statusCode !== 304;
     if (body.length && bodyAllowed) this.socket.write(body);
-    this.socket.end();
+    if (!persist) this.socket.end();
     this.emit('finish');
+    if (this._onDone) this._onDone();
     return this;
   }
 }
@@ -192,11 +205,65 @@ const MAX_HEAD = 16 * 1024;
 // unbounded one.
 const MAX_BODY = 1024 * 1024;
 
+// A connection that is answered and kept costs one slot for as long as it
+// is held, and the machine has a small fixed number of them. Closing every
+// answer instead costs one slot per request for a full TIME_WAIT, which is
+// far worse for a page that polls: the slots go to connections that are
+// already over. So the connection stays, and an inactivity timer takes it
+// back from a reader who has gone away.
+const IDLE_MS = 15000;
+
 function serveConnection(server, socket) {
   let buf = Buffer.alloc(0);
   let msg = null;
+  let res = null;
   let state = 'head';
   let remaining = 0;
+  let idleTimer = null;
+
+  function idleClear() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  }
+
+  // Only fires between requests. Mid-request the client owes us bytes and
+  // mid-response we owe it some, and neither is the connection sitting
+  // idle -- a long answer must not be cut off for being slow to write.
+  function onIdle() {
+    idleTimer = null;
+    if (state !== 'head') { idleArm(); return; }
+    state = 'done';
+    socket.end();
+  }
+
+  function idleArm() {
+    idleClear();
+    idleTimer = setTimeout(onIdle, IDLE_MS);
+  }
+
+  // The request is read, answered, and only then is the next one looked
+  // at: two responses interleaved on one socket is not a response at all.
+  function onDone() {
+    if (state === 'done') { idleClear(); return; }
+    if (res === null || !res._keepAlive) {
+      state = 'done';
+      idleClear();
+      return;
+    }
+    msg = null;
+    res = null;
+    state = 'head';
+    idleArm();
+    pump();
+  }
+
+  function wantsKeepAlive(m) {
+    const c = String(m.headers['connection'] || '').toLowerCase();
+    if (c.indexOf('close') >= 0) return false;
+    // HTTP/1.1 keeps the connection unless told otherwise; 1.0 is the
+    // other way round and has to ask.
+    if (m.httpVersion === '1.0') return c.indexOf('keep-alive') >= 0;
+    return true;
+  }
 
   // Answer, then hang up. A client that has already gone past a limit is
   // not going to be talked out of it, and leaving the socket open leaves
@@ -211,19 +278,24 @@ function serveConnection(server, socket) {
         'Connection: close' + CRLF + CRLF + body, 'utf8'));
     } catch (e) { /* the peer may already be gone */ }
     state = 'done';
+    idleClear();
     socket.end();
     socket.destroy();
   }
 
-  socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
+  socket.on('data', (chunk) => { idleArm(); buf = Buffer.concat([buf, chunk]); pump(); });
   socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
-  socket.on('error', (e) => { server.emit('clientError', e, socket); socket.destroy(); });
+  socket.on('error', (e) => { idleClear(); server.emit('clientError', e, socket); socket.destroy(); });
+  socket.on('close', () => { idleClear(); state = 'done'; });
 
   function pump() {
     if (state === 'done') { buf = Buffer.alloc(0); return; }
+    // Answering: anything already here belongs to the next request and
+    // waits in the buffer, which MAX_HEAD still bounds.
+    if (state === 'reply') { return; }
     if (state === 'head') {
       const he = findHeaderEnd(buf);
       if (he < 0) {
@@ -250,7 +322,9 @@ function serveConnection(server, socket) {
       if (!(remaining > 0)) remaining = 0;
       if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
       state = 'body';
-      const res = new ServerResponse(socket, msg.method);
+      res = new ServerResponse(socket, msg.method);
+      res._keepAlive = wantsKeepAlive(msg);
+      res._onDone = onDone;
       server.emit('request', msg, res);
     }
     if (state === 'body') {
@@ -260,7 +334,7 @@ function serveConnection(server, socket) {
         buf = buf.slice(take);
         remaining -= take;
       }
-      if (remaining <= 0) { state = 'done'; msg._end(); }
+      if (remaining <= 0) { state = 'reply'; msg._end(); }
     }
   }
 }
