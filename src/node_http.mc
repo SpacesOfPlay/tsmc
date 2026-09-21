@@ -21,6 +21,7 @@ const STATUS = {
   400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
   404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
   413: 'Payload Too Large', 429: 'Too Many Requests',
+  431: 'Request Header Fields Too Large',
   500: 'Internal Server Error', 501: 'Not Implemented',
   502: 'Bad Gateway', 503: 'Service Unavailable',
 };
@@ -173,11 +174,46 @@ class ServerResponse extends EventEmitter {
   }
 }
 
+// What a client may send before it has said anything we agreed to. The
+// head is buffered whole because it cannot be understood in pieces, so
+// without a ceiling a client that opens a connection and never sends the
+// blank line grows that buffer until the machine has no memory left. It
+// costs the attacker one socket and no cleverness.
+//
+// 16 KB is more than any real request line and header block, and well
+// under what a body is allowed. Node's own default is 16 KB for the same
+// reason.
+const MAX_HEAD = 16 * 1024;
+
+// A body is refused on the length the client declares, before any of it
+// is buffered. Nothing gets around that by lying: this server reads a
+// body only when Content-Length gives one, so a request that withholds
+// the length arrives as a request with no body rather than as an
+// unbounded one.
+const MAX_BODY = 1024 * 1024;
+
 function serveConnection(server, socket) {
   let buf = Buffer.alloc(0);
   let msg = null;
   let state = 'head';
   let remaining = 0;
+
+  // Answer, then hang up. A client that has already gone past a limit is
+  // not going to be talked out of it, and leaving the socket open leaves
+  // the thing being defended against in place.
+  function refuse(code, reason) {
+    try {
+      const body = reason + String.fromCharCode(10);
+      socket.write(Buffer.from(
+        'HTTP/1.1 ' + code + ' ' + statusText(code) + CRLF +
+        'Content-Type: text/plain' + CRLF +
+        'Content-Length: ' + Buffer.byteLength(body) + CRLF +
+        'Connection: close' + CRLF + CRLF + body, 'utf8'));
+    } catch (e) { /* the peer may already be gone */ }
+    state = 'done';
+    socket.end();
+    socket.destroy();
+  }
 
   socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
   socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
@@ -187,9 +223,16 @@ function serveConnection(server, socket) {
   socket.on('error', (e) => { server.emit('clientError', e, socket); socket.destroy(); });
 
   function pump() {
+    if (state === 'done') { buf = Buffer.alloc(0); return; }
     if (state === 'head') {
       const he = findHeaderEnd(buf);
-      if (he < 0) return;
+      if (he < 0) {
+        if (buf.length > MAX_HEAD) {
+          refuse(431, 'Request header too large');
+        }
+        return;
+      }
+      if (he > MAX_HEAD) { refuse(431, 'Request header too large'); return; }
       const text = buf.slice(0, he).toString('utf8');
       buf = buf.slice(he + 4);
       const lines = text.split(CRLF);
@@ -201,6 +244,11 @@ function serveConnection(server, socket) {
       msg.headers = parseHeaders(lines.join(CRLF));
       const cl = msg.headers['content-length'];
       remaining = cl !== undefined ? parseInt(cl, 10) : 0;
+      // A length that is absent, negative or not a number is none. A
+      // declared one past the ceiling is refused before a byte of it is
+      // kept, which is the point of it being declared.
+      if (!(remaining > 0)) remaining = 0;
+      if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
       state = 'body';
       const res = new ServerResponse(socket, msg.method);
       server.emit('request', msg, res);
