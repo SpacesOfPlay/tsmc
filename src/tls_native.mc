@@ -408,6 +408,14 @@ private bool tls_flush(TlsSession* s, i64 fd) {
 
 // Drive one readiness event: kick the handshake, drain inbound ciphertext,
 // flush outbound. Returns the TLS_* status bits.
+// Where the handshake's time goes, summed over every pump of a session
+// that is not yet established: the read, picotls, and the write. In
+// clock ticks; the embedder reports them.
+i64 tls_stat_hs_recv = 0;
+i64 tls_stat_hs_feed = 0;
+i64 tls_stat_hs_flush = 0;
+i64 tls_stat_hs_pumps = 0;
+
 i32 tls_pump(TlsSession* s, i64 fd) {
     if s.failed { return TLS_ERR; }
     i32 flags = 0;
@@ -428,10 +436,13 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     }
     if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
     bool more = true;
+    bool handshaking = !s.established;
     while more {
         more = false;
         u8[8192] tmp;
+        i64 q0 = qpc();
         i32 n = net_try_recv(fd, &tmp[0], 8192);
+        if handshaking { tls_stat_hs_recv = tls_stat_hs_recv + (qpc() - q0); }
         if n == 0 {
             s.eof = true;
             flags = flags | TLS_EOF;
@@ -444,8 +455,16 @@ i32 tls_pump(TlsSession* s, i64 fd) {
             s.cipher_in_len += n;
             more = true;
         }
+        i64 q1 = qpc();
         flags = flags | tls_feed(s);
+        i64 q2 = qpc();
         if !tls_flush(s, fd) { s.failed = true; flags = flags | TLS_ERR; }
+        i64 q3 = qpc();
+        if handshaking {
+            tls_stat_hs_feed = tls_stat_hs_feed + (q2 - q1);
+            tls_stat_hs_flush = tls_stat_hs_flush + (q3 - q2);
+            tls_stat_hs_pumps = tls_stat_hs_pumps + 1;
+        }
         if (flags & TLS_ERR) != 0 || (flags & TLS_EOF) != 0 { break; }
     }
     if s.recvbuf.off > 0 { flags = flags | TLS_HAS_DATA; }
