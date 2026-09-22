@@ -209,9 +209,17 @@ const MAX_BODY = 1024 * 1024;
 // is held, and the machine has a small fixed number of them. Closing every
 // answer instead costs one slot per request for a full TIME_WAIT, which is
 // far worse for a page that polls: the slots go to connections that are
-// already over. So the connection stays, and an inactivity timer takes it
-// back from a reader who has gone away.
-const IDLE_MS = 15000;
+// already over. So the connection stays, and a deadline takes it back.
+//
+// A deadline and not an inactivity timer, because a timer that any byte
+// resets is defeated by one byte every so often: sixteen kilobytes of
+// header, one byte at a time, held a slot for days. What a client is
+// given is a fixed time to deliver a complete request head -- from the
+// connection opening, or from the end of the previous answer -- and then
+// a fixed time to deliver the body it declared. nginx calls the same two
+// numbers client_header_timeout and client_body_timeout.
+const HEAD_MS = 15000;
+const BODY_MS = 30000;
 
 function serveConnection(server, socket) {
   let buf = Buffer.alloc(0);
@@ -219,40 +227,41 @@ function serveConnection(server, socket) {
   let res = null;
   let state = 'head';
   let remaining = 0;
-  let idleTimer = null;
+  let timer = null;
 
-  function idleClear() {
-    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  function clearDeadline() {
+    if (timer) { clearTimeout(timer); timer = null; }
   }
 
-  // Only fires between requests. Mid-request the client owes us bytes and
-  // mid-response we owe it some, and neither is the connection sitting
-  // idle -- a long answer must not be cut off for being slow to write.
-  function onIdle() {
-    idleTimer = null;
-    if (state !== 'head') { idleArm(); return; }
+  // The client's time is up. While an answer is being written there is
+  // no deadline at all: that is the server's turn, and a long answer must
+  // not be cut off for being slow to write.
+  function onDeadline() {
+    timer = null;
+    if (state === 'done' || state === 'reply') return;
     state = 'done';
     socket.end();
+    socket.destroy();
   }
 
-  function idleArm() {
-    idleClear();
-    idleTimer = setTimeout(onIdle, IDLE_MS);
+  function deadline(ms) {
+    clearDeadline();
+    timer = setTimeout(onDeadline, ms);
   }
 
   // The request is read, answered, and only then is the next one looked
   // at: two responses interleaved on one socket is not a response at all.
   function onDone() {
-    if (state === 'done') { idleClear(); return; }
+    if (state === 'done') { clearDeadline(); return; }
     if (res === null || !res._keepAlive) {
       state = 'done';
-      idleClear();
+      clearDeadline();
       return;
     }
     msg = null;
     res = null;
     state = 'head';
-    idleArm();
+    deadline(HEAD_MS);
     pump();
   }
 
@@ -278,18 +287,19 @@ function serveConnection(server, socket) {
         'Connection: close' + CRLF + CRLF + body, 'utf8'));
     } catch (e) { /* the peer may already be gone */ }
     state = 'done';
-    idleClear();
+    clearDeadline();
     socket.end();
     socket.destroy();
   }
 
-  socket.on('data', (chunk) => { idleArm(); buf = Buffer.concat([buf, chunk]); pump(); });
+  deadline(HEAD_MS);
+  socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
   socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
-  socket.on('error', (e) => { idleClear(); server.emit('clientError', e, socket); socket.destroy(); });
-  socket.on('close', () => { idleClear(); state = 'done'; });
+  socket.on('error', (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); });
+  socket.on('close', () => { clearDeadline(); state = 'done'; });
 
   function pump() {
     if (state === 'done') { buf = Buffer.alloc(0); return; }
@@ -321,6 +331,9 @@ function serveConnection(server, socket) {
       // kept, which is the point of it being declared.
       if (!(remaining > 0)) remaining = 0;
       if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
+      // The head arrived in time. A body gets its own budget; none
+      // expected means it is the server's turn and the clock stops.
+      if (remaining > 0) deadline(BODY_MS); else clearDeadline();
       state = 'body';
       res = new ServerResponse(socket, msg.method);
       res._keepAlive = wantsKeepAlive(msg);
@@ -334,7 +347,7 @@ function serveConnection(server, socket) {
         buf = buf.slice(take);
         remaining -= take;
       }
-      if (remaining <= 0) { state = 'reply'; msg._end(); }
+      if (remaining <= 0) { clearDeadline(); state = 'reply'; msg._end(); }
     }
   }
 }
