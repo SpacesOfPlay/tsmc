@@ -22,6 +22,7 @@ import deflate;
 import inflate;
 import net;
 import os_time;
+import uefi_host;
 import tls_native;
 import tls_chain;
 import tsmc_plugin_abi;
@@ -10287,6 +10288,17 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         }
     }
 }
+else when os(uefi) {
+    // One program, one address space, no environment to inherit and
+    // nowhere to have been started from. The console is a framebuffer or
+    // a serial line rather than a terminal, so nothing here claims a TTY
+    // and the colour paths stay off.
+    private str os_platform_name() { return "uefi"; }
+    private bool os_isatty(i32 fd) { return false; }
+    private i32 os_pid() { return 0; }
+    private Value os_cwd_str(VM* vm) { return new_str(vm, "/"); }
+    private void os_env_install(VM* vm, JsObject* env) { }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
@@ -12460,22 +12472,15 @@ private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* ar
 }
 
 // Half-close: stop sending, keep reading. end() needs this, or a peer that
-// replies after our FIN is talking to a socket that is already gone.
-when os(windows) {
-    private extern "ws2_32.dll" i32 shutdown(i64 s, i32 how);
-    private i32 net_shutdown_send(i64 fd) { return shutdown(fd, 1); }   // SD_SEND
-}
-else when os(macos) || os(ios) {
-    private extern "libSystem.B.dylib" i32 shutdown(i32 s, i32 how);
-    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
-}
-else when os(linux) || os(android) {
-    when os(android) { private extern "libc.so" i32 shutdown(i32 s, i32 how); }
-    else { private extern "libc.so.6" i32 shutdown(i32 s, i32 how); }
-    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }   // SHUT_WR
+// replies after our FIN is talking to a socket that is already gone. The
+// net library carries it on every target that has sockets at all, so this
+// is one call rather than a chain of them.
+when os(android) {
+    private extern "libc.so" i32 shutdown(i32 s, i32 how);
+    private i32 net_shutdown_send(i64 fd) { return shutdown(cast(i32, fd), 1); }
 }
 else {
-    private i32 net_shutdown_send(i64 fd) { return 0; }
+    private i32 net_shutdown_send(i64 fd) { return net_shutdown_write(fd); }
 }
 
 private Value nat_net_shutdown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -13344,6 +13349,14 @@ else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
     private u8 path_sep_ch() { return cast(u8, '/'); }
     private str path_delim_str() { return ":"; }
 }
+else when os(uefi) {
+    // The file namespace is flat and posix-shaped: one root, forward
+    // slashes, no drive letters.
+    private bool path_is_sep(u8 c) { return c == '/'; }
+    private str path_sep_str() { return "/"; }
+    private u8 path_sep_ch() { return cast(u8, '/'); }
+    private str path_delim_str() { return ":"; }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than assuming another platform's path conventions.
@@ -13370,6 +13383,9 @@ when os(windows) {
     private bool pf_host() { return true; }
 }
 else when os(macos) || os(ios) || os(linux) || os(android) || os(wasm) {
+    private bool pf_host() { return false; }
+}
+else when os(uefi) {
     private bool pf_host() { return false; }
 }
 else {
@@ -14247,6 +14263,45 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         ignore closedir(dp);
     }
 }
+else when os(uefi) {
+    // Reading and writing files needs nothing from here: open, read,
+    // write, close and remove cross over as runtime contract calls, and
+    // the builtins above use them directly. Directories do not cross
+    // over, so they go through whatever the embedder attached. With
+    // nothing attached the view is flat and these report failure, which
+    // is the same answer a read-only file view gives.
+    private bool fs_mkdir1(u8* p) { return uefi_mkdir(p); }
+    private bool fs_rmdir1(u8* p) { return uefi_rmdir(p); }
+    private bool fs_unlink1(u8* p) { return remove(p) == 0; }
+    // No rename in the contract. Reporting failure sends the caller down
+    // its copy-and-unlink path rather than silently losing the file.
+    private bool fs_rename1(u8* a, u8* b) { return false; }
+    private bool fs_is_dir(u8* p) { return uefi_is_dir(p); }
+    // ns since the Unix epoch -> ms. A target that keeps no stamp reports
+    // zero, which surfaces as the epoch rather than as a wrong date.
+    private f64 fs_mtime_ms(u64 mt) { return cast(f64, cast(i64, mt)) / 1000000.0; }
+
+    private void fs_readdir_into(VM* vm, str dir, JsObject* arr) {
+        u8* cdir = str_to_cstr(dir);
+        defer free(cdir);
+        noinit u8[256] name;
+        i32 idx = 0;
+        i32 out = 0;
+        while true {
+            i32 n = uefi_list(cdir, idx, &name[0], 256);
+            if n < 0 { break; }
+            idx++;
+            bool dot = (n == 1 && name[0] == '.')
+                || (n == 2 && name[0] == '.' && name[1] == '.');
+            if dot { continue; }
+            str nm;
+            nm.data = &name[0];
+            nm.len = n;
+            js_array_set(arr, out, new_str(vm, nm));
+            out++;
+        }
+    }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
@@ -14294,8 +14349,44 @@ private bool fs_path_is_dir(str path) {
 }
 
 // True when the path names something, directory or not.
+// Everything below asks this rather than file_stamp directly, because one
+// target cannot answer a stamp at all and has to be served another way.
+when os(uefi) {
+    private FileStamp fs_stat1(str path) {
+        FileStamp r = { .mtime = 0, .size = 0 - 1, .ok = false };
+        u8* c = str_to_cstr(path);
+        defer free(c);
+        if uefi_is_dir(c) {
+            r.ok = true;
+            r.size = 0;
+            return r;
+        }
+        if file_exists(c) == 0 { return r; }
+        r.ok = true;
+        // No size call crosses over: the contract carries open, read,
+        // write, close and remove and nothing else. Counting the bytes is
+        // what is left, and a stat is not a hot path on a machine whose
+        // whole file view was baked into its own image.
+        i64 fd = open(c, 0);
+        if fd == 0 - 1 { return r; }
+        noinit u8[4096] buf;
+        i64 n = 0;
+        while true {
+            i32 got = read(fd, &buf[0], 4096);
+            if got <= 0 { break; }
+            n = n + cast(i64, got);
+        }
+        ignore close(fd);
+        r.size = n;
+        return r;
+    }
+}
+else {
+    private FileStamp fs_stat1(str path) { return file_stamp(path); }
+}
+
 private bool fs_path_exists(str path) {
-    return file_stamp(path).ok || fs_path_is_dir(path);
+    return fs_stat1(path).ok || fs_path_is_dir(path);
 }
 
 // The directory a path sits in, as a view into it; empty when there is none.
@@ -14499,7 +14590,7 @@ private Value nat_fs_write_file(void* vmp, Value callee, Value thisv, Value* arg
     bool ok = file_write(path, fd);
     // a zero-length write reports failure even where the file was created, so
     // confirm before turning that into an error
-    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
+    if !ok && bytes.len == 0 { ok = fs_stat1(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -14522,7 +14613,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
     fd.data = bytes.data;
     fd.len = bytes.len;
     bool ok = file_write(path, fd);
-    if !ok && bytes.len == 0 { ok = file_stamp(path).ok; }
+    if !ok && bytes.len == 0 { ok = fs_stat1(path).ok; }
     str_buf_free(&bytes);
     if !ok { fs_throw(vm, "open", path); }
     vm_pop(vm);
@@ -14538,7 +14629,7 @@ private Value nat_fs_append_file(void* vmp, Value callee, Value thisv, Value* ar
 private Value nat_fs_exists(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    bool ok = file_stamp(path).ok;
+    bool ok = fs_stat1(path).ok;
     vm_pop(vm);
     return value_bool(ok);
 }
@@ -14698,7 +14789,7 @@ private Value nat_fs_rmdir(void* vmp, Value callee, Value thisv, Value* args, i3
 private Value nat_fs_stat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     str path = path_arg(vm, args, argc, 0);
-    FileStamp st = file_stamp(path);
+    FileStamp st = fs_stat1(path);
     if !st.ok {
         fs_throw(vm, "stat", path);
         vm_pop(vm);
@@ -15151,6 +15242,45 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
     private i32 os_uid() { return getuid(); }
     private i32 os_gid() { return getgid(); }
 }
+else when os(uefi) {
+    // Two of these are real: the machine says how many cores it brought
+    // up, and the monotonic counter says how long ago that was. The rest
+    // describe an identity this target does not have, and report the
+    // neutral values the accessors already use for "unknown" rather than
+    // inventing a user or a hostname.
+    private str os_type_str() { return "Uefi"; }
+    private str os_eol_str() { return "\n"; }
+    private i32 os_ncpu() { return cpu_count(); }
+
+    private f64 os_uptime_s() {
+        i64 f = qpf();
+        if f == 0 { return 0.0; }
+        return cast(f64, qpc()) / cast(f64, f);
+    }
+
+    // The runtime cannot see machine memory, but whoever handed it the
+    // machine can. Still 0 when the embedder declines to answer, which
+    // is the honest report rather than a guess.
+    private f64 os_mem(bool want_free) {
+        i64 v = want_free ? uefi_mem_free() : uefi_mem_total();
+        return cast(f64, v);
+    }
+
+    private void os_loadavg_into(f64* out) {
+        *(out) = 0.0;
+        *(out + 1) = 0.0;
+        *(out + 2) = 0.0;
+    }
+
+    private str os_devnull_str() { return "/dev/null"; }
+    private bool os_hostname_into(u8* buf, i32 cap) { return false; }
+    private u8* os_home() { return null; }
+    private u8* os_tmp() { return null; }
+    private u8* os_user() { return null; }
+    private u8* os_shell() { return null; }
+    private i32 os_uid() { return 0 - 1; }
+    private i32 os_gid() { return 0 - 1; }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
@@ -15196,6 +15326,22 @@ private Value nat_os_hostname(void* vmp, Value callee, Value thisv, Value* args,
 }
 private Value nat_os_uptime(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return value_number(os_uptime_s());
+}
+
+// os.machine() -- not a Node function. Node has no notion of a program
+// that is the whole machine, so there is nothing to be compatible with:
+// this returns whatever the embedder says it is running on, as a JSON
+// string, or "" where nobody is answering.
+private Value nat_os_machine(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = cast(VM*, vmp);
+    when os(uefi) {
+        noinit u8[2048] buf;
+        i32 n = uefi_machine(&buf[0], 2048);
+        if n <= 0 { return new_str(vm, ""); }
+        return new_str(vm, str_from(&buf[0], n));
+    } else {
+        return new_str(vm, "");
+    }
 }
 
 private Value nat_os_totalmem(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -15270,6 +15416,7 @@ private JsObject* build_os_module(VM* vm) {
     def_node_export(vm, mod, ns, "cpus", &nat_os_cpus);
     def_node_export(vm, mod, ns, "userInfo", &nat_os_userinfo);
     def_node_export(vm, mod, ns, "uptime", &nat_os_uptime);
+    def_node_export(vm, mod, ns, "machine", &nat_os_machine);
     def_node_export(vm, mod, ns, "totalmem", &nat_os_totalmem);
     def_node_export(vm, mod, ns, "freemem", &nat_os_freemem);
     def_node_export(vm, mod, ns, "loadavg", &nat_os_loadavg);
@@ -16521,10 +16668,28 @@ else when os(wasm) {
     // crypto functions throw rather than fall back to a weaker source.
     private bool os_random(u8* buf, i32 n) { return host_random_bytes(buf, n) != 0; }
 }
+else when os(uefi) {
+    // Entropy comes from whatever the embedder attached to the machine's
+    // source. When there is none, or it reports failure, the crypto
+    // functions throw rather than fall back to a weaker source: a key
+    // that looks random and is not is worse than no key.
+    private bool os_random(u8* buf, i32 n) { return uefi_random_bytes(buf, n); }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
     tsmc_unsupported_target__add_a_when_os_arm _unsupported_random;
+}
+
+// picotls reaches for a syscall where there is one. Where there is not,
+// it takes the same source the crypto builtins use, so there is one
+// answer to "where does entropy come from" per target rather than two.
+when os(uefi) || os(wasm) {
+    private bool crypto_csprng_source(u8* buf, i32 n) { return os_random(buf, n); }
+    private void crypto_install_csprng() { mc_csprng_set_source(crypto_csprng_source); }
+}
+else {
+    private void crypto_install_csprng() { }
 }
 
 // Coerce a key/data argument to a byte Buffer: a Buffer passes through, a
@@ -19058,6 +19223,7 @@ private void install_proxy_reflect(VM* vm) {
 }
 
 void builtins_install(VM* vm) {
+    crypto_install_csprng();
     // prototypes first; VM fields make them GC roots immediately
     vm.object_proto = js_new_object(&vm.heap, null);
     vm.array_proto = js_new_object(&vm.heap, vm.object_proto);

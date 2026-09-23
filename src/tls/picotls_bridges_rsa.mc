@@ -546,7 +546,7 @@ i32 rsa_pss_pinned_verify_cert_cb(ptls_verify_certificate_t* self,
     rsa_verify_ctx_t* ctx = new(rsa_verify_ctx_t);
     if mc_spki_extract_rsa_pubkey(spki_start, spki_len, &ctx.modulus[0],
                                   &ctx.modulus_len, &ctx.exponent) != 0 {
-        free(cast(void*, ctx));
+        free(ctx);
         eprint("rsa verify: SPKI pubkey extract failed (not RSA?)\n");
         return 0 - 1;
     }
@@ -828,6 +828,7 @@ bool mc_rsa_pss_sign(u8* n_be, i32 klen, u8* d_be, i32 dlen, i32 hlen, u8* mhash
     return mc_rsa_privop_plain(n_be, klen, d_be, dlen, &em[0], emlen, sig_out);
 }
 
+// LOCAL (tsmc): server-side signing for RSA keys; see the P-256 bridge.
 struct rsa_sign_cert_ctx_t {
     ptls_sign_certificate_t super;
     u8[512] n;    // modulus, big-endian

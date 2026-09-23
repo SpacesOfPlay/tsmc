@@ -9,6 +9,7 @@ import vec;
 import str;
 import map;
 import file;
+import uefi_host;
 import diag;
 import bump;
 import ast;
@@ -81,6 +82,16 @@ else when os(wasm) {
         return ok;
     }
 }
+else when os(uefi) {
+    // No realpath and no opendir: canon_into is defined below
+    // path_norm_join, which it needs, and directories are whatever the
+    // embedder attached says they are.
+    private bool dir_there(str path) {
+        u8* c = str_to_cstr(path);
+        defer free(c);
+        return uefi_is_dir(c);
+    }
+}
 else {
     // No arm for this target. Add a `when os(...)` arm above rather
     // than letting it fall back to another platform's syscalls.
@@ -94,7 +105,7 @@ when os(macos) || os(ios) || os(linux) || os(android) {
     }
 }
 
-when !os(wasm) {
+when !os(wasm) && !os(uefi) {
     private bool dir_there(str path) { return path_is_dir(path); }
 }
 
@@ -292,8 +303,8 @@ private str resolve_specifier(str importer, str spec) {
     return r;
 }
 
-when os(wasm) {
-    // No realpath in the sandbox, whose working directory is "/": the
+when os(wasm) || os(uefi) {
+    // No realpath on either: the working directory is "/" and the
     // canonical form is the lexical one, made absolute.
     private bool canon_into(u8* cpath, u8* buf, i32 cap) {
         str p = str_from_cstr(cpath);

@@ -197,7 +197,13 @@ private void gc_trace(GcHeap* h, GcCell* c) {
 
 // --- collect -------------------------------------------------------
 
+// How many collections, and how long they took, for the embedder to
+// report: a pause here is a pause in everything the runtime serves.
+i64 gc_stat_collections = 0;
+i64 gc_stat_ticks = 0;
+
 void gc_collect(GcHeap* h) {
+    i64 gc_t0 = qpc();
     if h.mark_roots != null { h.mark_roots(h, h.mark_ctx); }
     for i32 i = 0; i < h.roots.len; i++ {
         gc_mark_value(h, vec_get(&h.roots, i));
@@ -251,6 +257,8 @@ void gc_collect(GcHeap* h) {
     h.next_gc = live_bytes * 2;
     if h.next_gc < GC_MIN_THRESHOLD { h.next_gc = GC_MIN_THRESHOLD; }
     h.n_collections++;
+    gc_stat_collections = gc_stat_collections + 1;
+    gc_stat_ticks = gc_stat_ticks + (qpc() - gc_t0);
 }
 
 // A cell swept in stress mode keeps its memory and reads as kind -1, which

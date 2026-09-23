@@ -15,6 +15,7 @@ import object;
 import ustr;
 import bigint;
 import os_time;
+import uefi_host;
 import net;
 import bytecode;
 import numparse;
@@ -7878,6 +7879,14 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
         tv.tv_usec = 0;
         ignore gettimeofday(&tv, null);
         return cast(f64, tv.tv_sec) * 1000.0 + cast(f64, tv.tv_usec) / 1000.0;
+    }
+}
+else when os(uefi) {
+    // Whatever the embedder can say about real time, which may be the
+    // monotonic counter with the wrong origin. Date arithmetic still
+    // works; only an absolute date is untrustworthy.
+    f64 vm_now_millis(VM* vm) {
+        return cast(f64, uefi_wall_ms());
     }
 }
 else {

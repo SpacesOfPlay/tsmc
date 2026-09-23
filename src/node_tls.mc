@@ -160,6 +160,8 @@ function pemToChain(pem) {
 // net.createServer: `onSecure` (and the 'secureConnection' event) receive a
 // TLSSocket once its handshake completes. listen/address/close proxy to an
 // underlying net server; the shared context is freed on close.
+const HANDSHAKE_MS = 10000;
+
 function createServer(opts, onSecure) {
   if (typeof opts === 'function') { onSecure = opts; opts = {}; }
   opts = opts || {};
@@ -182,7 +184,13 @@ function createServer(opts, onSecure) {
     tsock._id = sock._id;
     tsock._connecting = true;
     __net_set_owner(sock._id, tsock);
-    tsock.on('secureConnect', () => server.emit('secureConnection', tsock));
+    // Nothing above this layer hears of a connection until it is secure,
+    // so a handshake that stalls holds its slot and is nobody's problem
+    // unless it is this one's. One round trip and the peer's signing
+    // time is all a handshake needs; ten seconds is a stalled peer.
+    const hs = setTimeout(() => { if (tsock._connecting) tsock.destroy(); }, HANDSHAKE_MS);
+    tsock.on('secureConnect', () => { clearTimeout(hs); server.emit('secureConnection', tsock); });
+    tsock.on('close', () => clearTimeout(hs));
     // A handshake that fails must take down one connection, not the server.
     // 'error' with no listener throws, and nothing has had the chance to
     // attach one yet, so the failure is reported as 'tlsClientError' — an

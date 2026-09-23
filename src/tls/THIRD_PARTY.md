@@ -5,10 +5,34 @@ minc-language port of [picotls](https://github.com/h2o/picotls) (TLS 1.3)
 with [cifra](https://github.com/ctz/cifra) (AEAD + hash) and
 [monocypher](https://monocypher.org/) (X25519 + Ed25519).
 
-- Snapshot: `transminc @ e952e38`, built 2026-07-20 (see the upstream
-  `VERSION`).
+- Snapshot: `transminc @ 59aba9d`, upstream picotls `3598470df012`,
+  built 2026-09-18 (see the upstream `VERSION`).
 - Upstream: the `picotls-minc` project by Mattias Ljungström / Spaces Of
   Play. Regenerated from C via transminc.
+
+## Local changes, and why they have to be re-applied
+
+picotls-minc is a **client**: it verifies a server's certificate and has
+no server-side signing, no freestanding target and no entropy source
+that fails loudly. Everything below is ours and does not exist upstream,
+so an update is a three-way merge rather than a copy. The 2026-09-18
+update nearly lost the first of these by copying a file wholesale.
+
+| file | what is ours |
+|---|---|
+| `picotls_bridges_p256.mc` | `ecdsa_sign_cert_ctx_t` and the P-256 signing path -- what makes a TLS *server* possible |
+| `picotls_bridges_rsa.mc` | `rsa_sign_cert_ctx_t`, the same for RSA keys |
+| `picotls_bridges.mc` | `mc_csprng_bytes`: a uefi/wasm arm over an installable source, `mc_csprng_fail()` on every failure upstream ignores, and a compile-time tripwire for an unhandled target. Upstream returns silently and leaves the buffer holding whatever it held, which is key material out of uninitialised memory |
+| `cvararg_shim.mc` | `puts` and `fwrite` for uefi, over the runtime's console |
+
+Each is marked `LOCAL (tsmc)` in the source. Grep for that before
+updating; a symbol that exists here and not upstream is the other
+signal (`comm -23` over the type names finds the signing contexts).
+
+To update: three-way merge against the *published snapshot nearest
+below* this one -- an older base is safer than a newer one, because
+changes both sides already have then appear identically rather than
+looking like a revert.
 
 ## What is vendored (and what is not)
 
