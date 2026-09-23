@@ -19,6 +19,13 @@
 // ./minc is preferred over PATH when present, which is how this repo
 // is developed; nothing needs it to be there.
 
+@minc_min_version "0.9.15"
+
+// Older minc ignores the tag above; this forces a clear error there.
+when !defined(MINC_VERSION) || MINC_VERSION < 9015 {
+    minc_0_9_15_or_newer_required please_update_minc;
+}
+
 import process;
 import file;
 import str;
