@@ -18725,6 +18725,182 @@ u32 sub_word(u32 w, u8* sbox) {
     return cast(u32, a) << 24 | cast(u32, b) << 16 | cast(u32, c) << 8 | d;
 }
 
+/* SubBytes as a boolean circuit over bit-planes: Boyar and Peralta,
+ * "A new combinational logic minimization technique with applications
+ * to cryptology", eprint 2009/191, Appendix C. No secret indexes memory,
+ * as with the masked table scan this replaces, at about a tenth of the
+ * work. Plane b holds bit b of every byte, lane 4*w + k byte k of word w.
+ * Decryption keeps the table; TLS 1.3 never decrypts a block. */
+void aes_planes_in(u32* state, u32* q) {
+    for u32 b = 0; b < 8; b++ {
+        u32 p = 0;
+        for u32 w = 0; w < 4; w++ {
+            u32 x = state[w] >> b & 0x01010101;
+            x = (x | x >> 7) & 0x00030003;
+            x = (x | x >> 14) & 0xF;
+            p |= x << 4 * w;
+        }
+        q[b] = p;
+    }
+}
+
+void aes_planes_out(u32* q, u32* state) {
+    for u32 w = 0; w < 4; w++ {
+        u32 word = 0;
+        for u32 b = 0; b < 8; b++ {
+            u32 x = q[b] >> 4 * w & 0xF;
+            x = (x | x << 14) & 0x00030003;
+            x = (x | x << 7) & 0x01010101;
+            word |= x << b;
+        }
+        state[w] = word;
+    }
+}
+
+void aes_sbox_planes(u32* q) {
+    u32 x0 = q[7];
+    u32 x1 = q[6];
+    u32 x2 = q[5];
+    u32 x3 = q[4];
+    u32 x4 = q[3];
+    u32 x5 = q[2];
+    u32 x6 = q[1];
+    u32 x7 = q[0];
+    u32 y14 = x3 ^ x5;
+    u32 y13 = x0 ^ x6;
+    u32 y9 = x0 ^ x3;
+    u32 y8 = x0 ^ x5;
+    u32 t0 = x1 ^ x2;
+    u32 y1 = t0 ^ x7;
+    u32 y4 = y1 ^ x3;
+    u32 y12 = y13 ^ y14;
+    u32 y2 = y1 ^ x0;
+    u32 y5 = y1 ^ x6;
+    u32 y3 = y5 ^ y8;
+    u32 t1 = x4 ^ y12;
+    u32 y15 = t1 ^ x5;
+    u32 y20 = t1 ^ x1;
+    u32 y6 = y15 ^ x7;
+    u32 y10 = y15 ^ t0;
+    u32 y11 = y20 ^ y9;
+    u32 y7 = x7 ^ y11;
+    u32 y17 = y10 ^ y11;
+    u32 y19 = y10 ^ y8;
+    u32 y16 = t0 ^ y11;
+    u32 y21 = y13 ^ y16;
+    u32 y18 = x0 ^ y16;
+    u32 t2 = y12 & y15;
+    u32 t3 = y3 & y6;
+    u32 t4 = t3 ^ t2;
+    u32 t5 = y4 & x7;
+    u32 t6 = t5 ^ t2;
+    u32 t7 = y13 & y16;
+    u32 t8 = y5 & y1;
+    u32 t9 = t8 ^ t7;
+    u32 t10 = y2 & y7;
+    u32 t11 = t10 ^ t7;
+    u32 t12 = y9 & y11;
+    u32 t13 = y14 & y17;
+    u32 t14 = t13 ^ t12;
+    u32 t15 = y8 & y10;
+    u32 t16 = t15 ^ t12;
+    u32 t17 = t4 ^ t14;
+    u32 t18 = t6 ^ t16;
+    u32 t19 = t9 ^ t14;
+    u32 t20 = t11 ^ t16;
+    u32 t21 = t17 ^ y20;
+    u32 t22 = t18 ^ y19;
+    u32 t23 = t19 ^ y21;
+    u32 t24 = t20 ^ y18;
+    u32 t25 = t21 ^ t22;
+    u32 t26 = t21 & t23;
+    u32 t27 = t24 ^ t26;
+    u32 t28 = t25 & t27;
+    u32 t29 = t28 ^ t22;
+    u32 t30 = t23 ^ t24;
+    u32 t31 = t22 ^ t26;
+    u32 t32 = t31 & t30;
+    u32 t33 = t32 ^ t24;
+    u32 t34 = t23 ^ t33;
+    u32 t35 = t27 ^ t33;
+    u32 t36 = t24 & t35;
+    u32 t37 = t36 ^ t34;
+    u32 t38 = t27 ^ t36;
+    u32 t39 = t29 & t38;
+    u32 t40 = t25 ^ t39;
+    u32 t41 = t40 ^ t37;
+    u32 t42 = t29 ^ t33;
+    u32 t43 = t29 ^ t40;
+    u32 t44 = t33 ^ t37;
+    u32 t45 = t42 ^ t41;
+    u32 z0 = t44 & y15;
+    u32 z1 = t37 & y6;
+    u32 z2 = t33 & x7;
+    u32 z3 = t43 & y16;
+    u32 z4 = t40 & y1;
+    u32 z5 = t29 & y7;
+    u32 z6 = t42 & y11;
+    u32 z7 = t45 & y17;
+    u32 z8 = t41 & y10;
+    u32 z9 = t44 & y12;
+    u32 z10 = t37 & y3;
+    u32 z11 = t33 & y4;
+    u32 z12 = t43 & y13;
+    u32 z13 = t40 & y5;
+    u32 z14 = t29 & y2;
+    u32 z15 = t42 & y9;
+    u32 z16 = t45 & y14;
+    u32 z17 = t41 & y8;
+    u32 t46 = z15 ^ z16;
+    u32 t47 = z10 ^ z11;
+    u32 t48 = z5 ^ z13;
+    u32 t49 = z9 ^ z10;
+    u32 t50 = z2 ^ z12;
+    u32 t51 = z2 ^ z5;
+    u32 t52 = z7 ^ z8;
+    u32 t53 = z0 ^ z3;
+    u32 t54 = z6 ^ z7;
+    u32 t55 = z16 ^ z17;
+    u32 t56 = z12 ^ t48;
+    u32 t57 = t50 ^ t53;
+    u32 t58 = z4 ^ t46;
+    u32 t59 = z3 ^ t54;
+    u32 t60 = t46 ^ t57;
+    u32 t61 = z14 ^ t57;
+    u32 t62 = t52 ^ t58;
+    u32 t63 = t49 ^ t58;
+    u32 t64 = z4 ^ t59;
+    u32 t65 = t61 ^ t62;
+    u32 t66 = z1 ^ t63;
+    u32 s0 = t59 ^ t63;
+    u32 s6 = t56 ^ ~t62;
+    u32 s7 = t48 ^ ~t60;
+    u32 t67 = t64 ^ t65;
+    u32 s3 = t53 ^ t66;
+    u32 s4 = t51 ^ t66;
+    u32 s5 = t47 ^ t65;
+    u32 s1 = t64 ^ ~s3;
+    u32 s2 = t55 ^ ~t67;
+    q[7] = s0;
+    q[6] = s1;
+    q[5] = s2;
+    q[4] = s3;
+    q[3] = s4;
+    q[2] = s5;
+    q[1] = s6;
+    q[0] = s7;
+}
+
+/* One word, for the key schedule. */
+u32 sub_word_ct(u32 w) {
+    u32[4] st = {w, 0, 0, 0};
+    noinit u32[8] q;
+    aes_planes_in(st, q);
+    aes_sbox_planes(q);
+    aes_planes_out(q, st);
+    return st[0];
+}
+
 void aes_schedule(cf_aes_context* ctx, u8* key, u64 nkey) {
     u64 i;
     var nb = cast(u64, 16 / 4);
@@ -18775,201 +18951,6 @@ void cf_aes_init(cf_aes_context* ctx, u8* key, u64 nkey) {
 }
 
 private {
-// --- SubBytes without a table --------------------------------------------
-//
-// The S-box as a boolean circuit over bit-planes: Boyar and Peralta's
-// 113-gate form, the one BearSSL's aes_ct runs. The sixteen bytes of the
-// state become eight planes, one per bit, with a lane per byte; the
-// circuit runs once for all sixteen lanes; the planes become bytes again.
-// Nothing here indexes memory by a secret or branches on one, so nothing
-// leaks the key through timing -- the property the masked table scan it
-// replaces was bought for, at a thousand operations per byte. This is a
-// hundred and fifteen per sixteen bytes, plus the transposes.
-//
-// Plane b holds bit b of every byte; lane 4*w + k is byte k of word w,
-// counted from the low byte. Checked exhaustively against the table in
-// test/unit/test_aes_ct.mc, and the whole cipher against FIPS-197.
-
-private void aes_planes_in(u32* state, u32* q) {
-    for i32 b = 0; b < 8; b++ {
-        u32 p = 0;
-        for i32 w = 0; w < 4; w++ {
-            u32 x = (state[w] >> cast(u32, b)) & 0x01010101;
-            x = (x | (x >> 7)) & 0x00030003;
-            x = (x | (x >> 14)) & 0xF;
-            p = p | (x << cast(u32, 4 * w));
-        }
-        q[b] = p;
-    }
-}
-
-private void aes_planes_out(u32* q, u32* state) {
-    for i32 w = 0; w < 4; w++ {
-        u32 word = 0;
-        for i32 b = 0; b < 8; b++ {
-            u32 x = (q[b] >> cast(u32, 4 * w)) & 0xF;
-            x = (x | (x << 14)) & 0x00030003;
-            x = (x | (x << 7)) & 0x01010101;
-            word = word | (x << cast(u32, b));
-        }
-        state[w] = word;
-    }
-}
-
-private void aes_sbox_planes(u32* q) {
-    u32 x0 = q[7];
-    u32 x1 = q[6];
-    u32 x2 = q[5];
-    u32 x3 = q[4];
-    u32 x4 = q[3];
-    u32 x5 = q[2];
-    u32 x6 = q[1];
-    u32 x7 = q[0];
-
-    // top linear transformation
-    u32 y14 = x3 ^ x5;
-    u32 y13 = x0 ^ x6;
-    u32 y9 = x0 ^ x3;
-    u32 y8 = x0 ^ x5;
-    u32 t0 = x1 ^ x2;
-    u32 y1 = t0 ^ x7;
-    u32 y4 = y1 ^ x3;
-    u32 y12 = y13 ^ y14;
-    u32 y2 = y1 ^ x0;
-    u32 y5 = y1 ^ x6;
-    u32 y3 = y5 ^ y8;
-    u32 t1 = x4 ^ y12;
-    u32 y15 = t1 ^ x5;
-    u32 y20 = t1 ^ x1;
-    u32 y6 = y15 ^ x7;
-    u32 y10 = y15 ^ t0;
-    u32 y11 = y20 ^ y9;
-    u32 y7 = x7 ^ y11;
-    u32 y17 = y10 ^ y11;
-    u32 y19 = y10 ^ y8;
-    u32 y16 = t0 ^ y11;
-    u32 y21 = y13 ^ y16;
-    u32 y18 = x0 ^ y16;
-
-    // non-linear section
-    u32 t2 = y12 & y15;
-    u32 t3 = y3 & y6;
-    u32 t4 = t3 ^ t2;
-    u32 t5 = y4 & x7;
-    u32 t6 = t5 ^ t2;
-    u32 t7 = y13 & y16;
-    u32 t8 = y5 & y1;
-    u32 t9 = t8 ^ t7;
-    u32 t10 = y2 & y7;
-    u32 t11 = t10 ^ t7;
-    u32 t12 = y9 & y11;
-    u32 t13 = y14 & y17;
-    u32 t14 = t13 ^ t12;
-    u32 t15 = y8 & y10;
-    u32 t16 = t15 ^ t12;
-    u32 t17 = t4 ^ t14;
-    u32 t18 = t6 ^ t16;
-    u32 t19 = t9 ^ t14;
-    u32 t20 = t11 ^ t16;
-    u32 t21 = t17 ^ y20;
-    u32 t22 = t18 ^ y19;
-    u32 t23 = t19 ^ y21;
-    u32 t24 = t20 ^ y18;
-
-    u32 t25 = t21 ^ t22;
-    u32 t26 = t21 & t23;
-    u32 t27 = t24 ^ t26;
-    u32 t28 = t25 & t27;
-    u32 t29 = t28 ^ t22;
-    u32 t30 = t23 ^ t24;
-    u32 t31 = t22 ^ t26;
-    u32 t32 = t31 & t30;
-    u32 t33 = t32 ^ t24;
-    u32 t34 = t23 ^ t33;
-    u32 t35 = t27 ^ t33;
-    u32 t36 = t24 & t35;
-    u32 t37 = t36 ^ t34;
-    u32 t38 = t27 ^ t36;
-    u32 t39 = t29 & t38;
-    u32 t40 = t25 ^ t39;
-
-    u32 t41 = t40 ^ t37;
-    u32 t42 = t29 ^ t33;
-    u32 t43 = t29 ^ t40;
-    u32 t44 = t33 ^ t37;
-    u32 t45 = t42 ^ t41;
-    u32 z0 = t44 & y15;
-    u32 z1 = t37 & y6;
-    u32 z2 = t33 & x7;
-    u32 z3 = t43 & y16;
-    u32 z4 = t40 & y1;
-    u32 z5 = t29 & y7;
-    u32 z6 = t42 & y11;
-    u32 z7 = t45 & y17;
-    u32 z8 = t41 & y10;
-    u32 z9 = t44 & y12;
-    u32 z10 = t37 & y3;
-    u32 z11 = t33 & y4;
-    u32 z12 = t43 & y13;
-    u32 z13 = t40 & y5;
-    u32 z14 = t29 & y2;
-    u32 z15 = t42 & y9;
-    u32 z16 = t45 & y14;
-    u32 z17 = t41 & y8;
-
-    // bottom linear transformation
-    u32 t46 = z15 ^ z16;
-    u32 t47 = z10 ^ z11;
-    u32 t48 = z5 ^ z13;
-    u32 t49 = z9 ^ z10;
-    u32 t50 = z2 ^ z12;
-    u32 t51 = z2 ^ z5;
-    u32 t52 = z7 ^ z8;
-    u32 t53 = z0 ^ z3;
-    u32 t54 = z6 ^ z7;
-    u32 t55 = z16 ^ z17;
-    u32 t56 = z12 ^ t48;
-    u32 t57 = t50 ^ t53;
-    u32 t58 = z4 ^ t46;
-    u32 t59 = z3 ^ t54;
-    u32 t60 = t46 ^ t57;
-    u32 t61 = z14 ^ t57;
-    u32 t62 = t52 ^ t58;
-    u32 t63 = t49 ^ t58;
-    u32 t64 = z4 ^ t59;
-    u32 t65 = t61 ^ t62;
-    u32 t66 = z1 ^ t63;
-    u32 s0 = t59 ^ t63;
-    u32 s6 = t56 ^ ~t62;
-    u32 s7 = t48 ^ ~t60;
-    u32 t67 = t64 ^ t65;
-    u32 s3 = t53 ^ t66;
-    u32 s4 = t51 ^ t66;
-    u32 s5 = t47 ^ t65;
-    u32 s1 = t64 ^ ~s3;
-    u32 s2 = t55 ^ ~t67;
-
-    q[7] = s0;
-    q[6] = s1;
-    q[5] = s2;
-    q[4] = s3;
-    q[3] = s4;
-    q[2] = s5;
-    q[1] = s6;
-    q[0] = s7;
-}
-
-// SubBytes on one word, for the key schedule: the same circuit, one lane
-// group in use.
-u32 sub_word_ct(u32 w) {
-    u32[4] st = {w, 0, 0, 0};
-    u32[8] q;
-    aes_planes_in(&st[0], &q[0]);
-    aes_sbox_planes(&q[0]);
-    aes_planes_out(&q[0], &st[0]);
-    return st[0];
-}
-
 void add_round_key(u32* state, u32* rk) {
     state[0] ^= rk[0];
     state[1] ^= rk[1];
@@ -18978,10 +18959,10 @@ void add_round_key(u32* state, u32* rk) {
 }
 
 void sub_block(u32* state) {
-    u32[8] q;
-    aes_planes_in(state, &q[0]);
-    aes_sbox_planes(&q[0]);
-    aes_planes_out(&q[0], state);
+    noinit u32[8] q;
+    aes_planes_in(state, q);
+    aes_sbox_planes(q);
+    aes_planes_out(q, state);
 }
 
 void shift_rows(u32* state) {
