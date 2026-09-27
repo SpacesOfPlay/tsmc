@@ -43,6 +43,14 @@ Missing: `WebSocket`, `MessageEvent`, `Blob`, `CloseEvent` (Node 22 has no
 global either, but the close event must carry `code`/`reason`/`wasClean`),
 `require('url')`, the upgrade events, `socket.unshift`, streaming zlib.
 
+`TLSSocket` (the socket of an `https` server or a `wss:` client) is further
+behind than `net.Socket`: no `unshift`, `cork`/`uncork`, `pause`/`resume` or
+`_writableState`, and no write queue. `write` hands the bytes to
+`__tls_write` at once, always returns `true` and never emits `'drain'`;
+ciphertext the socket does not take is buffered without limit, and a failed
+`__tls_write` ends the loop with the rest of the buffer dropped and no error.
+That is enough for one HTTP response; a long-lived stream is not safe on it.
+
 ## Design
 
 ### 1. The upgrade seam in `http` (the one structural change)
@@ -70,6 +78,22 @@ queue) for its `bufferedAmount`.
 The emit is synchronous, inside the `'data'` turn that completed the head,
 as in Node — the listener may write to the socket at once. What matters is
 that the parser's own listeners are gone before the next chunk arrives.
+
+**TLS.** An `https` server is `http.Server` over `tls.createServer`, so the
+seam covers it with no change of its own, but the socket handed over is a
+`TLSSocket`, and `ws` needs the same shape of it:
+
+- `unshift`, `cork`/`uncork` and `pause`/`resume`, as on `net.Socket`.
+- A write queue, as `net.Socket` has: `write` queues what `__tls_write`
+  does not take and flushes it on the reactor's write-ready turn; it returns
+  `false` while the queue (plaintext queued plus ciphertext the session still
+  holds) is past a high-water mark, and emits `'drain'` when it empties.
+  `_writableState.length` is the queued byte count, which `ws` reports as
+  `bufferedAmount`. A slow peer then holds its queue at the mark instead of
+  growing it.
+- A failed `__tls_write` destroys the socket with an `'error'`, never drops
+  the rest of the buffer silently: on a framed stream a lost span corrupts
+  every message after it.
 
 ### 2. The `WebSocket` global
 
@@ -137,9 +161,13 @@ Each lands with its own tests and leaves the suite green.
   bytes echoed over the handed socket; a case where the client's first
   payload rides in the same write as the request head, so `head` is
   non-empty on the server; a server without a listener (socket closed);
-  a client without one. Acceptance: the `ws` echo script (client + server
-  in one process, text and binary, clean close) prints the same as under
-  Node.
+  a client without one; the same exchange over `https.createServer`, the
+  server's `'upgrade'` handing over a `TLSSocket`.
+  `test/diff/tls_write_queue.js`: a `TLSSocket` writing a few MB to a peer
+  that reads slowly — `write` turns `false`, `'drain'` follows, every byte
+  arrives in order; `_writableState.length` falls back to 0. Acceptance: the
+  `ws` echo script (client + server in one process, text and binary, clean
+  close) prints the same as under Node, over `http` and over `https`.
 - **I3 — `WebSocket` + `MessageEvent` + `Blob`.** `test/diff/websocket.js`:
   since Node core has no server, the test carries a small frame server on
   an `http` `'upgrade'` listener, and the same script runs on both
@@ -153,7 +181,9 @@ Each lands with its own tests and leaves the suite green.
 - **I4 — `wss:`.** `test/diff/websocket_tls.js` over `https.createServer`
   with the existing `test/diff/https_server.*.pem` fixture and
   `process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'` set by the script,
-  which both runtimes read at connect time. If Node's client turns out
+  which both runtimes read at connect time. Both ends run in tsmc, so the
+  test covers the server side of `wss:` (frames over the `TLSSocket` the
+  `'upgrade'` hands over) as well as the client. If Node's client turns out
   not to honour it, the test moves to `test/tls/` (manual). A connection
   to a public echo endpoint stays manual, in `test/tls/`, not gated.
 
@@ -179,5 +209,10 @@ never mention `WebSocket` (lazy global); `bench` unaffected.
 - The close timeout (Node waits a bounded time for the peer's close frame,
   then destroys the socket) must not keep the process alive past what
   Node does; the reactor's ref/unref covers it.
-- Size: I1 ~200 lines, I2 ~80, I3 ~500–600 of JS plus ~80 for `Blob`,
-  I4 ~40, plus tests — the shape of M33.
+- The `TLSSocket` write queue changes every TLS write, HTTPS responses
+  included. The existing `https` and `fetch` diff tests and the TLS
+  benchmarks must stay unchanged; a response that fits in one write must
+  still go out in one.
+- Size: I1 ~200 lines, I2 ~80 plus ~100 for the `TLSSocket` shape and write
+  queue, I3 ~500–600 of JS plus ~80 for `Blob`, I4 ~40, plus tests — the
+  shape of M33.
