@@ -36,6 +36,9 @@ when os(wasm) {
     bool tls_wants_write(TlsSession* s) { return false; }
     i32 tls_pump(TlsSession* s, i64 fd) { return TLS_ERR; }
     bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) { return false; }
+    bool tls_flush_out(TlsSession* s, i64 fd) { return false; }
+    i32 tls_pending(TlsSession* s) { return 0; }
+    bool tls_shutdown(TlsSession* s, i64 fd) { return false; }
     i32 tls_read(TlsSession* s, u8* out, i32 max) { return -1; }
     bool tls_established(TlsSession* s) { return false; }
     bool tls_failed(TlsSession* s) { return true; }
@@ -478,6 +481,31 @@ bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) {
     i32 r = ptls_send(s.tls, &s.sendbuf, cast(void*, data), cast(u64, len));
     if r != 0 { s.failed = true; return false; }
     return tls_flush(s, fd);
+}
+
+// Push queued ciphertext without touching the inbound side: what a paused
+// reader still has to do. Returns false (and fails the session) on a socket
+// error.
+bool tls_flush_out(TlsSession* s, i64 fd) {
+    if s.failed { return false; }
+    if !tls_flush(s, fd) { s.failed = true; return false; }
+    return true;
+}
+
+// Ciphertext queued in the session that the socket has not taken yet.
+i32 tls_pending(TlsSession* s) {
+    return cast(i32, cast(i64, s.sendbuf.off) - s.send_off);
+}
+
+// Tell the peer the write side is done: a close_notify alert, queued behind
+// whatever ciphertext is waiting. The FIN follows once that has flushed.
+bool tls_shutdown(TlsSession* s, i64 fd) {
+    if s.failed { return false; }
+    // alert level warning (1), description close_notify (0)
+    i32 r = ptls_send_alert(s.tls, &s.sendbuf, cast(u8, 1), cast(u8, 0));
+    if r != 0 { s.failed = true; return false; }
+    if !tls_flush(s, fd) { s.failed = true; return false; }
+    return true;
 }
 
 // Copy up to `max` decrypted bytes into `out`; shift the rest. Returns n.

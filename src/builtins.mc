@@ -852,6 +852,12 @@ private bool define_property_core(void* vmp, Value* args, i32 argc, bool report)
     } else {
         Value val = value_undefined();
         if existing != null && !value_is_accessor(existing.val) { val = existing.val; }
+        // a descriptor with neither a value nor writable is generic: an
+        // accessor keeps its getter and setter and only the attributes move
+        if existing != null && value_is_accessor(existing.val)
+            && !desc_has(vm, desc, "value") && !desc_has(vm, desc, "writable") {
+            val = existing.val;
+        }
         if desc_has(vm, desc, "value") { ignore vm_get_prop_value(vm, desc, bi_atom(vm, "value"), &val); }
         if desc_has(vm, desc, "writable") {
             ignore vm_get_prop_value(vm, desc, bi_atom(vm, "writable"), &tmp);
@@ -12463,11 +12469,23 @@ private Value nat_net_send(void* vmp, Value callee, Value thisv, Value* args, i3
     return value_int(net_try_send(fd, &tmp[0], chunk));
 }
 
+// Read and write interest are set independently, so a paused socket stays
+// paused while its writes drain and a draining socket keeps reading.
 private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 id = to_int_arg(arg_at(args, argc, 0));
     bool want = js_truthy(arg_at(args, argc, 1));
-    vm_handle_set_interest(vm, id, want ? cast(i16, NET_POLLIN | NET_POLLOUT) : NET_POLLIN);
+    i16 keep = cast(i16, vm_handle_interest(vm, id) & NET_POLLIN);
+    vm_handle_set_interest(vm, id, want ? cast(i16, keep | NET_POLLOUT) : keep);
+    return value_undefined();
+}
+
+private Value nat_net_want_read(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    bool want = js_truthy(arg_at(args, argc, 1));
+    i16 keep = cast(i16, vm_handle_interest(vm, id) & NET_POLLOUT);
+    vm_handle_set_interest(vm, id, want ? cast(i16, keep | NET_POLLIN) : keep);
     return value_undefined();
 }
 
@@ -12584,9 +12602,18 @@ private Value nat_tls_pump(void* vmp, Value callee, Value thisv, Value* args, i3
     i64 fd = vm_handle_fd(vm, id);
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
     if s == null || fd < 0 { return value_int(TLS_ERR); }
-    i32 flags = tls_pump(s, fd);
-    i16 mask = NET_POLLIN;
-    if (flags & TLS_WANT_WRITE) != 0 { mask = cast(i16, NET_POLLIN | NET_POLLOUT); }
+    // A paused owner only flushes: nothing is read from the socket, so the
+    // peer's writes back up onto the peer, which is what pausing is for.
+    bool paused = js_truthy(arg_at(args, argc, 1));
+    i32 flags = 0;
+    if paused {
+        if !tls_flush_out(s, fd) { flags = TLS_ERR; }
+        else if tls_wants_write(s) { flags = TLS_WANT_WRITE; }
+    } else {
+        flags = tls_pump(s, fd);
+    }
+    i16 mask = paused ? cast(i16, 0) : NET_POLLIN;
+    if (flags & TLS_WANT_WRITE) != 0 { mask = cast(i16, mask | NET_POLLOUT); }
     vm_handle_set_interest(vm, id, mask);
     return value_int(flags);
 }
@@ -12622,7 +12649,31 @@ private Value nat_tls_write(void* vmp, Value callee, Value thisv, Value* args, i
         i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, off + i))) : buf_byte(o, off + i);
         tmp[i] = cast(u8, b & 0xFF);
     }
-    return value_int(tls_write(s, fd, &tmp[0], chunk) ? chunk : NET_ERR);
+    if !tls_write(s, fd, &tmp[0], chunk) { return value_int(NET_ERR); }
+    // ciphertext the socket did not take waits for it to become writable
+    if tls_wants_write(s) {
+        vm_handle_set_interest(vm, id, cast(i16, vm_handle_interest(vm, id) | NET_POLLOUT));
+    }
+    return value_int(chunk);
+}
+
+private Value nat_tls_shutdown(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    i64 fd = vm_handle_fd(vm, id);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    if s == null || fd < 0 { return value_bool(false); }
+    bool ok = tls_shutdown(s, fd);
+    if ok && tls_wants_write(s) {
+        vm_handle_set_interest(vm, id, cast(i16, vm_handle_interest(vm, id) | NET_POLLOUT));
+    }
+    return value_bool(ok);
+}
+
+private Value nat_tls_pending(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
+    return value_int(s == null ? 0 : tls_pending(s));
 }
 
 private Value nat_tls_close(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -12784,6 +12835,8 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_error_text", &nat_tls_error_text);
     ignore def_global_fn(vm, "__tls_error_name", &nat_tls_error_name);
     ignore def_global_fn(vm, "__tls_wants_write", &nat_tls_wants_write);
+    ignore def_global_fn(vm, "__tls_pending", &nat_tls_pending);
+    ignore def_global_fn(vm, "__tls_shutdown", &nat_tls_shutdown);
     ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);
     ignore def_global_fn(vm, "__net_listen", &nat_net_listen);
@@ -12791,6 +12844,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__net_recv", &nat_net_recv);
     ignore def_global_fn(vm, "__net_send", &nat_net_send);
     ignore def_global_fn(vm, "__net_want_write", &nat_net_want_write);
+    ignore def_global_fn(vm, "__net_want_read", &nat_net_want_read);
     ignore def_global_fn(vm, "__net_close", &nat_net_close);
     ignore def_global_fn(vm, "__net_shutdown", &nat_net_shutdown);
     ignore def_global_fn(vm, "__net_connect_result", &nat_net_connect_result);

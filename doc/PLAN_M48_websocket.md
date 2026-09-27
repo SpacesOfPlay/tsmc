@@ -1,6 +1,6 @@
 # M48 — WebSocket
 
-Status: scoped 2026-09-27, not started.
+Status: scoped 2026-09-27. I1 and I2 landed 2026-09-27; I3 and I4 open.
 
 ## Goal
 
@@ -61,8 +61,9 @@ carries `Upgrade:` and `Connection: upgrade` and the server has an
 the `data`/`end`/`close` listeners it installed, mark the connection as
 handed over, and `emit('upgrade', req, socket, head)` where `head` is
 whatever arrived after the request head. Those bytes travel only as
-`head`, never as a later `'data'`. No listener: the socket is destroyed,
-as in Node. `req` is an `IncomingMessage` with no body.
+`head`, never as a later `'data'`. No listener: the request is served
+like any other, `req.upgrade` false, as in Node. `req` is an
+`IncomingMessage` with no body and `req.upgrade` true.
 
 **Client.** In `ClientRequest._parse`, a `101` with `Upgrade:` does the
 same: detach, `emit('upgrade', res, socket, head)`; no listener destroys
@@ -153,10 +154,11 @@ lazy globals, so a script that never mentions them pays nothing.
 
 Each lands with its own tests and leaves the suite green.
 
-- **I1 — `url` module + full `STATUS_CODES`.** `test/diff/url_module.js`:
+- **I1 — `url` module + full `STATUS_CODES`.** Done. `test/diff/url_module.js`:
   `parse`/`format`/`resolve`/`fileURLToPath`/`pathToFileURL` over a fixed
-  list of inputs, vs Node.
-- **I2 — the upgrade seam + `socket.unshift`.** `test/diff/http_upgrade.js`:
+  list of inputs, vs Node. Also fixed on the way: `path.resolve` kept a
+  trailing separator.
+- **I2 — the upgrade seam + `socket.unshift`.** Done. `test/diff/http_upgrade.js`:
   `http.request` with `Upgrade:` and a server `'upgrade'` listener, raw
   bytes echoed over the handed socket; a case where the client's first
   payload rides in the same write as the request head, so `head` is
@@ -168,6 +170,22 @@ Each lands with its own tests and leaves the suite green.
   arrives in order; `_writableState.length` falls back to 0. Acceptance: the
   `ws` echo script (client + server in one process, text and binary, clean
   close) prints the same as under Node, over `http` and over `https`.
+  Landed with it: `TLSSocket.end()` is a half-close (close_notify, then
+  the FIN once the ciphertext has drained, reading on until the peer's
+  EOF), so the close order matches a plain socket and Node; both sockets
+  carry `_readableState.endEmitted` and `_writableState.finished`;
+  `stream.Writable` exposes `_writableState`; `Object.defineProperty` with
+  a generic descriptor (`{ enumerable: true }`) keeps an existing accessor
+  instead of replacing it with `undefined` — that one alone stopped `ws`
+  from ever opening.
+  **Acceptance result:** `ws` 7.5.10 unmodified, echo of a text and a small
+  binary message with a clean `1000` close, over http and over https,
+  prints what Node prints. A message that arrives in more than one chunk
+  does not: `ws` reassembles with `Buffer.prototype.set` and a
+  `Uint8Array` view over `buf.buffer`/`buf.byteOffset`, and `Buffer` here is
+  still array-backed. That is `doc/PLAN_M42_buffer_uint8array.md`, and the
+  `ws` server story is complete once it lands; nothing in this milestone
+  can substitute for it.
 - **I3 — `WebSocket` + `MessageEvent` + `Blob`.** `test/diff/websocket.js`:
   since Node core has no server, the test carries a small frame server on
   an `http` `'upgrade'` listener, and the same script runs on both

@@ -12,6 +12,13 @@ const T_EOF = 4;
 const T_ERR = 8;
 const T_WANT_WRITE = 16;
 
+// Bytes a write() may leave queued before it answers false and a 'drain'
+// is owed: plaintext still queued here plus ciphertext the session holds.
+const HWM = 16384;
+// Ciphertext the session may hold before the plaintext queue waits for the
+// socket to take some of it.
+const CIPHER_CAP = 65536;
+
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');
   return data;
@@ -22,14 +29,32 @@ class TLSSocket extends EventEmitter {
     super();
     this._id = -1;
     this._connecting = true;
-    this._pending = [];
+    this._wq = [];
+    this._wqBytes = 0;
+    this._needDrain = false;
+    this._paused = false;
+    this._pushback = [];
     this._ending = false;
+    this._sentAlert = false;
+    this._sentFin = false;
     this.destroyed = false;
     this.encrypted = true;
+    this.readable = false;
+    this.writable = true;
+    const self = this;
+    this._writableState = { get length() { return self._queued(); }, get finished() { return self._sentFin; } };
+    this._readableState = { endEmitted: false, get ended() { return this.endEmitted; } };
   }
+  // Bytes accepted by write() that the peer has not been sent: plaintext
+  // queued here plus ciphertext the session still holds.
+  _queued() {
+    return this._wqBytes + (this._id >= 0 && !this.destroyed ? __tls_pending(this._id) : 0);
+  }
+  get writableLength() { return this._queued(); }
+  get writableHighWaterMark() { return HWM; }
   __onReady(revents) {
     if (this.destroyed) return;
-    const st = __tls_pump(this._id);
+    const st = __tls_pump(this._id, this._paused);
     if (st & T_ERR) {
       const why = __tls_verify_error(this._id);
       if (why) this._fail('certificate verify failed: ' + why);
@@ -41,58 +66,121 @@ class TLSSocket extends EventEmitter {
     }
     if (this._connecting && __tls_established(this._id)) {
       this._connecting = false;
+      this.readable = true;
       this.emit('secureConnect');
       this.emit('connect');
-      const q = this._pending;
-      this._pending = [];
-      for (let i = 0; i < q.length; i++) this._sendBuf(q[i]);
+      if (this.destroyed) return;
     }
-    if (st & HAS_DATA) {
-      let b;
-      while ((b = __tls_read(this._id)) !== null) {
-        this.emit('data', b);
-        if (this.destroyed) return;
-      }
+    if ((st & HAS_DATA) && !this._paused) {
+      this._readAll();
+      if (this.destroyed) return;
     }
-    if (st & T_EOF) { this.emit('end'); this._finish(); return; }
-    // an end()ed socket closes once its outbound ciphertext has drained, so the
-    // peer sees EOF (a Connection: close response would otherwise hang)
-    this._maybeFinish();
+    if (st & T_EOF) { this.readable = false; this._readableState.endEmitted = true; this.emit('end'); this._finish(); return; }
+    if (!this._connecting) this._flush();
+    if (this.destroyed) return;
+    this._maybeShutdown();
   }
-  _maybeFinish() {
-    if (this._ending && !this.destroyed && !this._connecting && !__tls_wants_write(this._id)) {
-      this._finish();
+  _readAll() {
+    let b;
+    while (!this._paused && (b = __tls_read(this._id)) !== null) {
+      this.emit('data', b);
+      if (this.destroyed) return;
     }
   }
-  _sendBuf(buf) {
-    let off = 0;
-    while (off < buf.length) {
-      const n = __tls_write(this._id, buf, off);
-      if (n <= 0) break;
-      off += n;
+  _drainPushback() {
+    while (this._pushback.length > 0 && !this._paused && !this.destroyed) {
+      this.emit('data', this._pushback.shift());
     }
+  }
+  unshift(chunk) {
+    if (chunk == null || chunk.length === 0) return;
+    this._pushback.push(asBuffer(chunk));
+    queueMicrotask(() => this._drainPushback());
+  }
+  // Paused, nothing is read from the socket: the session only flushes what
+  // it already holds, and the peer's writes back up onto the peer.
+  pause() {
+    this._paused = true;
+    if (this._id >= 0 && !this._connecting && !this.destroyed) __net_want_read(this._id, false);
+    return this;
+  }
+  resume() {
+    if (!this._paused) return this;
+    this._paused = false;
+    queueMicrotask(() => {
+      if (this.destroyed || this._paused) return;
+      this._drainPushback();
+      if (this.destroyed || this._paused || this._connecting) return;
+      __net_want_read(this._id, true);
+      this._readAll();
+    });
+    return this;
+  }
+  // An end()ed socket half-closes, as a plain socket does: a close_notify
+  // goes out behind the queued plaintext, the FIN once the ciphertext has
+  // drained, and the socket stays open to read until the peer's own EOF.
+  _maybeShutdown() {
+    if (!this._ending || this.destroyed || this._connecting) return;
+    if (!this._sentAlert && this._wq.length === 0) {
+      this._sentAlert = true;
+      if (!__tls_shutdown(this._id)) { this._fail('write EIO', 'EPIPE'); return; }
+    }
+    if (this._sentAlert && !this._sentFin && !__tls_wants_write(this._id)) {
+      this._sentFin = true;
+      __net_shutdown(this._id);
+      this.emit('finish');
+    }
+  }
+  // Encrypt queued plaintext while the session has room for the ciphertext.
+  // Past the cap it waits: the native write arms the socket for writable,
+  // and the pump that follows flushes and returns here.
+  _flush() {
+    if (this._connecting || this.destroyed) return;
+    while (this._wq.length > 0) {
+      if (__tls_pending(this._id) >= CIPHER_CAP) return;
+      const it = this._wq[0];
+      const n = __tls_write(this._id, it.buf, it.off);
+      if (n < 0) { this._fail('write EIO', 'EPIPE'); return; }
+      it.off += n;
+      this._wqBytes -= n;
+      if (it.off >= it.buf.length) this._wq.shift();
+    }
+    if (this._needDrain && !__tls_wants_write(this._id)) {
+      this._needDrain = false;
+      queueMicrotask(() => { if (!this.destroyed) this.emit('drain'); });
+    }
+    if (this._ending) this._maybeShutdown();
   }
   write(data, enc, cb) {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }
-    if (!this.destroyed) {
+    if (!this.destroyed && !this._ending) {
       const buf = asBuffer(data, enc);
-      if (this._connecting) this._pending.push(buf);
-      else this._sendBuf(buf);
+      this._wq.push({ buf: buf, off: 0 });
+      this._wqBytes += buf.length;
     }
     if (typeof cb === 'function') queueMicrotask(cb);
-    return true;
+    const ok = this._queued() < HWM;
+    if (!ok) this._needDrain = true;
+    this._flush();
+    return ok;
   }
-  end(data, enc) {
+  end(data, enc, cb) {
+    if (typeof data === 'function') { cb = data; data = null; }
+    else if (typeof enc === 'function') { cb = enc; enc = undefined; }
     if (data != null) this.write(data, enc);
+    if (typeof cb === 'function') this.once('finish', cb);
     this._ending = true;
-    // close once the queued ciphertext has flushed; if it already has (the
-    // common small-response case, no reactor event pending) close now
-    if (!this._connecting) queueMicrotask(() => this._maybeFinish());
+    this.writable = false;
+    if (!this._connecting) queueMicrotask(() => this._maybeShutdown());
     return this;
   }
+  cork() {}
+  uncork() {}
   _finish() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.readable = false;
+    this.writable = false;
     __tls_close(this._id);
     this.emit('close');
   }

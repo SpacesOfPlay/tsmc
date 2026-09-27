@@ -7177,6 +7177,11 @@ void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
     if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).interest = events; }
 }
 
+i16 vm_handle_interest(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).interest; }
+    return 0;
+}
+
 i64 vm_handle_fd(VM* vm, i32 idx) {
     if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).fd; }
     return -1;

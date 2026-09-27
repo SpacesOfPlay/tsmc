@@ -112,9 +112,12 @@ class IncomingMessage extends EventEmitter {
     this.statusMessage = '';
     this.httpVersion = '1.1';
     this.complete = false;
+    this.upgrade = false;
     this._encoding = null;
   }
   setEncoding(enc) { this._encoding = enc; return this; }
+  pause() { return this; }
+  resume() { return this; }
   _data(buf) {
     if (buf.length === 0) return;
     this.emit('data', this._encoding ? buf.toString(this._encoding) : buf);
@@ -311,13 +314,33 @@ function serveConnection(server, socket) {
   }
 
   deadline(HEAD_MS);
-  socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
-  socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
+  const onData = (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); };
+  const onEnd = () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } };
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
-  socket.on('error', (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); });
-  socket.on('close', () => { clearDeadline(); state = 'done'; });
+  const onError = (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); };
+  const onClose = () => { clearDeadline(); state = 'done'; };
+  socket.on('data', onData);
+  socket.on('end', onEnd);
+  socket.on('error', onError);
+  socket.on('close', onClose);
+
+  // The protocol is changing under the request: the parser steps aside and
+  // whoever listens gets the socket as it is, with whatever followed the
+  // head. Nothing here touches the socket again.
+  function handOver() {
+    clearDeadline();
+    socket.removeListener('data', onData);
+    socket.removeListener('end', onEnd);
+    socket.removeListener('error', onError);
+    socket.removeListener('close', onClose);
+    state = 'done';
+    const head = buf;
+    buf = Buffer.alloc(0);
+    msg.upgrade = true;
+    server.emit('upgrade', msg, socket, head);
+  }
 
   function pump() {
     if (state === 'done') { buf = Buffer.alloc(0); return; }
@@ -349,6 +372,14 @@ function serveConnection(server, socket) {
       // kept, which is the point of it being declared.
       if (!(remaining > 0)) remaining = 0;
       if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
+      // An upgrade is only one when somebody is there to take it; otherwise
+      // the request is served like any other.
+      if (msg.headers['upgrade'] !== undefined &&
+          String(msg.headers['connection'] || '').toLowerCase().indexOf('upgrade') >= 0 &&
+          server.listenerCount('upgrade') > 0) {
+        handOver();
+        return;
+      }
       // The head arrived in time. A body gets its own budget; none
       // expected means it is the server's turn and the clock stops.
       if (remaining > 0) deadline(BODY_MS); else clearDeadline();
@@ -427,6 +458,7 @@ class ClientRequest extends EventEmitter {
     }
     this.socket.on('connect', () => this._trySend());
     this.socket.on('error', (e) => this.emit('error', e));
+    this.socket.on('close', () => this.emit('close'));
     this._parse();
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
@@ -467,14 +499,29 @@ class ClientRequest extends EventEmitter {
     let chunked = false;
     let cstate = 'size';
     let cn = 0;
-    this.socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
-    this.socket.on('close', () => {
+    const onData = (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); };
+    const onClose = () => {
       if (res && state !== 'done') {
         if (remaining < 0 && !chunked && buf.length) { res._data(buf); buf = Buffer.alloc(0); }
         res._end();
         state = 'done';
       }
-    });
+    };
+    this.socket.on('data', onData);
+    this.socket.on('close', onClose);
+    // The server agreed to change protocols. With an 'upgrade' listener the
+    // socket is handed over with whatever followed the head, and no
+    // 'response' is emitted; without one the socket is dropped.
+    function handOver() {
+      self.socket.removeListener('data', onData);
+      self.socket.removeListener('close', onClose);
+      state = 'done';
+      const head = buf;
+      buf = Buffer.alloc(0);
+      if (self.listenerCount('upgrade') === 0) { self.socket.destroy(); return; }
+      res.upgrade = true;
+      self.emit('upgrade', res, self.socket, head);
+    }
     function pump() {
       if (state === 'head') {
         const he = findHeaderEnd(buf);
@@ -488,6 +535,11 @@ class ClientRequest extends EventEmitter {
         res.statusCode = parseInt(first[1], 10) || 0;
         res.statusMessage = first.slice(2).join(' ');
         res.headers = parseHeaders(lines.join(CRLF));
+        if (res.statusCode === 101 || (res.headers['upgrade'] !== undefined &&
+            String(res.headers['connection'] || '').toLowerCase().indexOf('upgrade') >= 0)) {
+          handOver();
+          return;
+        }
         const te = res.headers['transfer-encoding'];
         const cl = res.headers['content-length'];
         if (te && te.toLowerCase().indexOf('chunked') >= 0) chunked = true;

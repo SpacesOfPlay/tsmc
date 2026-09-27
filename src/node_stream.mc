@@ -268,7 +268,13 @@ str node_stream_source() {
 "
         "    opts = opts || {};
 "
-        "    this._ws = { buffer: [], writing: false, ended: false, finished: false, destroyed: false };
+        "    this._ws = { buffer: [], writing: false, ended: false, finished: false, destroyed: false, errorEmitted: false };
+"
+        "    // the state object a stream exposes: the queue's byte count, and the flags above
+"
+        "    Object.defineProperty(this._ws, 'length', { get: () => { let n = 0; for (const it of this._ws.buffer) n += it.chunk.length || 0; return n; } });
+"
+        "    this._writableState = this._ws;
 "
         "    if (typeof opts.write === 'function') this._write = opts.write;
 "
@@ -286,7 +292,7 @@ str node_stream_source() {
 "
         "    const s = this._ws;
 "
-        "    if (s.ended) { const e = new Error('write after end'); if (cb) cb(e); this.emit('error', e); return false; }
+        "    if (s.ended) { const e = new Error('write after end'); if (cb) cb(e); s.errorEmitted = true; this.emit('error', e); return false; }
 "
         "    s.buffer.push({ chunk: chunk, enc: enc || 'utf8', cb: cb });
 "
@@ -316,7 +322,7 @@ str node_stream_source() {
 "
         "  }
 "
-        "  destroy(err) { const s = this._ws; if (s.destroyed) return this; s.destroyed = true; this.destroyed = true; if (err) this.emit('error', err); this.emit('close'); return this; }
+        "  destroy(err) { const s = this._ws; if (s.destroyed) return this; s.destroyed = true; this.destroyed = true; if (err) { s.errorEmitted = true; this.emit('error', err); } this.emit('close'); return this; }
 "
         "}
 "
@@ -342,7 +348,7 @@ str node_stream_source() {
 "
         "    if (item.cb) item.cb(err);
 "
-        "    if (err) { t.emit('error', err); return; }
+        "    if (err) { s.errorEmitted = true; t.emit('error', err); return; }
 "
         "    if (s.buffer.length > 0) processTransform(t); else { t.emit('drain'); maybeFinishTransform(t); }
 "
@@ -362,7 +368,7 @@ str node_stream_source() {
 "
         "      if (data !== undefined && data !== null) t.push(data);
 "
-        "      if (err) { t.emit('error', err); return; }
+        "      if (err) { t._ws.errorEmitted = true; t.emit('error', err); return; }
 "
         "      t.push(null);
 "
