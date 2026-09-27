@@ -29,6 +29,7 @@ import node_http;
 import node_fetch;
 import node_webapi;
 import node_querystring;
+import node_url;
 import node_strdec;
 import node_punycode;
 import node_webevents;
@@ -384,6 +385,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "tls") || str_equal(s, "https")
         || str_equal(s, "tty") || str_equal(s, "_fetch") || str_equal(s, "_webapi")
         || str_equal(s, "querystring") || str_equal(s, "string_decoder")
+        || str_equal(s, "url")
         || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
         || str_equal(s, "_webevents") || str_equal(s, "_eventsx")
         || str_equal(s, "_webcrypto")
@@ -1515,6 +1517,7 @@ private str builtin_js_source(str name) {
     if str_equal(name, "_webapi") { return node_webapi_source(); }
     if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     if str_equal(name, "querystring") { return node_querystring_source(); }
+    if str_equal(name, "url") { return node_url_source(); }
     if str_equal(name, "string_decoder") { return node_strdec_source(); }
     if str_equal(name, "punycode") { return node_punycode_source(); }
     if str_equal(name, "_webevents") { return node_webevents_source(); }

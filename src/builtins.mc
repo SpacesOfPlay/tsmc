@@ -13736,6 +13736,9 @@ private void pf_resolve_into(VM* vm, str_buf* out, bool win, Value* args, i32 ar
         str_buf_add(&pre, a);
     }
     pf_norm_into(out, str_buf_to_str(&pre), win);
+    // a resolved path never ends in a separator unless it is only a root
+    str r = str_buf_to_str(out);
+    if r.len > pf_root_len(win, r) && pf_is_sep(win, *(r.data + r.len - 1)) { out.len--; }
     str_buf_free(&pre);
     str_buf_free(&acc);
     vm_pop(vm);
