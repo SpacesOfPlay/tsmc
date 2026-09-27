@@ -3395,16 +3395,17 @@ private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
         // node shows the bytes in hex, which is what makes a Buffer readable
         str hexd = "0123456789abcdef";
         str_buf_add(sb, "<Buffer");
-        i32 shown = o.elen < 50 ? o.elen : 50;
+        i32 bl = (o.obj_flags & OBJF_TYPEDARRAY) != 0 ? cast(JsTypedArray*, o).ta_len : 0;
+        i32 shown = bl < 50 ? bl : 50;
         for i32 i = 0; i < shown; i++ {
-            Value e = js_array_get(o, i);
+            Value e = vm_ta_get(vm, o, i);
             i32 by = value_is_number(e) ? (cast(i32, js_to_number(e)) & 255) : 0;
             str_buf_add(sb, " ");
             str_buf_add_byte(sb, *(hexd.data + (by >> 4)));
             str_buf_add_byte(sb, *(hexd.data + (by & 15)));
         }
-        if o.elen > shown {
-            string more = format(" ... {} more bytes", o.elen - shown);
+        if bl > shown {
+            string more = format(" ... {} more bytes", bl - shown);
             str_buf_add(sb, more);
             free(more);
         }
@@ -3707,7 +3708,9 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
             string bl = format("byteLength: {}", blen);
             str_buf_add(&eb, bl);
             free(bl);
-        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0
+                && !(vm.buffer_proto != null && o.proto == vm.buffer_proto) {
+            // a Buffer is a typed array too, but shows as bytes further down
             i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
             i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
             if depth < 0 {

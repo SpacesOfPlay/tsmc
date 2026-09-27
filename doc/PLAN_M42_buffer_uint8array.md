@@ -1,5 +1,19 @@
 # M42 — Buffer as a real Uint8Array
 
+Status: landed 2026-09-27. `test/diff/buffer_semantics.js` carries the nine
+items below as cases again, all matching node; the whole diff suite and the
+gc-stress pass are green. What changed in practice: `buf_new` builds a
+Uint8Array view whose prototype is `Buffer.prototype` (now under
+`Uint8Array.prototype`); the byte helpers (`buf_len`, `buf_byte`,
+`buf_set_byte`) read a typed array's bytes or a plain array's numbers, so
+the natives that take "a Buffer or an array of bytes" kept working; `slice`
+and `subarray` are views; `Buffer.from(arrayBuffer[, off[, len]])` aliases;
+the eight BigInt64 accessors exist; `TextEncoder.encode` returns a
+Uint8Array; the hash/hmac accumulators became plain arrays; the ten
+hand-written unsigned accessors that the table re-registered are gone. The
+one place that needed care outside `builtins.mc` was `util.inspect`, which
+reaches the typed-array printer before the Buffer one.
+
 ## Why
 
 `Buffer` is currently a JS **array** whose prototype chain runs to
