@@ -37,6 +37,7 @@ class TLSSocket extends EventEmitter {
     this._ending = false;
     this._sentAlert = false;
     this._sentFin = false;
+    this._peerEnded = false;
     this.destroyed = false;
     this.encrypted = true;
     this.readable = false;
@@ -75,7 +76,18 @@ class TLSSocket extends EventEmitter {
       this._readAll();
       if (this.destroyed) return;
     }
-    if (st & T_EOF) { this.readable = false; this._readableState.endEmitted = true; this.emit('end'); this._finish(); return; }
+    if ((st & T_EOF) && !this._peerEnded) {
+      // the peer is done sending: what is queued here still goes out, then
+      // the socket closes
+      this.readable = false;
+      this._readableState.endEmitted = true;
+      this._peerEnded = true;
+      __net_want_read(this._id, false);
+      this.emit('end');
+      if (this.destroyed) return;
+      this._ending = true;
+      this.writable = false;
+    }
     if (!this._connecting) this._flush();
     if (this.destroyed) return;
     this._maybeShutdown();
@@ -96,6 +108,14 @@ class TLSSocket extends EventEmitter {
     if (chunk == null || chunk.length === 0) return;
     this._pushback.push(asBuffer(chunk));
     queueMicrotask(() => this._drainPushback());
+  }
+  // What a pull would find: the bytes put back by unshift(), or nothing.
+  // Everything else has already gone out as 'data'.
+  read() {
+    if (this._pushback.length === 0) return null;
+    const out = Buffer.concat(this._pushback);
+    this._pushback = [];
+    return out;
   }
   // Paused, nothing is read from the socket: the session only flushes what
   // it already holds, and the peer's writes back up onto the peer.
@@ -130,6 +150,7 @@ class TLSSocket extends EventEmitter {
       __net_shutdown(this._id);
       this.emit('finish');
     }
+    if (this._peerEnded && this._sentFin) this._finish();
   }
   // Encrypt queued plaintext while the session has room for the ciphertext.
   // Past the cap it waits: the native write arms the socket for writable,

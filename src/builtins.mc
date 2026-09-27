@@ -8363,13 +8363,10 @@ private Value nat_btoa(void* vmp, Value callee, Value thisv, Value* args, i32 ar
         str_buf_add_byte(&raw, cast(u8, cp));
         i += adv;
     }
-    Value tmp = buf_from_bytes(vm, raw.data, raw.len);
-    gc_root(&vm.heap, tmp);
-    str_buf_free(&raw);
     str_buf out;
     str_buf_init(&out);
-    JsObject* b = value_as_object(tmp);
-    b64_encode(&out, b, 0, buf_len(b), false);
+    b64_encode(&out, raw.data, raw.len, false);
+    str_buf_free(&raw);
     Value r = new_str(vm, str_buf_to_str(&out));
     str_buf_free(&out);
     gc_root_reset(&vm.heap, rm);
@@ -9120,7 +9117,8 @@ private Value nat_date_ctor(void* vmp, Value callee, Value thisv, Value* args, i
 
 private Value nat_date_now(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    return js_number_value(vm_now_millis(vm));
+    // whole milliseconds, as the clock's resolution is finer than that
+    return js_number_value(floor(vm_now_millis(vm)));
 }
 
 // Date.UTC(year, month=0, day=1, h=0, m=0, s=0, ms=0) -> timestamp.
@@ -10720,6 +10718,35 @@ private Value ta_alloc_like(VM* vm, JsObject* like, i32 len) {
     return r;
 }
 
+// Well-formed UTF-8, by the decoder's rules: no overlong form, no
+// surrogate, nothing past U+10FFFF. `fatal` rejects what this refuses.
+private bool utf8_is_valid(u8* p, i32 n) {
+    i32 i = 0;
+    while i < n {
+        i32 c = cast(i32, *(p + i));
+        i32 need = 0;
+        i32 cp = 0;
+        if c < 0x80 { i++; continue; }
+        else if (c & 0xE0) == 0xC0 { need = 1; cp = c & 0x1F; }
+        else if (c & 0xF0) == 0xE0 { need = 2; cp = c & 0x0F; }
+        else if (c & 0xF8) == 0xF0 { need = 3; cp = c & 0x07; }
+        else { return false; }
+        if i + need >= n { return false; }
+        for i32 k = 1; k <= need; k++ {
+            i32 cc = cast(i32, *(p + i + k));
+            if (cc & 0xC0) != 0x80 { return false; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if need == 1 && cp < 0x80 { return false; }
+        if need == 2 && cp < 0x800 { return false; }
+        if need == 3 && cp < 0x10000 { return false; }
+        if cp > 0x10FFFF { return false; }
+        if cp >= 0xD800 && cp <= 0xDFFF { return false; }
+        i = i + need + 1;
+    }
+    return true;
+}
+
 // --- Buffer -----------------------------------------------------------------
 //
 // Node's Buffer: a Uint8Array over an ArrayBuffer whose prototype is
@@ -10824,6 +10851,15 @@ private i32 buf_byte(JsObject* o, i32 i) {
     return cast(i32, cast(i64, js_to_number(v))) & 0xFF;
 }
 
+// The bytes of a typed-array view with their count, or null (and the
+// element count) for a plain array of numbers, which the callers then read
+// one number at a time.
+private u8* buf_ptr(JsObject* o, i32* n) {
+    if (o.obj_flags & OBJF_TYPEDARRAY) != 0 { return ta_bytes(o, n); }
+    *n = o.elen;
+    return null;
+}
+
 // Stores the low byte of `by` at index i; out of range is ignored.
 private void buf_set_byte(JsObject* o, i32 i, i32 by) {
     if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
@@ -10882,13 +10918,13 @@ private void b64_emit(str_buf* sb, str alpha, u8 c62, u8 c63, i32 v) {
     else { str_buf_add_byte(sb, *(alpha.data + v)); }
 }
 
-private void b64_encode(str_buf* sb, JsObject* b, i32 start, i32 end, bool url) {
+private void b64_encode(str_buf* sb, u8* p, i32 end, bool url) {
     str alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     u8 c62 = cast(u8, url ? '-' : '+');
     u8 c63 = cast(u8, url ? '_' : '/');
-    i32 i = start;
+    i32 i = 0;
     while end - i >= 3 {
-        i32 n = (buf_byte(b, i) << 16) | (buf_byte(b, i + 1) << 8) | buf_byte(b, i + 2);
+        i32 n = (cast(i32, *(p + i)) << 16) | (cast(i32, *(p + i + 1)) << 8) | cast(i32, *(p + i + 2));
         b64_emit(sb, alpha, c62, c63, (n >> 18) & 0x3F);
         b64_emit(sb, alpha, c62, c63, (n >> 12) & 0x3F);
         b64_emit(sb, alpha, c62, c63, (n >> 6) & 0x3F);
@@ -10897,12 +10933,12 @@ private void b64_encode(str_buf* sb, JsObject* b, i32 start, i32 end, bool url) 
     }
     i32 rem = end - i;
     if rem == 1 {
-        i32 n = buf_byte(b, i) << 16;
+        i32 n = cast(i32, *(p + i)) << 16;
         b64_emit(sb, alpha, c62, c63, (n >> 18) & 0x3F);
         b64_emit(sb, alpha, c62, c63, (n >> 12) & 0x3F);
         if !url { str_buf_add_byte(sb, '='); str_buf_add_byte(sb, '='); }
     } else if rem == 2 {
-        i32 n = (buf_byte(b, i) << 16) | (buf_byte(b, i + 1) << 8);
+        i32 n = (cast(i32, *(p + i)) << 16) | (cast(i32, *(p + i + 1)) << 8);
         b64_emit(sb, alpha, c62, c63, (n >> 18) & 0x3F);
         b64_emit(sb, alpha, c62, c63, (n >> 12) & 0x3F);
         b64_emit(sb, alpha, c62, c63, (n >> 6) & 0x3F);
@@ -10995,14 +11031,57 @@ private void str_to_bytes(str_buf* out, str s, i32 enc) {
     }
 }
 
-// Decodes buffer bytes [start,end) into a JS string under the encoding.
-private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
+// Decodes `n` raw bytes into a JS string under the encoding.
+private Value bytes_to_str_raw(VM* vm, u8* p, i32 n, i32 enc) {
+    if enc == ENC_UTF8 && utf8_is_valid(p, n) {
+        // the common case: well-formed text is the string's own bytes
+        str s;
+        s.data = p;
+        s.len = n;
+        return new_str(vm, s);
+    }
+    if enc == ENC_LATIN1 || enc == ENC_ASCII {
+        // one byte in, one or two out
+        u8* out = alloc<u8>(n > 0 ? n * 2 : 1);
+        i32 w = 0;
+        for i32 i = 0; i < n; i++ {
+            i32 by = cast(i32, *(p + i));
+            if enc == ENC_ASCII { by = by & 0x7F; }
+            if by < 0x80 { *(out + w) = cast(u8, by); w++; }
+            else {
+                *(out + w) = cast(u8, 0xC0 | (by >> 6));
+                *(out + w + 1) = cast(u8, 0x80 | (by & 0x3F));
+                w += 2;
+            }
+        }
+        str s;
+        s.data = out;
+        s.len = w;
+        Value v = new_str(vm, s);
+        free(out);
+        return v;
+    }
+    if enc == ENC_HEX {
+        str alpha = "0123456789abcdef";
+        u8* out = alloc<u8>(n > 0 ? n * 2 : 1);
+        for i32 i = 0; i < n; i++ {
+            i32 by = cast(i32, *(p + i));
+            *(out + i * 2) = *(alpha.data + (by >> 4));
+            *(out + i * 2 + 1) = *(alpha.data + (by & 0xF));
+        }
+        str s;
+        s.data = out;
+        s.len = n * 2;
+        Value v = new_str(vm, s);
+        free(out);
+        return v;
+    }
     str_buf sb;
     str_buf_init(&sb);
     if enc == ENC_UTF8 {
-        i32 i = start;
-        while i < end {
-            i32 c = buf_byte(b, i);
+        i32 i = 0;
+        while i < n {
+            i32 c = cast(i32, *(p + i));
             i32 need = 0;
             i32 cp = 0;
             // Range for the second byte. It is what rules out the overlong
@@ -11026,8 +11105,8 @@ private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
             bool ok = need >= 0;
             if ok {
                 for i32 k = 1; k <= need; k++ {
-                    if i + k >= end { ok = false; break; }
-                    i32 cc = buf_byte(b, i + k);
+                    if i + k >= n { ok = false; break; }
+                    i32 cc = cast(i32, *(p + i + k));
                     if cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF) { ok = false; break; }
                     cp = (cp << 6) | (cc & 0x3F);
                     taken++;
@@ -11035,61 +11114,66 @@ private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
             }
             u8[4] tmp;
             if ok {
-                i32 n = bi_utf8_encode(&tmp[0], cast(u32, cp));
-                str_buf_add_bytes(&sb, &tmp[0], n);
+                i32 m = bi_utf8_encode(&tmp[0], cast(u32, cp));
+                str_buf_add_bytes(&sb, &tmp[0], m);
                 i += need + 1;
             } else {
                 // One replacement per maximal subpart, so a truncated tail is
                 // a single error rather than one per leftover byte.
-                i32 n = bi_utf8_encode(&tmp[0], cast(u32, 0xFFFD));
-                str_buf_add_bytes(&sb, &tmp[0], n);
+                i32 m = bi_utf8_encode(&tmp[0], cast(u32, 0xFFFD));
+                str_buf_add_bytes(&sb, &tmp[0], m);
                 i += 1 + taken;
             }
         }
-    } else if enc == ENC_LATIN1 || enc == ENC_ASCII {
-        for i32 i = start; i < end; i++ {
-            i32 by = buf_byte(b, i);
-            if enc == ENC_ASCII {
-                u8[4] tmp;
-                i32 n = bi_utf8_encode(&tmp[0], cast(u32, by & 0x7F));
-                str_buf_add_bytes(&sb, &tmp[0], n);
-            } else {
-                u8[4] tmp;
-                i32 n = bi_utf8_encode(&tmp[0], cast(u32, by));
-                str_buf_add_bytes(&sb, &tmp[0], n);
-            }
-        }
-    } else if enc == ENC_HEX {
-        str alpha = "0123456789abcdef";
-        for i32 i = start; i < end; i++ {
-            i32 by = buf_byte(b, i);
-            str_buf_add_byte(&sb, *(alpha.data + (by >> 4)));
-            str_buf_add_byte(&sb, *(alpha.data + (by & 0xF)));
-        }
     } else if enc == ENC_UTF16LE {
-        i32 i = start;
-        while i + 1 < end {
-            u32 unit = cast(u32, buf_byte(b, i)) | (cast(u32, buf_byte(b, i + 1)) << 8);
+        i32 i = 0;
+        while i + 1 < n {
+            u32 unit = cast(u32, *(p + i)) | (cast(u32, *(p + i + 1)) << 8);
             i += 2;
             u32 cp = unit;
             // a leading surrogate joins the trailing one that follows it
-            if unit >= 0xD800 && unit <= 0xDBFF && i + 1 < end {
-                u32 lo = cast(u32, buf_byte(b, i)) | (cast(u32, buf_byte(b, i + 1)) << 8);
+            if unit >= 0xD800 && unit <= 0xDBFF && i + 1 < n {
+                u32 lo = cast(u32, *(p + i)) | (cast(u32, *(p + i + 1)) << 8);
                 if lo >= 0xDC00 && lo <= 0xDFFF {
                     cp = 0x10000 + ((unit - 0xD800) << 10) + (lo - 0xDC00);
                     i += 2;
                 }
             }
             u8[4] tmp;
-            i32 n = bi_utf8_encode(&tmp[0], cp);
-            str_buf_add_bytes(&sb, &tmp[0], n);
+            i32 m = bi_utf8_encode(&tmp[0], cp);
+            str_buf_add_bytes(&sb, &tmp[0], m);
         }
     } else {
-        b64_encode(&sb, b, start, end, enc == ENC_BASE64URL);
+        b64_encode(&sb, p, n, enc == ENC_BASE64URL);
     }
     str r = str_buf_to_str(&sb);
     Value v = new_str(vm, r);
     str_buf_free(&sb);
+    return v;
+}
+
+// Decodes buffer bytes [start,end) into a JS string under the encoding. A
+// plain array of numbers is gathered into bytes first.
+private Value bytes_to_str(VM* vm, JsObject* b, i32 enc, i32 start, i32 end) {
+    i32 total;
+    u8* p = buf_ptr(b, &total);
+    if start < 0 { start = 0; }
+    if end > total { end = total; }
+    i32 n = end - start;
+    if n < 0 { n = 0; }
+    if p != null {
+        // the string is made from the buffer's own storage, which the
+        // caller need not have rooted, so it is held here for the duration
+        i32 rm = gc_root_mark(&vm.heap);
+        gc_root(&vm.heap, value_cell(&b.head));
+        Value v = bytes_to_str_raw(vm, p + start, n, enc);
+        gc_root_reset(&vm.heap, rm);
+        return v;
+    }
+    u8* tmp = alloc<u8>(n > 0 ? n : 1);
+    for i32 i = 0; i < n; i++ { *(tmp + i) = cast(u8, buf_byte(b, start + i)); }
+    Value v = bytes_to_str_raw(vm, tmp, n, enc);
+    free(tmp);
     return v;
 }
 
@@ -11125,6 +11209,14 @@ private Value nat_buffer_from(void* vmp, Value callee, Value thisv, Value* args,
         JsObject* ta = value_as_object(src);
         i32 n = ta_len(vm, ta);
         JsObject* b = buf_new(vm, n);
+        if ta_elem_size(ta_kind(vm, ta)) == 1 {
+            i32 sn;
+            i32 dn;
+            u8* sp = ta_bytes(ta, &sn);
+            u8* dp = ta_bytes(b, &dn);
+            if sp != null && dp != null && n > 0 { memcpy(dp, sp, cast(i64, n)); }
+            return value_cell(&b.head);
+        }
         for i32 i = 0; i < n; i++ {
             Value e = vm_ta_get(vm, ta, i);
             i32 by = value_is_number(e) ? (cast(i32, cast(i64, js_to_number(e))) & 0xFF) : 0;
@@ -11163,7 +11255,9 @@ private Value nat_buffer_alloc(void* vmp, Value callee, Value thisv, Value* args
     Value fill = arg_at(args, argc, 1);
     if value_is_number(fill) {
         i32 by = cast(i32, cast(i64, js_to_number(fill))) & 0xFF;
-        for i32 i = 0; i < size; i++ { buf_set_byte(b, i, by); }
+        i32 bn;
+        u8* bp = ta_bytes(b, &bn);
+        for i32 i = 0; i < bn; i++ { *(bp + i) = cast(u8, by); }
     } else if value_is_string(fill) {
         i32 enc = buf_parse_enc(arg_at(args, argc, 2), ENC_UTF8);
         str_buf sb;
@@ -11198,10 +11292,19 @@ private Value nat_buffer_concat(void* vmp, Value callee, Value thisv, Value* arg
         Value bv = js_array_get(la, i);
         if is_bytes_like(bv) {
             JsObject* src = value_as_object(bv);
-            i32 n = buf_len(src);
-            for i32 j = 0; j < n && pos < cap; j++ {
-                buf_set_byte(out, pos, buf_byte(src, j));
-                pos++;
+            i32 n;
+            u8* sp = buf_ptr(src, &n);
+            i32 take = n < cap - pos ? n : cap - pos;
+            if sp != null {
+                i32 on;
+                u8* op = ta_bytes(out, &on);
+                if take > 0 { memcpy(op + pos, sp, cast(i64, take)); }
+                pos += take;
+            } else {
+                for i32 j = 0; j < take; j++ {
+                    buf_set_byte(out, pos, buf_byte(src, j));
+                    pos++;
+                }
             }
         }
     }
@@ -11264,8 +11367,15 @@ private Value nat_buf_equals(void* vmp, Value callee, Value thisv, Value* args, 
     if !is_bytes_like(thisv) || !is_bytes_like(ov) { return value_bool(false); }
     JsObject* a = value_as_object(thisv);
     JsObject* b = value_as_object(ov);
-    i32 n = buf_len(a);
-    if n != buf_len(b) { return value_bool(false); }
+    i32 n;
+    i32 m;
+    u8* ap = buf_ptr(a, &n);
+    u8* bp = buf_ptr(b, &m);
+    if n != m { return value_bool(false); }
+    if ap != null && bp != null {
+        for i32 i = 0; i < n; i++ { if *(ap + i) != *(bp + i) { return value_bool(false); } }
+        return value_bool(true);
+    }
     for i32 i = 0; i < n; i++ {
         if buf_byte(a, i) != buf_byte(b, i) { return value_bool(false); }
     }
@@ -11277,12 +11387,14 @@ private Value nat_buf_compare(void* vmp, Value callee, Value thisv, Value* args,
     if !is_bytes_like(thisv) || !is_bytes_like(ov) { return value_number(0.0); }
     JsObject* a = value_as_object(thisv);
     JsObject* b = value_as_object(ov);
-    i32 alen = buf_len(a);
-    i32 blen = buf_len(b);
+    i32 alen;
+    i32 blen;
+    u8* ap = buf_ptr(a, &alen);
+    u8* bp = buf_ptr(b, &blen);
     i32 n = alen < blen ? alen : blen;
     for i32 i = 0; i < n; i++ {
-        i32 x = buf_byte(a, i);
-        i32 y = buf_byte(b, i);
+        i32 x = ap != null ? cast(i32, *(ap + i)) : buf_byte(a, i);
+        i32 y = bp != null ? cast(i32, *(bp + i)) : buf_byte(b, i);
         if x < y { return value_number(-1.0); }
         if x > y { return value_number(1.0); }
     }
@@ -11309,8 +11421,14 @@ private Value nat_buf_copy(void* vmp, Value callee, Value thisv, Value* args, i3
     if count <= 0 { return value_number(0.0); }
     // through a copy: source and target may be the same storage
     u8* tmp = alloc<u8>(count);
-    for i32 i = 0; i < count; i++ { *(tmp + i) = cast(u8, buf_byte(src, sstart + i)); }
-    for i32 i = 0; i < count; i++ { buf_set_byte(tgt, tstart + i, cast(i32, *(tmp + i))); }
+    i32 sn;
+    i32 tn;
+    u8* sp = buf_ptr(src, &sn);
+    u8* tp = buf_ptr(tgt, &tn);
+    if sp != null { memcpy(tmp, sp + sstart, cast(i64, count)); }
+    else { for i32 i = 0; i < count; i++ { *(tmp + i) = cast(u8, buf_byte(src, sstart + i)); } }
+    if tp != null { memcpy(tp + tstart, tmp, cast(i64, count)); }
+    else { for i32 i = 0; i < count; i++ { buf_set_byte(tgt, tstart + i, cast(i32, *(tmp + i))); } }
     free(tmp);
     return value_number(cast(f64, count));
 }
@@ -11325,7 +11443,10 @@ private Value nat_buf_fill(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 end = value_is_undefined(ev) ? len : buf_clamp(to_int_arg(ev), len);
     if value_is_number(fv) {
         i32 by = cast(i32, cast(i64, js_to_number(fv))) & 0xFF;
-        for i32 i = start; i < end; i++ { buf_set_byte(b, i, by); }
+        i32 bn;
+        u8* bp = buf_ptr(b, &bn);
+        if bp != null { for i32 i = start; i < end; i++ { *(bp + i) = cast(u8, by); } }
+        else { for i32 i = start; i < end; i++ { buf_set_byte(b, i, by); } }
     } else if value_is_string(fv) {
         i32 enc = buf_parse_enc(arg_at(args, argc, 3), ENC_UTF8);
         str_buf pb;
@@ -11882,7 +12003,6 @@ private Value nat_ta_slice(void* vmp, Value callee, Value thisv, Value* args, i3
     JsObject* o = this_ta(vm, thisv);
     if o == null { return value_undefined(); }
     i32 len = ta_len(vm, o);
-    i32 kind = ta_kind(vm, o);
     i32 b = argc > 0 ? ta_rel(to_int_sat(arg_at(args, argc, 0)), len) : 0;
     i32 e = len;
     if argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) {
@@ -11908,6 +12028,29 @@ private Value nat_ta_set_meth(void* vmp, Value callee, Value thisv, Value* args,
     i32 offset = argc > 1 ? to_int_arg(arg_at(args, argc, 1)) : 0;
     if offset < 0 {
         vm_throw_error(vm, ERR_RANGE, "offset is out of bounds");
+        return value_undefined();
+    }
+    // A view of the same element kind copies as bytes, through a temporary
+    // since the two may overlap.
+    Value srcv = arg_at(args, argc, 0);
+    if vm_is_typed_array(srcv) && ta_kind(vm, value_as_object(srcv)) == ta_kind(vm, o) {
+        JsObject* so = value_as_object(srcv);
+        i32 sn;
+        i32 dn;
+        u8* sp = ta_bytes(so, &sn);
+        u8* dp = ta_bytes(o, &dn);
+        i32 es = ta_elem_size(ta_kind(vm, o));
+        i32 n = ta_len(vm, so);
+        if offset + n > len {
+            vm_throw_error(vm, ERR_RANGE, "offset is out of bounds");
+            return value_undefined();
+        }
+        if sp != null && dp != null && sn > 0 {
+            u8* tmp = alloc<u8>(sn);
+            memcpy(tmp, sp, cast(i64, sn));
+            memcpy(dp + offset * es, tmp, cast(i64, sn));
+            free(tmp);
+        }
         return value_undefined();
     }
     // Snapshot the source into a plain array so overlapping views are safe.
@@ -11937,7 +12080,6 @@ private Value ta_iterate(VM* vm, Value thisv, Value* args, i32 argc, i32 mode) {
         return value_undefined();
     }
     i32 len = ta_len(vm, o);
-    i32 kind = ta_kind(vm, o);
     i32 rm = gc_root_mark(&vm.heap);
     JsObject* out = null;
     JsObject* tmp = null;
@@ -12462,17 +12604,17 @@ private Value nat_net_send(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 off = to_int_arg(arg_at(args, argc, 2));
     if fd < 0 || !value_is_object(bufv) { return value_int(NET_ERR); }
     JsObject* o = value_as_object(bufv);
-    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
-    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    i32 len;
+    u8* p = buf_ptr(o, &len);
     if off < 0 { off = 0; }
     if off >= len { return value_int(0); }
+    // a view's bytes go to the socket as they are; the socket takes what it
+    // can and the caller comes back for the rest
+    if p != null { return value_int(net_try_send(fd, p + off, len - off)); }
     i32 chunk = len - off;
     if chunk > 16384 { chunk = 16384; }
     u8[16384] tmp;
-    for i32 i = 0; i < chunk; i++ {
-        i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, off + i))) : buf_byte(o, off + i);
-        tmp[i] = cast(u8, b & 0xFF);
-    }
+    for i32 i = 0; i < chunk; i++ { tmp[i] = cast(u8, buf_byte(o, off + i)); }
     return value_int(net_try_send(fd, &tmp[0], chunk));
 }
 
@@ -12645,18 +12787,20 @@ private Value nat_tls_write(void* vmp, Value callee, Value thisv, Value* args, i
     i32 off = to_int_arg(arg_at(args, argc, 2));
     if s == null || fd < 0 || !value_is_object(bufv) { return value_int(NET_ERR); }
     JsObject* o = value_as_object(bufv);
-    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
-    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    i32 len;
+    u8* p = buf_ptr(o, &len);
     if off < 0 { off = 0; }
     if off >= len { return value_int(0); }
+    // one record's worth at a time keeps the ciphertext queue bounded
     i32 chunk = len - off;
     if chunk > 16384 { chunk = 16384; }
     u8[16384] tmp;
-    for i32 i = 0; i < chunk; i++ {
-        i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, off + i))) : buf_byte(o, off + i);
-        tmp[i] = cast(u8, b & 0xFF);
+    if p == null {
+        for i32 i = 0; i < chunk; i++ { tmp[i] = cast(u8, buf_byte(o, off + i)); }
+        p = &tmp[0];
+        off = 0;
     }
-    if !tls_write(s, fd, &tmp[0], chunk) { return value_int(NET_ERR); }
+    if !tls_write(s, fd, p + off, chunk) { return value_int(NET_ERR); }
     // ciphertext the socket did not take waits for it to become writable
     if tls_wants_write(s) {
         vm_handle_set_interest(vm, id, cast(i16, vm_handle_interest(vm, id) | NET_POLLOUT));
@@ -12753,13 +12897,11 @@ private Value nat_tls_wants_write(void* vmp, Value callee, Value thisv, Value* a
 private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
     if !value_is_object(bufv) { return 0 - 1; }
     JsObject* o = value_as_object(bufv);
-    bool is_ta = (o.obj_flags & OBJF_TYPEDARRAY) != 0;
-    i32 len = is_ta ? ta_len(vm, o) : o.elen;
+    i32 len;
+    u8* p = buf_ptr(o, &len);
     if len > cap { return 0 - 1; }
-    for i32 i = 0; i < len; i++ {
-        i32 b = is_ta ? cast(i32, js_to_number(vm_ta_get(vm, o, i))) : buf_byte(o, i);
-        *(out + i) = cast(u8, b & 0xFF);
-    }
+    if p != null { if len > 0 { memcpy(out, p, cast(i64, len)); } return len; }
+    for i32 i = 0; i < len; i++ { *(out + i) = cast(u8, buf_byte(o, i)); }
     return len;
 }
 
@@ -13133,6 +13275,87 @@ private void def_buf_swap(VM* vm, str name, i32 group) {
     props_set_desc(&vm.buffer_proto.props, bi_atom(vm, name), value_cell(&n.head), METHOD_ATTRS);
 }
 
+// __buf_mask(source, mask, output, offset, length): the WebSocket masking
+// step, output[offset + i] = source[i] ^ mask[i & 3]. Behind the bufferutil
+// module; in JS this is a loop over every byte of every frame.
+private Value nat_buf_mask(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value sv = arg_at(args, argc, 0);
+    Value mv = arg_at(args, argc, 1);
+    Value ov = arg_at(args, argc, 2);
+    if !is_bytes_like(sv) || !is_bytes_like(mv) || !is_bytes_like(ov) {
+        vm_throw_error(vm, ERR_TYPE, "mask expects byte arrays");
+        return value_undefined();
+    }
+    JsObject* so = value_as_object(sv);
+    JsObject* mo = value_as_object(mv);
+    JsObject* oo = value_as_object(ov);
+    i32 off = to_int_arg(arg_at(args, argc, 3));
+    i32 len = to_int_arg(arg_at(args, argc, 4));
+    i32 sn;
+    i32 mn;
+    i32 on;
+    u8* sp = buf_ptr(so, &sn);
+    u8* mp = buf_ptr(mo, &mn);
+    u8* op = buf_ptr(oo, &on);
+    if mn < 4 || off < 0 || len < 0 || len > sn || off + len > on {
+        vm_throw_error(vm, ERR_RANGE, "mask: offset or length out of bounds");
+        return value_undefined();
+    }
+    if sp != null && mp != null && op != null {
+        for i32 i = 0; i < len; i++ { *(op + off + i) = cast(u8, *(sp + i) ^ *(mp + (i & 3))); }
+        return value_undefined();
+    }
+    for i32 i = 0; i < len; i++ { buf_set_byte(oo, off + i, buf_byte(so, i) ^ buf_byte(mo, i & 3)); }
+    return value_undefined();
+}
+
+// __buf_unmask(buffer, mask): the same, in place.
+private Value nat_buf_unmask(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value bv = arg_at(args, argc, 0);
+    Value mv = arg_at(args, argc, 1);
+    if !is_bytes_like(bv) || !is_bytes_like(mv) {
+        vm_throw_error(vm, ERR_TYPE, "unmask expects byte arrays");
+        return value_undefined();
+    }
+    JsObject* bo = value_as_object(bv);
+    JsObject* mo = value_as_object(mv);
+    i32 bn;
+    i32 mn;
+    u8* bp = buf_ptr(bo, &bn);
+    u8* mp = buf_ptr(mo, &mn);
+    if mn < 4 {
+        vm_throw_error(vm, ERR_RANGE, "unmask: the mask is 4 bytes");
+        return value_undefined();
+    }
+    if bp != null && mp != null {
+        for i32 i = 0; i < bn; i++ { *(bp + i) = cast(u8, *(bp + i) ^ *(mp + (i & 3))); }
+        return value_undefined();
+    }
+    for i32 i = 0; i < bn; i++ { buf_set_byte(bo, i, buf_byte(bo, i) ^ buf_byte(mo, i & 3)); }
+    return value_undefined();
+}
+
+// __utf8_valid(bytes): well-formed UTF-8, by the decoder's rules.
+private Value nat_utf8_valid(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value bv = arg_at(args, argc, 0);
+    if !is_bytes_like(bv) {
+        vm_throw_error(vm, ERR_TYPE, "isValidUTF8 expects a byte array");
+        return value_undefined();
+    }
+    JsObject* bo = value_as_object(bv);
+    i32 n;
+    u8* p = buf_ptr(bo, &n);
+    if p != null { return value_bool(utf8_is_valid(p, n)); }
+    u8* tmp = alloc<u8>(n > 0 ? n : 1);
+    for i32 i = 0; i < n; i++ { *(tmp + i) = cast(u8, buf_byte(bo, i)); }
+    bool ok = utf8_is_valid(tmp, n);
+    free(tmp);
+    return value_bool(ok);
+}
+
 private Value nat_buffer_compare_static(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value a = arg_at(args, argc, 0);
@@ -13230,6 +13453,10 @@ private void buffer_install(VM* vm) {
     def_buf_swap(vm, "swap64", 8);
     def_static(vm, ctor, "compare", &nat_buffer_compare_static);
     def_static(vm, ctor, "isEncoding", &nat_buffer_is_encoding);
+    // the frame helpers behind the bufferutil and utf-8-validate modules
+    ignore def_global_fn(vm, "__buf_mask", &nat_buf_mask);
+    ignore def_global_fn(vm, "__buf_unmask", &nat_buf_unmask);
+    ignore def_global_fn(vm, "__utf8_valid", &nat_utf8_valid);
     props_set_desc(&ctor.props, bi_atom(vm, "poolSize"), value_number(8192.0), PROP_DEFAULT);
 }
 
@@ -13261,35 +13488,6 @@ private bool codec_bytes(VM* vm, Value v, str_buf* out) {
         return true;
     }
     return false;
-}
-
-// Well-formed UTF-8, by the decoder's rules: no overlong form, no
-// surrogate, nothing past U+10FFFF. `fatal` rejects what this refuses.
-private bool utf8_is_valid(u8* p, i32 n) {
-    i32 i = 0;
-    while i < n {
-        i32 c = cast(i32, *(p + i));
-        i32 need = 0;
-        i32 cp = 0;
-        if c < 0x80 { i++; continue; }
-        else if (c & 0xE0) == 0xC0 { need = 1; cp = c & 0x1F; }
-        else if (c & 0xF0) == 0xE0 { need = 2; cp = c & 0x0F; }
-        else if (c & 0xF8) == 0xF0 { need = 3; cp = c & 0x07; }
-        else { return false; }
-        if i + need >= n { return false; }
-        for i32 k = 1; k <= need; k++ {
-            i32 cc = cast(i32, *(p + i + k));
-            if (cc & 0xC0) != 0x80 { return false; }
-            cp = (cp << 6) | (cc & 0x3F);
-        }
-        if need == 1 && cp < 0x80 { return false; }
-        if need == 2 && cp < 0x800 { return false; }
-        if need == 3 && cp < 0x10000 { return false; }
-        if cp > 0x10FFFF { return false; }
-        if cp >= 0xD800 && cp <= 0xDFFF { return false; }
-        i = i + need + 1;
-    }
-    return true;
 }
 
 private Value nat_textencoder_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {

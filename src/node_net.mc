@@ -35,6 +35,7 @@ class Socket extends EventEmitter {
     this._pushback = [];
     this._ending = false;
     this._sentFin = false;
+    this._peerEnded = false;
     this._encoding = null;
     this.destroyed = false;
     this.readable = false;
@@ -85,7 +86,7 @@ class Socket extends EventEmitter {
     while (true) {
       const r = __net_recv(this._id);
       if (r === null) return;
-      if (r === 0) { this.readable = false; this._readableState.endEmitted = true; this.emit('end'); this._finish(); return; }
+      if (r === 0) { this._onEof(); return; }
       if (r === -1) { this._fail('read EIO'); return; }
       this._emitData(r);
       if (this.destroyed || this._paused) return;
@@ -93,6 +94,23 @@ class Socket extends EventEmitter {
   }
   _emitData(r) {
     this.emit('data', this._encoding ? r.toString(this._encoding) : r);
+  }
+  // The peer is done sending. What is still queued here goes out first, and
+  // the socket closes once it has; anything written after this is dropped,
+  // as there is nobody to read it.
+  _onEof() {
+    if (this._peerEnded) return;
+    this.readable = false;
+    this._readableState.endEmitted = true;
+    this._peerEnded = true;
+    // nothing more will arrive, and an EOF stays readable, so stop reading
+    this._reading = false;
+    if (this._id >= 0) __net_want_read(this._id, false);
+    this.emit('end');
+    if (this.destroyed) return;
+    this._ending = true;
+    this.writable = false;
+    if (this._wq.length === 0) { this._shutdownSend(); this._finish(); }
   }
   // Bytes put back by unshift() go out ahead of anything still on the wire.
   _drainPushback() {
@@ -104,6 +122,14 @@ class Socket extends EventEmitter {
     if (chunk == null || chunk.length === 0) return;
     this._pushback.push(asBuffer(chunk));
     queueMicrotask(() => this._drainPushback());
+  }
+  // What a pull would find: the bytes put back by unshift(), or nothing.
+  // Everything else has already gone out as 'data'.
+  read() {
+    if (this._pushback.length === 0) return null;
+    const out = Buffer.concat(this._pushback);
+    this._pushback = [];
+    return out;
   }
   // Paused, the socket is not read at all, so the peer's writes back up
   // onto the peer: that is the backpressure.
@@ -145,6 +171,7 @@ class Socket extends EventEmitter {
       queueMicrotask(() => { if (!this.destroyed) this.emit('drain'); });
     }
     if (this._ending) this._shutdownSend();
+    if (this._peerEnded) this._finish();
   }
   write(data, enc, cb) {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }

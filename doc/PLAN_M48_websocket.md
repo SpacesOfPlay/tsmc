@@ -205,6 +205,42 @@ Each lands with its own tests and leaves the suite green.
   not to honour it, the test moves to `test/tls/` (manual). A connection
   to a public echo endpoint stays manual, in `test/tls/`, not gated.
 
+## Performance
+
+Measured 2026-09-27 before I3, with the `ws` package echoing between a
+client and a server in one process on loopback (node 22.16 for reference,
+same script). Round trips per second and bytes on the wire (payload both
+ways):
+
+| | node | tsmc before | tsmc after |
+|---|---|---|---|
+| 64 B messages, 100 in flight | 37k msg/s | 13k msg/s | 16.7k msg/s |
+| 4 KB messages | 144 MB/s | 4.5 MB/s | 95 MB/s |
+| 1 MB messages | 462 MB/s | 2.4 MB/s | 571 MB/s |
+| raw `net` echo, 64 KB writes | 1000 MB/s | 133 MB/s | 992 MB/s |
+| 1 MB messages over TLS | 335 MB/s | 1.3 MB/s | 3.2 MB/s |
+
+What the payload paid for, per MB, before and after: `Buffer.set` 319 ms →
+0.5 ms; `concat`/`copy`/`Buffer.from(buf)` 8–9 ms → 0.3–0.5 ms;
+`toString('utf8')` 13 ms → 3.7 ms; masking 115 ms in JS → native. Three
+changes did it: the byte operations on views are `memcpy` (sockets send
+straight from a view's bytes, the codecs read raw bytes, well-formed UTF-8
+becomes a string by one copy); `TypedArray.set` from a view of the same
+kind is one move; and the `bufferutil` and `utf-8-validate` modules exist as
+built-ins over two natives, so `ws` — which asks for them by name — masks
+and validates natively. The `WebSocket` global uses the same natives.
+
+What is left is not about buffers. The small-message rate is the
+interpreter running `ws`'s frame parser, stream and event machinery per
+message; a leaner codec in the global helps some. TLS throughput is the
+cipher: the pure-minc AES-GCM runs at a few MB/s per pass, and every byte
+crosses it four times in this benchmark. That is its own milestone.
+
+Two socket bugs the speed exposed, fixed with it: a socket closed on the
+peer's EOF while its write queue still held data (bytes lost once queues
+grew), and an EOF that stayed readable was read — and `'end'` emitted —
+again and again. Both sockets now stop reading at EOF, flush, then close.
+
 ## Validation
 
 Every diff test byte-identical to Node; `--gc-stress` over the new
