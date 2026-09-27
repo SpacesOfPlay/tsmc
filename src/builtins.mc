@@ -10629,17 +10629,22 @@ private bool is_dataview(VM* vm, Value v) {
     return value_is_object(v) && value_as_object(v).proto == vm.dataview_proto;
 }
 
+// The layout of a view lives in its own fields; a DataView is a plain
+// object and keeps it in the hidden properties.
 private i32 ta_len(VM* vm, JsObject* o) {
+    if (o.obj_flags & OBJF_TYPEDARRAY) != 0 { return cast(JsTypedArray*, o).ta_len; }
     Value* p = props_get(&o.props, vm.atom_ta_len);
     return p == null ? 0 : value_as_int(*p);
 }
 
 private i32 ta_off(VM* vm, JsObject* o) {
+    if (o.obj_flags & OBJF_TYPEDARRAY) != 0 { return cast(JsTypedArray*, o).ta_off; }
     Value* p = props_get(&o.props, vm.atom_ta_off);
     return p == null ? 0 : value_as_int(*p);
 }
 
 private i32 ta_kind(VM* vm, JsObject* o) {
+    if (o.obj_flags & OBJF_TYPEDARRAY) != 0 { return cast(JsTypedArray*, o).ta_kind; }
     Value* p = props_get(&o.props, vm.atom_ta_kind);
     return p == null ? 0 : value_as_int(*p);
 }
@@ -10678,14 +10683,11 @@ private Value ta_make_as(VM* vm, i32 kind, JsObject* buffer, i32 boff, i32 len, 
     gc_root(&vm.heap, value_cell(&ta.head));
     GcBytes* gb = value_as_bytes(*(buffer.elems));
     js_array_set(ta, 0, value_cell(&gb.head));
-    // the layout, in fields for the element accessors and as hidden properties
-    // for the prototype getters and the reflective paths
+    // the layout, in fields; the one property is the ArrayBuffer object,
+    // which the `buffer` getter hands out and which keeps it reachable
     tv.ta_off = boff;
     tv.ta_len = len;
     tv.ta_kind = kind;
-    props_set_desc(&ta.props, vm.atom_ta_off, value_int(boff), 0);
-    props_set_desc(&ta.props, vm.atom_ta_len, value_int(len), 0);
-    props_set_desc(&ta.props, vm.atom_ta_kind, value_int(kind), 0);
     props_set_desc(&ta.props, bi_atom(vm, "%tabuf"), value_cell(&buffer.head), 0);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&ta.head);

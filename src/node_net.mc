@@ -16,6 +16,8 @@ const POLLBAD = 0x0018;   // POLLERR | POLLHUP
 // Bytes a write() may leave queued before it answers false and a 'drain'
 // is owed.
 const HWM = 16384;
+// Small queued pieces are joined up to this many bytes before a send.
+const GATHER = 65536;
 
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');
@@ -29,6 +31,7 @@ class Socket extends EventEmitter {
     this._wq = [];
     this._wqBytes = 0;
     this._needDrain = false;
+    this._corked = 0;
     this._connecting = false;
     this._reading = false;
     this._paused = false;
@@ -150,9 +153,30 @@ class Socket extends EventEmitter {
     });
     return this;
   }
+  // Several small pieces at the head of the queue go out as one: a frame is
+  // often written as its header and its payload, and each send is a system
+  // call. Up to GATHER bytes are joined before sending.
+  _coalesce() {
+    if (this._wq.length < 2) return;
+    let n = 0;
+    let k = 0;
+    while (k < this._wq.length && n < GATHER) {
+      const it = this._wq[k];
+      n += it.buf.length - it.off;
+      k++;
+    }
+    if (k < 2) return;
+    const parts = [];
+    for (let i = 0; i < k; i++) {
+      const it = this._wq[i];
+      parts.push(it.off > 0 ? it.buf.subarray(it.off) : it.buf);
+    }
+    this._wq.splice(0, k, { buf: Buffer.concat(parts, n), off: 0 });
+  }
   _flush() {
-    if (this._wq.length === 0) return;
+    if (this._wq.length === 0 || this._corked > 0) return;
     while (this._wq.length > 0) {
+      this._coalesce();
       const it = this._wq[0];
       const n = __net_send(this._id, it.buf, it.off);
       if (n < 0) {
@@ -198,11 +222,18 @@ class Socket extends EventEmitter {
     if (typeof cb === 'function') this.once('finish', cb);
     this._ending = true;
     this.writable = false;
+    this._corked = 0;
     if (this._wq.length === 0 && !this._connecting) this._shutdownSend();
+    else this._flush();
     return this;
   }
-  cork() {}
-  uncork() {}
+  // Writes between cork() and uncork() are held and go out together.
+  cork() { this._corked++; }
+  uncork() {
+    if (this._corked === 0) return;
+    this._corked--;
+    if (this._corked === 0 && !this._connecting) this._flush();
+  }
   _shutdownSend() {
     if (this.destroyed || this._sentFin) return;
     this._sentFin = true;

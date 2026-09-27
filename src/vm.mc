@@ -3711,8 +3711,8 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
         } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0
                 && !(vm.buffer_proto != null && o.proto == vm.buffer_proto) {
             // a Buffer is a typed array too, but shows as bytes further down
-            i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
-            i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+            i32 kind = cast(JsTypedArray*, o).ta_kind;
+            i32 len = cast(JsTypedArray*, o).ta_len;
             if depth < 0 {
                 str_buf_add(sb, "[");
                 str_buf_add(sb, ta_kind_name(kind));
@@ -4874,7 +4874,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             r = true;
                         } else if idx >= 0 && (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
                             // a view's elements are bytes, not properties
-                            r = idx < ta_prop_int(vm, o, vm.atom_ta_len);
+                            r = idx < cast(JsTypedArray*, o).ta_len;
                         } else if idx >= 0 {
                             r = js_array_has(o, idx) || chain_has(vm, o, a);
                         } else if (o.obj_flags & OBJF_GLOBAL) != 0 {
@@ -5409,7 +5409,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             js_set_prop(d, a2, js_array_get(s, i));
                         }
                     } else if (s.obj_flags & OBJF_TYPEDARRAY) != 0 {
-                        i32 len = ta_prop_int(vm, s, vm.atom_ta_len);
+                        i32 len = cast(JsTypedArray*, s).ta_len;
                         for i32 i = 0; i < len; i++ {
                             string ks = format("{}", i);
                             u32 a2 = atom_intern(&vm.atoms, ks);
@@ -5843,7 +5843,7 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     } else if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
         // typed arrays enumerate their indices as own keys
         JsObject* o = value_as_object(objv);
-        i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+        i32 len = cast(JsTypedArray*, o).ta_len;
         for i32 i = 0; i < len; i++ {
             string s = format("{}", i);
             GcString* g = gc_new_string(&vm.heap, s);

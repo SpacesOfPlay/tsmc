@@ -214,7 +214,7 @@ ways):
 
 | | node | tsmc before | tsmc after |
 |---|---|---|---|
-| 64 B messages, 100 in flight | 37k msg/s | 13k msg/s | 16.7k msg/s |
+| 64 B messages, 100 in flight | 37k msg/s | 13k msg/s | 19.2k msg/s |
 | 4 KB messages | 144 MB/s | 4.5 MB/s | 95 MB/s |
 | 1 MB messages | 462 MB/s | 2.4 MB/s | 571 MB/s |
 | raw `net` echo, 64 KB writes | 1000 MB/s | 133 MB/s | 992 MB/s |
@@ -230,11 +230,21 @@ kind is one move; and the `bufferutil` and `utf-8-validate` modules exist as
 built-ins over two natives, so `ws` — which asks for them by name — masks
 and validates natively. The `WebSocket` global uses the same natives.
 
-What is left is not about buffers. The small-message rate is the
-interpreter running `ws`'s frame parser, stream and event machinery per
-message; a leaner codec in the global helps some. TLS throughput is the
-cipher: the pure-minc AES-GCM runs at a few MB/s per pass, and every byte
-crosses it four times in this benchmark. That is its own milestone.
+What is left is not about buffers, and the sampling profiler says where
+it is. Small messages: the bare socket layer alone round-trips 86k/s (node
+96k), so the rest is `ws`'s frame parser, stream and event machinery run
+per message by the interpreter, where a call is ~90 ns and a view ~300 ns
+against node's 5 and 34. Writes between `cork()` and `uncork()` now go out
+as one, and small queued pieces are joined before a send (each frame was
+two system calls); that and a lighter view (its layout in fields, one
+hidden property instead of four) took the rate from 16.7k to 19.2k. A
+leaner codec in the global is the next lever; a native frame-header
+parser after that. TLS: over 95% of the samples are in the cipher — a
+bit-sliced AES and a bit-at-a-time GHASH multiply — and every byte crosses
+it four times in this benchmark. Nothing in the socket or buffer paths
+registers. A table-driven AES and a table-driven GHASH would be a
+20–50x change there; that is its own milestone, with a trade-off to decide
+first (a table AES is not constant-time).
 
 Two socket bugs the speed exposed, fixed with it: a socket closed on the
 peer's EOF while its write queue still held data (bytes lost once queues

@@ -18,6 +18,10 @@ const HWM = 16384;
 // Ciphertext the session may hold before the plaintext queue waits for the
 // socket to take some of it.
 const CIPHER_CAP = 65536;
+// Small queued pieces are joined up to this many bytes before encryption:
+// each write is a record, with its own overhead on the wire and in the
+// cipher.
+const GATHER = 16384;
 
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');
@@ -32,6 +36,7 @@ class TLSSocket extends EventEmitter {
     this._wq = [];
     this._wqBytes = 0;
     this._needDrain = false;
+    this._corked = 0;
     this._paused = false;
     this._pushback = [];
     this._ending = false;
@@ -155,10 +160,31 @@ class TLSSocket extends EventEmitter {
   // Encrypt queued plaintext while the session has room for the ciphertext.
   // Past the cap it waits: the native write arms the socket for writable,
   // and the pump that follows flushes and returns here.
+  // Several small pieces at the head of the queue go out as one: a frame is
+  // often written as its header and its payload, and each send is a system
+  // call. Up to GATHER bytes are joined before sending.
+  _coalesce() {
+    if (this._wq.length < 2) return;
+    let n = 0;
+    let k = 0;
+    while (k < this._wq.length && n < GATHER) {
+      const it = this._wq[k];
+      n += it.buf.length - it.off;
+      k++;
+    }
+    if (k < 2) return;
+    const parts = [];
+    for (let i = 0; i < k; i++) {
+      const it = this._wq[i];
+      parts.push(it.off > 0 ? it.buf.subarray(it.off) : it.buf);
+    }
+    this._wq.splice(0, k, { buf: Buffer.concat(parts, n), off: 0 });
+  }
   _flush() {
-    if (this._connecting || this.destroyed) return;
+    if (this._connecting || this.destroyed || this._corked > 0) return;
     while (this._wq.length > 0) {
       if (__tls_pending(this._id) >= CIPHER_CAP) return;
+      this._coalesce();
       const it = this._wq[0];
       const n = __tls_write(this._id, it.buf, it.off);
       if (n < 0) { this._fail('write EIO', 'EPIPE'); return; }
@@ -192,11 +218,17 @@ class TLSSocket extends EventEmitter {
     if (typeof cb === 'function') this.once('finish', cb);
     this._ending = true;
     this.writable = false;
-    if (!this._connecting) queueMicrotask(() => this._maybeShutdown());
+    this._corked = 0;
+    if (!this._connecting) { this._flush(); queueMicrotask(() => this._maybeShutdown()); }
     return this;
   }
-  cork() {}
-  uncork() {}
+  // Writes between cork() and uncork() are held and go out together.
+  cork() { this._corked++; }
+  uncork() {
+    if (this._corked === 0) return;
+    this._corked--;
+    if (this._corked === 0 && !this._connecting) this._flush();
+  }
   _finish() {
     if (this.destroyed) return;
     this.destroyed = true;
