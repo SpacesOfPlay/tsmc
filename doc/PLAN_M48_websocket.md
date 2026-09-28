@@ -1,6 +1,6 @@
 # M48 — WebSocket
 
-Status: scoped 2026-09-27. I1 and I2 landed 2026-09-27, I3 on 2026-09-28; I4 open.
+Status: complete. I1 and I2 landed 2026-09-27, I3 and I4 on 2026-09-28.
 
 ## Goal
 
@@ -35,7 +35,7 @@ with `'drain'`, `_writableState`/`_readableState`), `Buffer` is a
 `Uint8Array`, `bufferutil` and `utf-8-validate` are built in over natives,
 and the `WebSocket`, `MessageEvent` and `Blob` globals exist. `ws` 7.5.10
 runs unmodified over http and https, including large messages, and the
-`WebSocket` global talks to it. What remains is I4, the `wss:` test.
+`WebSocket` global talks to it, over `ws:` and `wss:`. Nothing remains open.
 
 The state on 2026-09-27, for the record: `ws` failed at `require('url')`,
 then on `http.STATUS_CODES[426]`, then for want of `'upgrade'`; `Buffer`
@@ -209,14 +209,16 @@ Each lands with its own tests and leaves the suite green.
   Measured against the `ws` server in one process, 2026-09-28: 64 B
   messages 18.0k round trips/s (node's client on the same server: 36.1k),
   4 KB 97 MB/s (node 121), 1 MB 473 MB/s (node 306).
-- **I4 — `wss:`.** `test/diff/websocket_tls.js` over `https.createServer`
-  with the existing `test/diff/https_server.*.pem` fixture and
-  `process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'` set by the script,
-  which both runtimes read at connect time. Both ends run in tsmc, so the
-  test covers the server side of `wss:` (frames over the `TLSSocket` the
-  `'upgrade'` hands over) as well as the client. If Node's client turns out
-  not to honour it, the test moves to `test/tls/` (manual). A connection
-  to a public echo endpoint stays manual, in `test/tls/`, not gated.
+- **I4 — `wss:`.** Done. `test/diff/websocket_tls.js`: an `https.createServer`
+  on the existing fixture certificate with an `'upgrade'` listener running
+  the frame server over the `TLSSocket` it is handed, and the global as the
+  `wss:` client — a fragmented greeting that arrives with the handshake's
+  tail, echo, 70 KB binary and 200 KB text, a clean close. Verification is
+  switched off by `NODE_TLS_REJECT_UNAUTHORIZED=0`, which both runtimes read
+  at connect time; node announces the switch with a warning on stderr,
+  which the script silences (`process.removeAllListeners('warning')`), as
+  the harness compares stderr. Byte-identical to node, also under
+  `--gc-stress`. A connection to a public endpoint stays a manual check.
 
 ## Performance
 
