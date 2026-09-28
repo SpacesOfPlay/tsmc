@@ -443,7 +443,9 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     while more {
         more = false;
         u8[8192] tmp;
-        i64 q0 = qpc();
+        // The clock is read only for the handshake statistics: on some
+        // machines each read is a trap to the hypervisor.
+        i64 q0 = handshaking ? qpc() : 0;
         i32 n = net_try_recv(fd, &tmp[0], 8192);
         if handshaking { tls_stat_hs_recv = tls_stat_hs_recv + (qpc() - q0); }
         if n == 0 {
@@ -458,11 +460,11 @@ i32 tls_pump(TlsSession* s, i64 fd) {
             s.cipher_in_len += n;
             more = true;
         }
-        i64 q1 = qpc();
+        i64 q1 = handshaking ? qpc() : 0;
         flags = flags | tls_feed(s);
-        i64 q2 = qpc();
+        i64 q2 = handshaking ? qpc() : 0;
         if !tls_flush(s, fd) { s.failed = true; flags = flags | TLS_ERR; }
-        i64 q3 = qpc();
+        i64 q3 = handshaking ? qpc() : 0;
         if handshaking {
             tls_stat_hs_feed = tls_stat_hs_feed + (q2 - q1);
             tls_stat_hs_flush = tls_stat_hs_flush + (q3 - q2);

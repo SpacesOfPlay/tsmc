@@ -301,8 +301,7 @@ private { void aesgcm_pl_encrypt_v(ptls_aead_context_t* base, void* output, ptls
     u8* tmp = alloc<u8>(total);
     u64 off = 0;
     for u64 i = 0; i < incnt; i++ {
-        u8* src = input[i].base;
-        for u64 j = 0; j < input[i].len; j++ { *(tmp + off + j) = src[j]; }
+        memcpy(tmp + off, input[i].base, cast(i64, input[i].len));
         off = off + input[i].len;
     }
     aesgcm_pl_encrypt(base, output, cast(void*, tmp), total, seq, aad, aadlen, null);
@@ -448,8 +447,7 @@ private { void chapoly_pl_encrypt_v(ptls_aead_context_t* base, void* output, ptl
     u8* tmp = alloc<u8>(total);
     u64 off = 0;
     for u64 i = 0; i < incnt; i++ {
-        u8* src = input[i].base;
-        for u64 j = 0; j < input[i].len; j++ { *(tmp + off + j) = src[j]; }
+        memcpy(tmp + off, input[i].base, cast(i64, input[i].len));
         off = off + input[i].len;
     }
     chapoly_pl_encrypt(base, output, cast(void*, tmp), total, seq, aad, aadlen, null);
