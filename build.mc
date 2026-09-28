@@ -277,17 +277,23 @@ string out_exe() {
 
 // --- build ------------------------------------------------------------
 
+// `build --prof` compiles the profiler's hooks in (see src/prof.mc); the
+// binary then takes `--prof` at run time. Through `minc build` the flag does
+// not arrive, so this is the compiled build script's verb.
+str g_build_define = "";
+
 void build_tsmc() {
     step("build tsmc");
     assert_toolchain();
     ignore dir_create("build");
     string exe = out_exe();
     defer free(exe);
-    if compile("src/main.mc", str_from(exe.data, exe.len), "") != 0 {
+    if compile("src/main.mc", str_from(exe.data, exe.len), g_build_define) != 0 {
         outln("compile failed");
         exit(1);
     }
     pass(str_from(exe.data, exe.len));
+    if g_build_define.len > 0 { outln("        profiling build"); }
     // What built it. `bench` and `diff` rebuild through here, and the install is
     // whichever of MINC, ./minc and PATH answers first, so a binary can be
     // replaced by one built differently without anything being said. Printing it
@@ -1283,6 +1289,7 @@ i32 main() {
         return 0;
     }
     if str_equal(verb, "build") {
+        if argc > 2 && str_equal(str_from_cstr(get_arg(2)), "--prof") { g_build_define = "-DTSMC_PROF"; }
         build_tsmc();
         return 0;
     }

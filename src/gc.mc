@@ -201,6 +201,10 @@ private void gc_trace(GcHeap* h, GcCell* c) {
 // report: a pause here is a pause in everything the runtime serves.
 i64 gc_stat_collections = 0;
 i64 gc_stat_ticks = 0;
+// allocations by kind, counted only while a profile is being taken, in a
+// profiling build
+bool gc_stat_on = false;
+i64[16] gc_stat_allocs;
 
 void gc_collect(GcHeap* h) {
     i64 gc_t0 = qpc();
@@ -277,6 +281,9 @@ void gc_report_poison() {
 }
 
 GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
+    when defined(TSMC_PROF) {
+        if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
+    }
     if h.stress || h.bytes_live >= h.next_gc {
         gc_collect(h);
     }

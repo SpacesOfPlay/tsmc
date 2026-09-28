@@ -15,6 +15,7 @@ import object;
 import ustr;
 import bigint;
 import os_time;
+import prof;
 import uefi_host;
 import net;
 import bytecode;
@@ -114,6 +115,7 @@ type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 struct VM {
     GcHeap heap;
     AtomTable atoms;
+    Prof* prof;                // the `--prof` accounting, or null
     Value* stack;
     i32 sp;
     Frame* frames;
@@ -3942,6 +3944,7 @@ private void vm_install_globals(VM* vm) {
 // --- lifecycle -------------------------------------------------------------------------
 
 void vm_init(VM* vm) {
+    vm.prof = null;
     // process.uptime and performance.now count from here
     vm.start_ns = vm_clock_ns();
     vm.stack_limit = 10;
@@ -4364,6 +4367,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
         }
         i32 op = *(code + ip);
         ip++;
+        when defined(TSMC_PROF) {
+            if vm.prof != null { prof_step(vm.prof, t, op); }
+        }
         switch op {
             case OP_CONST: {
                 vpush(vm, *(t.consts + rd_u16(code, ip)));
@@ -4972,6 +4978,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     thisv = vpeek(vm, argc);
                     if value_is_native(fnv) {
                         JsNative* na = value_as_native(fnv);
+                        when defined(TSMC_PROF) {
+                            if vm.prof != null { vm.prof.native_calls++; }
+                        }
                         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
                         if op == OP_NEW && !value_is_reference(res) { res = thisv; }
                         vm.sp -= argc + 2;
@@ -5018,6 +5027,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             else { nf.new_target = value_undefined(); }
                             nf.gen = null;
                             vm.fp++;
+                            when defined(TSMC_PROF) {
+                                if vm.prof != null { vm.prof.js_calls++; }
+                            }
                             gc_root_reset(&vm.heap, arm);
                             fr = nf;
                             t = ft;

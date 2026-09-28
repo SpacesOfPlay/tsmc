@@ -207,6 +207,10 @@ struct FnTemplate {
     str src_text;
     i32 src_start;
     i32 src_end;
+    // what `--prof` charges to this function
+    i64 prof_ops;
+    i64 prof_ns;
+    i32 prof_samples;
 }
 
 type TmplPtr = FnTemplate*;
@@ -324,6 +328,9 @@ void tmpl_set_name(FnTemplate* t, str name) {
 FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool has_rest,
         bool is_gen, bool is_async) {
     FnTemplate* t = new(FnTemplate);
+    t.prof_ops = 0;
+    t.prof_ns = 0;
+    t.prof_samples = 0;
     t.src_text.data = null;
     t.src_text.len = 0;
     t.src_start = 0;

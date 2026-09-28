@@ -22,6 +22,7 @@ import deflate;
 import inflate;
 import net;
 import os_time;
+import prof;
 import uefi_host;
 import tls_native;
 import tls_chain;
@@ -10392,6 +10393,7 @@ private Value nat_process_exit(void* vmp, Value callee, Value thisv, Value* args
     }
     // 'exit' still runs, though nothing scheduled from it will
     ignore vm_process_emit(vm, "exit", value_int(code), value_undefined(), 1);
+    if vm.prof != null { prof_report(vm.prof, vm.heap.n_collections); }
     exit(code);
     return value_undefined();
 }
