@@ -207,23 +207,35 @@ Each lands with its own tests and leaves the suite green.
   `'error'` handler of a data-phase failure where the standard (and this
   runtime) has already moved to `CLOSED`.
   Measured against the `ws` server in one process, 2026-09-28: 64 B
-  messages 21.0k round trips/s (node's client on the same server: 36.1k),
-  4 KB 105 MB/s (node 121), 1 MB 497 MB/s (node 306).
-  The 64 B case taken apart: the bare socket round-trips 64 B at 86k/s
-  (node 96k), so ~11 µs of every round trip is system calls on both
+  messages 22.7k round trips/s (node's client on the same server: 36.1k),
+  4 KB 114 MB/s (node 121), 1 MB 533 MB/s (node 306).
+  The 64 B case taken apart: the bare socket round-trips 64 B at 86–95k/s
+  (node 96–106k), so ~11 µs of every round trip is system calls on both
   runtimes. Against a lean raw frame server (no `ws` on either end) the
-  client does 44k/s (node's client 59k, the `ws` client here 38k): the
-  client plus that server cost ~12 µs, after a round of taking per-frame
-  work out — mask keys from a 4 KB pool instead of a generator call per
-  frame, `bufferedAmount` read off the socket's queue instead of a
+  client went from 35k to 56k/s over two rounds (node's client: 57–59k on
+  the same server; the `ws` client here: 38k), guided by the profiling
+  build (`build --prof`), which charges time and ops to JavaScript
+  functions. Round one: mask keys from a pool instead of a generator call
+  per frame, `bufferedAmount` read off the socket's queue instead of a
   callback and microtask per write, frames parsed at an offset into the
-  chunk they arrived in (a text message is checked and decoded in place,
-  binary copied once into its ArrayBuffer), a Uint8Array sent as it is,
-  one-listener dispatch without a snapshot. What remains in the client is
-  the interpreter's own constant: ~40 calls and property operations per
-  frame at ~50–90 ns each. The other ~27 µs of the 47 µs round trip is
-  the `ws` package's server — a stream, a state machine and several emits
-  per frame, run by the interpreter — which node runs through a JIT.
+  chunk they arrived in, a Uint8Array sent as it is, one-listener dispatch
+  without a snapshot. Round two, from the profile: `fillMask` was 10% of
+  all ops for a 4-byte copy and the `Event`/`MessageEvent` constructors 13%
+  — an event's defaults now live on its prototype (as the standard's
+  accessors do; node's events have no own properties at all) and the
+  message event is built directly; a native draws the mask key and masks
+  the payload in one call; a native decodes and checks a frame header into
+  one packed number; and `socket.write` with nothing queued sends straight
+  away instead of queueing, coalescing and flushing, and a header and its
+  payload written between `cork()` and `uncork()` go out in one native send
+  without being joined first — the two of which also took the `ws`
+  package's own round trips from 19.2k to 20.7k. Ops per round trip fell
+  from 1,060 to 690, allocations from 27 to 25.
+  The other ~26 µs of the 46 µs round trip with `ws` on the server side is
+  the `ws` package's own code — a stream, a state machine and several
+  emits per frame, run by the interpreter — which node runs through a JIT;
+  the profile of that run names `getInfo`, `consume`, `frame`, `send` and
+  `startLoop` in `ws`, and nothing of ours above 10%.
 - **I4 — `wss:`.** Done. `test/diff/websocket_tls.js`: an `https.createServer`
   on the existing fixture certificate with an `'upgrade'` listener running
   the frame server over the `TLSSocket` it is handed, and the global as the

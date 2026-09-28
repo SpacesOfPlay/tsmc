@@ -54,34 +54,6 @@ function isToken(s) {
   return true;
 }
 
-// Mask keys come from a pool of random bytes filled in bulk: one call to the
-// system's generator per thousand frames rather than one per frame.
-let maskPool = null;
-let maskAt = 0;
-const MASK = Buffer.alloc(4);
-
-function fillMask(out, at) {
-  if (maskPool === null || maskAt >= maskPool.length) {
-    maskPool = crypto.randomBytes(4096);
-    maskAt = 0;
-  }
-  const p = maskPool;
-  const i = maskAt;
-  maskAt += 4;
-  const m0 = p[i];
-  const m1 = p[i + 1];
-  const m2 = p[i + 2];
-  const m3 = p[i + 3];
-  MASK[0] = m0;
-  MASK[1] = m1;
-  MASK[2] = m2;
-  MASK[3] = m3;
-  out[at] = m0;
-  out[at + 1] = m1;
-  out[at + 2] = m2;
-  out[at + 3] = m3;
-}
-
 // One outgoing frame: header, mask key and masked payload in a single
 // Buffer, so a message is one write.
 function frame(opcode, payload) {
@@ -101,8 +73,7 @@ function frame(opcode, payload) {
   } else {
     out[1] = 0x80 | len;
   }
-  fillMask(out, hdr);
-  if (len > 0) __buf_mask(payload, MASK, out, hdr + 4, len);
+  __buf_mask_frame(payload, out, hdr, len);
   return out;
 }
 
@@ -391,37 +362,22 @@ function parse(ws) {
   while (!ws._failed && ws._readyState !== CLOSED && ws._avail >= 2) {
     let c = ws._chunks[0];
     let off = ws._off;
-    if (c.length - off < 2) { c = join(ws); off = 0; }
-    const b0 = c[off];
-    const b1 = c[off + 1];
-    let len = b1 & 0x7f;
-    let hdr = 2;
-    if (len === 126) hdr = 4;
-    else if (len === 127) hdr = 10;
-    if ((b1 & 0x80) !== 0) hdr += 4;
-    if (ws._avail < hdr) return;
-    if (c.length - off < hdr) { c = join(ws); off = 0; }
-    if (len === 126) len = c.readUInt16BE(off + 2);
-    else if (len === 127) {
-      if (c.readUInt32BE(off + 2) !== 0 || (c[off + 6] & 0x80) !== 0) { fail(ws, 'Received a frame that is too large', 1009); return; }
-      len = c.readUInt32BE(off + 6);
+    // the header, decoded and checked natively: a packed number, or a
+    // negative code (see __ws_head)
+    let code = __ws_head(c, off, ws._fragOp);
+    if (code < 0 && code > -100) {
+      // the header straddles chunks
+      if (ws._avail < -code) return;
+      c = join(ws);
+      off = 0;
+      code = __ws_head(c, off, ws._fragOp);
     }
-    const op = b0 & 0x0f;
-    if ((b0 & 0x70) !== 0) { fail(ws, 'Received a frame with reserved bits set', 1002); return; }
-    if ((b1 & 0x80) !== 0) { fail(ws, 'Received a masked frame from the server', 1002); return; }
-    if (op >= 8) {
-      if ((b0 & 0x80) === 0 || len > 125 || (op !== OP_CLOSE && op !== OP_PING && op !== OP_PONG)) {
-        fail(ws, 'Received an invalid control frame', 1002);
-        return;
-      }
-    } else if (op === OP_CONT) {
-      if (ws._fragOp === -1) { fail(ws, 'Received a continuation frame with no message', 1002); return; }
-    } else if (op === OP_TEXT || op === OP_BIN) {
-      if (ws._fragOp !== -1) { fail(ws, 'Received a new message inside a fragmented one', 1002); return; }
-    } else {
-      fail(ws, 'Received an unknown opcode', 1002);
-      return;
-    }
+    if (code < 0) { failHead(ws, code); return; }
+    const meta = code & 255;
+    const op = meta & 15;
+    const hcode = meta >> 5;
+    const hdr = hcode === 0 ? 2 : (hcode === 1 ? 4 : 10);
+    const len = (code - meta) / 256;
     if (ws._avail < hdr + len) return;
     if (c.length - off < hdr + len) { c = join(ws); off = 0; }
     const start = off + hdr;
@@ -430,9 +386,18 @@ function parse(ws) {
     if (end === c.length) { ws._chunks.shift(); ws._off = 0; }
     else ws._off = end;
     if (op >= 8) control(ws, op, c.subarray(start, end));
-    else if ((b0 & 0x80) !== 0 && ws._fragOp === -1) message(ws, op, c, start, end);
-    else fragment(ws, op, (b0 & 0x80) !== 0, c.subarray(start, end));
+    else if ((code & 16) !== 0 && ws._fragOp === -1) message(ws, op, c, start, end);
+    else fragment(ws, op, (code & 16) !== 0, c.subarray(start, end));
   }
+}
+
+function failHead(ws, code) {
+  if (code === -100) fail(ws, 'Received a frame with reserved bits set', 1002);
+  else if (code === -101) fail(ws, 'Received a masked frame from the server', 1002);
+  else if (code === -103) fail(ws, 'Received a frame that is too large', 1009);
+  else if (code === -104) fail(ws, 'Received a continuation frame with no message', 1002);
+  else if (code === -105) fail(ws, 'Received a new message inside a fragmented one', 1002);
+  else fail(ws, 'Received an invalid frame', 1002);
 }
 
 // A whole message, delivered straight out of the chunk it arrived in: text
@@ -451,7 +416,10 @@ function message(ws, op, c, start, end) {
   } else {
     value = new Blob([c.subarray(start, end)]);
   }
-  ws.dispatchEvent(new MessageEvent('message', { data: value, origin: ws._origin }));
+  const ev = new MessageEvent('message');
+  ev.data = value;
+  ev.origin = ws._origin;
+  ws.dispatchEvent(ev);
 }
 
 function fragment(ws, op, fin, payload) {

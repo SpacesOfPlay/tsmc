@@ -61,19 +61,18 @@ for (const k of Object.keys(CONSTANTS)) {
   Object.defineProperty(DOMException.prototype, k, { value: CONSTANTS[k], enumerable: true });
 }
 
+// An event's fields default on the prototype, the way the standard keeps
+// them as accessors rather than own properties: a constructor sets the type
+// and whatever the options change, and dispatch sets the target.
 class Event {
   constructor(type, options) {
     if (type === undefined) throw new TypeError('The type argument must be specified');
-    const o = options === undefined || options === null ? {} : options;
-    this.type = String(type);
-    this.bubbles = !!o.bubbles;
-    this.cancelable = !!o.cancelable;
-    this.composed = !!o.composed;
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
-    this.eventPhase = 0;
-    this.isTrusted = false;
+    this.type = typeof type === 'string' ? type : String(type);
+    if (options !== undefined && options !== null) {
+      if (options.bubbles) this.bubbles = true;
+      if (options.cancelable) this.cancelable = true;
+      if (options.composed) this.composed = true;
+    }
   }
   preventDefault() {
     if (this.cancelable) this.defaultPrevented = true;
@@ -82,6 +81,15 @@ class Event {
   stopImmediatePropagation() { this._stopped = true; }
   composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
 }
+Event.prototype.bubbles = false;
+Event.prototype.cancelable = false;
+Event.prototype.composed = false;
+Event.prototype.defaultPrevented = false;
+Event.prototype.target = null;
+Event.prototype.currentTarget = null;
+Event.prototype.eventPhase = 0;
+Event.prototype.isTrusted = false;
+Event.prototype._stopped = false;
 tag(Event, 'Event');
 
 class CustomEvent extends Event {
@@ -96,14 +104,19 @@ tag(CustomEvent, 'CustomEvent');
 class MessageEvent extends Event {
   constructor(type, options) {
     super(type, options);
-    const o = options === undefined || options === null ? {} : options;
-    this.data = o.data === undefined ? null : o.data;
-    this.origin = o.origin === undefined ? '' : String(o.origin);
-    this.lastEventId = o.lastEventId === undefined ? '' : String(o.lastEventId);
-    this.source = o.source === undefined ? null : o.source;
-    this.ports = o.ports === undefined ? [] : o.ports;
+    if (options === undefined || options === null) return;
+    if (options.data !== undefined) this.data = options.data;
+    if (options.origin !== undefined) this.origin = String(options.origin);
+    if (options.lastEventId !== undefined) this.lastEventId = String(options.lastEventId);
+    if (options.source !== undefined) this.source = options.source;
+    if (options.ports !== undefined) this.ports = options.ports;
   }
 }
+MessageEvent.prototype.data = null;
+MessageEvent.prototype.origin = '';
+MessageEvent.prototype.lastEventId = '';
+MessageEvent.prototype.source = null;
+MessageEvent.prototype.ports = Object.freeze([]);
 tag(MessageEvent, 'MessageEvent');
 
 class CloseEvent extends Event {

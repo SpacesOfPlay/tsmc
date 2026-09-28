@@ -173,9 +173,39 @@ class Socket extends EventEmitter {
     }
     this._wq.splice(0, k, { buf: Buffer.concat(parts, n), off: 0 });
   }
+  // Two pieces — a header and its payload, the shape of a framed protocol
+  // between cork() and uncork() — go out in one send without being joined
+  // first. Returns false when the socket did not take them whole.
+  _sendPair() {
+    const a = this._wq[0];
+    const b = this._wq[1];
+    if (b.off !== 0) return false;
+    const n = __net_send2(this._id, a.buf, a.off, b.buf);
+    if (n === -3) return false;
+    if (n < 0) {
+      if (n === -1) { __net_want_write(this._id, true); return true; }
+      this._fail('write EIO');
+      return true;
+    }
+    const arest = a.buf.length - a.off;
+    if (n >= arest + b.buf.length) {
+      this._wq.splice(0, 2);
+      this._wqBytes -= arest + b.buf.length;
+      return true;
+    }
+    // part of it went: advance through the two pieces
+    if (n >= arest) { this._wq.shift(); this._wqBytes -= arest; b.off = n - arest; this._wqBytes -= b.off; }
+    else { a.off += n; this._wqBytes -= n; }
+    __net_want_write(this._id, true);
+    return true;
+  }
   _flush() {
     if (this._wq.length === 0 || this._corked > 0) return;
     while (this._wq.length > 0) {
+      if (this._wq.length === 2 && this._sendPair()) {
+        if (this._wq.length > 0 || this.destroyed) return;
+        break;
+      }
       this._coalesce();
       const it = this._wq[0];
       const n = __net_send(this._id, it.buf, it.off);
@@ -199,21 +229,45 @@ class Socket extends EventEmitter {
   }
   write(data, enc, cb) {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (typeof cb === 'function') queueMicrotask(cb);
     // Once end() has sent the FIN the send direction is closed, so there is
     // nowhere for this to go. Queueing it anyway meant a later flush tried
     // to send on a half-closed socket and reported the failure as an error.
-    if (!this.destroyed && !this._ending) {
-      const buf = asBuffer(data, enc);
-      this._wq.push({ buf: buf, off: 0 });
-      this._wqBytes += buf.length;
+    if (this.destroyed || this._ending) return this._wqBytes < HWM;
+    const buf = asBuffer(data, enc);
+    // The common case: nothing queued, not corked, and the socket takes the
+    // whole write at once, so there is nothing to queue.
+    if (this._wq.length === 0 && this._corked === 0 && !this._connecting) {
+      const n = __net_send(this._id, buf, 0);
+      if (n === buf.length) {
+        // the answer is about size, not about what the socket took: a large
+        // write is false even when it goes out whole, and 'drain' follows
+        if (buf.length < HWM) return true;
+        this._needDrain = true;
+        queueMicrotask(() => this._drainIfIdle());
+        return false;
+      }
+      if (n < -1) { this._fail('write EIO'); return false; }
+      const sent = n > 0 ? n : 0;
+      this._wq.push({ buf: buf, off: sent });
+      this._wqBytes += buf.length - sent;
+      __net_want_write(this._id, true);
+      const ok = this._wqBytes < HWM;
+      if (!ok) this._needDrain = true;
+      return ok;
     }
-    if (typeof cb === 'function') queueMicrotask(cb);
-    // The answer is about what was queued, not about what the socket then
-    // took at once: a large write is false even when it goes out whole.
+    this._wq.push({ buf: buf, off: 0 });
+    this._wqBytes += buf.length;
     const ok = this._wqBytes < HWM;
     if (!ok) this._needDrain = true;
     if (!this._connecting) this._flush();
     return ok;
+  }
+  _drainIfIdle() {
+    if (!this.destroyed && this._wq.length === 0 && this._needDrain) {
+      this._needDrain = false;
+      this.emit('drain');
+    }
   }
   end(data, enc, cb) {
     if (typeof data === 'function') { cb = data; data = null; }

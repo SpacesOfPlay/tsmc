@@ -12622,6 +12622,32 @@ private Value nat_net_send(void* vmp, Value callee, Value thisv, Value* args, i3
     return value_int(net_try_send(fd, &tmp[0], chunk));
 }
 
+// __net_send2(id, a, aoff, b): the rest of `a` and all of `b` in one send,
+// which is a frame's header and payload written between cork() and
+// uncork(). Both are gathered on the stack; a pair too large for that is
+// refused with -3 and the caller falls back to joining them.
+private Value nat_net_send2(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
+    Value av = arg_at(args, argc, 1);
+    i32 aoff = to_int_arg(arg_at(args, argc, 2));
+    Value bv = arg_at(args, argc, 3);
+    if fd < 0 || !is_bytes_like(av) || !is_bytes_like(bv) { return value_int(NET_ERR); }
+    i32 an;
+    i32 bn;
+    u8* ap = buf_ptr(value_as_object(av), &an);
+    u8* bp = buf_ptr(value_as_object(bv), &bn);
+    if ap == null || bp == null { return value_int(-3); }
+    if aoff < 0 { aoff = 0; }
+    if aoff > an { aoff = an; }
+    i32 arest = an - aoff;
+    if arest + bn > 65536 { return value_int(-3); }
+    u8[65536] tmp;
+    if arest > 0 { memcpy(&tmp[0], ap + aoff, cast(i64, arest)); }
+    if bn > 0 { memcpy(&tmp[arest], bp, cast(i64, bn)); }
+    return value_int(net_try_send(fd, &tmp[0], arest + bn));
+}
+
 // Read and write interest are set independently, so a paused socket stays
 // paused while its writes drain and a draining socket keeps reading.
 private Value nat_net_want_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -12998,6 +13024,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__net_send", &nat_net_send);
     ignore def_global_fn(vm, "__net_want_write", &nat_net_want_write);
     ignore def_global_fn(vm, "__net_want_read", &nat_net_want_read);
+    ignore def_global_fn(vm, "__net_send2", &nat_net_send2);
     ignore def_global_fn(vm, "__net_close", &nat_net_close);
     ignore def_global_fn(vm, "__net_shutdown", &nat_net_shutdown);
     ignore def_global_fn(vm, "__net_connect_result", &nat_net_connect_result);
@@ -13319,6 +13346,109 @@ private Value nat_buf_mask(void* vmp, Value callee, Value thisv, Value* args, i3
     return value_undefined();
 }
 
+// __buf_mask_frame(payload, out, hdr, length): the client side of masking
+// in one step. Four key bytes go to out[hdr..hdr+4) and the payload, masked
+// with them, to out[hdr+4..). The keys come from a pool of random bytes
+// filled in bulk, one call to the system's generator per thousand frames.
+private u8[4096] g_mask_pool;
+private i32 g_mask_at = 4096;
+
+private Value nat_buf_mask_frame(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value sv = arg_at(args, argc, 0);
+    Value ov = arg_at(args, argc, 1);
+    if !is_bytes_like(sv) || !is_bytes_like(ov) {
+        vm_throw_error(vm, ERR_TYPE, "mask expects byte arrays");
+        return value_undefined();
+    }
+    JsObject* so = value_as_object(sv);
+    JsObject* oo = value_as_object(ov);
+    i32 hdr = to_int_arg(arg_at(args, argc, 2));
+    i32 len = to_int_arg(arg_at(args, argc, 3));
+    i32 sn;
+    i32 on;
+    u8* sp = buf_ptr(so, &sn);
+    u8* op = buf_ptr(oo, &on);
+    if sp == null || op == null || hdr < 0 || len < 0 || len > sn || hdr + 4 + len > on {
+        vm_throw_error(vm, ERR_RANGE, "mask: offset or length out of bounds");
+        return value_undefined();
+    }
+    if g_mask_at + 4 > 4096 {
+        if !os_random(&g_mask_pool[0], 4096) {
+            vm_throw_error(vm, ERR_ERROR, "no entropy for a mask key");
+            return value_undefined();
+        }
+        g_mask_at = 0;
+    }
+    u8* key = &g_mask_pool[g_mask_at];
+    g_mask_at += 4;
+    u8* dst = op + hdr;
+    *dst = *key;
+    *(dst + 1) = *(key + 1);
+    *(dst + 2) = *(key + 2);
+    *(dst + 3) = *(key + 3);
+    dst += 4;
+    for i32 i = 0; i < len; i++ { *(dst + i) = cast(u8, *(sp + i) ^ *(key + (i & 3))); }
+    return value_undefined();
+}
+
+// __ws_head(chunk, off, fragOp): decodes the header of a frame from a
+// server (unmasked) at chunk[off..], and checks it the way the receiving
+// side must. Returns len * 256 + hcode * 32 + fin * 16 + op when the header
+// is whole and valid, where hcode 0/1/2 stands for a 2/4/10-byte header; -n
+// when n bytes of header are needed but not there; and
+// a code at or below -100 for a frame that fails the connection:
+//   -100 reserved bits set, -101 masked, -102 an invalid control frame or
+//   unknown opcode, -103 too large, -104 a continuation with no message
+//   open, -105 a new message inside a fragmented one.
+private Value nat_ws_head(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value cv = arg_at(args, argc, 0);
+    if !is_bytes_like(cv) {
+        vm_throw_error(vm, ERR_TYPE, "expected a byte array");
+        return value_undefined();
+    }
+    i32 off = to_int_arg(arg_at(args, argc, 1));
+    i32 frag = to_int_arg(arg_at(args, argc, 2));
+    i32 n;
+    u8* p = buf_ptr(value_as_object(cv), &n);
+    if p == null || off < 0 { return value_int(-2); }
+    i32 have = n - off;
+    if have < 2 { return value_int(-2); }
+    i32 b0 = cast(i32, *(p + off));
+    i32 b1 = cast(i32, *(p + off + 1));
+    i32 op = b0 & 0x0f;
+    bool fin = (b0 & 0x80) != 0;
+    i64 len = cast(i64, b1 & 0x7f);
+    i32 hdr = 2;
+    if len == 126 { hdr = 4; }
+    else if len == 127 { hdr = 10; }
+    if (b1 & 0x80) != 0 { hdr += 4; }
+    if have < hdr { return value_int(0 - hdr); }
+    if len == 126 {
+        len = (cast(i64, *(p + off + 2)) << 8) | cast(i64, *(p + off + 3));
+    } else if len == 127 {
+        if *(p + off + 2) != 0 || *(p + off + 3) != 0 || *(p + off + 4) != 0 || *(p + off + 5) != 0
+            || (*(p + off + 6) & 0x80) != 0 { return value_int(-103); }
+        len = (cast(i64, *(p + off + 6)) << 24) | (cast(i64, *(p + off + 7)) << 16)
+            | (cast(i64, *(p + off + 8)) << 8) | cast(i64, *(p + off + 9));
+    }
+    if (b0 & 0x70) != 0 { return value_int(-100); }
+    if (b1 & 0x80) != 0 { return value_int(-101); }
+    if op >= 8 {
+        if !fin || len > 125 || (op != 8 && op != 9 && op != 10) { return value_int(-102); }
+    } else if op == 0 {
+        if frag == -1 { return value_int(-104); }
+    } else if op == 1 || op == 2 {
+        if frag != -1 { return value_int(-105); }
+    } else {
+        return value_int(-102);
+    }
+    i64 hcode = hdr == 2 ? 0 : (hdr == 4 ? 1 : 2);
+    i64 code = len * 256 + hcode * 32 + (fin ? 16 : 0) + cast(i64, op);
+    return value_number(cast(f64, code));
+}
+
 // __buf_unmask(buffer, mask): the same, in place.
 private Value nat_buf_unmask(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -13472,6 +13602,8 @@ private void buffer_install(VM* vm) {
     // the frame helpers behind the bufferutil and utf-8-validate modules
     ignore def_global_fn(vm, "__buf_mask", &nat_buf_mask);
     ignore def_global_fn(vm, "__buf_unmask", &nat_buf_unmask);
+    ignore def_global_fn(vm, "__buf_mask_frame", &nat_buf_mask_frame);
+    ignore def_global_fn(vm, "__ws_head", &nat_ws_head);
     ignore def_global_fn(vm, "__utf8_valid", &nat_utf8_valid);
     props_set_desc(&ctor.props, bi_atom(vm, "poolSize"), value_number(8192.0), PROP_DEFAULT);
 }
