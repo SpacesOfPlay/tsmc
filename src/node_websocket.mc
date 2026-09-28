@@ -1,0 +1,483 @@
+// node_websocket.mc -- the `WebSocket` global: the WHATWG client.
+//
+// Internal module (require('_websocket')) behind the lazy `WebSocket`
+// global, so a script that never names it pays nothing. The handshake is an
+// `http`/`https` request that ends in 'upgrade'; from there the socket
+// carries RFC 6455 frames. Masking and UTF-8 checks are the two natives that
+// `bufferutil` and `utf-8-validate` wrap, so no byte is walked in JS.
+//
+// Kept lean on purpose: one Buffer per outgoing frame, one write; incoming
+// chunks are consumed by slicing, joined only when a frame straddles them.
+//
+// Embedded JS: no backslash escapes (minc processes them in string literals)
+// and no double quotes.
+
+str node_websocket_source() {
+    return "'use strict';
+const webevents = require('_webevents');
+const EventTarget = webevents.EventTarget;
+const Event = webevents.Event;
+const MessageEvent = webevents.MessageEvent;
+const CloseEvent = webevents.CloseEvent;
+const ErrorEvent = webevents.ErrorEvent;
+const DOMException = webevents.DOMException;
+const Blob = require('_webapi').Blob;
+const crypto = require('crypto');
+
+const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const CONNECTING = 0;
+const OPEN = 1;
+const CLOSING = 2;
+const CLOSED = 3;
+const OP_CONT = 0;
+const OP_TEXT = 1;
+const OP_BIN = 2;
+const OP_CLOSE = 8;
+const OP_PING = 9;
+const OP_PONG = 10;
+const EMPTY = Buffer.alloc(0);
+
+function hidden(obj, key, value) {
+  Object.defineProperty(obj, key, { value: value, writable: true, enumerable: false, configurable: true });
+}
+
+// A subprotocol name is an HTTP token: visible ASCII minus the separators.
+function isToken(s) {
+  if (s.length === 0) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 32 || c >= 127) return false;
+    if (c === 40 || c === 41 || c === 60 || c === 62 || c === 64 || c === 44 || c === 59 ||
+        c === 58 || c === 92 || c === 34 || c === 47 || c === 91 || c === 93 || c === 63 ||
+        c === 61 || c === 123 || c === 125) return false;
+  }
+  return true;
+}
+
+// One outgoing frame: header, mask key and masked payload in a single
+// Buffer, so a message is one write.
+function frame(opcode, payload) {
+  const len = payload.length;
+  let hdr = 2;
+  if (len >= 65536) hdr += 8;
+  else if (len >= 126) hdr += 2;
+  const out = Buffer.allocUnsafe(hdr + 4 + len);
+  out[0] = 0x80 | opcode;
+  if (len >= 65536) {
+    out[1] = 0x80 | 127;
+    out.writeUInt32BE(0, 2);
+    out.writeUInt32BE(len, 6);
+  } else if (len >= 126) {
+    out[1] = 0x80 | 126;
+    out.writeUInt16BE(len, 2);
+  } else {
+    out[1] = 0x80 | len;
+  }
+  const mask = crypto.randomBytes(4);
+  out[hdr] = mask[0];
+  out[hdr + 1] = mask[1];
+  out[hdr + 2] = mask[2];
+  out[hdr + 3] = mask[3];
+  if (len > 0) __buf_mask(payload, mask, out, hdr + 4, len);
+  return out;
+}
+
+// Takes `n` bytes off the front of the chunk list: a slice when one chunk
+// holds them, a join only when they straddle chunks.
+function consume(ws, n) {
+  ws._avail -= n;
+  const first = ws._chunks[0];
+  if (n === first.length) return ws._chunks.shift();
+  if (n < first.length) {
+    ws._chunks[0] = first.subarray(n);
+    return first.subarray(0, n);
+  }
+  const out = Buffer.allocUnsafe(n);
+  let off = 0;
+  while (off < n) {
+    const c = ws._chunks[0];
+    const take = c.length < n - off ? c.length : n - off;
+    out.set(take === c.length ? c : c.subarray(0, take), off);
+    if (take === c.length) ws._chunks.shift();
+    else ws._chunks[0] = c.subarray(take);
+    off += take;
+  }
+  return out;
+}
+
+// The first `n` bytes in one piece, for reading a header.
+function head(ws, n) {
+  if (ws._chunks[0].length < n) {
+    ws._chunks[0] = Buffer.concat(ws._chunks);
+    ws._chunks.length = 1;
+  }
+  return ws._chunks[0];
+}
+
+function toArrayBuffer(buf) {
+  const ab = new ArrayBuffer(buf.length);
+  new Uint8Array(ab).set(buf);
+  return ab;
+}
+
+function validCloseCode(code) {
+  if (code >= 3000 && code <= 4999) return true;
+  return code === 1000 || code === 1001 || code === 1002 || code === 1003 ||
+    (code >= 1007 && code <= 1011);
+}
+
+class WebSocket extends EventTarget {
+  constructor(url, protocols) {
+    super();
+    let u;
+    try { u = new URL(String(url)); } catch (e) { u = null; }
+    if (u === null) throw new DOMException('The URL ' + String(url) + ' is invalid.', 'SyntaxError');
+    // http and https name the same endpoints
+    if (u.protocol === 'http:' || u.protocol === 'https:') u = new URL('ws' + u.href.slice(4));
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') {
+      throw new DOMException('Expected a ws: or wss: protocol, got ' + u.protocol, 'SyntaxError');
+    }
+    if (u.hash !== '' || u.href.charCodeAt(u.href.length - 1) === 35) {
+      throw new DOMException('Got fragment', 'SyntaxError');
+    }
+    let list = [];
+    if (protocols !== undefined) {
+      if (typeof protocols === 'string') list = [protocols];
+      else if (Array.isArray(protocols)) list = protocols.map(String);
+      else list = [String(protocols)];
+      for (let i = 0; i < list.length; i++) {
+        if (!isToken(list[i]) || list.indexOf(list[i]) !== i) {
+          throw new DOMException('Invalid Sec-WebSocket-Protocol value', 'SyntaxError');
+        }
+      }
+    }
+    hidden(this, '_url', u.href);
+    hidden(this, '_origin', u.origin);
+    hidden(this, '_protocols', list);
+    hidden(this, '_readyState', CONNECTING);
+    hidden(this, '_binaryType', 'blob');
+    hidden(this, '_bufferedAmount', 0);
+    hidden(this, '_protocol', '');
+    hidden(this, '_extensions', '');
+    hidden(this, '_socket', null);
+    hidden(this, '_req', null);
+    hidden(this, '_chunks', []);
+    hidden(this, '_avail', 0);
+    hidden(this, '_frags', []);
+    hidden(this, '_fragLen', 0);
+    hidden(this, '_fragOp', -1);
+    hidden(this, '_sentClose', false);
+    hidden(this, '_receivedClose', false);
+    hidden(this, '_closeCode', 1005);
+    hidden(this, '_closeReason', '');
+    hidden(this, '_failed', false);
+    hidden(this, '_failMessage', '');
+    hidden(this, '_finished', false);
+    hidden(this, '_h', { open: null, message: null, error: null, close: null });
+    connect(this, u);
+  }
+
+  get url() { return this._url; }
+  get readyState() { return this._readyState; }
+  get bufferedAmount() { return this._bufferedAmount; }
+  get extensions() { return this._extensions; }
+  get protocol() { return this._protocol; }
+  get binaryType() { return this._binaryType; }
+  set binaryType(v) { if (v === 'blob' || v === 'arraybuffer') this._binaryType = v; }
+
+  get onopen() { return this._h.open; }
+  set onopen(f) { setHandler(this, 'open', f); }
+  get onmessage() { return this._h.message; }
+  set onmessage(f) { setHandler(this, 'message', f); }
+  get onerror() { return this._h.error; }
+  set onerror(f) { setHandler(this, 'error', f); }
+  get onclose() { return this._h.close; }
+  set onclose(f) { setHandler(this, 'close', f); }
+
+  send(data) {
+    if (this._readyState === CONNECTING) {
+      throw new DOMException('Failed to execute ' + q('send') + ' on ' + q('WebSocket') + ': Still in CONNECTING state.', 'InvalidStateError');
+    }
+    if (data instanceof Blob) {
+      const size = data.size;
+      this._bufferedAmount += size;
+      data.arrayBuffer().then((ab) => {
+        this._bufferedAmount -= size;
+        if (this._readyState === OPEN) sendFrame(this, OP_BIN, Buffer.from(ab));
+      });
+      return;
+    }
+    let op = OP_TEXT;
+    let buf;
+    if (typeof data === 'string') buf = Buffer.from(data, 'utf8');
+    else if (data instanceof ArrayBuffer) { buf = Buffer.from(data); op = OP_BIN; }
+    else if (ArrayBuffer.isView(data)) { buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength); op = OP_BIN; }
+    else buf = Buffer.from(String(data), 'utf8');
+    // closing or closed: nothing to send it on
+    if (this._readyState !== OPEN) return;
+    sendFrame(this, op, buf);
+  }
+
+  close(code, reason) {
+    let body = EMPTY;
+    if (code !== undefined) {
+      code = Number(code);
+      if (code !== 1000 && !(code >= 3000 && code <= 4999)) {
+        throw new DOMException('invalid code', 'InvalidAccessError');
+      }
+    }
+    if (reason !== undefined) {
+      const rb = Buffer.from(String(reason), 'utf8');
+      if (rb.length > 123) throw new DOMException('Reason must be less than 123 bytes; received ' + rb.length, 'SyntaxError');
+      // a reason travels only with a code; without one the frame is empty
+      if (code !== undefined) {
+        body = Buffer.allocUnsafe(2 + rb.length);
+        body.writeUInt16BE(code, 0);
+        rb.copy(body, 2);
+      }
+    } else if (code !== undefined) {
+      body = Buffer.allocUnsafe(2);
+      body.writeUInt16BE(code, 0);
+    }
+    if (this._readyState === CLOSING || this._readyState === CLOSED) return;
+    if (this._readyState === CONNECTING) {
+      // the connection is failed: no handshake to finish
+      this._readyState = CLOSING;
+      this._failed = true;
+      this._failMessage = 'WebSocket was closed before the connection was established';
+      if (this._req) this._req.destroy();
+      // events never fire from inside the call that causes them
+      queueMicrotask(() => finish(this));
+      return;
+    }
+    this._readyState = CLOSING;
+    this._sentClose = true;
+    this._socket.write(frame(OP_CLOSE, body));
+    // the peer answers with its own close frame and then closes; the socket
+    // ending is what fires 'close' here
+  }
+}
+
+const q = (s) => String.fromCharCode(39) + s + String.fromCharCode(39);
+
+function setHandler(ws, type, f) {
+  const old = ws._h[type];
+  if (old) ws.removeEventListener(type, old);
+  ws._h[type] = typeof f === 'function' ? f : null;
+  if (ws._h[type]) ws.addEventListener(type, ws._h[type]);
+}
+
+for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+  const v = k === 'CONNECTING' ? 0 : k === 'OPEN' ? 1 : k === 'CLOSING' ? 2 : 3;
+  Object.defineProperty(WebSocket, k, { value: v, enumerable: true });
+  Object.defineProperty(WebSocket.prototype, k, { value: v, enumerable: true });
+}
+Object.defineProperty(WebSocket.prototype, Symbol.toStringTag, { value: 'WebSocket', configurable: true });
+
+function sendFrame(ws, op, buf) {
+  const n = buf.length;
+  ws._bufferedAmount += n;
+  ws._socket.write(frame(op, buf), () => { ws._bufferedAmount -= n; });
+}
+
+// The handshake: a GET that asks to upgrade, whose 101 hands the socket over.
+function connect(ws, u) {
+  const secure = u.protocol === 'wss:';
+  const mod = secure ? require('https') : require('http');
+  const key = crypto.randomBytes(16).toString('base64');
+  const headers = {
+    Upgrade: 'websocket',
+    Connection: 'Upgrade',
+    'Sec-WebSocket-Key': key,
+    'Sec-WebSocket-Version': '13',
+  };
+  if (ws._protocols.length > 0) headers['Sec-WebSocket-Protocol'] = ws._protocols.join(', ');
+  let host = u.hostname;
+  if (host.charCodeAt(0) === 91) host = host.slice(1, -1);
+  const req = mod.request({
+    host: host, port: u.port === '' ? (secure ? 443 : 80) : Number(u.port),
+    path: u.pathname + u.search, method: 'GET', headers: headers,
+    servername: u.hostname,
+  });
+  ws._req = req;
+  req.on('upgrade', (res, socket, head) => {
+    ws._req = null;
+    const why = checkHandshake(ws, key, res);
+    if (why !== null) {
+      socket.destroy();
+      fail(ws, why);
+      return;
+    }
+    attach(ws, socket, head);
+  });
+  req.on('response', (res) => {
+    ws._req = null;
+    res.resume();
+    req.destroy();
+    fail(ws, 'Received network error or non-101 status code.');
+  });
+  req.on('error', () => {
+    if (ws._req === null) return;
+    ws._req = null;
+    fail(ws, 'Received network error or non-101 status code.');
+  });
+  req.end();
+}
+
+function checkHandshake(ws, key, res) {
+  if (res.statusCode !== 101) return 'Received network error or non-101 status code.';
+  if (String(res.headers['upgrade'] || '').toLowerCase() !== 'websocket') return 'Expected Upgrade: websocket';
+  if (String(res.headers['connection'] || '').toLowerCase().indexOf('upgrade') < 0) return 'Expected Connection: Upgrade';
+  const expect = crypto.createHash('sha1').update(key + GUID).digest('base64');
+  if (res.headers['sec-websocket-accept'] !== expect) return 'Invalid Sec-WebSocket-Accept header';
+  if (res.headers['sec-websocket-extensions'] !== undefined) return 'Received unexpected Sec-WebSocket-Extensions';
+  const proto = res.headers['sec-websocket-protocol'];
+  if (proto !== undefined) {
+    if (ws._protocols.indexOf(proto) < 0) return 'Server selected a subprotocol that was not offered';
+    ws._protocol = proto;
+  } else if (ws._protocols.length > 0) {
+    return 'Server did not select a subprotocol';
+  }
+  return null;
+}
+
+function attach(ws, socket, head) {
+  ws._socket = socket;
+  socket.setNoDelay(true);
+  socket.on('error', () => {});
+  socket.on('data', (d) => { ws._chunks.push(d); ws._avail += d.length; parse(ws); });
+  socket.on('close', () => finish(ws));
+  ws._readyState = OPEN;
+  ws.dispatchEvent(new Event('open'));
+  if (head.length > 0) { ws._chunks.push(head); ws._avail += head.length; parse(ws); }
+}
+
+// A protocol violation fails the connection: a close frame with the reason
+// goes out, the socket is shut once it has left, and 'error' precedes
+// 'close'.
+function fail(ws, message, code) {
+  if (ws._failed || ws._readyState === CLOSED) return;
+  ws._failed = true;
+  ws._failMessage = message;
+  ws._readyState = CLOSING;
+  const s = ws._socket;
+  if (s === null) { finish(ws); return; }
+  if (!ws._sentClose && code !== undefined) {
+    ws._sentClose = true;
+    const body = Buffer.allocUnsafe(2);
+    body.writeUInt16BE(code, 0);
+    s.write(frame(OP_CLOSE, body));
+  }
+  s.once('finish', () => s.destroy());
+  s.end();
+}
+
+function finish(ws) {
+  if (ws._finished) return;
+  ws._finished = true;
+  ws._readyState = CLOSED;
+  const clean = ws._sentClose && ws._receivedClose && !ws._failed;
+  if (ws._failed) {
+    ws.dispatchEvent(new ErrorEvent('error', { message: ws._failMessage, error: new Error(ws._failMessage) }));
+  }
+  ws.dispatchEvent(new CloseEvent('close', {
+    wasClean: clean,
+    code: ws._receivedClose ? ws._closeCode : 1006,
+    reason: ws._receivedClose ? ws._closeReason : '',
+  }));
+}
+
+function parse(ws) {
+  while (ws._avail >= 2 && !ws._failed && ws._readyState !== CLOSED) {
+    let h = head(ws, 2);
+    const b0 = h[0];
+    const b1 = h[1];
+    const fin = (b0 & 0x80) !== 0;
+    const op = b0 & 0x0f;
+    let len = b1 & 0x7f;
+    let hdr = 2;
+    if (len === 126) hdr = 4;
+    else if (len === 127) hdr = 10;
+    if ((b1 & 0x80) !== 0) hdr += 4;
+    if (ws._avail < hdr) return;
+    h = head(ws, hdr);
+    if (len === 126) len = h.readUInt16BE(2);
+    else if (len === 127) {
+      if (h.readUInt32BE(2) !== 0 || (h[6] & 0x80) !== 0) { fail(ws, 'Received a frame that is too large', 1009); return; }
+      len = h.readUInt32BE(6);
+    }
+    if ((b0 & 0x70) !== 0) { fail(ws, 'Received a frame with reserved bits set', 1002); return; }
+    if ((b1 & 0x80) !== 0) { fail(ws, 'Received a masked frame from the server', 1002); return; }
+    if (op >= 8) {
+      if (!fin || len > 125 || (op !== OP_CLOSE && op !== OP_PING && op !== OP_PONG)) {
+        fail(ws, 'Received an invalid control frame', 1002);
+        return;
+      }
+    } else if (op === OP_CONT) {
+      if (ws._fragOp === -1) { fail(ws, 'Received a continuation frame with no message', 1002); return; }
+    } else if (op === OP_TEXT || op === OP_BIN) {
+      if (ws._fragOp !== -1) { fail(ws, 'Received a new message inside a fragmented one', 1002); return; }
+    } else {
+      fail(ws, 'Received an unknown opcode', 1002);
+      return;
+    }
+    if (ws._avail < hdr + len) return;
+    consume(ws, hdr);
+    const payload = len > 0 ? consume(ws, len) : EMPTY;
+    if (op >= 8) control(ws, op, payload);
+    else data(ws, op, fin, payload);
+  }
+}
+
+function data(ws, op, fin, payload) {
+  if (op !== OP_CONT) ws._fragOp = op;
+  ws._frags.push(payload);
+  ws._fragLen += payload.length;
+  if (!fin) return;
+  const whole = ws._frags.length === 1 ? ws._frags[0] : Buffer.concat(ws._frags, ws._fragLen);
+  const mop = ws._fragOp;
+  ws._frags = [];
+  ws._fragLen = 0;
+  ws._fragOp = -1;
+  if (ws._receivedClose) return;
+  let value;
+  if (mop === OP_TEXT) {
+    if (!__utf8_valid(whole)) { fail(ws, 'Received invalid UTF-8 in a text frame', 1007); return; }
+    value = whole.toString('utf8');
+  } else {
+    value = ws._binaryType === 'arraybuffer' ? toArrayBuffer(whole) : new Blob([whole]);
+  }
+  ws.dispatchEvent(new MessageEvent('message', { data: value, origin: ws._origin }));
+}
+
+function control(ws, op, payload) {
+  if (op === OP_PING) {
+    if (ws._readyState === OPEN) ws._socket.write(frame(OP_PONG, payload));
+    return;
+  }
+  if (op === OP_PONG) return;
+  // a close frame: code and reason, then ours in return, then the socket
+  let code = 1005;
+  let reason = '';
+  if (payload.length === 1) { fail(ws, 'Received a close frame with a one-byte body', 1002); return; }
+  if (payload.length >= 2) {
+    code = payload.readUInt16BE(0);
+    if (!validCloseCode(code)) { fail(ws, 'Received an invalid close code', 1002); return; }
+    const rb = payload.subarray(2);
+    if (!__utf8_valid(rb)) { fail(ws, 'Received an invalid close reason', 1007); return; }
+    reason = rb.toString('utf8');
+  }
+  ws._receivedClose = true;
+  ws._closeCode = code;
+  ws._closeReason = reason;
+  ws._readyState = CLOSING;
+  if (!ws._sentClose) {
+    ws._sentClose = true;
+    ws._socket.write(frame(OP_CLOSE, payload.length >= 2 ? payload.subarray(0, 2) : EMPTY));
+  }
+  ws._socket.end();
+}
+
+module.exports = { WebSocket: WebSocket };
+";
+}

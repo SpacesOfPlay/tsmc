@@ -93,6 +93,43 @@ class CustomEvent extends Event {
 }
 tag(CustomEvent, 'CustomEvent');
 
+class MessageEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    const o = options === undefined || options === null ? {} : options;
+    this.data = o.data === undefined ? null : o.data;
+    this.origin = o.origin === undefined ? '' : String(o.origin);
+    this.lastEventId = o.lastEventId === undefined ? '' : String(o.lastEventId);
+    this.source = o.source === undefined ? null : o.source;
+    this.ports = o.ports === undefined ? [] : o.ports;
+  }
+}
+tag(MessageEvent, 'MessageEvent');
+
+class CloseEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    const o = options === undefined || options === null ? {} : options;
+    this.wasClean = !!o.wasClean;
+    this.code = o.code === undefined ? 0 : Number(o.code);
+    this.reason = o.reason === undefined ? '' : String(o.reason);
+  }
+}
+tag(CloseEvent, 'CloseEvent');
+
+class ErrorEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    const o = options === undefined || options === null ? {} : options;
+    this.message = o.message === undefined ? '' : String(o.message);
+    this.filename = o.filename === undefined ? '' : String(o.filename);
+    this.lineno = o.lineno === undefined ? 0 : Number(o.lineno);
+    this.colno = o.colno === undefined ? 0 : Number(o.colno);
+    this.error = o.error === undefined ? null : o.error;
+  }
+}
+tag(ErrorEvent, 'ErrorEvent');
+
 // Listeners are kept in registration order. A listener removed while a
 // dispatch is running must not be called, so the walk checks the live list
 // rather than only the snapshot it started from.
@@ -252,6 +289,9 @@ module.exports = {
   DOMException: DOMException,
   Event: Event,
   CustomEvent: CustomEvent,
+  MessageEvent: MessageEvent,
+  CloseEvent: CloseEvent,
+  ErrorEvent: ErrorEvent,
   EventTarget: EventTarget,
   AbortSignal: AbortSignal,
   AbortController: AbortController,

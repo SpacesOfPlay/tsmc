@@ -1,6 +1,6 @@
 # M48 — WebSocket
 
-Status: scoped 2026-09-27. I1 and I2 landed 2026-09-27; I3 and I4 open.
+Status: scoped 2026-09-27. I1 and I2 landed 2026-09-27, I3 on 2026-09-28; I4 open.
 
 ## Goal
 
@@ -26,30 +26,21 @@ defaults to off) — needs streaming raw deflate/inflate in `zlib`, its own
 milestone if ever wanted. `WebSocketStream` (not in Node 22). Proxies,
 cookies, HTTP/2 upgrades, `CONNECT` (same seam, later).
 
-## Where things stand (measured 2026-09-27, Node 22.16)
+## Where things stand
 
-`ws` 7.5.10 under tsmc: fails at `require('url')`. With `url` shimmed it
-gets as far as the handshake, then dies on `http.STATUS_CODES[426]` being
-undefined. Past that, both sides need the `'upgrade'` event, which does
-not exist.
+As of 2026-09-28: `require('url')` exists, `http.Server` and
+`http.ClientRequest` emit `'upgrade'`, both sockets have the shape a frame
+codec needs (`unshift`, `cork`/`uncork`, `pause`/`resume`, a write queue
+with `'drain'`, `_writableState`/`_readableState`), `Buffer` is a
+`Uint8Array`, `bufferutil` and `utf-8-validate` are built in over natives,
+and the `WebSocket`, `MessageEvent` and `Blob` globals exist. `ws` 7.5.10
+runs unmodified over http and https, including large messages, and the
+`WebSocket` global talks to it. What remains is I4, the `wss:` test.
 
-Already present: SHA-1 (the accept key for the RFC 6455 sample matches),
-base64, Buffer big-endian accessors, `crypto.randomBytes`, lazy globals
-(`Headers`, `EventTarget`, ...), `EventTarget`/`Event`/`DOMException`,
-`tls.connect` and `https.createServer` for `wss:`, `socket.setNoDelay`,
-`stream.Duplex`, `TextDecoder` with `fatal`, `http.STATUS_CODES` (short).
-
-Missing: `WebSocket`, `MessageEvent`, `Blob`, `CloseEvent` (Node 22 has no
-global either, but the close event must carry `code`/`reason`/`wasClean`),
-`require('url')`, the upgrade events, `socket.unshift`, streaming zlib.
-
-`TLSSocket` (the socket of an `https` server or a `wss:` client) is further
-behind than `net.Socket`: no `unshift`, `cork`/`uncork`, `pause`/`resume` or
-`_writableState`, and no write queue. `write` hands the bytes to
-`__tls_write` at once, always returns `true` and never emits `'drain'`;
-ciphertext the socket does not take is buffered without limit, and a failed
-`__tls_write` ends the loop with the rest of the buffer dropped and no error.
-That is enough for one HTTP response; a long-lived stream is not safe on it.
+The state on 2026-09-27, for the record: `ws` failed at `require('url')`,
+then on `http.STATUS_CODES[426]`, then for want of `'upgrade'`; `Buffer`
+was a JS array (no `set`, `.buffer`, `.byteOffset`); `TLSSocket` had no
+write queue, always answered `true` and dropped bytes on a failed write.
 
 ## Design
 
@@ -186,16 +177,38 @@ Each lands with its own tests and leaves the suite green.
   still array-backed. That is `doc/PLAN_M42_buffer_uint8array.md`, and the
   `ws` server story is complete once it lands; nothing in this milestone
   can substitute for it.
-- **I3 — `WebSocket` + `MessageEvent` + `Blob`.** `test/diff/websocket.js`:
-  since Node core has no server, the test carries a small frame server on
-  an `http` `'upgrade'` listener, and the same script runs on both
-  runtimes. Cases: text and binary echo; a 70 KB message (16-bit length)
-  and a 200 KB one (64-bit); a fragmented message from the server; a
-  server ping (pong observed server-side); close with code and reason,
-  `wasClean` true; a wrong accept key → `error` + `1006`; invalid UTF-8
-  → `1007`; both `binaryType` values; event order (`open` before any
-  `message`, `close` last); `readyState` at each step; `bufferedAmount`
-  back to 0 after the flush. All under `--gc-stress`.
+- **I3 — `WebSocket` + `MessageEvent` + `Blob`.** Done. `src/node_websocket.mc`
+  is the client: handshake over `http.request` and `'upgrade'` (key, accept
+  check, subprotocol rules, no extensions), RFC 6455 framing over the two
+  natives, fragmentation, ping/pong, both directions of the close
+  handshake with code validation, `binaryType` `blob`/`arraybuffer`,
+  `bufferedAmount`, the `onopen`/`onmessage`/`onerror`/`onclose`
+  properties, the four constants on class and prototype. `MessageEvent`,
+  `CloseEvent` and `ErrorEvent` live in `_webevents` (only the first is a
+  global, as in Node 22); `Blob` lives in `_webapi`, and `Response.blob()`
+  came with it. `test/diff/websocket.js` carries a small frame server on an
+  `http` `'upgrade'` listener and runs the same 81 lines on both runtimes:
+  text and binary echo in both `binaryType` modes, 70 KB and 200 KB
+  messages (16- and 64-bit lengths), a Blob and a number sent, a fragmented
+  message, a ping answered, client- and server-initiated close with code
+  and reason, `wasClean`, event order, `readyState` at each step,
+  `bufferedAmount`, the constructor's and `close()`'s argument errors, the
+  handler properties, and the failures: a subprotocol not offered or not
+  selected, a wrong accept key, a non-101 reply, invalid UTF-8, a reserved
+  bit, a dropped connection. Byte-identical to node, also under
+  `--gc-stress`. The global also talks to the `ws` package's server: text,
+  binary, 70 KB and 200 KB, clean close, same output as node.
+  **Where node 22 differs from the standard, this runtime follows the
+  standard, and the test asserts only what both agree on:** after a failed
+  handshake node fires `'error'` and leaves the socket `CONNECTING` for
+  good, with no `'close'`; here `'error'` is followed by `'close'` with
+  1006 and the state is `CLOSED`. `close()` while connecting fires
+  `'error'` twice in node. And node reports `readyState` 1 from inside the
+  `'error'` handler of a data-phase failure where the standard (and this
+  runtime) has already moved to `CLOSED`.
+  Measured against the `ws` server in one process, 2026-09-28: 64 B
+  messages 18.0k round trips/s (node's client on the same server: 36.1k),
+  4 KB 97 MB/s (node 121), 1 MB 473 MB/s (node 306).
 - **I4 — `wss:`.** `test/diff/websocket_tls.js` over `https.createServer`
   with the existing `test/diff/https_server.*.pem` fixture and
   `process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'` set by the script,
