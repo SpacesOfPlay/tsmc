@@ -40,6 +40,7 @@ when os(wasm) {
     i32 tls_pending(TlsSession* s) { return 0; }
     bool tls_shutdown(TlsSession* s, i64 fd) { return false; }
     i32 tls_read(TlsSession* s, u8* out, i32 max) { return -1; }
+    i32 tls_available(TlsSession* s) { return 0; }
     bool tls_established(TlsSession* s) { return false; }
     bool tls_failed(TlsSession* s) { return true; }
     i32 tls_chain_error(TlsSession* s) { return 0; }
@@ -281,6 +282,7 @@ struct TlsSession {
     u8[1024] send_small;
     i64 send_off;             // flushed prefix of sendbuf
     ptls_buffer_t recvbuf;    // decrypted plaintext accumulated for the reader
+    i64 recv_off;             // consumed prefix of recvbuf
     u8[8192] recv_small;
     u8[16384] cipher_in;      // inbound ciphertext awaiting decrypt
     i32 cipher_in_len;
@@ -308,6 +310,7 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
     ptls_buffer_init(&s.sendbuf, &s.send_small[0], 1024);
     ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
     s.send_off = 0;
+    s.recv_off = 0;
     s.cipher_in_len = 0;
     s.chain_err = 0;
     s.checked_connect = false;
@@ -387,7 +390,7 @@ private i32 tls_feed(TlsSession* s) {
         }
         if consumed == 0 { break; }   // picotls needs more than we have
     }
-    if s.recvbuf.off > 0 { flags = flags | TLS_HAS_DATA; }
+    if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
     return flags;
 }
 
@@ -472,7 +475,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         }
         if (flags & TLS_ERR) != 0 || (flags & TLS_EOF) != 0 { break; }
     }
-    if s.recvbuf.off > 0 { flags = flags | TLS_HAS_DATA; }
+    if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
     if tls_wants_write(s) { flags = flags | TLS_WANT_WRITE; }
     return flags;
 }
@@ -510,15 +513,24 @@ bool tls_shutdown(TlsSession* s, i64 fd) {
     return true;
 }
 
-// Copy up to `max` decrypted bytes into `out`; shift the rest. Returns n.
+// Decrypted bytes waiting for the reader.
+i32 tls_available(TlsSession* s) {
+    return cast(i32, cast(i64, s.recvbuf.off) - s.recv_off);
+}
+
+// Copy up to `max` decrypted bytes into `out`. The consumed prefix is
+// remembered rather than shifted out, so reading a large accumulation in
+// pieces costs each piece once; the buffer resets when it has been drained.
 i32 tls_read(TlsSession* s, u8* out, i32 max) {
-    i32 avail = cast(i32, s.recvbuf.off);
-    if avail == 0 { return 0; }
+    i32 avail = tls_available(s);
+    if avail <= 0 { return 0; }
     i32 n = avail < max ? avail : max;
-    for i32 i = 0; i < n; i++ { *(out + i) = *(s.recvbuf.base + i); }
-    i32 rem = avail - n;
-    for i32 i = 0; i < rem; i++ { *(s.recvbuf.base + i) = *(s.recvbuf.base + n + i); }
-    s.recvbuf.off = cast(u64, rem);
+    memcpy(out, s.recvbuf.base + s.recv_off, cast(i64, n));
+    s.recv_off += cast(i64, n);
+    if s.recv_off >= cast(i64, s.recvbuf.off) {
+        s.recvbuf.off = cast(u64, 0);
+        s.recv_off = 0;
+    }
     return n;
 }
 
@@ -860,6 +872,7 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     ptls_buffer_init(&s.sendbuf, &s.send_small[0], 1024);
     ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
     s.send_off = 0;
+    s.recv_off = 0;
     s.cipher_in_len = 0;
     s.chain_err = 0;
     s.checked_connect = false;

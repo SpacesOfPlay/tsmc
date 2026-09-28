@@ -218,7 +218,9 @@ ways):
 | 4 KB messages | 144 MB/s | 4.5 MB/s | 95 MB/s |
 | 1 MB messages | 462 MB/s | 2.4 MB/s | 571 MB/s |
 | raw `net` echo, 64 KB writes | 1000 MB/s | 133 MB/s | 992 MB/s |
-| 1 MB messages over TLS | 335 MB/s | 1.3 MB/s | 3.2 MB/s |
+| 1 MB messages over TLS | 335 MB/s | 1.3 MB/s | 244 MB/s |
+| raw TLS echo, 64 KB writes | 335 MB/s | 3.0 MB/s | 327 MB/s |
+| 64 B messages over TLS, bare socket | — | 15k msg/s | 65k msg/s |
 
 What the payload paid for, per MB, before and after: `Buffer.set` 319 ms →
 0.5 ms; `concat`/`copy`/`Buffer.from(buf)` 8–9 ms → 0.3–0.5 ms;
@@ -239,12 +241,16 @@ as one, and small queued pieces are joined before a send (each frame was
 two system calls); that and a lighter view (its layout in fields, one
 hidden property instead of four) took the rate from 16.7k to 19.2k. A
 leaner codec in the global is the next lever; a native frame-header
-parser after that. TLS: over 95% of the samples are in the cipher — a
-bit-sliced AES and a bit-at-a-time GHASH multiply — and every byte crosses
-it four times in this benchmark. Nothing in the socket or buffer paths
-registers. A table-driven AES and a table-driven GHASH would be a
-20–50x change there; that is its own milestone, with a trade-off to decide
-first (a table AES is not constant-time).
+parser after that. TLS, measured 2026-09-27: over 95% of the samples were
+in the cipher — a bit-sliced AES and a bit-at-a-time GHASH multiply. On
+2026-09-28 the vendored TLS library gained the processor's AES and
+carry-less multiply instructions, which took the raw TLS echo from 3 to
+107 MB/s; the profile then showed half the time in `tls_read`, which
+shifted the remaining plaintext down after every 16 KB handed out — a
+quadratic cost on a large accumulation. It keeps a read offset now and
+reads straight into the Buffer it returns, up to 64 KB a call: 327 MB/s,
+level with node, and the profile is cipher 40%, system calls and copies
+30%, record handling 20%.
 
 Two socket bugs the speed exposed, fixed with it: a socket closed on the
 peer's EOF while its write queue still held data (bytes lost once queues

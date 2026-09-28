@@ -12774,10 +12774,15 @@ private Value nat_tls_read(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 id = to_int_arg(arg_at(args, argc, 0));
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
     if s == null { return value_null(); }
-    u8[16384] buf;
-    i32 n = tls_read(s, &buf[0], 16384);
-    if n <= 0 { return value_null(); }
-    return buf_from_bytes(vm, &buf[0], n);
+    // straight into the Buffer that is handed out, up to 64 KB a call
+    i32 avail = tls_available(s);
+    if avail <= 0 { return value_null(); }
+    if avail > 65536 { avail = 65536; }
+    JsObject* b = buf_new(vm, avail);
+    i32 cap;
+    u8* p = ta_bytes(b, &cap);
+    if p == null || tls_read(s, p, avail) <= 0 { return value_null(); }
+    return value_cell(&b.head);
 }
 
 private Value nat_tls_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
