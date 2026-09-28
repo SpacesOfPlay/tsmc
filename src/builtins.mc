@@ -12903,6 +12903,7 @@ private Value nat_tls_error_text(void* vmp, Value callee, Value thisv, Value* ar
     if code == TLS_ERR_NOT_TLS {
         return new_str(vm, "peer is not speaking TLS (a plain HTTP request on an HTTPS port?)");
     }
+    if code == TLS_ERR_READ { return new_str(vm, "read EIO"); }
     if code >= 512 { return new_str(vm, format("internal error {}", code)); }
     str who = "alert sent: ";
     if code >= 256 { who = "peer alert: "; }
@@ -12916,6 +12917,7 @@ private Value nat_tls_error_name(void* vmp, Value callee, Value thisv, Value* ar
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, to_int_arg(arg_at(args, argc, 0))));
     if s == null { return value_null(); }
     if tls_error_code(s) == TLS_ERR_NOT_TLS { return new_str(vm, "ERR_SSL_HTTP_REQUEST"); }
+    if tls_error_code(s) == TLS_ERR_READ { return new_str(vm, "EIO"); }
     return value_null();
 }
 

@@ -62,6 +62,16 @@ class TLSSocket extends EventEmitter {
     if (this.destroyed) return;
     const st = __tls_pump(this._id, this._paused);
     if (st & T_ERR) {
+      // A read that failed: what arrived before it is delivered first, as a
+      // plain socket delivers it, and the error is a socket error.
+      if (__tls_error_name(this._id) === 'EIO') {
+        if ((st & HAS_DATA) && !this._paused) {
+          this._readAll();
+          if (this.destroyed) return;
+        }
+        this._fail('read EIO', 'EIO');
+        return;
+      }
       const why = __tls_verify_error(this._id);
       if (why) this._fail('certificate verify failed: ' + why);
       else {

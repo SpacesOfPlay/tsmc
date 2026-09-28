@@ -30,6 +30,7 @@ const i32 TLS_WANT_WRITE = 16;
 when os(wasm) {
     struct TlsSession { bool established; bool failed; }
     const i32 TLS_ERR_NOT_TLS = 400;
+    const i32 TLS_ERR_READ = 401;
     void tls_set_ecdsa_pin(u8* spki32) { }
     TlsSession* tls_session_new(u8* sni, bool insecure) { return null; }
     void tls_session_free(TlsSession* s) { }
@@ -454,6 +455,15 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         if n == 0 {
             s.eof = true;
             flags = flags | TLS_EOF;
+        } else if n != NET_WOULDBLOCK && n < 0 {
+            // A reset or a network error. Taking it for "nothing yet" would
+            // leave the socket readable forever with nothing to read and
+            // nothing reported. What arrived before it is still decrypted
+            // for the reader; then the session fails.
+            flags = flags | tls_feed(s);
+            s.failed = true;
+            s.tls_err = TLS_ERR_READ;
+            flags = flags | TLS_ERR;
         } else if n > 0 {
             if s.cipher_in_len + n > 16384 {
                 flags = flags | tls_feed(s);
@@ -549,6 +559,9 @@ i32 tls_error_code(TlsSession* s) { return s.tls_err; }
 // all. Above the alert range and below picotls's own error class, so it can be
 // mistaken for neither.
 const i32 TLS_ERR_NOT_TLS = 400;
+// Reported when reading the socket failed: the connection was reset, or the
+// network failed under it. In the same range, for the same reason.
+const i32 TLS_ERR_READ = 401;
 
 // Short name for an alert, for the message on a failed handshake.
 str tls_alert_str(i32 alert) {
