@@ -185,7 +185,14 @@ class EventTarget {
     event.target = this;
     event.currentTarget = this;
     event.eventPhase = 2;
-    if (list) {
+    if (list && list.length === 1) {
+      // one listener: no snapshot to take, nothing to re-check
+      const entry = list[0];
+      if (entry.once) this.removeEventListener(event.type, entry.callback, { capture: entry.capture });
+      const cb = entry.callback;
+      if (typeof cb === 'function') cb.call(this, event);
+      else if (cb && typeof cb.handleEvent === 'function') cb.handleEvent(event);
+    } else if (list) {
       const snapshot = list.slice();
       for (const entry of snapshot) {
         if (list.indexOf(entry) < 0) continue;

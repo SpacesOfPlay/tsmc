@@ -13344,7 +13344,8 @@ private Value nat_buf_unmask(void* vmp, Value callee, Value thisv, Value* args, 
     return value_undefined();
 }
 
-// __utf8_valid(bytes): well-formed UTF-8, by the decoder's rules.
+// __utf8_valid(bytes[, start[, end]]): well-formed UTF-8, by the decoder's
+// rules, over the whole array or a range of it.
 private Value nat_utf8_valid(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value bv = arg_at(args, argc, 0);
@@ -13355,10 +13356,16 @@ private Value nat_utf8_valid(void* vmp, Value callee, Value thisv, Value* args, 
     JsObject* bo = value_as_object(bv);
     i32 n;
     u8* p = buf_ptr(bo, &n);
-    if p != null { return value_bool(utf8_is_valid(p, n)); }
-    u8* tmp = alloc<u8>(n > 0 ? n : 1);
-    for i32 i = 0; i < n; i++ { *(tmp + i) = cast(u8, buf_byte(bo, i)); }
-    bool ok = utf8_is_valid(tmp, n);
+    i32 start = argc > 1 && !value_is_undefined(arg_at(args, argc, 1)) ? to_int_arg(arg_at(args, argc, 1)) : 0;
+    i32 end = argc > 2 && !value_is_undefined(arg_at(args, argc, 2)) ? to_int_arg(arg_at(args, argc, 2)) : n;
+    if start < 0 { start = 0; }
+    if end > n { end = n; }
+    if end < start { end = start; }
+    if p != null { return value_bool(utf8_is_valid(p + start, end - start)); }
+    i32 m = end - start;
+    u8* tmp = alloc<u8>(m > 0 ? m : 1);
+    for i32 i = 0; i < m; i++ { *(tmp + i) = cast(u8, buf_byte(bo, start + i)); }
+    bool ok = utf8_is_valid(tmp, m);
     free(tmp);
     return value_bool(ok);
 }

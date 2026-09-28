@@ -54,6 +54,34 @@ function isToken(s) {
   return true;
 }
 
+// Mask keys come from a pool of random bytes filled in bulk: one call to the
+// system's generator per thousand frames rather than one per frame.
+let maskPool = null;
+let maskAt = 0;
+const MASK = Buffer.alloc(4);
+
+function fillMask(out, at) {
+  if (maskPool === null || maskAt >= maskPool.length) {
+    maskPool = crypto.randomBytes(4096);
+    maskAt = 0;
+  }
+  const p = maskPool;
+  const i = maskAt;
+  maskAt += 4;
+  const m0 = p[i];
+  const m1 = p[i + 1];
+  const m2 = p[i + 2];
+  const m3 = p[i + 3];
+  MASK[0] = m0;
+  MASK[1] = m1;
+  MASK[2] = m2;
+  MASK[3] = m3;
+  out[at] = m0;
+  out[at + 1] = m1;
+  out[at + 2] = m2;
+  out[at + 3] = m3;
+}
+
 // One outgoing frame: header, mask key and masked payload in a single
 // Buffer, so a message is one write.
 function frame(opcode, payload) {
@@ -73,51 +101,20 @@ function frame(opcode, payload) {
   } else {
     out[1] = 0x80 | len;
   }
-  const mask = crypto.randomBytes(4);
-  out[hdr] = mask[0];
-  out[hdr + 1] = mask[1];
-  out[hdr + 2] = mask[2];
-  out[hdr + 3] = mask[3];
-  if (len > 0) __buf_mask(payload, mask, out, hdr + 4, len);
+  fillMask(out, hdr);
+  if (len > 0) __buf_mask(payload, MASK, out, hdr + 4, len);
   return out;
 }
 
-// Takes `n` bytes off the front of the chunk list: a slice when one chunk
-// holds them, a join only when they straddle chunks.
-function consume(ws, n) {
-  ws._avail -= n;
-  const first = ws._chunks[0];
-  if (n === first.length) return ws._chunks.shift();
-  if (n < first.length) {
-    ws._chunks[0] = first.subarray(n);
-    return first.subarray(0, n);
-  }
-  const out = Buffer.allocUnsafe(n);
-  let off = 0;
-  while (off < n) {
-    const c = ws._chunks[0];
-    const take = c.length < n - off ? c.length : n - off;
-    out.set(take === c.length ? c : c.subarray(0, take), off);
-    if (take === c.length) ws._chunks.shift();
-    else ws._chunks[0] = c.subarray(take);
-    off += take;
-  }
-  return out;
-}
-
-// The first `n` bytes in one piece, for reading a header.
-function head(ws, n) {
-  if (ws._chunks[0].length < n) {
-    ws._chunks[0] = Buffer.concat(ws._chunks);
-    ws._chunks.length = 1;
-  }
-  return ws._chunks[0];
-}
-
-function toArrayBuffer(buf) {
-  const ab = new ArrayBuffer(buf.length);
-  new Uint8Array(ab).set(buf);
-  return ab;
+// Everything received and not yet parsed, as one chunk: what a frame that
+// straddles chunks needs. Rare with small frames; once per message with
+// large ones.
+function join(ws) {
+  if (ws._off > 0) ws._chunks[0] = ws._chunks[0].subarray(ws._off);
+  const c = ws._chunks.length === 1 ? ws._chunks[0] : Buffer.concat(ws._chunks, ws._avail);
+  ws._chunks = [c];
+  ws._off = 0;
+  return c;
 }
 
 function validCloseCode(code) {
@@ -162,6 +159,7 @@ class WebSocket extends EventTarget {
     hidden(this, '_socket', null);
     hidden(this, '_req', null);
     hidden(this, '_chunks', []);
+    hidden(this, '_off', 0);
     hidden(this, '_avail', 0);
     hidden(this, '_frags', []);
     hidden(this, '_fragLen', 0);
@@ -179,7 +177,10 @@ class WebSocket extends EventTarget {
 
   get url() { return this._url; }
   get readyState() { return this._readyState; }
-  get bufferedAmount() { return this._bufferedAmount; }
+  get bufferedAmount() {
+    const queued = this._socket !== null && this._readyState === OPEN ? this._socket.writableLength : 0;
+    return queued + this._bufferedAmount;
+  }
   get extensions() { return this._extensions; }
   get protocol() { return this._protocol; }
   get binaryType() { return this._binaryType; }
@@ -210,6 +211,7 @@ class WebSocket extends EventTarget {
     let op = OP_TEXT;
     let buf;
     if (typeof data === 'string') buf = Buffer.from(data, 'utf8');
+    else if (data instanceof Uint8Array) { buf = data; op = OP_BIN; }
     else if (data instanceof ArrayBuffer) { buf = Buffer.from(data); op = OP_BIN; }
     else if (ArrayBuffer.isView(data)) { buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength); op = OP_BIN; }
     else buf = Buffer.from(String(data), 'utf8');
@@ -275,9 +277,7 @@ for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
 Object.defineProperty(WebSocket.prototype, Symbol.toStringTag, { value: 'WebSocket', configurable: true });
 
 function sendFrame(ws, op, buf) {
-  const n = buf.length;
-  ws._bufferedAmount += n;
-  ws._socket.write(frame(op, buf), () => { ws._bufferedAmount -= n; });
+  ws._socket.write(frame(op, buf));
 }
 
 // The handshake: a GET that asks to upgrade, whose 101 hands the socket over.
@@ -388,28 +388,29 @@ function finish(ws) {
 }
 
 function parse(ws) {
-  while (ws._avail >= 2 && !ws._failed && ws._readyState !== CLOSED) {
-    let h = head(ws, 2);
-    const b0 = h[0];
-    const b1 = h[1];
-    const fin = (b0 & 0x80) !== 0;
-    const op = b0 & 0x0f;
+  while (!ws._failed && ws._readyState !== CLOSED && ws._avail >= 2) {
+    let c = ws._chunks[0];
+    let off = ws._off;
+    if (c.length - off < 2) { c = join(ws); off = 0; }
+    const b0 = c[off];
+    const b1 = c[off + 1];
     let len = b1 & 0x7f;
     let hdr = 2;
     if (len === 126) hdr = 4;
     else if (len === 127) hdr = 10;
     if ((b1 & 0x80) !== 0) hdr += 4;
     if (ws._avail < hdr) return;
-    h = head(ws, hdr);
-    if (len === 126) len = h.readUInt16BE(2);
+    if (c.length - off < hdr) { c = join(ws); off = 0; }
+    if (len === 126) len = c.readUInt16BE(off + 2);
     else if (len === 127) {
-      if (h.readUInt32BE(2) !== 0 || (h[6] & 0x80) !== 0) { fail(ws, 'Received a frame that is too large', 1009); return; }
-      len = h.readUInt32BE(6);
+      if (c.readUInt32BE(off + 2) !== 0 || (c[off + 6] & 0x80) !== 0) { fail(ws, 'Received a frame that is too large', 1009); return; }
+      len = c.readUInt32BE(off + 6);
     }
+    const op = b0 & 0x0f;
     if ((b0 & 0x70) !== 0) { fail(ws, 'Received a frame with reserved bits set', 1002); return; }
     if ((b1 & 0x80) !== 0) { fail(ws, 'Received a masked frame from the server', 1002); return; }
     if (op >= 8) {
-      if (!fin || len > 125 || (op !== OP_CLOSE && op !== OP_PING && op !== OP_PONG)) {
+      if ((b0 & 0x80) === 0 || len > 125 || (op !== OP_CLOSE && op !== OP_PING && op !== OP_PONG)) {
         fail(ws, 'Received an invalid control frame', 1002);
         return;
       }
@@ -422,14 +423,38 @@ function parse(ws) {
       return;
     }
     if (ws._avail < hdr + len) return;
-    consume(ws, hdr);
-    const payload = len > 0 ? consume(ws, len) : EMPTY;
-    if (op >= 8) control(ws, op, payload);
-    else data(ws, op, fin, payload);
+    if (c.length - off < hdr + len) { c = join(ws); off = 0; }
+    const start = off + hdr;
+    const end = start + len;
+    ws._avail -= hdr + len;
+    if (end === c.length) { ws._chunks.shift(); ws._off = 0; }
+    else ws._off = end;
+    if (op >= 8) control(ws, op, c.subarray(start, end));
+    else if ((b0 & 0x80) !== 0 && ws._fragOp === -1) message(ws, op, c, start, end);
+    else fragment(ws, op, (b0 & 0x80) !== 0, c.subarray(start, end));
   }
 }
 
-function data(ws, op, fin, payload) {
+// A whole message, delivered straight out of the chunk it arrived in: text
+// is checked and decoded in place, binary is copied once into what the
+// binaryType asks for.
+function message(ws, op, c, start, end) {
+  if (ws._receivedClose) return;
+  let value;
+  if (op === OP_TEXT) {
+    if (!__utf8_valid(c, start, end)) { fail(ws, 'Received invalid UTF-8 in a text frame', 1007); return; }
+    value = c.toString('utf8', start, end);
+  } else if (ws._binaryType === 'arraybuffer') {
+    const ab = new ArrayBuffer(end - start);
+    if (end > start) c.copy(new Uint8Array(ab), 0, start, end);
+    value = ab;
+  } else {
+    value = new Blob([c.subarray(start, end)]);
+  }
+  ws.dispatchEvent(new MessageEvent('message', { data: value, origin: ws._origin }));
+}
+
+function fragment(ws, op, fin, payload) {
   if (op !== OP_CONT) ws._fragOp = op;
   ws._frags.push(payload);
   ws._fragLen += payload.length;
@@ -439,15 +464,7 @@ function data(ws, op, fin, payload) {
   ws._frags = [];
   ws._fragLen = 0;
   ws._fragOp = -1;
-  if (ws._receivedClose) return;
-  let value;
-  if (mop === OP_TEXT) {
-    if (!__utf8_valid(whole)) { fail(ws, 'Received invalid UTF-8 in a text frame', 1007); return; }
-    value = whole.toString('utf8');
-  } else {
-    value = ws._binaryType === 'arraybuffer' ? toArrayBuffer(whole) : new Blob([whole]);
-  }
-  ws.dispatchEvent(new MessageEvent('message', { data: value, origin: ws._origin }));
+  message(ws, mop, whole, 0, whole.length);
 }
 
 function control(ws, op, payload) {
