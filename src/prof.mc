@@ -36,8 +36,13 @@ struct Prof {
                          // be gone by the time of the report
 }
 
+// The profile prof_new made last, for an embedding whose program does not
+// exit, such as a server: it reports with prof_report_reset.
+Prof* prof_current = null;
+
 Prof* prof_new() {
     Prof* p = new(Prof);
+    prof_current = p;
     p.ops = 0;
     p.js_calls = 0;
     p.native_calls = 0;
@@ -364,4 +369,26 @@ void prof_report(Prof* p, i64 collections) {
         free(c);
     }
     eprint("\n");
+}
+
+// Reports, then starts over: the counts, the opcode mix and the charges to
+// every function go to zero, and the next report covers the time since.
+void prof_report_reset(Prof* p, i64 collections) {
+    prof_report(p, collections);
+    for i32 i = 0; i < p.seen.len; i++ {
+        FnTemplate* t = vec_get(&p.seen, i);
+        t.prof_ns = 0;
+        t.prof_ops = 0;
+        t.prof_samples = 0;
+    }
+    for i32 i = 0; i < p.files.len; i++ { free(*(p.files.data + i)); }
+    p.seen.len = 0;
+    p.files.len = 0;
+    p.ops = 0;
+    p.js_calls = 0;
+    p.native_calls = 0;
+    for i32 i = 0; i < 256; i++ { p.hist[i] = 0; }
+    p.budget = PROF_STRIDE;
+    p.start_ns = vm_clock_ns();
+    p.last_ns = p.start_ns;
 }
