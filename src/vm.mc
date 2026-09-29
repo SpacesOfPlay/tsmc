@@ -224,7 +224,8 @@ struct VM {
     Vec<VmJob> jobs;         // microtask FIFO (head index avoids shifting)
     i32 job_head;
     Vec<Value> rejections;   // promises rejected with no handler at reject time
-    Vec<VmTimer> timers;
+    Vec<VmTimer> timers;     // in id order; dead ones until the next compaction
+    i32 timers_dead;
     i32 next_timer_id;
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
@@ -4052,6 +4053,7 @@ void vm_init(VM* vm) {
     vm.job_head = 0;
     vec_init<Value>(&vm.rejections, 4);
     vec_init<VmTimer>(&vm.timers, 4);
+    vm.timers_dead = 0;
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
@@ -7263,28 +7265,64 @@ i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     return tm.id;
 }
 
-// Node's ref/unref/refresh, reached through the Timeout object.
-bool vm_timer_set_ref(VM* vm, i32 id, bool on) {
+// The live timer with this id, or null. Ids only grow and compaction
+// keeps the order, so the list is sorted by id and a lookup is a binary
+// search: a server that sets and clears a timer per request would
+// otherwise scan every timer it ever made on each clear.
+private VmTimer* vm_timer_find(VM* vm, i32 id) {
+    i32 lo = 0;
+    i32 hi = vm.timers.len - 1;
+    while lo <= hi {
+        i32 mid = lo + (hi - lo) / 2;
+        VmTimer* tm = vm.timers.data + mid;
+        if tm.id == id { return tm.alive ? tm : null; }
+        if tm.id < id { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return null;
+}
+
+// Ends a timer. Its callback and arguments are let go at once, so the
+// collector can take them before the entry itself goes.
+private void vm_timer_kill(VM* vm, VmTimer* tm) {
+    if !tm.alive { return; }
+    tm.alive = false;
+    tm.cb = value_undefined();
+    tm.args = value_undefined();
+    vm.timers_dead++;
+}
+
+// Drops dead timers once they are more than half the list, keeping the
+// rest in order. Called between turns of the loop, when no pointer into
+// the list is held.
+private void vm_timers_compact(VM* vm) {
+    if vm.timers_dead < 16 || vm.timers_dead * 2 < vm.timers.len { return; }
+    i32 k = 0;
     for i32 i = 0; i < vm.timers.len; i++ {
         VmTimer* tm = vm.timers.data + i;
-        if tm.id == id && tm.alive { tm.reffed = on; return true; }
+        if !tm.alive { continue; }
+        if k != i { *(vm.timers.data + k) = *tm; }
+        k++;
     }
-    return false;
+    vm.timers.len = k;
+    vm.timers_dead = 0;
+}
+
+// Node's ref/unref/refresh, reached through the Timeout object.
+bool vm_timer_set_ref(VM* vm, i32 id, bool on) {
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm == null { return false; }
+    tm.reffed = on;
+    return true;
 }
 
 bool vm_timer_has_ref(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id { return tm.alive && tm.reffed; }
-    }
-    return false;
+    VmTimer* tm = vm_timer_find(vm, id);
+    return tm != null && tm.reffed;
 }
 
 void vm_timer_refresh(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id && tm.alive { tm.due = vm_now_ms(vm) + tm.delay; }
-    }
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm != null { tm.due = vm_now_ms(vm) + tm.delay; }
 }
 
 // True while some live timer still holds the loop open.
@@ -7297,10 +7335,8 @@ bool vm_timers_reffed(VM* vm) {
 }
 
 void vm_clear_timer(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id { tm.alive = false; }
-    }
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm != null { vm_timer_kill(vm, tm); }
 }
 
 // The reactor. Drains microtasks, then either fires the earliest due
@@ -7397,6 +7433,7 @@ i32 vm_run_event_loop(VM* vm) {
         // turn, rather than at the end of the run: that is when node reports
         // it, and it is fatal there too unless a listener takes it.
         if vm.rejections.len > 0 && vm_report_unhandled(vm) != 0 { return 1; }
+        vm_timers_compact(vm);
         // earliest live timer by (deadline, insertion order)
         i32 best = -1;
         for i32 i = 0; i < vm.timers.len; i++ {
@@ -7455,7 +7492,7 @@ i32 vm_run_event_loop(VM* vm) {
         // a repeating timer is rearmed before it runs, so clearing it from
         // inside its own callback still takes effect
         if bt2.period > 0.0 { bt2.due = now + bt2.period; }
-        else { bt2.alive = false; }
+        else { vm_timer_kill(vm, bt2); }
         vpush(vm, cbfn);
         vpush(vm, extra);
         Value dummy = value_undefined();
@@ -7474,6 +7511,7 @@ i32 vm_run_event_loop(VM* vm) {
         }
     }
     vm.timers.len = 0;
+    vm.timers_dead = 0;
     vm.handles.len = 0;
     return 0;
 }
