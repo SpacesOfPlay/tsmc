@@ -301,6 +301,18 @@ tag(AbortController, 'AbortController');
 // resolution the monotonic clock has.
 const performance = {
   now() { return process.uptime() * 1000; },
+  // The share of the time since the event loop started that it spent
+  // running rather than waiting, as node reports it: with one earlier
+  // result, since that; with two, between them.
+  eventLoopUtilization(u1, u2) {
+    const t = process._loopTimes();
+    let idle = t[1], active = t[0] - t[1];
+    if (t[0] === 0) return { idle: 0, active: 0, utilization: 0 };
+    if (u1 && u2) { idle = u1.idle - u2.idle; active = u1.active - u2.active; }
+    else if (u1) { idle -= u1.idle; active -= u1.active; }
+    const total = idle + active;
+    return { idle: idle, active: active, utilization: total > 0 ? active / total : 0 };
+  },
   timeOrigin: Date.now() - process.uptime() * 1000,
   toJSON() { return { timeOrigin: this.timeOrigin, now: this.now() }; },
 };

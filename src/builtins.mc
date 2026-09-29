@@ -10358,6 +10358,22 @@ private Value nat_process_uptime(void* vmp, Value callee, Value thisv, Value* ar
     return value_number(cast(f64, since) / 1000000000.0);
 }
 
+// [milliseconds the event loop has run, milliseconds of them spent
+// waiting], for performance.eventLoopUtilization; [0, 0] before it runs.
+private Value nat_process_loop_times(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    f64 ran = 0.0;
+    f64 idle = 0.0;
+    if vm.loop_start_ns != 0 {
+        ran = cast(f64, vm_clock_ns() - vm.loop_start_ns) / 1000000.0;
+        idle = cast(f64, vm.loop_idle_ns) / 1000000.0;
+    }
+    JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+    js_array_set(a, 0, value_number(ran));
+    js_array_set(a, 1, value_number(idle));
+    return value_cell(&a.head);
+}
+
 // Heap figures from the collector. rss and external have no counterpart here,
 // so they report the heap total rather than inventing a number.
 private Value nat_process_memory(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -10582,6 +10598,7 @@ private void process_install(VM* vm) {
 
     def_method(vm, proc, "cwd", &nat_process_cwd);
     def_method(vm, proc, "uptime", &nat_process_uptime);
+    def_method(vm, proc, "_loopTimes", &nat_process_loop_times);
     def_method(vm, proc, "memoryUsage", &nat_process_memory);
     def_method(vm, proc, "exit", &nat_process_exit);
     def_method(vm, proc, "emitWarning", &nat_process_emit_warning);

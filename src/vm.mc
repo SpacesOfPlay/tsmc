@@ -123,6 +123,9 @@ struct VM {
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     i32 pending_super_for;     // super_for for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
+    u64 loop_start_ns;         // when the event loop first ran, 0 before
+    u64 loop_idle_ns;          // time since then spent waiting for I/O or a timer
+    f64 last_poll_ms;          // when the sockets were last polled
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
     u32 sym_inspect_custom;    // key atom of Symbol.for(nodejs.util.inspect.custom)
@@ -3948,6 +3951,9 @@ void vm_init(VM* vm) {
     vm.prof = null;
     // process.uptime and performance.now count from here
     vm.start_ns = vm_clock_ns();
+    vm.loop_start_ns = 0;
+    vm.loop_idle_ns = 0;
+    vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
     vm.sym_inspect_custom = 0;
@@ -7350,13 +7356,16 @@ const i64 REACTOR_IDLE_MS = 5;
 // (-1 blocks until I/O), and dispatches every ready handle through the
 // reactor hook. If nothing is pollable, just sleeps out the deadline.
 private void reactor_poll(VM* vm, i64 timeout_ms) {
+    vm.last_poll_ms = vm_now_ms(vm);
     i32 npoll = 0;
     for i32 i = 0; i < vm.handles.len; i++ {
         IoHandle* h = vm.handles.data + i;
         if h.alive && h.interest != 0 && h.fd >= 0 { npoll++; }
     }
+    u64 w0 = vm_clock_ns();
     if npoll == 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
+        vm.loop_idle_ns += vm_clock_ns() - w0;
         return;
     }
     NetPollFd* pf = alloc<NetPollFd>(npoll);
@@ -7374,6 +7383,9 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     }
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
     i32 r = net_poll(pf, npoll, to);
+    // The wait counts as idle, as node counts the time in its poll: the
+    // event loop utilisation is the rest.
+    vm.loop_idle_ns += vm_clock_ns() - w0;
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;
@@ -7390,6 +7402,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
 }
 
 i32 vm_run_event_loop(VM* vm) {
+    if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
     while true {
         while vm.job_head < vm.jobs.len {
             VmJob j = vec_get(&vm.jobs, vm.job_head);
@@ -7478,6 +7491,21 @@ i32 vm_run_event_loop(VM* vm) {
                 timeout = d < 1.0 ? 1 : cast(i64, d);
             }
             reactor_poll(vm, timeout);
+            if vm.has_pending {
+                Value e = vm.pending;
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                if !vm_uncaught(vm, e) { return 1; }
+            }
+            continue;
+        }
+        // A timer is due. The sockets are polled first, without waiting,
+        // when a millisecond has passed since they last were, as node polls
+        // between its timers and its immediates: a script that chains
+        // setImmediate or zero timeouts to split up long work would
+        // otherwise keep every socket waiting until the chain ends.
+        if vm.handles.len > 0 && now - vm.last_poll_ms >= 1.0 {
+            reactor_poll(vm, 0);
             if vm.has_pending {
                 Value e = vm.pending;
                 vm.has_pending = false;
