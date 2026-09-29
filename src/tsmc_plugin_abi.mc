@@ -7,6 +7,21 @@
 // checked before any of a plugin's exports are called, so a plugin built
 // against an older table is refused rather than run.
 //
+// A plugin can also be compiled into the program that embeds tsmc, where
+// there is no compiler to call at require() time. The embedder includes
+// the plugin's source and names its register function with
+// tsmc_plugin_static("name.mc", fn) before the script runs; require() of
+// a path ending in that name then registers it without compiling. So that
+// several plugins can share one program, a plugin defines its register
+// function under its own name and the two symbols below only when
+// TSMC_STATIC_PLUGINS is not defined:
+//
+//     void spatial_register(TsmcApi* a, void* reg) { ... }
+//     when !defined(TSMC_STATIC_PLUGINS) {
+//         u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
+//         void tsmc_plugin_register(TsmcApi* a, void* reg) { spatial_register(a, reg); }
+//     }
+//
 // Rules at the seam:
 //
 // - Handles (vm, reg) are opaque. A plugin passes them back and never
@@ -23,8 +38,12 @@
 //   allocate.
 //
 // - export_fn is valid only during tsmc_plugin_register.
+//
+// - bytes points into the collector's heap. It stays valid while the array
+//   is reachable and nothing allocates, so a native reads and writes
+//   through it before it calls anything that can allocate.
 
-const u32 TSMC_PLUGIN_ABI = 1;
+const u32 TSMC_PLUGIN_ABI = 2;
 
 // Same one-word layout as the interpreter's Value. Declared here so a
 // plugin needs nothing from src/ but this file.
@@ -60,6 +79,11 @@ struct TsmcApi {
     // Throwing. The native must return straight after; the interpreter
     // unwinds when it regains control.
     fn(void*, str): void               throw_type_error;   // (vm, message)
+
+    // The bytes a typed array or Buffer covers, with their count in
+    // `*len`; null and 0 for anything else. An Int32Array of n elements
+    // is 4 * n bytes.
+    fn(void*, Value, i64*): u8*        bytes;              // (vm, v, len)
 }
 
 // The two symbols tsmc resolves in a freshly compiled plugin. Both must be

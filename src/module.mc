@@ -1645,6 +1645,35 @@ private bool path_is_mc_ext(str p) {
         && *(p.data + p.len - 1) == 'c';
 }
 
+// Registers static plugin `si` once, cached under "static:<name>", and
+// returns its exports.
+private Value require_static_plugin(VM* vm, i32 si) {
+    str_buf kb;
+    str_buf_init(&kb);
+    str_buf_add(&kb, "static:");
+    str_buf_add(&kb, builtins_static_plugin_name(si));
+    u32 key = atom_intern(&vm.atoms, str_buf_to_str(&kb));
+    str_buf_free(&kb);
+    u32 exports_atom = atom_intern(&vm.atoms, "exports");
+    JsObject* cache = require_cache(vm);
+    Value cached;
+    if js_get_prop(cache, key, &cached) {
+        Value ex;
+        if value_is_object(cached) && vm_get_prop_value(vm, cached, exports_atom, &ex) { return ex; }
+        return value_undefined();
+    }
+    i32 pm = gc_root_mark(&vm.heap);
+    Value ex = builtins_load_static_plugin(vm, si);
+    gc_root(&vm.heap, ex);
+    JsObject* pmod = js_new_object(&vm.heap, vm.object_proto);
+    Value pmv = value_cell(&pmod.head);
+    gc_root(&vm.heap, pmv);
+    js_set_prop(pmod, exports_atom, ex);
+    js_set_prop(cache, key, pmv);
+    gc_root_reset(&vm.heap, pm);
+    return ex;
+}
+
 Value module_require(VM* vm, str importer_path, str spec) {
     // 1. built-in module (fs / path / os / ..., incl. node: prefix)
     str bname = builtin_name(spec);
@@ -1658,6 +1687,13 @@ Value module_require(VM* vm, str importer_path, str spec) {
         // JS-source built-in (e.g. stream)
         str jsrc = builtin_js_source(bname);
         if jsrc.data != null { return run_js_builtin(vm, bname, jsrc); }
+    }
+    // 1b. a plugin compiled into the program: found by its file name,
+    //     before the file system, since there may be no file and no
+    //     compiler to build one.
+    if path_is_mc_ext(spec) {
+        i32 si = builtins_static_plugin(spec);
+        if si >= 0 { return require_static_plugin(vm, si); }
     }
     // 2. resolve (relative/absolute file, or a node_modules package)
     str resolved = resolve_require(vm, importer_path, spec, false);

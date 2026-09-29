@@ -14553,6 +14553,18 @@ private void plug_throw_type(void* vmp, str msg) {
     vm_throw_error(as_vm(vmp), ERR_TYPE, msg);
 }
 
+private u8* plug_bytes(void* vmp, Value v, i64* len) {
+    *len = 0;
+    if !value_is_object(v) { return null; }
+    JsObject* o = value_as_object(v);
+    if (o.obj_flags & OBJF_TYPEDARRAY) == 0 { return null; }
+    i32 n = 0;
+    u8* p = ta_bytes(o, &n);
+    if p == null { return null; }
+    *len = cast(i64, n);
+    return p;
+}
+
 private TsmcApi g_plugin_api;
 private bool g_plugin_api_filled = false;
 
@@ -14570,9 +14582,65 @@ private TsmcApi* plugin_api() {
         g_plugin_api.push_root = &plug_push_root;
         g_plugin_api.pop_root = &plug_pop_root;
         g_plugin_api.throw_type_error = &plug_throw_type;
+        g_plugin_api.bytes = &plug_bytes;
         g_plugin_api_filled = true;
     }
     return &g_plugin_api;
+}
+
+// Lets a plugin's register function hang exports on a fresh namespace.
+// Returns the module object.
+private Value plugin_register_into(VM* vm, TsmcPluginRegFn plugin_register) {
+    JsObject* mod = null;
+    JsObject* ns = new_node_module(vm, &mod);
+    PluginReg reg;
+    reg.vm = vm;
+    reg.mod = mod;
+    reg.ns = ns;
+    plugin_register(plugin_api(), &reg);
+    return value_cell(&mod.head);
+}
+
+// Plugins compiled into the program (tsmc_plugin_abi.mc), by file name.
+const i32 PLUGIN_STATIC_MAX = 16;
+private str[16] g_static_names;
+private TsmcPluginRegFn[16] g_static_regs;
+private i32 g_static_n = 0;
+
+// Registers a plugin compiled into the program under `name`, a file name
+// such as "spatial.mc". False when the table is full.
+bool tsmc_plugin_static(str name, TsmcPluginRegFn reg) {
+    if g_static_n >= PLUGIN_STATIC_MAX { return false; }
+    g_static_names[g_static_n] = name;
+    g_static_regs[g_static_n] = reg;
+    g_static_n++;
+    return true;
+}
+
+// The index of the static plugin whose name ends `spec` after a path
+// separator (or is all of it), or -1.
+i32 builtins_static_plugin(str spec) {
+    for i32 i = 0; i < g_static_n; i++ {
+        str n = g_static_names[i];
+        if spec.len < n.len { continue; }
+        i32 at = spec.len - n.len;
+        if at > 0 {
+            u8 sep = *(spec.data + at - 1);
+            if sep != '/' && sep != '\\' { continue; }
+        }
+        bool same = true;
+        for i32 k = 0; k < n.len; k++ {
+            if *(spec.data + at + k) != *(n.data + k) { same = false; break; }
+        }
+        if same { return i; }
+    }
+    return -1;
+}
+
+str builtins_static_plugin_name(i32 i) { return g_static_names[i]; }
+
+Value builtins_load_static_plugin(VM* vm, i32 i) {
+    return plugin_register_into(vm, g_static_regs[i]);
 }
 
 // Compiles `path`, refuses it unless its ABI word matches, then lets it hang
@@ -14607,15 +14675,7 @@ Value builtins_load_plugin(VM* vm, str path) {
         vm_throw_error(vm, ERR_TYPE, "plugin was built against a different tsmc plugin ABI");
         return value_undefined();
     }
-    JsObject* mod = null;
-    JsObject* ns = new_node_module(vm, &mod);
-    PluginReg reg;
-    reg.vm = vm;
-    reg.mod = mod;
-    reg.ns = ns;
-    TsmcPluginRegFn plugin_register = cast(TsmcPluginRegFn, preg);
-    plugin_register(plugin_api(), &reg);
-    return value_cell(&mod.head);
+    return plugin_register_into(vm, cast(TsmcPluginRegFn, preg));
 }
 
 // --- fs: OS layer (dir/type ops; read/write/stat use the file lib) ---
