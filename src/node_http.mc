@@ -194,13 +194,21 @@ class ServerResponse extends EventEmitter {
     head += CRLF;
     this.headersSent = true;
     this.finished = true;
-    this.socket.write(Buffer.from(head, 'utf8'));
     // A response to HEAD, and a 204 or 304, carry no body -- the headers
     // still describe what a GET would return. Sending one anyway leaves the
     // client reading it as the start of the next response.
     const bodyAllowed = this._method !== 'HEAD'
       && this.statusCode !== 204 && this.statusCode !== 304;
-    if (body.length && bodyAllowed) this.socket.write(body);
+    const headBuf = Buffer.from(head, 'utf8');
+    // A small body goes in the same write as the head: over TLS each
+    // write is a record and a segment of its own, and a reply in two
+    // segments is twice as likely to lose one. A large one is not copied.
+    if (body.length && bodyAllowed && body.length <= 16384) {
+      this.socket.write(Buffer.concat([headBuf, body]));
+    } else {
+      this.socket.write(headBuf);
+      if (body.length && bodyAllowed) this.socket.write(body);
+    }
     if (!persist) this.socket.end();
     this.emit('finish');
     if (this._onDone) this._onDone();
