@@ -21,8 +21,9 @@ update nearly lost the first of these by copying a file wholesale.
 | file | what is ours |
 |---|---|
 | `picotls_bridges_p256.mc` | `ecdsa_sign_cert_ctx_t` and the P-256 signing path -- what makes a TLS *server* possible |
+| `p256_sign.mc` | the P-256 signer that path calls: a fixed-base table and its own field arithmetic |
 | `picotls_bridges_rsa.mc` | `rsa_sign_cert_ctx_t`, the same for RSA keys |
-| `picotls_bridges.mc` | `mc_csprng_bytes`: a uefi/wasm arm over an installable source, `mc_csprng_fail()` on every failure upstream ignores, and a compile-time tripwire for an unhandled target. Upstream returns silently and leaves the buffer holding whatever it held, which is key material out of uninitialised memory |
+| `picotls_bridges.mc` | `x25519_keygen`: a fresh key share's public key by `crypto_x25519_dirty_fast` on the clamped secret, the same key as the ladder in half the time. `mc_csprng_bytes`: a uefi/wasm arm over an installable source, `mc_csprng_fail()` on every failure upstream ignores, and a compile-time tripwire for an unhandled target. Upstream returns silently and leaves the buffer holding whatever it held, which is key material out of uninitialised memory |
 | `cvararg_shim.mc` | `puts` and `fwrite` for uefi, over the runtime's console |
 
 Each is marked `LOCAL (tsmc)` in the source. Grep for that before
@@ -94,9 +95,10 @@ so returning it lets the client process the server's whole flight in one
   `ecdsa_p256_pl_sign_certificate` (the `sign_certificate` callback),
   `mc_ecdsa_sig_raw_to_der` (r‖s → DER), `mc_ecdsa_p256_sign_init` (nonce
   RNG), `ecdsa_sign_cert_ctx_t`, and `ecdsa_p256_raw_verify_cert_cb` (a
-  raw-public-key verify). picotls-minc ships only Ed25519 signing; the
-  P-256 signing primitive (`uECC_sign`) is present but unbridged. Used by
-  the TLS server (`src/tls_native.mc`).
+  raw-public-key verify). picotls-minc ships only Ed25519 signing. The
+  signature is `p256_sign` (`p256_sign.mc`), a fixed-base-table signer
+  about five times faster than micro-ecc's `uECC_sign`, whose output
+  format it shares. Used by the TLS server (`src/tls_native.mc`).
 - RSA-PSS **server-side signing** (`picotls_bridges_rsa.mc`):
   `rsa_pss_pl_sign_certificate` (the `sign_certificate` callback),
   `mc_rsa_pss_prepare` / `mc_rsa_privop_plain` / `mc_rsa_pss_sign`

@@ -3,6 +3,7 @@ import cstdlib_shim;
 import picotls_shim;
 import picotls_lib;
 import picotls_bridges;
+import p256_sign;
 
 // picotls_bridges_p256.mc — ECDSA-P256 cert verify, SPKI-pinned.
 
@@ -332,7 +333,7 @@ i32 ecdsa_p256_pl_sign_certificate(ptls_sign_certificate_t* self, ptls_t* tls,
     u8[32] digest;
     mc_sha256_hash(input.base, input.len, &digest[0]);
     u8[64] raw;
-    if uECC_sign(&ctx.private_key[0], &digest[0], cast(u32, 32), &raw[0], uECC_secp256r1()) != 1 {
+    if p256_sign(&ctx.private_key[0], &digest[0], cast(u32, 32), &raw[0]) != 1 {
         return 0 - 1;
     }
     u8[80] der;

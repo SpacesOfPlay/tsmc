@@ -285,6 +285,23 @@ private bool run_rsa_crt() {
                           &sig[0], RSA_TEST_KLEN, &mhash[0], 32);
 }
 
+// The comb signer (src/tls/p256_sign.mc): its arithmetic against slow
+// references, and its signatures under micro-ecc's verifier.
+private bool run_p256_sign() {
+    if p256_selftest(500) != 0 { return false; }
+    u8[32] priv;
+    u8[64] pub;
+    if uECC_make_key(&pub[0], &priv[0], uECC_secp256r1()) != 1 { return false; }
+    u8[32] digest;
+    u8[64] sig;
+    for i32 r = 0; r < 50; r++ {
+        mc_csprng_bytes(cast(void*, &digest[0]), 32);
+        if p256_sign(&priv[0], &digest[0], 32, &sig[0]) != 1 { return false; }
+        if uECC_verify(&pub[0], &digest[0], 32, &sig[0], uECC_secp256r1()) != 1 { return false; }
+    }
+    return true;
+}
+
 i32 main() {
     // Live VM heap alongside picotls: exercises both allocators together.
     VM m;
@@ -294,6 +311,7 @@ i32 main() {
 
     check(run_handshake_ed25519(), "in-memory TLS 1.3 handshake (Ed25519 server cert)");
     check(run_handshake_ecdsa(), "in-memory TLS 1.3 handshake (ECDSA-P256 server cert)");
+    check(run_p256_sign(), "P-256 comb signer: arithmetic self-test, signatures verify");
     check(run_rsa_sign_verify(), "RSASSA-PSS sign/verify round-trip (2048-bit, sha256/384/512)");
     check(run_rsa_crt(), "RSA CRT private op equals plain EM^d mod n, and verifies");
 

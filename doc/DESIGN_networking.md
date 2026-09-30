@@ -242,8 +242,8 @@ Stages 1–5 shipped (M31–M37).
 5. **Servers.** `net.Server` + `http.createServer` (accept loop in the
    reactor) landed in M32/M33. The TLS server uses picotls server mode
    with an **ECDSA-P256** (M37) or **RSA** (M38) certificate, auto-
-   detected from the key: `sign_certificate` bridges over the vendored
-   `uECC_sign` (ECDSA) and a tsmc-added RSASSA-PSS signer (a big-exponent
+   detected from the key: `sign_certificate` bridges over `p256_sign`
+   (ECDSA with a fixed-base table, `src/tls/p256_sign.mc`) and a tsmc-added RSASSA-PSS signer (a big-exponent
    modexp + PSS encode, CRT-accelerated when the key carries
    `p/q/dP/dQ/qInv`, M39), private-key parsing (EC SEC1/PKCS#8, RSA
    PKCS#1/PKCS#8), a per-server context, and `tls.createServer` /
