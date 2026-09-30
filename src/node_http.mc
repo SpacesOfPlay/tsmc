@@ -292,6 +292,9 @@ const MAX_HEAD = 16 * 1024;
 // the length arrives as a request with no body rather than as an
 // unbounded one.
 const MAX_BODY = 1024 * 1024;
+// The longest chunk-size line, extensions included. A size needs eight
+// hex digits at most; the rest is extensions, which are ignored.
+const MAX_CHUNK_LINE = 1024;
 
 // A connection that is answered and kept costs one slot for as long as it
 // is held, and the machine has a small fixed number of them. Closing every
@@ -307,6 +310,9 @@ const MAX_BODY = 1024 * 1024;
 // a fixed time to deliver the body it declared. nginx calls the same two
 // numbers client_header_timeout and client_body_timeout.
 const HEAD_MS = 15000;
+// How long a refused connection keeps reading, and dropping, what the
+// client still sends before it is closed (refuse).
+const LINGER_MS = 2000;
 const BODY_MS = 30000;
 
 function serveConnection(server, socket) {
@@ -315,6 +321,14 @@ function serveConnection(server, socket) {
   let res = null;
   let state = 'head';
   let remaining = 0;
+  // A chunked request body: where the reader is (size, data, crlf,
+  // trailer), what is left of the chunk, what the body has come to, and
+  // the bytes of trailer lines so far.
+  let chunked = false;
+  let cstate = 'size';
+  let csize = 0;
+  let received = 0;
+  let trailerBytes = 0;
   let timer = null;
 
   function clearDeadline() {
@@ -366,6 +380,14 @@ function serveConnection(server, socket) {
   // not going to be talked out of it, and leaving the socket open leaves
   // the thing being defended against in place.
   function refuse(code, reason) {
+    // A reply already under way cannot take a status line in its middle:
+    // the connection just ends.
+    if (res !== null && res.headersSent) {
+      state = 'done';
+      clearDeadline();
+      socket.destroy();
+      return;
+    }
     try {
       const body = reason + String.fromCharCode(10);
       socket.write(Buffer.from(
@@ -377,7 +399,12 @@ function serveConnection(server, socket) {
     state = 'done';
     clearDeadline();
     socket.end();
-    socket.destroy();
+    // A client still sending its body would have its data unread at the
+    // close, and the system answers that with a reset, which can reach
+    // the client before the answer does. So the connection reads on for
+    // a while, dropping what comes (pump does in state done), and then
+    // closes.
+    timer = setTimeout(() => { timer = null; socket.destroy(); }, LINGER_MS);
   }
 
   deadline(HEAD_MS);
@@ -443,6 +470,22 @@ function serveConnection(server, socket) {
       msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
       msg.headers = parseHeaders(lines.join(CRLF));
       const cl = msg.headers['content-length'];
+      const te = msg.headers['transfer-encoding'];
+      chunked = false;
+      if (te !== undefined) {
+        // A length and a coding together can be read two ways, and a
+        // proxy in front may read the other one: that is how a request is
+        // smuggled past it. Refused, as node refuses it.
+        if (cl !== undefined) { refuse(400, 'Bad request'); return; }
+        // Only chunked, applied last, says where the body ends.
+        const codings = String(te).toLowerCase().split(',');
+        if (codings[codings.length - 1].trim() !== 'chunked') { refuse(400, 'Bad request'); return; }
+        chunked = true;
+        cstate = 'size';
+        csize = 0;
+        received = 0;
+        trailerBytes = 0;
+      }
       remaining = cl !== undefined ? parseInt(cl, 10) : 0;
       // A length that is absent, negative or not a number is none. A
       // declared one past the ceiling is refused before a byte of it is
@@ -459,7 +502,7 @@ function serveConnection(server, socket) {
       }
       // The head arrived in time. A body gets its own budget; none
       // expected means it is the server's turn and the clock stops.
-      if (remaining > 0) deadline(BODY_MS); else clearDeadline();
+      if (remaining > 0 || chunked) deadline(BODY_MS); else clearDeadline();
       state = 'body';
       res = new ServerResponse(socket, msg.method);
       res._keepAlive = wantsKeepAlive(msg);
@@ -468,6 +511,10 @@ function serveConnection(server, socket) {
       server.emit('request', msg, res);
     }
     if (state === 'body') {
+      if (chunked) {
+        if (readChunked()) { clearDeadline(); state = 'reply'; msg._end(); }
+        return;
+      }
       if (remaining > 0 && buf.length > 0) {
         const take = Math.min(remaining, buf.length);
         msg._data(buf.slice(0, take));
@@ -477,6 +524,67 @@ function serveConnection(server, socket) {
       if (remaining <= 0) { clearDeadline(); state = 'reply'; msg._end(); }
     }
   }
+
+  // Reads a chunked body as far as it has arrived, handing each piece to
+  // the request as it comes rather than a whole chunk at a time. True at
+  // the body's end. Chunk extensions are ignored, and trailer lines are
+  // read and dropped. A size that is not hex, a line past its limit or a
+  // chunk not followed by CRLF is refused (400); a body past MAX_BODY too
+  // (413), as a declared length past it is.
+  function readChunked() {
+    for (;;) {
+      if (cstate === 'size') {
+        const ln = findLine(buf);
+        if (ln < 0 || ln > MAX_CHUNK_LINE) {
+          if (ln > MAX_CHUNK_LINE || buf.length > MAX_CHUNK_LINE) refuse(400, 'Bad request');
+          return false;
+        }
+        let line = buf.slice(0, ln).toString('latin1');
+        const semi = line.indexOf(';');
+        if (semi >= 0) line = line.slice(0, semi);
+        line = line.trim();
+        if (line.length === 0 || line.length > 8 || !isHex(line)) { refuse(400, 'Bad request'); return false; }
+        csize = parseInt(line, 16);
+        buf = buf.slice(ln + 2);
+        if (csize === 0) { cstate = 'trailer'; continue; }
+        if (received + csize > MAX_BODY) { refuse(413, 'Payload too large'); return false; }
+        cstate = 'data';
+      } else if (cstate === 'data') {
+        if (buf.length === 0) return false;
+        const take = Math.min(csize, buf.length);
+        msg._data(buf.slice(0, take));
+        buf = buf.slice(take);
+        csize -= take;
+        received += take;
+        if (state === 'done') return false;     // the handler ended the connection
+        if (csize > 0) return false;
+        cstate = 'crlf';
+      } else if (cstate === 'crlf') {
+        if (buf.length < 2) return false;
+        if (buf[0] !== CR || buf[1] !== LF) { refuse(400, 'Bad request'); return false; }
+        buf = buf.slice(2);
+        cstate = 'size';
+      } else {
+        const ln = findLine(buf);
+        if (ln < 0) {
+          if (trailerBytes + buf.length > MAX_HEAD) refuse(431, 'Request header too large');
+          return false;
+        }
+        trailerBytes += ln + 2;
+        if (trailerBytes > MAX_HEAD) { refuse(431, 'Request header too large'); return false; }
+        buf = buf.slice(ln + 2);
+        if (ln === 0) return true;
+      }
+    }
+  }
+}
+
+function isHex(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) return false;
+  }
+  return true;
 }
 
 class Server extends EventEmitter {
@@ -661,9 +769,12 @@ class ClientRequest extends EventEmitter {
           buf = buf.slice(2);
           cstate = 'size';
         } else {
+          // Trailer lines, if any, then the empty line that ends the body;
+          // left in the buffer they would start the next response.
           const ln = findLine(buf);
           if (ln < 0) return;
           buf = buf.slice(ln + 2);
+          if (ln > 0) continue;
           state = 'done';
           res._end();
           return;

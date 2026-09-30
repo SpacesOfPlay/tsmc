@@ -107,6 +107,13 @@ set (on HTTP/1.0 the body ends with the connection instead); a body that
 `end()` sends whole gets a Content-Length. `write` returns false when the
 connection holds more than it wants and `'drain'` follows, and a response
 hears `'close'` if its connection goes before it ends.
+A request body arrives by Content-Length or chunked, handed to the
+request as it comes; extensions and trailers are read past. A request
+with both, or a coding that does not end in chunked, is refused (400) as
+a smuggling attempt, and a body past 1 MB either way is refused (413);
+a refused connection reads and drops what the client still sends for
+two seconds before it closes, so that the answer is not overtaken by
+the reset a close with unread data causes.
 `fetch` + `Headers`/`Request`/`Response` wrap the client
 codec and resolve a Promise with a `Response` whose body is available as
 `.text()`/`.json()`/`.arrayBuffer()`. `https` is exactly `http` over a
