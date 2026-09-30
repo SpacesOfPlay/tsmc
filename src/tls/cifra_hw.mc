@@ -143,6 +143,9 @@ i32 cf_gf128_hw_mul(u32* x, u32* y, u32* out) {
 // two halves (cifra_hw_ghash_powers); `nb` is 4 or 16.
 
 i8[16] g_cifra_hw_bswap = { 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
+// Reverses the last four bytes of a block: a counter block's big-endian
+// counter to a little-endian lane and back.
+i8[16] g_cifra_hw_ctr_rev = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 14, 13, 12 };
 i8[16] g_cifra_hw_halves = { 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7 };
 
 // The most powers of H a message needs, and the bytes that hold them and
@@ -431,32 +434,43 @@ u64 cifra_hw_ghash_powers_for(u64 n) {
 
 // Counter mode over `n` bytes, from `in` to `out` (which may be the same
 // buffer), starting at counter `ctr`. A counter block is the 12-byte
-// nonce in `j0` and the counter as 32 big-endian bits.
+// nonce in `j0` and the counter as 32 big-endian bits. The eight blocks of
+// a group are made in registers: the block with its last four bytes
+// reversed holds the counter as lane 3 of an int4, where it is added to,
+// and one shuffle puts each block back in order. Blocks written to memory
+// a byte at a time and read back whole would wait for the bytes to reach
+// the cache.
 void cifra_hw_ctr(u8* rk, u32 rounds, u8* j0, u32 ctr, u8* in, u8* out, u64 n) {
-    u8[128] cb;
-    for i32 b = 0; b < 8; b++ {
-        for i32 k = 0; k < 12; k++ { cb[16 * b + k] = *(j0 + k); }
-    }
+    u8[16] cb;
+    for i32 k = 0; k < 12; k++ { cb[k] = *(j0 + k); }
     u8* last = rk + 16 * cast(u64, rounds);
     u64 i = 0;
+    i8x16 rev = i8x16_load(&g_cifra_hw_ctr_rev[0]);
+    cb[12] = cast(u8, ctr);
+    cb[13] = cast(u8, ctr >> 8);
+    cb[14] = cast(u8, ctr >> 16);
+    cb[15] = cast(u8, ctr >> 24);
+    int4 cv = cast(int4, i8x16_load(cast(i8*, &cb[0])));
+    int4 one = int4{0, 0, 0, 1};
     while i + 128 <= n {
-        for u32 b = 0; b < 8; b++ {
-            u32 c = ctr + b;
-            cb[16 * b + 12] = cast(u8, c >> 24);
-            cb[16 * b + 13] = cast(u8, c >> 16);
-            cb[16 * b + 14] = cast(u8, c >> 8);
-            cb[16 * b + 15] = cast(u8, c);
-        }
-        ctr = ctr + 8;
         i8x16 k0 = i8x16_load(cast(i8*, rk));
-        i8x16 s0 = i8x16_load(cast(i8*, &cb[0])) ^ k0;
-        i8x16 s1 = i8x16_load(cast(i8*, &cb[16])) ^ k0;
-        i8x16 s2 = i8x16_load(cast(i8*, &cb[32])) ^ k0;
-        i8x16 s3 = i8x16_load(cast(i8*, &cb[48])) ^ k0;
-        i8x16 s4 = i8x16_load(cast(i8*, &cb[64])) ^ k0;
-        i8x16 s5 = i8x16_load(cast(i8*, &cb[80])) ^ k0;
-        i8x16 s6 = i8x16_load(cast(i8*, &cb[96])) ^ k0;
-        i8x16 s7 = i8x16_load(cast(i8*, &cb[112])) ^ k0;
+        i8x16 s0 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s1 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s2 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s3 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s4 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s5 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s6 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        i8x16 s7 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
+        cv = cv + one;
+        ctr = ctr + 8;
         for u32 r = 1; r < rounds; r++ {
             i8x16 k = i8x16_load(cast(i8*, rk + 16 * cast(u64, r)));
             s0 = aesenc(s0, k);
