@@ -7174,8 +7174,18 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
     return vm.handles.len - 1;
 }
 
+// Marks a handle closed once its descriptor is. The descriptor number is
+// forgotten: the system hands the same number to the next socket it
+// opens, and a close, send or read that reached this handle later (a
+// second close on another path, a write queued before the close) would
+// act on that other connection.
 void vm_handle_close(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).alive = false; }
+    if idx >= 0 && idx < vm.handles.len {
+        IoHandle* h = vm.handles.data + idx;
+        h.alive = false;
+        h.fd = -1;
+        h.interest = 0;
+    }
 }
 
 void vm_handle_ref(VM* vm, i32 idx) {
@@ -7205,8 +7215,9 @@ i16 vm_handle_interest(VM* vm, i32 idx) {
     return 0;
 }
 
+// The handle's descriptor, or -1 once it is closed.
 i64 vm_handle_fd(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).fd; }
+    if idx >= 0 && idx < vm.handles.len && (vm.handles.data + idx).alive { return (vm.handles.data + idx).fd; }
     return -1;
 }
 
