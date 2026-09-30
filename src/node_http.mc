@@ -306,9 +306,10 @@ const MAX_CHUNK_LINE = 1024;
 // resets is defeated by one byte every so often: sixteen kilobytes of
 // header, one byte at a time, held a slot for days. What a client is
 // given is a fixed time to deliver a complete request head -- from the
-// connection opening, or from the end of the previous answer -- and then
-// a fixed time to deliver the body it declared. nginx calls the same two
-// numbers client_header_timeout and client_body_timeout.
+// connection opening, or from when the previous answer has left this
+// process -- and then a fixed time to deliver the body it declared. nginx
+// calls the same two numbers client_header_timeout and
+// client_body_timeout.
 const HEAD_MS = 15000;
 // How long a refused connection keeps reading, and dropping, what the
 // client still sends before it is closed (refuse).
@@ -363,8 +364,23 @@ function serveConnection(server, socket) {
     msg = null;
     res = null;
     state = 'head';
-    deadline(HEAD_MS);
+    awaitNext();
     pump();
+  }
+
+  // The next request's time starts once the answer has left: a client
+  // reads an answer before it sends again, and one reading a large answer
+  // slowly would otherwise lose the connection in the middle of it. While
+  // the answer is still queued here, and the client has not begun its
+  // next request, the check comes back every second.
+  function awaitNext() {
+    clearDeadline();
+    if (state !== 'head') return;
+    if (socket.writableLength > 0 && buf.length === 0) {
+      timer = setTimeout(awaitNext, 1000);
+      return;
+    }
+    deadline(HEAD_MS);
   }
 
   function wantsKeepAlive(m) {
