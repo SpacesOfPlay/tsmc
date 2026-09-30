@@ -17,10 +17,11 @@
 // equals neither d*16^j*G nor its negative for any k < n.
 //
 // The arithmetic is this module's own, as micro-ecc keeps its field
-// routines private: elements as eight 32-bit words, least significant
-// first; a product as 64 exact 32x32 multiplications summed per column
-// (a square as 36), reduced with the NIST method for p-256 (FIPS 186-4
-// D.2.3); inversion in the field by a fixed addition chain of 255
+// routines private: elements as four 64-bit words, least significant
+// first; a product as 16 exact 64x64 multiplications (`*` for the low
+// half, `mulhi` for the high), a square as 10, reduced with the NIST
+// method for p-256 (FIPS 186-4 D.2.3) over the 32-bit halves of the
+// words; inversion in the field by a fixed addition chain of 255
 // squarings and 12 multiplications (constant time), and of the nonce by
 // binary extended GCD behind a random blinding factor, as micro-ecc does
 // it. Products mod n are Montgomery multiplications. The table's rows
@@ -35,139 +36,144 @@ import picotls_lib;
 import picotls_bridges;
 
 // p = 2^256 - 2^224 + 2^192 + 2^96 - 1
-u32[8] P256_P = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF };
+u64[4] P256_P = { 0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF, 0x0000000000000000, 0xFFFFFFFF00000001 };
 // the group order
-u32[8] P256_N = { 0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF };
-u32[8] P256_GX = { 0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81, 0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2 };
-u32[8] P256_GY = { 0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357, 0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2 };
+u64[4] P256_N = { 0xF3B9CAC2FC632551, 0xBCE6FAADA7179E84, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000 };
+u64[4] P256_GX = { 0xF4A13945D898C296, 0x77037D812DEB33A0, 0xF8BCE6E563A440F2, 0x6B17D1F2E12C4247 };
+u64[4] P256_GY = { 0xCBB6406837BF51F5, 0x2BCE33576B315ECE, 0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B };
 
 const i32 P256_ROWS = 64;       // four-bit digits of a 256-bit scalar
 const i32 P256_COLS = 15;       // nonzero digit values
 
-// Row j, column i - 1: x then y of i * 16^j * G, 16 words.
-private u32* p256_table = null;
+// Row j, column i - 1: x then y of i * 16^j * G, 8 words.
+private u64* p256_table = null;
 
 // --- 256-bit words ---------------------------------------------------------
 
-private void w_set(u32* r, u32* a) { for i32 i = 0; i < 8; i++ { r[i] = a[i]; } }
-private void w_zero(u32* r) { for i32 i = 0; i < 8; i++ { r[i] = 0; } }
+private void w_set(u64* r, u64* a) { for i32 i = 0; i < 4; i++ { r[i] = a[i]; } }
+private void w_zero(u64* r) { for i32 i = 0; i < 4; i++ { r[i] = 0; } }
 
-private bool w_is_zero(u32* a) {
-    u32 x = 0;
-    for i32 i = 0; i < 8; i++ { x = x | a[i]; }
+private bool w_is_zero(u64* a) {
+    u64 x = 0;
+    for i32 i = 0; i < 4; i++ { x = x | a[i]; }
     return x == 0;
 }
 
-// r = a + b; the carry out.
-private u32 w_add(u32* r, u32* a, u32* b) {
+// r = a + b; the carry out. A carry is found by comparison: a sum
+// below one of its operands wrapped.
+private u64 w_add(u64* r, u64* a, u64* b) {
     u64 c = 0;
-    for i32 i = 0; i < 8; i++ {
-        c = c + cast(u64, a[i]) + cast(u64, b[i]);
-        r[i] = cast(u32, c);
-        c = c >> 32;
+    for i32 i = 0; i < 4; i++ {
+        u64 s = a[i] + b[i];
+        u64 k = cast(u64, s < a[i]);
+        u64 t = s + c;
+        c = k + cast(u64, t < s);
+        r[i] = t;
     }
-    return cast(u32, c);
+    return c;
 }
 
 // r = a - b; the borrow out.
-private u32 w_sub(u32* r, u32* a, u32* b) {
-    i64 c = 0;
-    for i32 i = 0; i < 8; i++ {
-        c = c + cast(i64, a[i]) - cast(i64, b[i]);
-        r[i] = cast(u32, c);
-        c = c >> 32;
+private u64 w_sub(u64* r, u64* a, u64* b) {
+    u64 br = 0;
+    for i32 i = 0; i < 4; i++ {
+        u64 d = a[i] - b[i];
+        u64 k = cast(u64, a[i] < b[i]);
+        u64 t = d - br;
+        br = k + cast(u64, d < br);
+        r[i] = t;
     }
-    return cast(u32, 0 - c);
+    return br;
 }
 
 // r = a where mask is all ones, else unchanged.
-private void w_select(u32* r, u32* a, u32 mask) {
-    for i32 i = 0; i < 8; i++ { r[i] = (r[i] & ~mask) | (a[i] & mask); }
+private void w_select(u64* r, u64* a, u64 mask) {
+    for i32 i = 0; i < 4; i++ { r[i] = (r[i] & ~mask) | (a[i] & mask); }
 }
 
 // a >= m, without a branch on the values.
-private u32 w_geq_mask(u32* a, u32* m) {
-    u32[8] t;
-    u32 borrow = w_sub(&t[0], a, m);
+private u64 w_geq_mask(u64* a, u64* m) {
+    u64[4] t;
+    u64 borrow = w_sub(&t[0], a, m);
     return borrow - 1;              // all ones when no borrow
 }
 
-private void w_from_bytes(u32* r, u8* b) {
-    for i32 i = 0; i < 8; i++ {
-        u8* q = b + 28 - 4 * i;
-        r[i] = (cast(u32, q[0]) << 24) | (cast(u32, q[1]) << 16) | (cast(u32, q[2]) << 8) | cast(u32, q[3]);
+private void w_from_bytes(u64* r, u8* b) {
+    for i32 i = 0; i < 4; i++ {
+        u8* q = b + 24 - 8 * i;
+        u64 w = 0;
+        for i32 k = 0; k < 8; k++ { w = (w << 8) | cast(u64, q[k]); }
+        r[i] = w;
     }
 }
 
-private void w_to_bytes(u8* b, u32* a) {
-    for i32 i = 0; i < 8; i++ {
-        u8* q = b + 28 - 4 * i;
-        q[0] = cast(u8, a[i] >> 24);
-        q[1] = cast(u8, a[i] >> 16);
-        q[2] = cast(u8, a[i] >> 8);
-        q[3] = cast(u8, a[i]);
+private void w_to_bytes(u8* b, u64* a) {
+    for i32 i = 0; i < 4; i++ {
+        u8* q = b + 24 - 8 * i;
+        u64 w = a[i];
+        for i32 k = 7; k >= 0; k-- { q[k] = cast(u8, w); w = w >> 8; }
     }
 }
 
 // --- the field mod p -------------------------------------------------------
 
-private void fe_add(u32* r, u32* a, u32* b) {
-    u32 carry = w_add(r, a, b);
-    u32[8] t;
-    u32 borrow = w_sub(&t[0], r, &P256_P[0]);
+private void fe_add(u64* r, u64* a, u64* b) {
+    u64 carry = w_add(r, a, b);
+    u64[4] t;
+    u64 borrow = w_sub(&t[0], r, &P256_P[0]);
     // subtract p when the sum carried out or is at least p
-    u32 m = (cast(u32, 0) - carry) | (borrow - 1);
+    u64 m = (cast(u64, 0) - carry) | (borrow - 1);
     w_select(r, &t[0], m);
 }
 
-private void fe_sub(u32* r, u32* a, u32* b) {
-    u32 borrow = w_sub(r, a, b);
-    u32[8] t;
+private void fe_sub(u64* r, u64* a, u64* b) {
+    u64 borrow = w_sub(r, a, b);
+    u64[4] t;
     ignore w_add(&t[0], r, &P256_P[0]);
-    w_select(r, &t[0], cast(u32, 0) - borrow);
+    w_select(r, &t[0], cast(u64, 0) - borrow);
 }
 
-// r = the 16-word product a * b: 64 exact 32x32 products, each split into
-// its low and high halves summed in separate column accumulators, so no
-// sum can overflow and nothing waits on a comparison.
-private void w_mul_wide(u32* r, u32* a, u32* b) {
-    u64[17] lo;
-    u64[17] hi;
-    for i32 k = 0; k < 17; k++ { lo[k] = 0; hi[k] = 0; }
-    for i32 i = 0; i < 8; i++ {
-        u64 ai = cast(u64, a[i]);
-        for i32 j = 0; j < 8; j++ {
-            u64 p = ai * cast(u64, b[j]);
-            lo[i + j] = lo[i + j] + (p & 0xFFFFFFFF);
-            hi[i + j + 1] = hi[i + j + 1] + (p >> 32);
+// r = the 8-word product a * b, a row of four products per word of b,
+// each added into the running row with a one-word carry. The carry
+// hi + k1 + k2 cannot wrap: a b + t + c is below 2^128.
+private void w_mul_wide(u64* r, u64* a, u64* b) {
+    for i32 k = 0; k < 8; k++ { r[k] = 0; }
+    for i32 i = 0; i < 4; i++ {
+        u64 c = 0;
+        u64 bi = b[i];
+        for i32 j = 0; j < 4; j++ {
+            u64 lo = a[j] * bi;
+            u64 hi = mulhi(a[j], bi);
+            u64 s = r[i + j] + lo;
+            u64 k = cast(u64, s < lo);
+            u64 u = s + c;
+            c = hi + k + cast(u64, u < c);
+            r[i + j] = u;
         }
-    }
-    u64 c = 0;
-    for i32 k = 0; k < 16; k++ {
-        c = c + lo[k] + hi[k];
-        r[k] = cast(u32, c);
-        c = c >> 32;
+        r[i + 4] = c;
     }
 }
 
-// r = the 16-word c mod p (FIPS 186-4 D.2.3): r = s1 + 2 s2 + 2 s3 + s4
-// + s5 - s6 - s7 - s8 - s9, each s a rearrangement of c's words, summed
-// per word with signed carries. What passes 2^256 is folded back with
-// 2^256 = 2^224 - 2^192 - 2^96 + 1 (mod p), twice: after the second fold
-// the top carry is -1, 0 or 1, and the value is below p after one masked
-// addition of p (when negative) and one masked subtraction (when at or
-// above p).
-private void fe_reduce(u32* r, u32* c) {
-    i64 c8 = cast(i64, c[8]); i64 c9 = cast(i64, c[9]); i64 c10 = cast(i64, c[10]); i64 c11 = cast(i64, c[11]);
-    i64 c12 = cast(i64, c[12]); i64 c13 = cast(i64, c[13]); i64 c14 = cast(i64, c[14]); i64 c15 = cast(i64, c[15]);
-    i64 t0 = cast(i64, c[0]) + c8 + c9 - c11 - c12 - c13 - c14;
-    i64 t1 = cast(i64, c[1]) + c9 + c10 - c12 - c13 - c14 - c15;
-    i64 t2 = cast(i64, c[2]) + c10 + c11 - c13 - c14 - c15;
-    i64 t3 = cast(i64, c[3]) + 2 * c11 + 2 * c12 + c13 - c15 - c8 - c9;
-    i64 t4 = cast(i64, c[4]) + 2 * c12 + 2 * c13 + c14 - c9 - c10;
-    i64 t5 = cast(i64, c[5]) + 2 * c13 + 2 * c14 + c15 - c10 - c11;
-    i64 t6 = cast(i64, c[6]) + 3 * c14 + 2 * c15 + c13 - c8 - c9;
-    i64 t7 = cast(i64, c[7]) + 3 * c15 + c8 - c10 - c11 - c12 - c13;
+// r = the 8-word c mod p (FIPS 186-4 D.2.3) over the sixteen 32-bit
+// halves: r = s1 + 2 s2 + 2 s3 + s4 + s5 - s6 - s7 - s8 - s9, each s a
+// rearrangement of the halves, summed per half with signed carries. What
+// passes 2^256 is folded back with 2^256 = 2^224 - 2^192 - 2^96 + 1 (mod
+// p), twice: after the second fold the top carry is -1, 0 or 1, and the
+// value is below p after one masked addition of p (when negative) and
+// one masked subtraction (when at or above p).
+private void fe_reduce(u64* r, u64* c) {
+    i64 c8 = cast(i64, c[4] & 0xFFFFFFFF); i64 c9 = cast(i64, c[4] >> 32);
+    i64 c10 = cast(i64, c[5] & 0xFFFFFFFF); i64 c11 = cast(i64, c[5] >> 32);
+    i64 c12 = cast(i64, c[6] & 0xFFFFFFFF); i64 c13 = cast(i64, c[6] >> 32);
+    i64 c14 = cast(i64, c[7] & 0xFFFFFFFF); i64 c15 = cast(i64, c[7] >> 32);
+    i64 t0 = cast(i64, c[0] & 0xFFFFFFFF) + c8 + c9 - c11 - c12 - c13 - c14;
+    i64 t1 = cast(i64, c[0] >> 32) + c9 + c10 - c12 - c13 - c14 - c15;
+    i64 t2 = cast(i64, c[1] & 0xFFFFFFFF) + c10 + c11 - c13 - c14 - c15;
+    i64 t3 = cast(i64, c[1] >> 32) + 2 * c11 + 2 * c12 + c13 - c15 - c8 - c9;
+    i64 t4 = cast(i64, c[2] & 0xFFFFFFFF) + 2 * c12 + 2 * c13 + c14 - c9 - c10;
+    i64 t5 = cast(i64, c[2] >> 32) + 2 * c13 + 2 * c14 + c15 - c10 - c11;
+    i64 t6 = cast(i64, c[3] & 0xFFFFFFFF) + 3 * c14 + 2 * c15 + c13 - c8 - c9;
+    i64 t7 = cast(i64, c[3] >> 32) + 3 * c15 + c8 - c10 - c11 - c12 - c13;
     i64 k = 0;
     for i32 round = 0; round < 2; round++ {
         t1 = t1 + (t0 >> 32); t0 = t0 & 0xFFFFFFFF;
@@ -188,63 +194,76 @@ private void fe_reduce(u32* r, u32* c) {
     t6 = t6 + (t5 >> 32); t5 = t5 & 0xFFFFFFFF;
     t7 = t7 + (t6 >> 32); t6 = t6 & 0xFFFFFFFF;
     i64 top = t7 >> 32; t7 = t7 & 0xFFFFFFFF;
-    u32[8] v = { cast(u32, t0), cast(u32, t1), cast(u32, t2), cast(u32, t3),
-                 cast(u32, t4), cast(u32, t5), cast(u32, t6), cast(u32, t7) };
-    u32[8] w;
+    u64[4] v = { cast(u64, t0) | (cast(u64, t1) << 32), cast(u64, t2) | (cast(u64, t3) << 32),
+                 cast(u64, t4) | (cast(u64, t5) << 32), cast(u64, t6) | (cast(u64, t7) << 32) };
+    u64[4] w;
     ignore w_add(&w[0], &v[0], &P256_P[0]);
-    w_select(&v[0], &w[0], cast(u32, top >> 63));
-    u32 borrow = w_sub(&w[0], &v[0], &P256_P[0]);
-    w_select(&v[0], &w[0], (borrow - 1) | (cast(u32, 0) - cast(u32, (top + 1) >> 1)));
+    w_select(&v[0], &w[0], cast(u64, top >> 63));
+    u64 borrow = w_sub(&w[0], &v[0], &P256_P[0]);
+    w_select(&v[0], &w[0], (borrow - 1) | (cast(u64, 0) - cast(u64, (top + 1) >> 1)));
     w_set(r, &v[0]);
 }
 
-private void fe_mul(u32* r, u32* a, u32* b) {
-    u32[16] c;
+private void fe_mul(u64* r, u64* a, u64* b) {
+    u64[8] c;
     w_mul_wide(&c[0], a, b);
     fe_reduce(r, &c[0]);
 }
 
 // r = a^2: the products a[i] a[j] with i < j once and doubled, the
-// squares once, 36 multiplications where a product takes 64.
-private void fe_sqr(u32* r, u32* a) {
-    u64[17] lo;
-    u64[17] hi;
-    for i32 k = 0; k < 17; k++ { lo[k] = 0; hi[k] = 0; }
-    for i32 i = 0; i < 8; i++ {
-        u64 ai = cast(u64, a[i]);
-        for i32 j = i + 1; j < 8; j++ {
-            u64 p = ai * cast(u64, a[j]);
-            lo[i + j] = lo[i + j] + (p & 0xFFFFFFFF);
-            hi[i + j + 1] = hi[i + j + 1] + (p >> 32);
+// squares once, 10 multiplications where a product takes 16.
+private void fe_sqr(u64* r, u64* a) {
+    u64[8] t;
+    for i32 k = 0; k < 8; k++ { t[k] = 0; }
+    for i32 i = 0; i < 3; i++ {
+        u64 c = 0;
+        u64 ai = a[i];
+        for i32 j = i + 1; j < 4; j++ {
+            u64 lo = ai * a[j];
+            u64 hi = mulhi(ai, a[j]);
+            u64 s = t[i + j] + lo;
+            u64 k = cast(u64, s < lo);
+            u64 u = s + c;
+            c = hi + k + cast(u64, u < c);
+            t[i + j] = u;
         }
+        t[i + 4] = c;
     }
-    for i32 k = 0; k < 17; k++ { lo[k] = lo[k] * 2; hi[k] = hi[k] * 2; }
-    for i32 i = 0; i < 8; i++ {
-        u64 p = cast(u64, a[i]) * cast(u64, a[i]);
-        lo[2 * i] = lo[2 * i] + (p & 0xFFFFFFFF);
-        hi[2 * i + 1] = hi[2 * i + 1] + (p >> 32);
+    u64 top = 0;
+    for i32 k = 0; k < 8; k++ {
+        u64 v = t[k];
+        t[k] = (v << 1) | top;
+        top = v >> 63;
     }
-    u32[16] c;
-    u64 cy = 0;
-    for i32 k = 0; k < 16; k++ {
-        cy = cy + lo[k] + hi[k];
-        c[k] = cast(u32, cy);
-        cy = cy >> 32;
+    u64 c = 0;
+    for i32 i = 0; i < 4; i++ {
+        u64 lo = a[i] * a[i];
+        u64 hi = mulhi(a[i], a[i]);
+        u64 s = t[2 * i] + lo;
+        u64 k = cast(u64, s < lo);
+        u64 u = s + c;
+        c = k + cast(u64, u < c);
+        t[2 * i] = u;
+        s = t[2 * i + 1] + hi;
+        k = cast(u64, s < hi);
+        u = s + c;
+        c = k + cast(u64, u < c);
+        t[2 * i + 1] = u;
     }
-    fe_reduce(r, &c[0]);
+    fe_reduce(r, &t[0]);
 }
 
 // x squared n times.
-private void fe_sqr_n(u32* r, u32* a, i32 n) {
+private void fe_sqr_n(u64* r, u64* a, i32 n) {
     w_set(r, a);
     for i32 i = 0; i < n; i++ { fe_sqr(r, r); }
 }
 
 // r = a^(p - 2) = 1/a, by a fixed addition chain: 255
 // squarings and 12 multiplications, the same whatever a is.
-private void fe_inv(u32* r, u32* z) {
-    u32[8] t10; u32[8] t11; u32[8] t111; u32[8] t111111; u32[8] x12; u32[8] x15; u32[8] x16;
-    u32[8] x32; u32[8] i53; u32[8] x47; u32[8] t;
+private void fe_inv(u64* r, u64* z) {
+    u64[4] t10; u64[4] t11; u64[4] t111; u64[4] t111111; u64[4] x12; u64[4] x15; u64[4] x16;
+    u64[4] x32; u64[4] i53; u64[4] x47; u64[4] t;
     fe_sqr(&t10[0], z);
     fe_mul(&t11[0], &t10[0], z);
     fe_sqr(&t[0], &t11[0]);
@@ -274,8 +293,8 @@ private void fe_inv(u32* r, u32* z) {
 // --- the curve ---------------------------------------------------------------
 
 // Doubles the Jacobian point (x, y, z) in place (dbl-2001-b, a = -3).
-private void jac_double(u32* x, u32* y, u32* z) {
-    u32[8] delta; u32[8] gamma; u32[8] beta; u32[8] alpha; u32[8] t; u32[8] u;
+private void jac_double(u64* x, u64* y, u64* z) {
+    u64[4] delta; u64[4] gamma; u64[4] beta; u64[4] alpha; u64[4] t; u64[4] u;
     fe_sqr(&delta[0], z);
     fe_sqr(&gamma[0], y);
     fe_mul(&beta[0], x, &gamma[0]);
@@ -304,8 +323,8 @@ private void jac_double(u32* x, u32* y, u32* z) {
 
 // Adds the affine point (ax, ay) to the Jacobian point (x, y, z) in place
 // (madd-2007-bl). The two must differ and neither be at infinity.
-private void jac_add_affine(u32* x, u32* y, u32* z, u32* ax, u32* ay) {
-    u32[8] z1z1; u32[8] u2; u32[8] s2; u32[8] h; u32[8] hh; u32[8] i; u32[8] j; u32[8] r; u32[8] v; u32[8] t;
+private void jac_add_affine(u64* x, u64* y, u64* z, u64* ax, u64* ay) {
+    u64[4] z1z1; u64[4] u2; u64[4] s2; u64[4] h; u64[4] hh; u64[4] i; u64[4] j; u64[4] r; u64[4] v; u64[4] t;
     fe_sqr(&z1z1[0], z);
     fe_mul(&u2[0], ax, &z1z1[0]);
     fe_mul(&t[0], z, &z1z1[0]);
@@ -322,7 +341,7 @@ private void jac_add_affine(u32* x, u32* y, u32* z, u32* ax, u32* ay) {
     fe_sub(&t[0], &t[0], &j[0]);
     fe_sub(&t[0], &t[0], &v[0]);
     fe_sub(&t[0], &t[0], &v[0]);                             // x3 = r^2 - J - 2V
-    u32[8] zs;
+    u64[4] zs;
     fe_add(&zs[0], z, &h[0]);
     fe_sqr(&zs[0], &zs[0]);
     fe_sub(&zs[0], &zs[0], &z1z1[0]);
@@ -335,8 +354,8 @@ private void jac_add_affine(u32* x, u32* y, u32* z, u32* ax, u32* ay) {
     w_set(x, &t[0]);
 }
 
-private void jac_to_affine(u32* ax, u32* ay, u32* x, u32* y, u32* z) {
-    u32[8] zi; u32[8] zi2; u32[8] zi3;
+private void jac_to_affine(u64* ax, u64* ay, u64* x, u64* y, u64* z) {
+    u64[4] zi; u64[4] zi2; u64[4] zi3;
     fe_inv(&zi[0], z);
     fe_sqr(&zi2[0], &zi[0]);
     fe_mul(&zi3[0], &zi2[0], &zi[0]);
@@ -350,57 +369,57 @@ private void jac_to_affine(u32* ax, u32* ay, u32* x, u32* y, u32* z) {
 // Nothing here is secret, so ordinary branches are fine.
 private bool p256_table_build() {
     if p256_table != null { return true; }
-    u32* t = alloc<u32>(P256_ROWS * P256_COLS * 16);
+    u64* t = alloc<u64>(P256_ROWS * P256_COLS * 8);
     if t == null { return false; }
-    u32* jx = alloc<u32>(P256_COLS * 8);
-    u32* jy = alloc<u32>(P256_COLS * 8);
-    u32* jz = alloc<u32>(P256_COLS * 8);
-    u32* pre = alloc<u32>(P256_COLS * 8);
+    u64* jx = alloc<u64>(P256_COLS * 4);
+    u64* jy = alloc<u64>(P256_COLS * 4);
+    u64* jz = alloc<u64>(P256_COLS * 4);
+    u64* pre = alloc<u64>(P256_COLS * 4);
     defer free(jx);
     defer free(jy);
     defer free(jz);
     defer free(pre);
-    u32[8] bx; u32[8] by;                  // 16^j * G, affine
+    u64[4] bx; u64[4] by;                  // 16^j * G, affine
     w_set(&bx[0], &P256_GX[0]);
     w_set(&by[0], &P256_GY[0]);
     for i32 row = 0; row < P256_ROWS; row++ {
         // i * base for i = 1..15: 1 the base, 2 its double, the rest sums.
-        u32[8] x; u32[8] y; u32[8] z;
+        u64[4] x; u64[4] y; u64[4] z;
         w_set(&x[0], &bx[0]);
         w_set(&y[0], &by[0]);
         w_zero(&z[0]);
         z[0] = 1;
         for i32 col = 0; col < P256_COLS; col++ {
-            w_set(jx + col * 8, &x[0]);
-            w_set(jy + col * 8, &y[0]);
-            w_set(jz + col * 8, &z[0]);
+            w_set(jx + col * 4, &x[0]);
+            w_set(jy + col * 4, &y[0]);
+            w_set(jz + col * 4, &z[0]);
             if col == 0 { jac_double(&x[0], &y[0], &z[0]); }
             else { jac_add_affine(&x[0], &y[0], &z[0], &bx[0], &by[0]); }
         }
         // 16 * base, the next row's, from the 15th point plus the base.
-        u32[8] nx; u32[8] ny; u32[8] nz;
+        u64[4] nx; u64[4] ny; u64[4] nz;
         w_set(&nx[0], &x[0]);
         w_set(&ny[0], &y[0]);
         w_set(&nz[0], &z[0]);
         // pre[i] = z_0 * ... * z_i
         w_set(pre, jz);
-        for i32 col = 1; col < P256_COLS; col++ { fe_mul(pre + col * 8, pre + (col - 1) * 8, jz + col * 8); }
-        u32[8] inv;
-        fe_inv(&inv[0], pre + (P256_COLS - 1) * 8);
+        for i32 col = 1; col < P256_COLS; col++ { fe_mul(pre + col * 4, pre + (col - 1) * 4, jz + col * 4); }
+        u64[4] inv;
+        fe_inv(&inv[0], pre + (P256_COLS - 1) * 4);
         for i32 col = P256_COLS - 1; col >= 0; col-- {
-            u32[8] zi;
+            u64[4] zi;
             if col > 0 {
-                fe_mul(&zi[0], &inv[0], pre + (col - 1) * 8);
-                fe_mul(&inv[0], &inv[0], jz + col * 8);
+                fe_mul(&zi[0], &inv[0], pre + (col - 1) * 4);
+                fe_mul(&inv[0], &inv[0], jz + col * 4);
             } else {
                 w_set(&zi[0], &inv[0]);
             }
-            u32[8] zi2; u32[8] zi3;
+            u64[4] zi2; u64[4] zi3;
             fe_sqr(&zi2[0], &zi[0]);
             fe_mul(&zi3[0], &zi2[0], &zi[0]);
-            u32* e = t + (row * P256_COLS + col) * 16;
-            fe_mul(e, jx + col * 8, &zi2[0]);
-            fe_mul(e + 8, jy + col * 8, &zi3[0]);
+            u64* e = t + (row * P256_COLS + col) * 8;
+            fe_mul(e, jx + col * 4, &zi2[0]);
+            fe_mul(e + 4, jy + col * 4, &zi3[0]);
         }
         jac_to_affine(&bx[0], &by[0], &nx[0], &ny[0], &nz[0]);
     }
@@ -408,50 +427,50 @@ private bool p256_table_build() {
     return true;
 }
 
-// All ones when a == b, else zero, without a branch (a, b < 2^31).
-private u32 mask_eq(u32 a, u32 b) {
-    u32 x = a ^ b;
-    return cast(u32, 0) - ((x - 1) >> 31);
+// All ones when a == b, else zero, without a branch (a, b < 2^63).
+private u64 mask_eq(u64 a, u64 b) {
+    u64 x = a ^ b;
+    return cast(u64, 0) - ((x - 1) >> 63);
 }
 
 // (ax, ay) = k * G, affine; k in [1, n - 1]. False when the table could
 // not be built.
-bool p256_base_mult(u32* ax, u32* ay, u32* k) {
+bool p256_base_mult(u64* ax, u64* ay, u64* k) {
     if !p256_table_build() { return false; }
-    u32[8] x; u32[8] y; u32[8] z;
+    u64[4] x; u64[4] y; u64[4] z;
     w_zero(&x[0]);
     w_zero(&y[0]);
     w_zero(&z[0]);
-    u32[8] one;
+    u64[4] one;
     w_zero(&one[0]);
     one[0] = 1;
-    u32 empty = cast(u32, 0) - 1;          // all ones while the sum is at infinity
+    u64 empty = cast(u64, 0) - 1;          // all ones while the sum is at infinity
     for i32 row = 0; row < P256_ROWS; row++ {
-        u32 d = (k[row / 8] >> cast(u32, (row % 8) * 4)) & 15;
+        u64 d = (k[row / 16] >> cast(u64, (row % 16) * 4)) & 15;
         // The entry for d, read by scanning the whole row.
-        u32[16] e;
-        for i32 w = 0; w < 16; w++ { e[w] = 0; }
-        u32* rowp = p256_table + row * P256_COLS * 16;
+        u64[8] e;
+        for i32 w = 0; w < 8; w++ { e[w] = 0; }
+        u64* rowp = p256_table + row * P256_COLS * 8;
         for i32 col = 0; col < P256_COLS; col++ {
-            u32 m = mask_eq(d, cast(u32, col + 1));
-            u32* src = rowp + col * 16;
-            for i32 w = 0; w < 16; w++ { e[w] = e[w] | (src[w] & m); }
+            u64 m = mask_eq(d, cast(u64, col + 1));
+            u64* src = rowp + col * 8;
+            for i32 w = 0; w < 8; w++ { e[w] = e[w] | (src[w] & m); }
         }
         // The sum with the entry, kept only when d is nonzero; while the
         // sum is at infinity it becomes the entry itself.
-        u32[8] nx; u32[8] ny; u32[8] nz;
+        u64[4] nx; u64[4] ny; u64[4] nz;
         w_set(&nx[0], &x[0]);
         w_set(&ny[0], &y[0]);
         w_set(&nz[0], &z[0]);
-        jac_add_affine(&nx[0], &ny[0], &nz[0], &e[0], &e[8]);
-        u32 take = ~mask_eq(d, 0);
-        u32 fresh = take & empty;
-        u32 add = take & ~empty;
+        jac_add_affine(&nx[0], &ny[0], &nz[0], &e[0], &e[4]);
+        u64 take = ~mask_eq(d, 0);
+        u64 fresh = take & empty;
+        u64 add = take & ~empty;
         w_select(&x[0], &nx[0], add);
         w_select(&y[0], &ny[0], add);
         w_select(&z[0], &nz[0], add);
         w_select(&x[0], &e[0], fresh);
-        w_select(&y[0], &e[8], fresh);
+        w_select(&y[0], &e[4], fresh);
         w_select(&z[0], &one[0], fresh);
         empty = empty & ~take;
     }
@@ -461,128 +480,140 @@ bool p256_base_mult(u32* ax, u32* ay, u32* k) {
 
 // --- scalars mod n -----------------------------------------------------------
 
-// r = the 16-word c mod n, by long division one bit at a time; the same
+// r = the 8-word c mod n, by long division one bit at a time; the same
 // operations whatever c is.
-private void sc_reduce_wide(u32* r, u32* c) {
-    u32[9] a;                              // the remainder, one word of headroom
-    for i32 i = 0; i < 9; i++ { a[i] = 0; }
-    u32[9] n9;
-    for i32 i = 0; i < 8; i++ { n9[i] = P256_N[i]; }
-    n9[8] = 0;
+private void sc_reduce_wide(u64* r, u64* c) {
+    u64[5] a;                              // the remainder, one word of headroom
+    for i32 i = 0; i < 5; i++ { a[i] = 0; }
+    u64[5] n5;
+    for i32 i = 0; i < 4; i++ { n5[i] = P256_N[i]; }
+    n5[4] = 0;
     for i32 bit = 511; bit >= 0; bit-- {
         // a = 2a + the next bit
-        for i32 i = 8; i > 0; i-- { a[i] = (a[i] << 1) | (a[i - 1] >> 31); }
-        a[0] = (a[0] << 1) | ((c[bit / 32] >> cast(u32, bit % 32)) & 1);
+        for i32 i = 4; i > 0; i-- { a[i] = (a[i] << 1) | (a[i - 1] >> 63); }
+        a[0] = (a[0] << 1) | ((c[bit / 64] >> cast(u64, bit % 64)) & 1);
         // a -= n when a >= n
-        u32[9] t;
-        i64 br = 0;
-        for i32 i = 0; i < 9; i++ {
-            br = br + cast(i64, a[i]) - cast(i64, n9[i]);
-            t[i] = cast(u32, br);
-            br = br >> 32;
+        u64[5] t;
+        u64 br = 0;
+        for i32 i = 0; i < 5; i++ {
+            u64 d = a[i] - n5[i];
+            u64 k = cast(u64, a[i] < n5[i]);
+            t[i] = d - br;
+            br = k + cast(u64, d < br);
         }
-        u32 m = cast(u32, br + 1) * 0xFFFFFFFF;    // all ones when no borrow
-        for i32 i = 0; i < 9; i++ { a[i] = (a[i] & ~m) | (t[i] & m); }
+        u64 m = br - 1;                    // all ones when no borrow
+        for i32 i = 0; i < 5; i++ { a[i] = (a[i] & ~m) | (t[i] & m); }
     }
-    for i32 i = 0; i < 8; i++ { r[i] = a[i]; }
+    for i32 i = 0; i < 4; i++ { r[i] = a[i]; }
 }
 
-// Montgomery multiplication mod n (CIOS, 32-bit words): r = a b / 2^256
+// Montgomery multiplication mod n (CIOS, 64-bit words): r = a b / 2^256
 // mod n. A product needs two of them, the second by 2^512 mod n.
-private u32[8] p256_r2 = { 0, 0, 0, 0, 0, 0, 0, 0 };   // 2^512 mod n
-private u32 p256_n0 = 0;                                // -1/n mod 2^32
+private u64[4] p256_r2 = { 0, 0, 0, 0 };   // 2^512 mod n
+private u64 p256_n0 = 0;                    // -1/n mod 2^64
 private bool p256_mont_ready = false;
 
-private void mont_mul(u32* r, u32* a, u32* b) {
-    u64[10] t;
-    for i32 i = 0; i < 10; i++ { t[i] = 0; }
-    for i32 i = 0; i < 8; i++ {
+private void mont_mul(u64* r, u64* a, u64* b) {
+    u64[6] t;
+    for i32 i = 0; i < 6; i++ { t[i] = 0; }
+    for i32 i = 0; i < 4; i++ {
         u64 c = 0;
-        u64 bi = cast(u64, b[i]);
-        for i32 j = 0; j < 8; j++ {
-            c = t[j] + cast(u64, a[j]) * bi + c;
-            t[j] = c & 0xFFFFFFFF;
-            c = c >> 32;
+        u64 bi = b[i];
+        for i32 j = 0; j < 4; j++ {
+            u64 lo = a[j] * bi;
+            u64 hi = mulhi(a[j], bi);
+            u64 s = t[j] + lo;
+            u64 k = cast(u64, s < lo);
+            u64 u = s + c;
+            c = hi + k + cast(u64, u < c);
+            t[j] = u;
         }
-        c = t[8] + c;
-        t[8] = c & 0xFFFFFFFF;
-        t[9] = c >> 32;
-        u64 m = (t[0] * cast(u64, p256_n0)) & 0xFFFFFFFF;
-        c = (t[0] + m * cast(u64, P256_N[0])) >> 32;
-        for i32 j = 1; j < 8; j++ {
-            c = t[j] + m * cast(u64, P256_N[j]) + c;
-            t[j - 1] = c & 0xFFFFFFFF;
-            c = c >> 32;
+        u64 s4 = t[4] + c;
+        t[4] = s4;
+        t[5] = cast(u64, s4 < c);
+        u64 m = t[0] * p256_n0;
+        // t = (t + m n) / 2^64: the low word becomes zero and drops off.
+        u64 lo0 = m * P256_N[0];
+        u64 s0 = t[0] + lo0;
+        c = mulhi(m, P256_N[0]) + cast(u64, s0 < lo0);
+        for i32 j = 1; j < 4; j++ {
+            u64 lo = m * P256_N[j];
+            u64 hi = mulhi(m, P256_N[j]);
+            u64 s = t[j] + lo;
+            u64 k = cast(u64, s < lo);
+            u64 u = s + c;
+            c = hi + k + cast(u64, u < c);
+            t[j - 1] = u;
         }
-        c = t[8] + c;
-        t[7] = c & 0xFFFFFFFF;
-        t[8] = t[9] + (c >> 32);
+        u64 s3 = t[4] + c;
+        t[3] = s3;
+        t[4] = t[5] + cast(u64, s3 < c);
     }
-    u32[8] v;
-    for i32 i = 0; i < 8; i++ { v[i] = cast(u32, t[i]); }
-    u32[8] w;
-    u32 borrow = w_sub(&w[0], &v[0], &P256_N[0]);
-    w_select(&v[0], &w[0], (borrow - 1) | (cast(u32, 0) - cast(u32, t[8])));
+    u64[4] v;
+    for i32 i = 0; i < 4; i++ { v[i] = t[i]; }
+    u64[4] w;
+    u64 borrow = w_sub(&w[0], &v[0], &P256_N[0]);
+    w_select(&v[0], &w[0], (borrow - 1) | (cast(u64, 0) - t[4]));
     w_set(r, &v[0]);
 }
 
 private void mont_init() {
     if p256_mont_ready { return; }
-    // -1/n mod 2^32 by Newton's iteration: each step doubles the bits.
-    u32 inv = P256_N[0];
-    for i32 i = 0; i < 5; i++ { inv = inv * (2 - P256_N[0] * inv); }
-    p256_n0 = cast(u32, 0) - inv;
+    // -1/n mod 2^64 by Newton's iteration: each step doubles the bits.
+    u64 inv = P256_N[0];
+    for i32 i = 0; i < 6; i++ { inv = inv * (2 - P256_N[0] * inv); }
+    p256_n0 = cast(u64, 0) - inv;
     // 2^256 mod n is 2^256 - n; its square mod n is 2^512 mod n.
-    u32[8] rm;
-    u32[8] zero;
+    u64[4] rm;
+    u64[4] zero;
     w_zero(&zero[0]);
     ignore w_sub(&rm[0], &zero[0], &P256_N[0]);
-    u32[16] c;
+    u64[8] c;
     w_mul_wide(&c[0], &rm[0], &rm[0]);
     sc_reduce_wide(&p256_r2[0], &c[0]);
     p256_mont_ready = true;
 }
 
 // r = a b mod n.
-private void sc_mul(u32* r, u32* a, u32* b) {
+private void sc_mul(u64* r, u64* a, u64* b) {
     mont_init();
-    u32[8] t;
+    u64[4] t;
     mont_mul(&t[0], a, b);
     mont_mul(r, &t[0], &p256_r2[0]);
 }
 
-private void sc_add(u32* r, u32* a, u32* b) {
-    u32 carry = w_add(r, a, b);
-    u32[8] t;
-    u32 borrow = w_sub(&t[0], r, &P256_N[0]);
-    w_select(r, &t[0], (cast(u32, 0) - carry) | (borrow - 1));
+private void sc_add(u64* r, u64* a, u64* b) {
+    u64 carry = w_add(r, a, b);
+    u64[4] t;
+    u64 borrow = w_sub(&t[0], r, &P256_N[0]);
+    w_select(r, &t[0], (cast(u64, 0) - carry) | (borrow - 1));
 }
 
-private void w_shr1(u32* a, u32 top) {
-    for i32 i = 0; i < 7; i++ { a[i] = (a[i] >> 1) | (a[i + 1] << 31); }
-    a[7] = (a[7] >> 1) | (top << 31);
+private void w_shr1(u64* a, u64 top) {
+    for i32 i = 0; i < 3; i++ { a[i] = (a[i] >> 1) | (a[i + 1] << 63); }
+    a[3] = (a[3] >> 1) | (top << 63);
 }
 
 // x / 2 mod m, for the extended GCD below.
-private void inv_half(u32* x, u32* m) {
-    u32 carry = 0;
+private void inv_half(u64* x, u64* m) {
+    u64 carry = 0;
     if (x[0] & 1) != 0 { carry = w_add(x, x, m); }
     w_shr1(x, carry);
 }
 
 // r = 1/a mod m, by binary extended GCD (micro-ecc's uECC_vli_modInv). Its
 // time depends on a, so a caller with a secret blinds it first.
-private void sc_inv(u32* r, u32* a, u32* m) {
+private void sc_inv(u64* r, u64* a, u64* m) {
     if w_is_zero(a) { w_zero(r); return; }
-    u32[8] u; u32[8] v; u32[8] x1; u32[8] x2;
+    u64[4] u; u64[4] v; u64[4] x1; u64[4] x2;
     w_set(&u[0], a);
     w_set(&v[0], m);
     w_zero(&x1[0]);
     x1[0] = 1;
     w_zero(&x2[0]);
     while true {
-        u32[8] d;
-        u32 lt = w_sub(&d[0], &u[0], &v[0]);            // u < v
+        u64[4] d;
+        u64 lt = w_sub(&d[0], &u[0], &v[0]);            // u < v
         if lt == 0 && w_is_zero(&d[0]) { break; }       // u == v
         if (u[0] & 1) == 0 {
             w_shr1(&u[0], 0);
@@ -608,7 +639,7 @@ private void sc_inv(u32* r, u32* a, u32* m) {
 }
 
 // A uniform random scalar in [1, n - 1].
-private void sc_random(u32* r) {
+private void sc_random(u64* r) {
     while true {
         u8[32] b;
         mc_csprng_bytes(cast(void*, &b[0]), 32);
@@ -624,28 +655,28 @@ private void sc_random(u32* r) {
 i32 p256_sign(u8* private_key, u8* message_hash, u32 hash_size, u8* signature) {
     if hash_size != 32 { return 0; }
     for i32 tries = 0; tries < 64; tries++ {
-        u32[8] k;
+        u64[4] k;
         sc_random(&k[0]);
-        u32[8] px; u32[8] py;
+        u64[4] px; u64[4] py;
         if !p256_base_mult(&px[0], &py[0], &k[0]) { return 0; }
         // r = x mod n
-        u32[8] t;
-        u32 borrow = w_sub(&t[0], &px[0], &P256_N[0]);
+        u64[4] t;
+        u64 borrow = w_sub(&t[0], &px[0], &P256_N[0]);
         w_select(&px[0], &t[0], borrow - 1);
         if w_is_zero(&px[0]) { continue; }
         // 1/k, blinded by a random factor so the inversion's time says
         // nothing about k.
-        u32[8] b;
+        u64[4] b;
         sc_random(&b[0]);
         sc_mul(&k[0], &k[0], &b[0]);
         sc_inv(&k[0], &k[0], &P256_N[0]);
         sc_mul(&k[0], &k[0], &b[0]);
         // s = (e + r d) / k
-        u32[8] d; u32[8] e; u32[8] s;
+        u64[4] d; u64[4] e; u64[4] s;
         w_from_bytes(&d[0], private_key);
         sc_mul(&s[0], &d[0], &px[0]);
         w_from_bytes(&e[0], message_hash);
-        u32 eb = w_sub(&t[0], &e[0], &P256_N[0]);
+        u64 eb = w_sub(&t[0], &e[0], &P256_N[0]);
         w_select(&e[0], &t[0], eb - 1);                   // e mod n
         sc_add(&s[0], &e[0], &s[0]);
         sc_mul(&s[0], &s[0], &k[0]);
@@ -661,27 +692,29 @@ i32 p256_sign(u8* private_key, u8* message_hash, u32 hash_size, u8* signature) {
 
 // --- a self-test ---------------------------------------------------------------
 
-// r = the 16-word c mod m, one bit at a time (the reference).
-private void ref_reduce(u32* r, u32* c, u32* m) {
-    u32[9] a;
-    for i32 i = 0; i < 9; i++ { a[i] = 0; }
+// r = the 8-word c mod m, one bit at a time (the reference).
+private void ref_reduce(u64* r, u64* c, u64* m) {
+    u64[5] a;
+    for i32 i = 0; i < 5; i++ { a[i] = 0; }
     for i32 bit = 511; bit >= 0; bit-- {
-        for i32 i = 8; i > 0; i-- { a[i] = (a[i] << 1) | (a[i - 1] >> 31); }
-        a[0] = (a[0] << 1) | ((c[bit / 32] >> cast(u32, bit % 32)) & 1);
-        u32[9] t;
-        i64 br = 0;
-        for i32 i = 0; i < 9; i++ {
-            br = br + cast(i64, a[i]) - cast(i64, i < 8 ? m[i] : cast(u32, 0));
-            t[i] = cast(u32, br);
-            br = br >> 32;
+        for i32 i = 4; i > 0; i-- { a[i] = (a[i] << 1) | (a[i - 1] >> 63); }
+        a[0] = (a[0] << 1) | ((c[bit / 64] >> cast(u64, bit % 64)) & 1);
+        u64[5] t;
+        u64 br = 0;
+        for i32 i = 0; i < 5; i++ {
+            u64 mi = i < 4 ? m[i] : cast(u64, 0);
+            u64 d = a[i] - mi;
+            u64 k = cast(u64, a[i] < mi);
+            t[i] = d - br;
+            br = k + cast(u64, d < br);
         }
-        if br == 0 { for i32 i = 0; i < 9; i++ { a[i] = t[i]; } }
+        if br == 0 { for i32 i = 0; i < 5; i++ { a[i] = t[i]; } }
     }
-    for i32 i = 0; i < 8; i++ { r[i] = a[i]; }
+    for i32 i = 0; i < 4; i++ { r[i] = a[i]; }
 }
 
-private bool w_eq(u32* a, u32* b) {
-    for i32 i = 0; i < 8; i++ { if a[i] != b[i] { return false; } }
+private bool w_eq(u64* a, u64* b) {
+    for i32 i = 0; i < 4; i++ { if a[i] != b[i] { return false; } }
     return true;
 }
 
@@ -690,16 +723,16 @@ private bool w_eq(u32* a, u32* b) {
 // reductions are most likely to go wrong. The number of mismatches.
 i32 p256_selftest(i32 rounds) {
     i32 bad = 0;
-    u32[8] pm1; u32[8] nm1; u32[8] one; u32[8] ones;
+    u64[4] pm1; u64[4] nm1; u64[4] one; u64[4] ones;
     w_set(&pm1[0], &P256_P[0]);
     pm1[0] = pm1[0] - 1;
     w_set(&nm1[0], &P256_N[0]);
     nm1[0] = nm1[0] - 1;
     w_zero(&one[0]);
     one[0] = 1;
-    for i32 i = 0; i < 8; i++ { ones[i] = 0xFFFFFFFF; }
+    for i32 i = 0; i < 4; i++ { ones[i] = 0xFFFFFFFFFFFFFFFF; }
     for i32 r = 0; r < rounds; r++ {
-        u32[8] a; u32[8] b;
+        u64[4] a; u64[4] b;
         u8[32] ra; u8[32] rb;
         mc_csprng_bytes(cast(void*, &ra[0]), 32);
         mc_csprng_bytes(cast(void*, &rb[0]), 32);
@@ -708,13 +741,13 @@ i32 p256_selftest(i32 rounds) {
         if r % 4 == 1 { w_set(&a[0], &pm1[0]); }
         if r % 4 == 2 { w_set(&b[0], &pm1[0]); w_set(&a[0], &pm1[0]); }
         if r % 8 == 3 { w_set(&a[0], &one[0]); }
-        if r % 16 == 5 { a[0] = 0; a[1] = 0; a[2] = 0; a[3] = 0xFFFFFFFF; }
+        if r % 16 == 5 { a[0] = 0; a[1] = 0xFFFFFFFF00000000; }
         // field operands below p
-        u32[8] t;
+        u64[4] t;
         if w_sub(&t[0], &a[0], &P256_P[0]) == 0 { w_set(&a[0], &t[0]); }
         if w_sub(&t[0], &b[0], &P256_P[0]) == 0 { w_set(&b[0], &t[0]); }
-        u32[16] c;
-        u32[8] want; u32[8] got;
+        u64[8] c;
+        u64[4] want; u64[4] got;
         w_mul_wide(&c[0], &a[0], &b[0]);
         ref_reduce(&want[0], &c[0], &P256_P[0]);
         fe_mul(&got[0], &a[0], &b[0]);
