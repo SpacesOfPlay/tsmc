@@ -101,7 +101,13 @@ acceptable → `accept`, wrap the new fd, emit `'connection'`. `.ref()`/
 Above `net`: an HTTP/1.1 codec (request writer + streaming response
 parser with chunked transfer-encoding and keep-alive). `http`/`https`
 expose `request`/`get`, `ClientRequest`, `IncomingMessage`, and
-`createServer`. `fetch` + `Headers`/`Request`/`Response` wrap the client
+`createServer`. A server response goes out as it is written: the head
+with the first write, then each write, chunked when no Content-Length is
+set (on HTTP/1.0 the body ends with the connection instead); a body that
+`end()` sends whole gets a Content-Length. `write` returns false when the
+connection holds more than it wants and `'drain'` follows, and a response
+hears `'close'` if its connection goes before it ends.
+`fetch` + `Headers`/`Request`/`Response` wrap the client
 codec and resolve a Promise with a `Response` whose body is available as
 `.text()`/`.json()`/`.arrayBuffer()`. `https` is exactly `http` over a
 TLS handle (§4).

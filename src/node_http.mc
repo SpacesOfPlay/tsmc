@@ -139,12 +139,15 @@ class ServerResponse extends EventEmitter {
     this.statusMessage = '';
     this.headersSent = false;
     this.finished = false;
+    this.writableEnded = false;
     this._headers = {};
-    this._body = [];
     // Set by the server for a request whose connection may be reused. A
     // response built any other way closes, which is what this did before
     // there was a choice.
     this._keepAlive = false;
+    // An HTTP/1.0 request: a body of unknown length cannot be chunked.
+    this._http10 = false;
+    this._chunked = false;
     this._onDone = null;
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
@@ -164,27 +167,40 @@ class ServerResponse extends EventEmitter {
     if (headers) for (const k in headers) this.setHeader(k, headers[k]);
     return this;
   }
-  write(chunk, enc) { this._body.push(toBuf(chunk, enc)); return true; }
-  end(chunk, enc) {
-    if (this.finished) return this;
-    if (chunk != null) this.write(chunk, enc);
-    const body = Buffer.concat(this._body);
-    const reason = this.statusMessage || statusText(this.statusCode);
-    if (this._headers['content-length'] === undefined) this._headers['content-length'] = body.length;
-    if (this._headers['connection'] === undefined) {
-      this._headers['connection'] = this._keepAlive ? 'keep-alive' : 'close';
+  // A response to HEAD, and a 204 or 304, carry no body -- the headers
+  // still describe what a GET would return. Sending one anyway leaves the
+  // client reading it as the start of the next response.
+  _bodyAllowed() {
+    return this._method !== 'HEAD' && this.statusCode !== 204 && this.statusCode !== 304;
+  }
+  // The head, which also settles how the body is framed. `whole` is the
+  // length of a body that end() sends in one piece, or -1 when writes
+  // send it as it comes. A body of unknown length is chunked; an HTTP/1.0
+  // client knows no chunks, so its body ends with the connection.
+  _head(whole) {
+    const h = this._headers;
+    const te = String(h['transfer-encoding'] || '').toLowerCase();
+    if (te.indexOf('chunked') >= 0) {
+      this._chunked = this._bodyAllowed();
+    } else if (h['content-length'] === undefined) {
+      if (whole >= 0) h['content-length'] = whole;
+      else if (this._bodyAllowed()) {
+        if (this._http10) this._keepAlive = false;
+        else { h['transfer-encoding'] = 'chunked'; this._chunked = true; }
+      }
     }
+    if (h['connection'] === undefined) h['connection'] = this._keepAlive ? 'keep-alive' : 'close';
     // A handler that asked to close outranks the server's willingness to
     // keep going, and what goes on the wire has to be what happens.
-    const connHdr = String(this._headers['connection']).toLowerCase();
-    const persist = this._keepAlive && connHdr.indexOf('close') < 0;
-    this._keepAlive = persist;
+    const connHdr = String(h['connection']).toLowerCase();
+    this._keepAlive = this._keepAlive && connHdr.indexOf('close') < 0;
+    const reason = this.statusMessage || statusText(this.statusCode);
     let head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + CRLF;
     // An array value means one header line per element, not one line holding a
     // comma-joined list: that is how Set-Cookie sends several cookies, and
     // folding them produces a single cookie no client can take apart.
-    for (const k in this._headers) {
-      const v = this._headers[k];
+    for (const k in h) {
+      const v = h[k];
       if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) head += canon(k) + ': ' + v[i] + CRLF;
       } else {
@@ -193,24 +209,67 @@ class ServerResponse extends EventEmitter {
     }
     head += CRLF;
     this.headersSent = true;
-    this.finished = true;
-    // A response to HEAD, and a 204 or 304, carry no body -- the headers
-    // still describe what a GET would return. Sending one anyway leaves the
-    // client reading it as the start of the next response.
-    const bodyAllowed = this._method !== 'HEAD'
-      && this.statusCode !== 204 && this.statusCode !== 304;
-    const headBuf = Buffer.from(head, 'utf8');
-    // A small body goes in the same write as the head: over TLS each
-    // write is a record and a segment of its own, and a reply in two
-    // segments is twice as likely to lose one. A large one is not copied.
-    if (body.length && bodyAllowed && body.length <= 16384) {
-      this.socket.write(Buffer.concat([headBuf, body]));
-    } else {
-      this.socket.write(headBuf);
-      if (body.length && bodyAllowed) this.socket.write(body);
+    return Buffer.from(head, 'utf8');
+  }
+  // `data` as it goes on the wire: as a chunk when chunked, nothing when
+  // this response has no body.
+  _framed(data, out) {
+    if (data.length === 0 || !this._bodyAllowed()) return;
+    if (this._chunked) out.push(Buffer.from(data.length.toString(16) + CRLF, 'latin1'), data, Buffer.from(CRLF, 'latin1'));
+    else out.push(data);
+  }
+  // Writes the pieces. Small ones go in one write: over TLS each write is
+  // a record and a segment of its own, and a reply in two segments is
+  // twice as likely to lose one. A large one is not copied.
+  _send(parts) {
+    if (parts.length === 0) return true;
+    let n = 0;
+    for (let i = 0; i < parts.length; i++) n += parts[i].length;
+    if (parts.length === 1) return this.socket.write(parts[0]);
+    if (n <= 16384) return this.socket.write(Buffer.concat(parts));
+    let ok = true;
+    for (let i = 0; i < parts.length; i++) ok = this.socket.write(parts[i]);
+    return ok;
+  }
+  // Sends the head now, before any of the body.
+  flushHeaders() {
+    if (!this.headersSent && !this.finished) this._send([this._head(-1)]);
+  }
+  // Sends `chunk` now, the head first if it has not gone. Returns false
+  // when the connection holds more than it wants to (wait for 'drain').
+  write(chunk, enc, cb) {
+    if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (this.finished) {
+      const e = new Error('write after end');
+      e.code = 'ERR_STREAM_WRITE_AFTER_END';
+      if (typeof cb === 'function') queueMicrotask(() => cb(e));
+      if (this.listenerCount('error') > 0) queueMicrotask(() => this.emit('error', e));
+      return false;
     }
-    if (!persist) this.socket.end();
+    const out = [];
+    if (!this.headersSent) out.push(this._head(-1));
+    this._framed(toBuf(chunk, enc), out);
+    const ok = this._send(out);
+    if (typeof cb === 'function') queueMicrotask(cb);
+    return ok;
+  }
+  end(chunk, enc, cb) {
+    if (typeof chunk === 'function') { cb = chunk; chunk = null; }
+    else if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (this.finished) return this;
+    if (typeof cb === 'function') this.once('finish', cb);
+    const data = toBuf(chunk, enc);
+    const out = [];
+    // Nothing written yet: the whole body is here, and its length known.
+    if (!this.headersSent) out.push(this._head(data.length));
+    this._framed(data, out);
+    if (this._chunked) out.push(Buffer.from('0' + CRLF + CRLF, 'latin1'));
+    this._send(out);
+    this.finished = true;
+    this.writableEnded = true;
+    if (!this._keepAlive) this.socket.end();
     this.emit('finish');
+    this.emit('close');
     if (this._onDone) this._onDone();
     return this;
   }
@@ -328,8 +387,17 @@ function serveConnection(server, socket) {
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
   const onError = (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); };
-  const onClose = () => { clearDeadline(); state = 'done'; };
+  // A response that has not ended hears that its connection is gone, so a
+  // handler writing as things happen can stop; one waiting to write more
+  // hears that it may.
+  const onClose = () => {
+    clearDeadline();
+    state = 'done';
+    if (res !== null && !res.finished) res.emit('close');
+  };
+  const onDrain = () => { if (res !== null) res.emit('drain'); };
   socket.on('data', onData);
+  socket.on('drain', onDrain);
   socket.on('end', onEnd);
   socket.on('error', onError);
   socket.on('close', onClose);
@@ -343,6 +411,7 @@ function serveConnection(server, socket) {
     socket.removeListener('end', onEnd);
     socket.removeListener('error', onError);
     socket.removeListener('close', onClose);
+    socket.removeListener('drain', onDrain);
     state = 'done';
     const head = buf;
     buf = Buffer.alloc(0);
@@ -394,6 +463,7 @@ function serveConnection(server, socket) {
       state = 'body';
       res = new ServerResponse(socket, msg.method);
       res._keepAlive = wantsKeepAlive(msg);
+      res._http10 = msg.httpVersion === '1.0';
       res._onDone = onDone;
       server.emit('request', msg, res);
     }

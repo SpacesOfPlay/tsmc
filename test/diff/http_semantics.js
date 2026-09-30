@@ -5,9 +5,9 @@
 //
 // Which framing a response uses -- Content-Length or chunked -- is not
 // asserted: both are legal HTTP/1.1 and the choice is an implementation
-// matter. node buffers less and chunks; tsmc knows the whole body and sends a
-// length. What is checked is that the response IS framed and the body arrives
-// whole.
+// matter, and both runtimes choose by how the handler writes (http_streaming
+// checks that). What is checked is that the response IS framed and the body
+// arrives whole.
 
 const http = require('http');
 
