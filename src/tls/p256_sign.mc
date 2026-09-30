@@ -18,10 +18,10 @@
 //
 // The arithmetic is this module's own, as micro-ecc keeps its field
 // routines private: elements as four 64-bit words, least significant
-// first; a product as 16 exact 64x64 multiplications (`*` for the low
-// half, `mulhi` for the high), a square as 10, reduced with the NIST
-// method for p-256 (FIPS 186-4 D.2.3) over the 32-bit halves of the
-// words; inversion in the field by a fixed addition chain of 255
+// first; a product as 16 exact 64x64 multiplications accumulated by
+// column with `mac128`, reduced with the NIST method for p-256 (FIPS
+// 186-4 D.2.3) over the 32-bit halves of the words; inversion in the
+// field by a fixed addition chain of 255
 // squarings and 12 multiplications (constant time), and of the nonce by
 // binary extended GCD behind a random blinding factor, as micro-ecc does
 // it. Products mod n are Montgomery multiplications. The table's rows
@@ -133,25 +133,22 @@ private void fe_sub(u64* r, u64* a, u64* b) {
     w_select(r, &t[0], cast(u64, 0) - borrow);
 }
 
-// r = the 8-word product a * b, a row of four products per word of b,
-// each added into the running row with a one-word carry. The carry
-// hi + k1 + k2 cannot wrap: a b + t + c is below 2^128.
+// r = the 8-word product a * b in r[0..7], with r[8] the word the last
+// column carries into. The 16 products go in by column into a local:
+// each mac128 adds a product into three words, and taking the columns
+// in order keeps the third word a small count of carries, so it never
+// wraps. The local is copied out word by word so it stays in registers.
 private void w_mul_wide(u64* r, u64* a, u64* b) {
-    for i32 k = 0; k < 8; k++ { r[k] = 0; }
-    for i32 i = 0; i < 4; i++ {
-        u64 c = 0;
-        u64 bi = b[i];
-        for i32 j = 0; j < 4; j++ {
-            u64 lo = a[j] * bi;
-            u64 hi = mulhi(a[j], bi);
-            u64 s = r[i + j] + lo;
-            u64 k = cast(u64, s < lo);
-            u64 u = s + c;
-            c = hi + k + cast(u64, u < c);
-            r[i + j] = u;
-        }
-        r[i + 4] = c;
-    }
+    u64[9] t;
+    mac128(&t[0], a[0], b[0]);
+    mac128(&t[1], a[0], b[1]); mac128(&t[1], a[1], b[0]);
+    mac128(&t[2], a[0], b[2]); mac128(&t[2], a[1], b[1]); mac128(&t[2], a[2], b[0]);
+    mac128(&t[3], a[0], b[3]); mac128(&t[3], a[1], b[2]); mac128(&t[3], a[2], b[1]); mac128(&t[3], a[3], b[0]);
+    mac128(&t[4], a[1], b[3]); mac128(&t[4], a[2], b[2]); mac128(&t[4], a[3], b[1]);
+    mac128(&t[5], a[2], b[3]); mac128(&t[5], a[3], b[2]);
+    mac128(&t[6], a[3], b[3]);
+    r[0] = t[0]; r[1] = t[1]; r[2] = t[2]; r[3] = t[3]; r[4] = t[4];
+    r[5] = t[5]; r[6] = t[6]; r[7] = t[7]; r[8] = t[8];
 }
 
 // r = the 8-word c mod p (FIPS 186-4 D.2.3) over the sixteen 32-bit
@@ -205,51 +202,17 @@ private void fe_reduce(u64* r, u64* c) {
 }
 
 private void fe_mul(u64* r, u64* a, u64* b) {
-    u64[8] c;
+    u64[9] c;
     w_mul_wide(&c[0], a, b);
     fe_reduce(r, &c[0]);
 }
 
-// r = a^2: the products a[i] a[j] with i < j once and doubled, the
-// squares once, 10 multiplications where a product takes 16.
+// r = a^2, as the general product. The 10-product form (cross products
+// once and doubled) measured slower: its doubled words need a full
+// carry chain before the squares go in, which the column form avoids.
 private void fe_sqr(u64* r, u64* a) {
-    u64[8] t;
-    for i32 k = 0; k < 8; k++ { t[k] = 0; }
-    for i32 i = 0; i < 3; i++ {
-        u64 c = 0;
-        u64 ai = a[i];
-        for i32 j = i + 1; j < 4; j++ {
-            u64 lo = ai * a[j];
-            u64 hi = mulhi(ai, a[j]);
-            u64 s = t[i + j] + lo;
-            u64 k = cast(u64, s < lo);
-            u64 u = s + c;
-            c = hi + k + cast(u64, u < c);
-            t[i + j] = u;
-        }
-        t[i + 4] = c;
-    }
-    u64 top = 0;
-    for i32 k = 0; k < 8; k++ {
-        u64 v = t[k];
-        t[k] = (v << 1) | top;
-        top = v >> 63;
-    }
-    u64 c = 0;
-    for i32 i = 0; i < 4; i++ {
-        u64 lo = a[i] * a[i];
-        u64 hi = mulhi(a[i], a[i]);
-        u64 s = t[2 * i] + lo;
-        u64 k = cast(u64, s < lo);
-        u64 u = s + c;
-        c = k + cast(u64, u < c);
-        t[2 * i] = u;
-        s = t[2 * i + 1] + hi;
-        k = cast(u64, s < hi);
-        u = s + c;
-        c = k + cast(u64, u < c);
-        t[2 * i + 1] = u;
-    }
+    u64[9] t;
+    w_mul_wide(&t[0], a, a);
     fe_reduce(r, &t[0]);
 }
 
@@ -507,53 +470,45 @@ private void sc_reduce_wide(u64* r, u64* c) {
     for i32 i = 0; i < 4; i++ { r[i] = a[i]; }
 }
 
-// Montgomery multiplication mod n (CIOS, 64-bit words): r = a b / 2^256
-// mod n. A product needs two of them, the second by 2^512 mod n.
+// Montgomery multiplication mod n, 64-bit words, by columns: r = a b /
+// 2^256 mod n. Column k takes the products a[i] b[k-i] and m[i] n[k-i],
+// then for k < 4 the word m[k] that makes the column zero, so the
+// result is t[4..8] with t[8] the final carry. A product needs two of
+// these, the second by 2^512 mod n.
 private u64[4] p256_r2 = { 0, 0, 0, 0 };   // 2^512 mod n
 private u64 p256_n0 = 0;                    // -1/n mod 2^64
 private bool p256_mont_ready = false;
 
 private void mont_mul(u64* r, u64* a, u64* b) {
-    u64[6] t;
-    for i32 i = 0; i < 6; i++ { t[i] = 0; }
-    for i32 i = 0; i < 4; i++ {
-        u64 c = 0;
-        u64 bi = b[i];
-        for i32 j = 0; j < 4; j++ {
-            u64 lo = a[j] * bi;
-            u64 hi = mulhi(a[j], bi);
-            u64 s = t[j] + lo;
-            u64 k = cast(u64, s < lo);
-            u64 u = s + c;
-            c = hi + k + cast(u64, u < c);
-            t[j] = u;
-        }
-        u64 s4 = t[4] + c;
-        t[4] = s4;
-        t[5] = cast(u64, s4 < c);
-        u64 m = t[0] * p256_n0;
-        // t = (t + m n) / 2^64: the low word becomes zero and drops off.
-        u64 lo0 = m * P256_N[0];
-        u64 s0 = t[0] + lo0;
-        c = mulhi(m, P256_N[0]) + cast(u64, s0 < lo0);
-        for i32 j = 1; j < 4; j++ {
-            u64 lo = m * P256_N[j];
-            u64 hi = mulhi(m, P256_N[j]);
-            u64 s = t[j] + lo;
-            u64 k = cast(u64, s < lo);
-            u64 u = s + c;
-            c = hi + k + cast(u64, u < c);
-            t[j - 1] = u;
-        }
-        u64 s3 = t[4] + c;
-        t[3] = s3;
-        t[4] = t[5] + cast(u64, s3 < c);
-    }
-    u64[4] v;
-    for i32 i = 0; i < 4; i++ { v[i] = t[i]; }
+    u64[10] t;
+    u64* n = &P256_N[0];
+    u64[4] m;
+    mac128(&t[0], a[0], b[0]);
+    m[0] = t[0] * p256_n0;
+    mac128(&t[0], m[0], n[0]);
+    mac128(&t[1], a[0], b[1]); mac128(&t[1], a[1], b[0]);
+    mac128(&t[1], m[0], n[1]);
+    m[1] = t[1] * p256_n0;
+    mac128(&t[1], m[1], n[0]);
+    mac128(&t[2], a[0], b[2]); mac128(&t[2], a[1], b[1]); mac128(&t[2], a[2], b[0]);
+    mac128(&t[2], m[0], n[2]); mac128(&t[2], m[1], n[1]);
+    m[2] = t[2] * p256_n0;
+    mac128(&t[2], m[2], n[0]);
+    mac128(&t[3], a[0], b[3]); mac128(&t[3], a[1], b[2]); mac128(&t[3], a[2], b[1]); mac128(&t[3], a[3], b[0]);
+    mac128(&t[3], m[0], n[3]); mac128(&t[3], m[1], n[2]); mac128(&t[3], m[2], n[1]);
+    m[3] = t[3] * p256_n0;
+    mac128(&t[3], m[3], n[0]);
+    mac128(&t[4], a[1], b[3]); mac128(&t[4], a[2], b[2]); mac128(&t[4], a[3], b[1]);
+    mac128(&t[4], m[1], n[3]); mac128(&t[4], m[2], n[2]); mac128(&t[4], m[3], n[1]);
+    mac128(&t[5], a[2], b[3]); mac128(&t[5], a[3], b[2]);
+    mac128(&t[5], m[2], n[3]); mac128(&t[5], m[3], n[2]);
+    mac128(&t[6], a[3], b[3]);
+    mac128(&t[6], m[3], n[3]);
+    u64[4] v = { t[4], t[5], t[6], t[7] };
+    u64 top = t[8];
     u64[4] w;
-    u64 borrow = w_sub(&w[0], &v[0], &P256_N[0]);
-    w_select(&v[0], &w[0], (borrow - 1) | (cast(u64, 0) - t[4]));
+    u64 borrow = w_sub(&w[0], &v[0], n);
+    w_select(&v[0], &w[0], (borrow - 1) | (cast(u64, 0) - top));
     w_set(r, &v[0]);
 }
 
@@ -568,7 +523,7 @@ private void mont_init() {
     u64[4] zero;
     w_zero(&zero[0]);
     ignore w_sub(&rm[0], &zero[0], &P256_N[0]);
-    u64[8] c;
+    u64[9] c;
     w_mul_wide(&c[0], &rm[0], &rm[0]);
     sc_reduce_wide(&p256_r2[0], &c[0]);
     p256_mont_ready = true;
@@ -746,7 +701,7 @@ i32 p256_selftest(i32 rounds) {
         u64[4] t;
         if w_sub(&t[0], &a[0], &P256_P[0]) == 0 { w_set(&a[0], &t[0]); }
         if w_sub(&t[0], &b[0], &P256_P[0]) == 0 { w_set(&b[0], &t[0]); }
-        u64[8] c;
+        u64[9] c;
         u64[4] want; u64[4] got;
         w_mul_wide(&c[0], &a[0], &b[0]);
         ref_reduce(&want[0], &c[0], &P256_P[0]);
