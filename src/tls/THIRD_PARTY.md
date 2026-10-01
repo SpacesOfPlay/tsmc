@@ -25,6 +25,7 @@ update nearly lost the first of these by copying a file wholesale.
 | `picotls_bridges_rsa.mc` | `rsa_sign_cert_ctx_t`, the same for RSA keys |
 | `picotls_bridges.mc` | `x25519_keygen`: a fresh key share's public key by `crypto_x25519_dirty_fast` on the clamped secret, the same key as the ladder in half the time. `mc_csprng_bytes`: a uefi/wasm arm over an installable source, `mc_csprng_fail()` on every failure upstream ignores, and a compile-time tripwire for an unhandled target. Upstream returns silently and leaves the buffer holding whatever it held, which is key material out of uninitialised memory |
 | `cvararg_shim.mc` | `puts` and `fwrite` for uefi, over the runtime's console |
+| `cifra_hw.mc` | the hardware AES-GCM behind cifra's `0002-hw-aes-gcm.patch`, from transminc's `ext/cifra_hw.mc`, ahead of it here: GHASH over sixteen powers with Karatsuba, counter blocks made in registers, and the 256-bit arm (VAES, VPCLMULQDQ) in an image built with `CIFRA_HW_256` for an -avx2 target |
 
 Each is marked `LOCAL (tsmc)` in the source. Grep for that before
 updating; a symbol that exists here and not upstream is the other

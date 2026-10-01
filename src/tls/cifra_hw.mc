@@ -29,6 +29,31 @@ bool cifra_hw_force(i32 on) {
     return cifra_hw_on();
 }
 
+// The 256-bit arm (two blocks per VAESENC and VPCLMULQDQ), in an image
+// built with CIFRA_HW_256 (an -avx2 target, where the 256-bit vectors
+// are ymm registers) on a CPU that has both instructions.
+i32 g_cifra_hw_wide = -1;      // -1 not asked yet, 0 128-bit, 1 256-bit
+
+bool cifra_hw_wide() {
+    if g_cifra_hw_wide < 0 {
+        g_cifra_hw_wide = 0;
+        when defined(CIFRA_HW_256) {
+            when arch(x64) {
+                if cifra_hw_on() && cpu_has_vaes() && cpu_has_vpclmulqdq() { g_cifra_hw_wide = 1; }
+            }
+        }
+    }
+    return g_cifra_hw_wide == 1;
+}
+
+// on: 0 for the 128-bit arm, 1 for the 256-bit one where it is built and
+// the CPU has it. Returns whether the 256-bit arm is now in use.
+bool cifra_hw_force_wide(i32 on) {
+    g_cifra_hw_wide = -1;
+    if on == 0 { g_cifra_hw_wide = 0; }
+    return cifra_hw_wide();
+}
+
 // cifra keeps a block as u32 words, each the big-endian value of four
 // bytes, stored little-endian: reversing the bytes of each word gives the
 // block's bytes in order, and the same shuffle turns them back.
@@ -405,9 +430,66 @@ u64x2 cifra_hw_ghash16(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
     return y;
 }
 
+when defined(CIFRA_HW_256) {
+// cifra_hw_ghash16 two blocks to an instruction: pair j is blocks 2j and
+// 2j+1 in one 256-bit vector, against H^(16-2j) and H^(15-2j), whose
+// products and Karatsuba middles add up lane by lane; the two lanes fold
+// into one 256-bit product before the reduction, as the 128-bit form
+// does. The powers are laid out in pairs first, high power in the low
+// lane, since `hp` holds them in ascending order.
+u64x2 cifra_hw_ghash16w(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
+    u8[512] hw;
+    for i32 j = 0; j < 8; j++ {
+        i8x16_store(cast(i8*, &hw[32 * j]), i8x16_load(cast(i8*, hp + 16 * (15 - 2 * j))));
+        i8x16_store(cast(i8*, &hw[32 * j + 16]), i8x16_load(cast(i8*, hp + 16 * (14 - 2 * j))));
+        i8x16_store(cast(i8*, &hw[256 + 32 * j]), i8x16_load(cast(i8*, hp + 256 + 16 * (15 - 2 * j))));
+        i8x16_store(cast(i8*, &hw[256 + 32 * j + 16]), i8x16_load(cast(i8*, hp + 256 + 16 * (14 - 2 * j))));
+    }
+    i8x16 bswap1 = i8x16_load(&g_cifra_hw_bswap[0]);
+    i8x16 halves1 = i8x16_load(&g_cifra_hw_halves[0]);
+    i8x32 bswap = i8x32_pack(bswap1, bswap1);
+    i8x32 halves = i8x32_pack(halves1, halves1);
+    i8x16 zero = cast(i8x16, u64x2{0, 0});
+    u64 i = 0;
+    while i + 256 <= n {
+        u8* q = p + i;
+        i8x32 lo = i8x32_pack(zero, zero);
+        i8x32 hi = lo;
+        i8x32 mid = lo;
+        for i32 j = 0; j < 8; j++ {
+            i8x32 x = byte_shuffle(i8x32_load(cast(i8*, q + 32 * j)), bswap);
+            if j == 0 { x = x ^ i8x32_pack(cast(i8x16, y), zero); }
+            i8x32 h = i8x32_load(cast(i8*, &hw[32 * j]));
+            i8x32 l = clmul(x, h, 0x00);
+            i8x32 t = clmul(x, h, 0x11);
+            lo = lo ^ l;
+            hi = hi ^ t;
+            mid = mid ^ clmul(x ^ byte_shuffle(x, halves), i8x32_load(cast(i8*, &hw[256 + 32 * j])), 0x00) ^ l ^ t;
+        }
+        u64x2 lo1 = cast(u64x2, i8x32_lo(lo) ^ i8x32_hi(lo));
+        u64x2 hi1 = cast(u64x2, i8x32_lo(hi) ^ i8x32_hi(hi));
+        i8x16 mid1 = i8x32_lo(mid) ^ i8x32_hi(mid);
+        lo1 = lo1 ^ cast(u64x2, byte_shl(mid1, 8));
+        hi1 = hi1 ^ cast(u64x2, byte_shr(mid1, 8));
+        y = cifra_hw_reduce_rev(lo1, hi1);
+        i = i + 256;
+    }
+    *done = i;
+    return y;
+}
+}
+
 u64x2 cifra_hw_ghash(u64x2 y, u8* hp, u64 nb, u8* p, u64 n) {
     u64 i = 0;
-    if nb == 16 { y = cifra_hw_ghash16(y, hp, p, n, &i); }
+    bool wide = false;
+    when defined(CIFRA_HW_256) {
+        if nb == 16 && cifra_hw_wide() {
+            y = cifra_hw_ghash16w(y, hp, p, n, &i);
+            wide = true;
+        }
+    }
+    if wide { }
+    else if nb == 16 { y = cifra_hw_ghash16(y, hp, p, n, &i); }
     else { y = cifra_hw_ghash4(y, hp, p, n, &i); }
     u64x2 h1 = u64x2_load(cast(u64*, hp));
     u64x2 h1k = u64x2_load(cast(u64*, hp + 16 * nb));
@@ -452,6 +534,69 @@ void cifra_hw_ctr(u8* rk, u32 rounds, u8* j0, u32 ctr, u8* in, u8* out, u64 n) {
     cb[15] = cast(u8, ctr >> 24);
     int4 cv = cast(int4, i8x16_load(cast(i8*, &cb[0])));
     int4 one = int4{0, 0, 0, 1};
+    // Sixteen blocks at a time, two to an instruction, where the 256-bit
+    // arm is in use; the rest as below.
+    when defined(CIFRA_HW_256) {
+        if n >= 256 && cifra_hw_wide() {
+            u8[480] rk2;                                 // each round key twice
+            for u32 r = 0; r <= rounds; r++ {
+                i8x16 k = i8x16_load(cast(i8*, rk + 16 * cast(u64, r)));
+                i8x32_store(cast(i8*, &rk2[32 * r]), i8x32_pack(k, k));
+            }
+            u8* last2 = &rk2[32 * rounds];
+            while i + 256 <= n {
+                i8x32 k0 = i8x32_load(cast(i8*, &rk2[0]));
+                i8x16 c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x16 c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s0 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s1 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s2 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s3 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s4 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s5 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s6 = i8x32_pack(c0, c1) ^ k0;
+                c0 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                c1 = byte_shuffle(cast(i8x16, cv), rev); cv = cv + one;
+                i8x32 s7 = i8x32_pack(c0, c1) ^ k0;
+                ctr = ctr + 16;
+                for u32 r = 1; r < rounds; r++ {
+                    i8x32 k = i8x32_load(cast(i8*, &rk2[32 * r]));
+                    s0 = aesenc(s0, k);
+                    s1 = aesenc(s1, k);
+                    s2 = aesenc(s2, k);
+                    s3 = aesenc(s3, k);
+                    s4 = aesenc(s4, k);
+                    s5 = aesenc(s5, k);
+                    s6 = aesenc(s6, k);
+                    s7 = aesenc(s7, k);
+                }
+                i8x32 kl = i8x32_load(cast(i8*, last2));
+                u8* ip = in + i;
+                u8* op = out + i;
+                i8x32_store(cast(i8*, op), aesenclast(s0, kl) ^ i8x32_load(cast(i8*, ip)));
+                i8x32_store(cast(i8*, op + 32), aesenclast(s1, kl) ^ i8x32_load(cast(i8*, ip + 32)));
+                i8x32_store(cast(i8*, op + 64), aesenclast(s2, kl) ^ i8x32_load(cast(i8*, ip + 64)));
+                i8x32_store(cast(i8*, op + 96), aesenclast(s3, kl) ^ i8x32_load(cast(i8*, ip + 96)));
+                i8x32_store(cast(i8*, op + 128), aesenclast(s4, kl) ^ i8x32_load(cast(i8*, ip + 128)));
+                i8x32_store(cast(i8*, op + 160), aesenclast(s5, kl) ^ i8x32_load(cast(i8*, ip + 160)));
+                i8x32_store(cast(i8*, op + 192), aesenclast(s6, kl) ^ i8x32_load(cast(i8*, ip + 192)));
+                i8x32_store(cast(i8*, op + 224), aesenclast(s7, kl) ^ i8x32_load(cast(i8*, ip + 224)));
+                i = i + 256;
+            }
+        }
+    }
     while i + 128 <= n {
         i8x16 k0 = i8x16_load(cast(i8*, rk));
         i8x16 s0 = byte_shuffle(cast(i8x16, cv), rev) ^ k0;
