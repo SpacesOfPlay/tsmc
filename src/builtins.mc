@@ -922,7 +922,7 @@ private u32 reflect_key(VM* vm, Value kv, str* sk) {
     Value ks = js_to_string_value(vm, kv);
     vm_pop(vm);
     vm_push(vm, ks);
-    u32 a = atom_intern(&vm.atoms, sview(ks));
+    u32 a = vm_atom_dyn(vm, sview(ks));
     *sk = atom_name(&vm.atoms, a);
     vm_pop(vm);
     return a;
@@ -3545,7 +3545,7 @@ private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value
                 JsObject* p = value_as_object(pair);
                 Value ks = js_to_string_value(vm, js_array_get(p, 0));
                 vm_push(vm, ks);
-                u32 atom = bi_atom(vm, sview(ks));
+                u32 atom = vm_atom_dyn(vm, sview(ks));
                 vm_pop(vm);
                 js_set_prop(o, atom, js_array_get(p, 1));
             }
@@ -3564,7 +3564,7 @@ private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value
                     JsObject* p = value_as_object(e);
                     Value ks = js_to_string_value(vm, js_array_get(p, 0));
                     vm_push(vm, ks);
-                    u32 atom = bi_atom(vm, sview(ks));
+                    u32 atom = vm_atom_dyn(vm, sview(ks));
                     vm_pop(vm);
                     js_set_prop(o, atom, js_array_get(p, 1));
                 }
@@ -5486,7 +5486,7 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
                 p.pos++;
                 Value val = json_parse_value(vm, p);
                 if p.failed { break; }
-                js_set_prop(obj, bi_atom(vm, sview(key)), val);
+                js_set_prop(obj, vm_atom_dyn(vm, sview(key)), val);
                 json_ws(p);
                 if p.pos < p.s.len && *(p.s.data + p.pos) == ',' {
                     p.pos++;
@@ -13172,7 +13172,7 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
             u8 c = *(k.data + i);
             *(kb + i) = c >= cast(u8, 65) && c <= cast(u8, 90) ? cast(u8, c + 32) : c;
         }
-        u32 key = bi_atom(vm, str_from(kb, k.len));
+        u32 key = vm_atom_dyn(vm, str_from(kb, k.len));
         if kb != &lower[0] { free(kb); }
         Value vs = new_str(vm, v);
         vm_push(vm, vs);

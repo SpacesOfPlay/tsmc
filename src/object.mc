@@ -419,7 +419,9 @@ struct JsGenerator {
 
 private void mark_props(GcHeap* h, PropList* p) {
     for i32 i = 0; i < p.len; i++ {
-        gc_mark_value(h, (p.items + i).val);
+        Prop* pr = p.items + i;
+        gc_mark_value(h, pr.val);
+        if pr.key < cast(u32, h.key_marks_len) { *(h.key_marks + pr.key) = cast(u8, 1); }
     }
 }
 

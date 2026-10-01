@@ -158,6 +158,7 @@ struct VM {
     bool has_pending;
     bool unwind_return;   // the pending value is a return completion, not a throw
     bool quiet_errors;    // suppress diagnostic/uncaught printing (embedders running expected-failure sources)
+    i32 key_marks_cap;   // bytes behind heap.key_marks
     u32 atom_length;
     u32 atom_prototype;
     u32 atom_name;
@@ -326,6 +327,9 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
 // collection. Runs before the sweep, while marks are still valid.
 private void vm_weak_sweep(GcHeap* h, void* ctx) {
     VM* vms = cast(VM*, ctx);
+    if h.key_marks_len > 0 {
+        ignore atoms_sweep(&vms.atoms, h.key_marks, h.key_marks_len, h.alloc_total);
+    }
     if !vms.any_weak { return; }
     GcCell* c = h.all;
     while c != null {
@@ -347,8 +351,24 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
     }
 }
 
+// The key marks for this collection: a byte per atom, when there are
+// dynamic atoms for atoms_sweep to consider.
+private void vm_key_marks_reset(GcHeap* h, VM* vm) {
+    h.key_marks_len = 0;
+    if vm.atoms.n_dynamic == 0 { return; }
+    i32 n = atom_count(&vm.atoms);
+    if n > vm.key_marks_cap {
+        if h.key_marks != null { free(h.key_marks); }
+        vm.key_marks_cap = n + n / 2;
+        h.key_marks = alloc<u8>(vm.key_marks_cap);
+    }
+    memset(h.key_marks, 0, cast(i64, n));
+    h.key_marks_len = n;
+}
+
 private void vm_mark_roots(GcHeap* h, void* ctx) {
     VM* vm = cast(VM*, ctx);
+    vm_key_marks_reset(h, vm);
     gc_mark_value(h, vm.pending_new_target);
     gc_mark_value(h, vm.util_inspect_fn);
     for i32 i = 0; i < vm.sp; i++ {
@@ -363,7 +383,10 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 i = 0; i < vm.globals.cap; i++ {
         IntSlot<Value>* sl = vm.globals.slots + i;
-        if sl.state == SLOT_USED { gc_mark_value(h, sl.val); }
+        if sl.state == SLOT_USED {
+            gc_mark_value(h, sl.val);
+            if sl.key < cast(u32, h.key_marks_len) { *(h.key_marks + sl.key) = cast(u8, 1); }
+        }
     }
     for i32 i = 0; i < vm.troots.len; i++ {
         mark_template(h, vec_get(&vm.troots, i));
@@ -2209,9 +2232,15 @@ private u32 key_to_atom(VM* vm, Value key) {
     Value s = js_to_string_value(vm, k);
     vm.sp--;
     vpush(vm, s);
-    u32 a = atom_intern(&vm.atoms, gc_string_view(value_as_string(s)));
+    u32 a = vm_atom_dyn(vm, gc_string_view(value_as_string(s)));
     vm.sp--;
     return a;
+}
+
+// The atom for a property name that arrives as data: the collector frees
+// it once nothing uses it (atom.mc).
+u32 vm_atom_dyn(VM* vm, str name) {
+    return atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
 }
 
 // a + b for two string values. When a high surrogate at the end of a
@@ -3966,6 +3995,7 @@ void vm_init(VM* vm) {
     vm.heap.weak_sweep = &vm_weak_sweep;
     vm.heap.mark_ctx = cast(void*, vm);
     atoms_init(&vm.atoms);
+    vm.key_marks_cap = 0;
     vm.stack = alloc<Value>(VM_STACK_MAX);
     vm.sp = 0;
     vm.frames = alloc<Frame>(VM_FRAMES_MAX);
