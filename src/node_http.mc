@@ -575,7 +575,8 @@ function serveConnection(server, socket) {
     // waits in the buffer, which MAX_HEAD still bounds.
     if (state === 'reply') { return; }
     if (state === 'head') {
-      const he = findHeaderEnd(buf, scanned);
+      let he = __http_head_end(buf, scanned);
+      if (he === undefined) he = findHeaderEnd(buf, scanned);
       if (he < 0) {
         scanned = Math.max(0, buf.length - 3);
         if (buf.length > MAX_HEAD) {
@@ -627,7 +628,7 @@ function serveConnection(server, socket) {
       }
       // The head arrived in time. A body gets its own budget; none
       // expected means it is the server's turn and the clock stops.
-      if (remaining > 0 || chunked) deadline(BODY_MS); else clearDeadline();
+      if (remaining > 0 || chunked) deadline(BODY_MS);
       state = 'body';
       res = new ServerResponse(socket, msg.method);
       res._keepAlive = (facts & F_KEEP) !== 0;

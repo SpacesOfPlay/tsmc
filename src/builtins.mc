@@ -13479,8 +13479,9 @@ private bool http_utf8_view(Value v, u8** p, i32* n) {
 // Connection header, and the keep-alive a "close" in it ends), then the
 // head and `body` (a Buffer, a string in UTF-8, or none for null and
 // undefined), into the TLS session as one record and on to the socket;
-// res.headersSent is set. The bytes taken, -1 when the session failed, or
-// undefined for a response left to the JavaScript: a chunked coding, a
+// res.headersSent is set. The ciphertext the session still holds after
+// it, -1 when the session failed, or undefined for a response left to
+// the JavaScript: a chunked coding, a
 // Connection or coding that is not a string, another encoding, a body
 // past a record, a session with a record's worth queued, or a head the
 // formatter refuses; the last two after the framing, which _frame then
@@ -13557,7 +13558,7 @@ private Value nat_tls_respond(void* vmp, Value callee, Value thisv, Value* args,
     if tls_wants_write(s) {
         vm_handle_set_interest(vm, id, cast(i16, vm_handle_interest(vm, id) | NET_POLLOUT));
     }
-    return value_int(sb.len);
+    return value_int(tls_pending(s));
 }
 
 private void net_install(VM* vm) {

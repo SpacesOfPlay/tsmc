@@ -61,6 +61,19 @@ class TLSSocket extends EventEmitter {
   __onReady(revents) {
     if (this.destroyed) return;
     const st = __tls_pump(this._id, this._paused);
+    // The common case: data, and nothing queued, pending or ending. What
+    // the reader does with it decides whether a flush follows.
+    if (st === HAS_DATA && !this._paused && !this._connecting && this._wq.length === 0 &&
+        !this._needDrain && !this._ending) {
+      this._readAll();
+      if (this.destroyed) return;
+      if (this._wq.length !== 0 || this._needDrain || this._ending) {
+        this._flush();
+        if (this.destroyed) return;
+        this._maybeShutdown();
+      }
+      return;
+    }
     if (st & T_ERR) {
       // A read that failed: what arrived before it is delivered first, as a
       // plain socket delivers it, and the error is a socket error.
@@ -233,10 +246,10 @@ class TLSSocket extends EventEmitter {
   // write().
   _sendResponse(res, reason, body, enc) {
     if (this._wq.length !== 0 || this._corked !== 0 || this._connecting || this.destroyed || this._ending) return false;
-    const n = __tls_respond(this._id, res, reason, body, enc);
-    if (n === undefined) return false;
-    if (n < 0) { this._fail('write EIO', 'EPIPE'); return true; }
-    if (__tls_pending(this._id) >= HWM) this._needDrain = true;
+    const pending = __tls_respond(this._id, res, reason, body, enc);
+    if (pending === undefined) return false;
+    if (pending < 0) { this._fail('write EIO', 'EPIPE'); return true; }
+    if (pending >= HWM) this._needDrain = true;
     return true;
   }
   end(data, enc, cb) {
