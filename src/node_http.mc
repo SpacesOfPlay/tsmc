@@ -176,7 +176,14 @@ class ServerResponse extends EventEmitter {
   // still describe what a GET would return. Sending one anyway leaves the
   // client reading it as the start of the next response.
   _bodyAllowed() {
-    return this._method !== 'HEAD' && this.statusCode !== 204 && this.statusCode !== 304;
+    return this._method !== 'HEAD' && !this._noLength();
+  }
+  // A 1xx or 204 must not carry a Content-Length, and a 304's would have
+  // to be the length a GET is answered with, which is not known here: none
+  // is added (one the handler set stays).
+  _noLength() {
+    const c = this.statusCode;
+    return c === 204 || c === 304 || (c >= 100 && c < 200);
   }
   // The head, which also settles how the body is framed. `whole` is the
   // length of a body that end() sends in one piece, or -1 when writes
@@ -193,7 +200,7 @@ class ServerResponse extends EventEmitter {
     const te = h['transfer-encoding'];
     if (te && String(te).toLowerCase().indexOf('chunked') >= 0) {
       this._chunked = this._bodyAllowed();
-    } else if (h['content-length'] === undefined) {
+    } else if (h['content-length'] === undefined && !this._noLength()) {
       if (whole >= 0) h['content-length'] = whole;
       else if (this._bodyAllowed()) {
         if (this._http10) this._keepAlive = false;
@@ -813,7 +820,10 @@ class ClientRequest extends EventEmitter {
         }
         const te = res.headers['transfer-encoding'];
         const cl = res.headers['content-length'];
-        if (te && te.toLowerCase().indexOf('chunked') >= 0) chunked = true;
+        // A 204, a 304 and the answer to a HEAD have no body, whatever the
+        // headers say: a Content-Length there describes the GET's body.
+        if (self.method === 'HEAD' || res.statusCode === 204 || res.statusCode === 304) remaining = 0;
+        else if (te && te.toLowerCase().indexOf('chunked') >= 0) chunked = true;
         else if (cl !== undefined) remaining = parseInt(cl, 10);
         else remaining = -1;
         state = 'body';

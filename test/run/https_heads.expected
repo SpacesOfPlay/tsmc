@@ -3,9 +3,9 @@ HTTP/1.1 200 OK | Content-Type: text/plain | Content-Length: 9 | Connection: clo
 --- HEAD /
 HTTP/1.1 200 OK | Content-Type: text/plain | Content-Length: 10 | Connection: close |  | 
 --- GET /204
-HTTP/1.1 204 No Content | Content-Length: 0 | Connection: close |  | 
+HTTP/1.1 204 No Content | Connection: close |  | 
 --- GET /304
-HTTP/1.1 304 Not Modified | Etag: x | Content-Length: 0 | Connection: close |  | 
+HTTP/1.1 304 Not Modified | Etag: x | Connection: close |  | 
 --- GET /cookies
 HTTP/1.1 200 OK | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Num: 7 | Content-Length: 1 | Connection: close |  | c
 --- GET /close

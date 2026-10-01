@@ -1,0 +1,9 @@
+server GET /204: HTTP/1.1 204 No Content | Connection: close |  | 
+server GET /304: HTTP/1.1 304 Not Modified | Etag: x | Connection: close |  | 
+server GET /304-length: HTTP/1.1 304 Not Modified | Content-Length: 5 | Connection: close |  | 
+server HEAD /: HTTP/1.1 200 OK | Content-Length: 5 | Connection: close |  | 
+server GET /: HTTP/1.1 200 OK | Content-Length: 5 | Connection: close |  | hello
+client GET /204: 204 ended, body ""
+client GET /304: 304 ended, body ""
+client HEAD /: 200 ended, body ""
+client GET /: 200 ended, body "hello"
