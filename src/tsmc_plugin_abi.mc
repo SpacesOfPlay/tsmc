@@ -18,8 +18,8 @@
 //
 //     void spatial_register(TsmcApi* a, void* reg) { ... }
 //     when !defined(TSMC_STATIC_PLUGINS) {
-//         u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
-//         void tsmc_plugin_register(TsmcApi* a, void* reg) { spatial_register(a, reg); }
+//         export u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
+//         export void tsmc_plugin_register(TsmcApi* a, void* reg) { spatial_register(a, reg); }
 //     }
 //
 // Rules at the seam:

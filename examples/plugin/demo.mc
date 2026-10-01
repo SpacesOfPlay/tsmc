@@ -60,8 +60,8 @@ void demo_register(TsmcApi* a, void* reg) {
 }
 
 // The two symbols tsmc looks up when it compiles this file at require()
-// time. Both must be public.
+// time. Both must be exported: they are what the shared library offers.
 when !defined(TSMC_STATIC_PLUGINS) {
-    u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
-    void tsmc_plugin_register(TsmcApi* a, void* reg) { demo_register(a, reg); }
+    export u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
+    export void tsmc_plugin_register(TsmcApi* a, void* reg) { demo_register(a, reg); }
 }
