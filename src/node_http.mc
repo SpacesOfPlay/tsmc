@@ -184,8 +184,8 @@ class ServerResponse extends EventEmitter {
   // client knows no chunks, so its body ends with the connection.
   _head(whole) {
     const h = this._headers;
-    const te = String(h['transfer-encoding'] || '').toLowerCase();
-    if (te.indexOf('chunked') >= 0) {
+    const te = h['transfer-encoding'];
+    if (te && String(te).toLowerCase().indexOf('chunked') >= 0) {
       this._chunked = this._bodyAllowed();
     } else if (h['content-length'] === undefined) {
       if (whole >= 0) h['content-length'] = whole;
@@ -194,11 +194,10 @@ class ServerResponse extends EventEmitter {
         else { h['transfer-encoding'] = 'chunked'; this._chunked = true; }
       }
     }
-    if (h['connection'] === undefined) h['connection'] = this._keepAlive ? 'keep-alive' : 'close';
     // A handler that asked to close outranks the server's willingness to
     // keep going, and what goes on the wire has to be what happens.
-    const connHdr = String(h['connection']).toLowerCase();
-    this._keepAlive = this._keepAlive && connHdr.indexOf('close') < 0;
+    if (h['connection'] === undefined) h['connection'] = this._keepAlive ? 'keep-alive' : 'close';
+    else if (String(h['connection']).toLowerCase().indexOf('close') >= 0) this._keepAlive = false;
     const reason = this.statusMessage || statusText(this.statusCode);
     const bytes = __http_head_bytes(this.statusCode, reason, h);
     if (bytes !== undefined) {

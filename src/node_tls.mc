@@ -212,8 +212,15 @@ class TLSSocket extends EventEmitter {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }
     if (!this.destroyed && !this._ending) {
       const buf = asBuffer(data, enc);
-      this._wq.push({ buf: buf, off: 0 });
-      this._wqBytes += buf.length;
+      // Nothing queued ahead and room in the session: a record's worth
+      // goes to the session at once, without a queue entry.
+      if (this._wq.length === 0 && this._corked === 0 && !this._connecting &&
+          buf.length <= GATHER && __tls_pending(this._id) < CIPHER_CAP) {
+        if (buf.length > 0 && __tls_write(this._id, buf, 0) < 0) this._fail('write EIO', 'EPIPE');
+      } else {
+        this._wq.push({ buf: buf, off: 0 });
+        this._wqBytes += buf.length;
+      }
     }
     if (typeof cb === 'function') queueMicrotask(cb);
     const ok = this._queued() < HWM;
