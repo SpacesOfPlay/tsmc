@@ -183,6 +183,12 @@ class ServerResponse extends EventEmitter {
   // send it as it comes. A body of unknown length is chunked; an HTTP/1.0
   // client knows no chunks, so its body ends with the connection.
   _head(whole) {
+    this._frame(whole);
+    return this._headBytes();
+  }
+  // The framing half of _head: the headers that say how the body ends and
+  // whether the connection stays.
+  _frame(whole) {
     const h = this._headers;
     const te = h['transfer-encoding'];
     if (te && String(te).toLowerCase().indexOf('chunked') >= 0) {
@@ -198,6 +204,9 @@ class ServerResponse extends EventEmitter {
     // keep going, and what goes on the wire has to be what happens.
     if (h['connection'] === undefined) h['connection'] = this._keepAlive ? 'keep-alive' : 'close';
     else if (String(h['connection']).toLowerCase().indexOf('close') >= 0) this._keepAlive = false;
+  }
+  _headBytes() {
+    const h = this._headers;
     const reason = this.statusMessage || statusText(this.statusCode);
     const bytes = __http_head_bytes(this.statusCode, reason, h);
     if (bytes !== undefined) {
@@ -268,12 +277,25 @@ class ServerResponse extends EventEmitter {
     if (this.finished) return this;
     if (typeof cb === 'function') this.once('finish', cb);
     const data = toBuf(chunk, enc);
-    const out = [];
+    let sent = false;
     // Nothing written yet: the whole body is here, and its length known.
-    if (!this.headersSent) out.push(this._head(data.length));
-    this._framed(data, out);
-    if (this._chunked) out.push(Buffer.from('0' + CRLF + CRLF, 'latin1'));
-    this._send(out);
+    // A socket that takes a whole response at once (a TLS socket with
+    // nothing queued) gets the head and the body in one call.
+    if (!this.headersSent) {
+      this._frame(data.length);
+      if (!this._chunked && this.socket._sendWhole !== undefined) {
+        const reason = this.statusMessage || statusText(this.statusCode);
+        sent = this.socket._sendWhole(this.statusCode, reason, this._headers, this._bodyAllowed() ? data : null);
+        if (sent) this.headersSent = true;
+      }
+    }
+    if (!sent) {
+      const out = [];
+      if (!this.headersSent) out.push(this._headBytes());
+      this._framed(data, out);
+      if (this._chunked) out.push(Buffer.from('0' + CRLF + CRLF, 'latin1'));
+      this._send(out);
+    }
     this.finished = true;
     this.writableEnded = true;
     if (!this._keepAlive) this.socket.end();
@@ -341,35 +363,68 @@ function serveConnection(server, socket) {
   let csize = 0;
   let received = 0;
   let trailerBytes = 0;
+  // The deadline: when it falls on the Date.now() clock (0 for none) and
+  // what runs then. One timer serves it. A deadline moved later leaves the
+  // timer as it is, and the timer, firing early, waits out the rest; so a
+  // request on a kept-alive connection moves a number and touches no
+  // timer. Only an earlier deadline re-arms it.
+  let due = 0;
+  let onDue = null;
   let timer = null;
+  let timerAt = 0;
 
-  function clearDeadline() {
-    if (timer) { clearTimeout(timer); timer = null; }
+  function clearDeadline() { due = 0; }
+
+  // The connection is over: no deadline, and no timer holding the loop.
+  function stopTimer() {
+    due = 0;
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  }
+
+  function arm(ms, fn) {
+    due = Date.now() + ms;
+    onDue = fn;
+    if (timer !== null) {
+      if (timerAt <= due) return;
+      clearTimeout(timer);
+    }
+    timerAt = due;
+    timer = setTimeout(onTimer, ms);
+  }
+
+  function onTimer() {
+    timer = null;
+    if (due === 0) return;
+    const left = due - Date.now();
+    if (left > 0) {
+      timerAt = due;
+      timer = setTimeout(onTimer, left);
+      return;
+    }
+    due = 0;
+    onDue();
   }
 
   // The client's time is up. While an answer is being written there is
   // no deadline at all: that is the server's turn, and a long answer must
   // not be cut off for being slow to write.
   function onDeadline() {
-    timer = null;
     if (state === 'done' || state === 'reply') return;
     state = 'done';
+    stopTimer();
     socket.end();
     socket.destroy();
   }
 
-  function deadline(ms) {
-    clearDeadline();
-    timer = setTimeout(onDeadline, ms);
-  }
+  function deadline(ms) { arm(ms, onDeadline); }
 
   // The request is read, answered, and only then is the next one looked
   // at: two responses interleaved on one socket is not a response at all.
   function onDone() {
-    if (state === 'done') { clearDeadline(); return; }
+    if (state === 'done') { stopTimer(); return; }
     if (res === null || !res._keepAlive) {
       state = 'done';
-      clearDeadline();
+      stopTimer();
       return;
     }
     msg = null;
@@ -388,7 +443,7 @@ function serveConnection(server, socket) {
     clearDeadline();
     if (state !== 'head') return;
     if (socket.writableLength > 0 && buf.length === 0) {
-      timer = setTimeout(awaitNext, 1000);
+      arm(1000, awaitNext);
       return;
     }
     deadline(HEAD_MS);
@@ -411,7 +466,7 @@ function serveConnection(server, socket) {
     // the connection just ends.
     if (res !== null && res.headersSent) {
       state = 'done';
-      clearDeadline();
+      stopTimer();
       socket.destroy();
       return;
     }
@@ -424,14 +479,13 @@ function serveConnection(server, socket) {
         'Connection: close' + CRLF + CRLF + body, 'utf8'));
     } catch (e) { /* the peer may already be gone */ }
     state = 'done';
-    clearDeadline();
     socket.end();
     // A client still sending its body would have its data unread at the
     // close, and the system answers that with a reset, which can reach
     // the client before the answer does. So the connection reads on for
     // a while, dropping what comes (pump does in state done), and then
     // closes.
-    timer = setTimeout(() => { timer = null; socket.destroy(); }, LINGER_MS);
+    arm(LINGER_MS, () => socket.destroy());
   }
 
   deadline(HEAD_MS);
@@ -440,12 +494,12 @@ function serveConnection(server, socket) {
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
-  const onError = (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); };
+  const onError = (e) => { stopTimer(); server.emit('clientError', e, socket); socket.destroy(); };
   // A response that has not ended hears that its connection is gone, so a
   // handler writing as things happen can stop; one waiting to write more
   // hears that it may.
   const onClose = () => {
-    clearDeadline();
+    stopTimer();
     state = 'done';
     if (res !== null && !res.finished) res.emit('close');
   };
@@ -460,7 +514,7 @@ function serveConnection(server, socket) {
   // whoever listens gets the socket as it is, with whatever followed the
   // head. Nothing here touches the socket again.
   function handOver() {
-    clearDeadline();
+    stopTimer();
     socket.removeListener('data', onData);
     socket.removeListener('end', onEnd);
     socket.removeListener('error', onError);

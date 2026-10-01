@@ -13234,24 +13234,18 @@ private void http_add_name(str_buf* sb, str k) {
     }
 }
 
-// __http_head_bytes(code, reason, headers): the response head as a
-// Buffer: the status line, a line per own enumerable header in for-in
-// order (an array value gives a line per element), and the blank line.
-private Value nat_http_head_bytes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    VM* vm = as_vm(vmp);
-    Value code = arg_at(args, argc, 0);
-    Value reason = arg_at(args, argc, 1);
-    Value hv = arg_at(args, argc, 2);
+// The response head appended to sb: the status line, a line per own
+// enumerable header in for-in order (an array value gives a line per
+// element), and the blank line. False for what the JavaScript formats.
+private bool http_head_build(VM* vm, str_buf* sb, Value code, Value reason, Value hv) {
     if !value_is_object(hv) || (value_as_object(hv).obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 {
-        return value_undefined();
+        return false;
     }
-    str_buf sb;
-    str_buf_init(&sb);
-    str_buf_add(&sb, "HTTP/1.1 ");
-    bool ok = http_add_value(vm, &sb, code);
-    str_buf_add_byte(&sb, cast(u8, 32));
-    ok = ok && http_add_value(vm, &sb, reason);
-    str_buf_add(&sb, "\r\n");
+    str_buf_add(sb, "HTTP/1.1 ");
+    bool ok = http_add_value(vm, sb, code);
+    str_buf_add_byte(sb, cast(u8, 32));
+    ok = ok && http_add_value(vm, sb, reason);
+    str_buf_add(sb, "\r\n");
     PropList* props = &value_as_object(hv).props;
     vm_props_order(vm, props);
     for i32 i = 0; ok && i < props.len; i++ {
@@ -13265,22 +13259,68 @@ private Value nat_http_head_bytes(void* vmp, Value callee, Value thisv, Value* a
         if value_is_array(v) {
             JsObject* a = value_as_object(v);
             for i32 j = 0; ok && j < a.elen; j++ {
-                http_add_name(&sb, k);
-                str_buf_add(&sb, ": ");
-                ok = http_add_value(vm, &sb, js_array_get(a, j));
-                str_buf_add(&sb, "\r\n");
+                http_add_name(sb, k);
+                str_buf_add(sb, ": ");
+                ok = http_add_value(vm, sb, js_array_get(a, j));
+                str_buf_add(sb, "\r\n");
             }
         } else {
-            http_add_name(&sb, k);
-            str_buf_add(&sb, ": ");
-            ok = ok && http_add_value(vm, &sb, v);
-            str_buf_add(&sb, "\r\n");
+            http_add_name(sb, k);
+            str_buf_add(sb, ": ");
+            ok = ok && http_add_value(vm, sb, v);
+            str_buf_add(sb, "\r\n");
         }
     }
-    str_buf_add(&sb, "\r\n");
+    str_buf_add(sb, "\r\n");
+    return ok;
+}
+
+// __http_head_bytes(code, reason, headers): the response head as a Buffer.
+private Value nat_http_head_bytes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
+    bool ok = http_head_build(vm, &sb, arg_at(args, argc, 0), arg_at(args, argc, 1), arg_at(args, argc, 2));
     Value r = ok ? buf_from_bytes(vm, sb.data, sb.len) : value_undefined();
     str_buf_free(&sb);
     return r;
+}
+
+// __tls_respond(id, code, reason, headers, body): a whole response, the
+// head and then `body` (a Buffer, or null for none), into the TLS session
+// as one record and on to the socket. The bytes taken, -1 when the
+// session failed, or undefined for a response it leaves to the
+// JavaScript: one past a record, one the head formatter refuses, or a
+// session with a record's worth or more still queued.
+private Value nat_tls_respond(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    i32 id = to_int_arg(arg_at(args, argc, 0));
+    i64 fd = vm_handle_fd(vm, id);
+    TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
+    if s == null || fd < 0 || tls_pending(s) >= 16384 { return value_undefined(); }
+    Value bodyv = arg_at(args, argc, 4);
+    u8* bp = null;
+    i32 bn = 0;
+    if !value_is_null(bodyv) && !value_is_undefined(bodyv) {
+        if !is_bytes_like(bodyv) { return value_undefined(); }
+        bp = buf_ptr(value_as_object(bodyv), &bn);
+        if bp == null && bn > 0 { return value_undefined(); }
+    }
+    if bn > 16384 { return value_undefined(); }
+    str_buf sb;
+    str_buf_init(&sb);
+    defer str_buf_free(&sb);
+    if !http_head_build(vm, &sb, arg_at(args, argc, 1), arg_at(args, argc, 2), arg_at(args, argc, 3)) {
+        return value_undefined();
+    }
+    if sb.len + bn > 16384 { return value_undefined(); }
+    if bn > 0 { str_buf_add_bytes(&sb, bp, bn); }
+    if !tls_write(s, fd, sb.data, sb.len) { return value_int(-1); }
+    // ciphertext the socket did not take waits for it to become writable
+    if tls_wants_write(s) {
+        vm_handle_set_interest(vm, id, cast(i16, vm_handle_interest(vm, id) | NET_POLLOUT));
+    }
+    return value_int(sb.len);
 }
 
 private void net_install(VM* vm) {
@@ -13294,6 +13334,7 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__http_head_end", &nat_http_head_end);
     ignore def_global_fn(vm, "__http_parse_head", &nat_http_parse_head);
     ignore def_global_fn(vm, "__http_head_bytes", &nat_http_head_bytes);
+    ignore def_global_fn(vm, "__tls_respond", &nat_tls_respond);
     ignore def_global_fn(vm, "__tls_read", &nat_tls_read);
     ignore def_global_fn(vm, "__tls_write", &nat_tls_write);
     ignore def_global_fn(vm, "__tls_close", &nat_tls_close);
