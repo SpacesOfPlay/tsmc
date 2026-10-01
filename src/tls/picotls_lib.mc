@@ -18406,9 +18406,41 @@ void cf_sha224_init(cf_sha256_context* ctx) {
     ctx.H[7] = 0xbefa4fa4;
 }
 
+// LOCAL (tsmc): SHA-256 on the CPU's instructions (sha256_compress:
+// SHA-NI, FEAT_SHA256) where it has them, cifra's code otherwise. The CPU
+// is asked once; sha256_hw_force switches the path, for tests that
+// compare the two.
+i32 g_sha256_hw = -1;            // -1 not asked yet, 0 software, 1 hardware
+
+bool sha256_hw_on() {
+    if g_sha256_hw < 0 {
+        g_sha256_hw = 0;
+        when arch(x64) || arch(arm64) {
+            if cpu_has_sha256() { g_sha256_hw = 1; }
+        }
+    }
+    return g_sha256_hw == 1;
+}
+
+// on: 0 for cifra's code, 1 for the instructions where the CPU has them.
+// Returns whether the instructions are now in use.
+bool sha256_hw_force(i32 on) {
+    g_sha256_hw = -1;
+    if on == 0 { g_sha256_hw = 0; }
+    return sha256_hw_on();
+}
+
 private {
 void sha256_update_block(void* vctx, u8* inp) {
     cf_sha256_context* ctx = vctx;
+    // LOCAL (tsmc): the instructions, where the CPU has them.
+    when arch(x64) || arch(arm64) {
+        if sha256_hw_on() {
+            sha256_compress(&ctx.H[0], inp, 1);
+            ctx.blocks++;
+            return;
+        }
+    }
     noinit u32[16] W;
     u32 a = ctx.H[0];
     u32 b = ctx.H[1];
@@ -18453,6 +18485,17 @@ void sha256_update_block(void* vctx, u8* inp) {
 }
 
 void cf_sha256_update(cf_sha256_context* ctx, void* data, u64 nbytes) {
+    // LOCAL (tsmc): whole blocks go to the instructions in one call when
+    // nothing is buffered.
+    when arch(x64) || arch(arm64) {
+        if ctx.npartial == 0 && nbytes >= 64 && sha256_hw_on() {
+            u64 nb = nbytes / 64;
+            sha256_compress(&ctx.H[0], cast(u8*, data), cast(i64, nb));
+            ctx.blocks += cast(u32, nb);
+            data = cast(void*, cast(u8*, data) + nb * 64);
+            nbytes = nbytes - nb * 64;
+        }
+    }
     cf_blockwise_accumulate(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), data, nbytes, sha256_update_block, ctx);
 }
 

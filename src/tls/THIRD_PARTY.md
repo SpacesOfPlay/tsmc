@@ -78,6 +78,16 @@ rejects that. Restore them on re-export:
 | `send_certificate_verify` | `return ret;` |
 | `select_negotiated_group` | `return ret;` |
 
+One local *hook* in `picotls_lib.mc`, marked `LOCAL (tsmc)`: cifra's
+SHA-256 block function (`sha256_update_block`) and `cf_sha256_update`
+run whole blocks through the compiler's `sha256_compress` (SHA-NI,
+FEAT_SHA256) when `cpu_has_sha256()`, with `g_sha256_hw`,
+`sha256_hw_on` and `sha256_hw_force` beside them; cifra's code stays the
+fallback. `test/unit/test_sha256_hw.mc` holds the two paths to each
+other and to the FIPS vectors. The permanent home is a cifra patch in
+transminc's `ext/cifra/patches`, beside `0002-hw-aes-gcm.patch`;
+re-apply the hook on re-export until then.
+
 Not cosmetic: `client_handle_hello` ends with `ret = PTLS_ERROR_IN_PROGRESS`,
 so returning it lets the client process the server's whole flight in one
 `ptls_handshake` call instead of stopping after ServerHello.
