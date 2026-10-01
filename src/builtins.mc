@@ -13017,6 +13017,272 @@ private Value nat_tls_server_ctx_free(void* vmp, Value callee, Value thisv, Valu
     return value_undefined();
 }
 
+// --- HTTP/1.1 heads, for the http module ------------------------------------
+//
+// The byte scans and string building of a request head and a response head,
+// which as JavaScript were most of the work of answering a small request.
+// The parse and the format return undefined for what they leave to the
+// module's JavaScript: a head with a byte outside ASCII, a header named
+// __proto__, a header value other than a string or a number.
+
+// __http_head_end(buf, from): the offset of the CR LF CR LF that ends a
+// head, searching from `from`, or -1.
+private Value nat_http_head_end(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    Value bv = arg_at(args, argc, 0);
+    if !is_bytes_like(bv) { return value_undefined(); }
+    i32 n;
+    u8* p = buf_ptr(value_as_object(bv), &n);
+    if p == null { return value_undefined(); }
+    i32 i = to_int_arg(arg_at(args, argc, 1));
+    if i < 0 { i = 0; }
+    while i + 3 < n {
+        // the fourth byte first: anything but LF moves the search on by
+        // up to four
+        u8 c = *(p + i + 3);
+        if c != cast(u8, 10) {
+            i += c == cast(u8, 13) ? 1 : 4;
+            continue;
+        }
+        if *(p + i) == cast(u8, 13) && *(p + i + 1) == cast(u8, 10) && *(p + i + 2) == cast(u8, 13) {
+            return value_number(cast(f64, i));
+        }
+        i++;
+    }
+    return value_number(-1.0);
+}
+
+private bool http_space(u8 c) {
+    return c == cast(u8, 32) || (c >= cast(u8, 9) && c <= cast(u8, 13));
+}
+
+// The ASCII whitespace that String.prototype.trim removes, off both ends.
+private str http_trim(str t) {
+    i32 a = 0;
+    i32 b = t.len;
+    while a < b && http_space(*(t.data + a)) { a++; }
+    while b > a && http_space(*(t.data + b - 1)) { b--; }
+    return str_from(t.data + a, b - a);
+}
+
+// "__proto__" in any case: as a property name it would set the prototype.
+private bool http_is_proto(str k) {
+    str want = "__proto__";
+    if k.len != want.len { return false; }
+    for i32 i = 0; i < k.len; i++ {
+        u8 c = *(k.data + i);
+        if c >= cast(u8, 65) && c <= cast(u8, 90) { c = cast(u8, c + 32); }
+        if c != *(want.data + i) { return false; }
+    }
+    return true;
+}
+
+// The next line of p[*at, end), which ends at CR LF or at `end`; *at moves
+// past it.
+private str http_line(u8* p, i32 end, i32* at) {
+    i32 a = *at;
+    i32 i = a;
+    while i < end {
+        if *(p + i) == cast(u8, 13) && i + 1 < end && *(p + i + 1) == cast(u8, 10) {
+            *at = i + 2;
+            return str_from(p + a, i - a);
+        }
+        i++;
+    }
+    *at = end + 2;
+    return str_from(p + a, end - a);
+}
+
+private void http_set(VM* vm, Value obj, str name, Value v) {
+    vm_push(vm, v);
+    props_set_desc(&value_as_object(obj).props, bi_atom(vm, name), v, PROP_DEFAULT);
+    vm_pop(vm);
+}
+
+// __http_parse_head(buf, end, msg): the request line and the header lines
+// in buf[0, end) into msg.method, msg.url, msg.httpVersion and
+// msg.headers. The request line splits at spaces; the version is what
+// follows the first '/' of its third word, 1.1 when that is absent or
+// empty. Header names are trimmed and lowercased and values trimmed; a
+// repeated header's values join with ", ", except Set-Cookie, whose values
+// form an array. True, or undefined with msg untouched.
+private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value bv = arg_at(args, argc, 0);
+    Value msgv = arg_at(args, argc, 2);
+    if !is_bytes_like(bv) || !value_is_object(msgv) { return value_undefined(); }
+    i32 n;
+    u8* p = buf_ptr(value_as_object(bv), &n);
+    i32 end = to_int_arg(arg_at(args, argc, 1));
+    if p == null || end < 0 || end > n { return value_undefined(); }
+    for i32 i = 0; i < end; i++ {
+        if *(p + i) >= cast(u8, 128) { return value_undefined(); }
+    }
+    // the names first, so a refusal leaves msg as it was
+    i32 at = 0;
+    ignore http_line(p, end, &at);
+    while at < end {
+        str line = http_line(p, end, &at);
+        i32 colon = 0;
+        while colon < line.len && *(line.data + colon) != cast(u8, 58) { colon++; }
+        if colon == line.len { continue; }
+        str k = http_trim(str_from(line.data, colon));
+        if http_is_proto(k) { return value_undefined(); }
+    }
+
+    at = 0;
+    str first = http_line(p, end, &at);
+    str[3] word;
+    i32 words = 0;
+    i32 w0 = 0;
+    for i32 i = 0; i <= first.len && words < 3; i++ {
+        if i == first.len || *(first.data + i) == cast(u8, 32) {
+            word[words] = str_from(first.data + w0, i - w0);
+            words++;
+            w0 = i + 1;
+        }
+    }
+    str version = "1.1";
+    if words == 3 && word[2].len > 0 {
+        i32 slash = 0;
+        while slash < word[2].len && *(word[2].data + slash) != cast(u8, 47) { slash++; }
+        i32 v0 = slash + 1;
+        i32 v1 = v0;
+        while v1 < word[2].len && *(word[2].data + v1) != cast(u8, 47) { v1++; }
+        if v0 < word[2].len && v1 > v0 { version = str_from(word[2].data + v0, v1 - v0); }
+    }
+    http_set(vm, msgv, "method", new_str(vm, word[0]));
+    http_set(vm, msgv, "url", words > 1 ? new_str(vm, word[1]) : value_undefined());
+    http_set(vm, msgv, "httpVersion", new_str(vm, version));
+
+    JsObject* h = js_new_object(&vm.heap, vm.object_proto);
+    Value hv = value_cell(&h.head);
+    vm_push(vm, hv);
+    u8[256] lower;
+    u32 cookie = bi_atom(vm, "set-cookie");
+    while at < end {
+        str line = http_line(p, end, &at);
+        if line.len == 0 { continue; }
+        i32 colon = 0;
+        while colon < line.len && *(line.data + colon) != cast(u8, 58) { colon++; }
+        if colon == line.len { continue; }
+        str k = http_trim(str_from(line.data, colon));
+        str v = http_trim(str_from(line.data + colon + 1, line.len - colon - 1));
+        u8* kb = k.len <= 256 ? &lower[0] : alloc<u8>(k.len);
+        for i32 i = 0; i < k.len; i++ {
+            u8 c = *(k.data + i);
+            *(kb + i) = c >= cast(u8, 65) && c <= cast(u8, 90) ? cast(u8, c + 32) : c;
+        }
+        u32 key = bi_atom(vm, str_from(kb, k.len));
+        if kb != &lower[0] { free(kb); }
+        Value vs = new_str(vm, v);
+        vm_push(vm, vs);
+        Value* ex = props_get(&h.props, key);
+        if key == cookie {
+            if ex == null {
+                JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+                js_array_set(a, 0, vs);
+                props_set_desc(&h.props, key, value_cell(&a.head), PROP_DEFAULT);
+            } else if value_is_array(*ex) {
+                JsObject* a = value_as_object(*ex);
+                js_array_set(a, a.elen, vs);
+            }
+        } else if ex == null {
+            props_set_desc(&h.props, key, vs, PROP_DEFAULT);
+        } else {
+            str_buf sb;
+            str_buf_init(&sb);
+            str_buf_add(&sb, sview(*ex));
+            str_buf_add(&sb, ", ");
+            str_buf_add(&sb, v);
+            Value j = new_str(vm, str_buf_to_str(&sb));
+            str_buf_free(&sb);
+            *props_get(&h.props, key) = j;
+        }
+        vm_pop(vm);
+    }
+    http_set(vm, msgv, "headers", hv);
+    vm_pop(vm);
+    return value_bool(true);
+}
+
+// Appends the ASCII text of a string or number header value; false for any
+// other value, or a string with a byte outside ASCII.
+private bool http_add_value(VM* vm, str_buf* sb, Value v) {
+    if value_is_number(v) {
+        Value t = js_to_string_value(vm, v);
+        str_buf_add(sb, sview(t));
+        return true;
+    }
+    if !value_is_string(v) { return false; }
+    str t = sview(v);
+    for i32 i = 0; i < t.len; i++ {
+        if *(t.data + i) >= cast(u8, 128) { return false; }
+    }
+    str_buf_add(sb, t);
+    return true;
+}
+
+// A header name with the first letter of each '-' separated part in upper
+// case, as the module's canon() writes it.
+private void http_add_name(str_buf* sb, str k) {
+    bool up = true;
+    for i32 i = 0; i < k.len; i++ {
+        u8 c = *(k.data + i);
+        if up && c >= cast(u8, 97) && c <= cast(u8, 122) { c = cast(u8, c - 32); }
+        str_buf_add_byte(sb, c);
+        up = c == cast(u8, 45);
+    }
+}
+
+// __http_head_bytes(code, reason, headers): the response head as a
+// Buffer: the status line, a line per own enumerable header in for-in
+// order (an array value gives a line per element), and the blank line.
+private Value nat_http_head_bytes(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value code = arg_at(args, argc, 0);
+    Value reason = arg_at(args, argc, 1);
+    Value hv = arg_at(args, argc, 2);
+    if !value_is_object(hv) || (value_as_object(hv).obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 {
+        return value_undefined();
+    }
+    str_buf sb;
+    str_buf_init(&sb);
+    str_buf_add(&sb, "HTTP/1.1 ");
+    bool ok = http_add_value(vm, &sb, code);
+    str_buf_add_byte(&sb, cast(u8, 32));
+    ok = ok && http_add_value(vm, &sb, reason);
+    str_buf_add(&sb, "\r\n");
+    PropList* props = &value_as_object(hv).props;
+    vm_props_order(vm, props);
+    for i32 i = 0; ok && i < props.len; i++ {
+        Prop* pr = props.items + i;
+        if !prop_enumerable(vm, pr) { continue; }
+        str k = atom_name(&vm.atoms, pr.key);
+        for i32 j = 0; j < k.len; j++ {
+            if *(k.data + j) >= cast(u8, 128) { ok = false; }
+        }
+        Value v = pr.val;
+        if value_is_array(v) {
+            JsObject* a = value_as_object(v);
+            for i32 j = 0; ok && j < a.elen; j++ {
+                http_add_name(&sb, k);
+                str_buf_add(&sb, ": ");
+                ok = http_add_value(vm, &sb, js_array_get(a, j));
+                str_buf_add(&sb, "\r\n");
+            }
+        } else {
+            http_add_name(&sb, k);
+            str_buf_add(&sb, ": ");
+            ok = ok && http_add_value(vm, &sb, v);
+            str_buf_add(&sb, "\r\n");
+        }
+    }
+    str_buf_add(&sb, "\r\n");
+    Value r = ok ? buf_from_bytes(vm, sb.data, sb.len) : value_undefined();
+    str_buf_free(&sb);
+    return r;
+}
+
 private void net_install(VM* vm) {
     ignore net_init();
     vm_set_reactor_hook(vm, &net_reactor_dispatch);
@@ -13025,6 +13291,9 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_server_wrap", &nat_tls_server_wrap);
     ignore def_global_fn(vm, "__tls_server_ctx_free", &nat_tls_server_ctx_free);
     ignore def_global_fn(vm, "__tls_pump", &nat_tls_pump);
+    ignore def_global_fn(vm, "__http_head_end", &nat_http_head_end);
+    ignore def_global_fn(vm, "__http_parse_head", &nat_http_parse_head);
+    ignore def_global_fn(vm, "__http_head_bytes", &nat_http_head_bytes);
     ignore def_global_fn(vm, "__tls_read", &nat_tls_read);
     ignore def_global_fn(vm, "__tls_write", &nat_tls_write);
     ignore def_global_fn(vm, "__tls_close", &nat_tls_close);

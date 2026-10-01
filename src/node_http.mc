@@ -60,8 +60,13 @@ function canon(name) {
   return parts.join('-');
 }
 
-function findHeaderEnd(buf) {
-  for (let i = 0; i + 3 < buf.length; i++) {
+// The scan, the request head's parse and the response head's format are
+// natives (__http_*); the JavaScript beside each is what they return
+// undefined to.
+function findHeaderEnd(buf, from) {
+  const e = __http_head_end(buf, from || 0);
+  if (e !== undefined) return e;
+  for (let i = from || 0; i + 3 < buf.length; i++) {
     if (buf[i] === CR && buf[i + 1] === LF && buf[i + 2] === CR && buf[i + 3] === LF) return i;
   }
   return -1;
@@ -195,6 +200,11 @@ class ServerResponse extends EventEmitter {
     const connHdr = String(h['connection']).toLowerCase();
     this._keepAlive = this._keepAlive && connHdr.indexOf('close') < 0;
     const reason = this.statusMessage || statusText(this.statusCode);
+    const bytes = __http_head_bytes(this.statusCode, reason, h);
+    if (bytes !== undefined) {
+      this.headersSent = true;
+      return bytes;
+    }
     let head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + CRLF;
     // An array value means one header line per element, not one line holding a
     // comma-joined list: that is how Set-Cookie sends several cookies, and
@@ -318,6 +328,8 @@ const BODY_MS = 30000;
 
 function serveConnection(server, socket) {
   let buf = Buffer.alloc(0);
+  // How much of buf the search for the head's end has been through.
+  let scanned = 0;
   let msg = null;
   let res = null;
   let state = 'head';
@@ -424,7 +436,7 @@ function serveConnection(server, socket) {
   }
 
   deadline(HEAD_MS);
-  const onData = (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); };
+  const onData = (chunk) => { buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]); pump(); };
   const onEnd = () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } };
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
@@ -468,23 +480,27 @@ function serveConnection(server, socket) {
     // waits in the buffer, which MAX_HEAD still bounds.
     if (state === 'reply') { return; }
     if (state === 'head') {
-      const he = findHeaderEnd(buf);
+      const he = findHeaderEnd(buf, scanned);
       if (he < 0) {
+        scanned = Math.max(0, buf.length - 3);
         if (buf.length > MAX_HEAD) {
           refuse(431, 'Request header too large');
         }
         return;
       }
+      scanned = 0;
       if (he > MAX_HEAD) { refuse(431, 'Request header too large'); return; }
-      const text = buf.slice(0, he).toString('utf8');
-      buf = buf.slice(he + 4);
-      const lines = text.split(CRLF);
-      const first = lines.shift().split(' ');
       msg = new IncomingMessage();
-      msg.method = first[0];
-      msg.url = first[1];
-      msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
-      msg.headers = parseHeaders(lines.join(CRLF));
+      if (__http_parse_head(buf, he, msg) !== true) {
+        const text = buf.slice(0, he).toString('utf8');
+        const lines = text.split(CRLF);
+        const first = lines.shift().split(' ');
+        msg.method = first[0];
+        msg.url = first[1];
+        msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
+        msg.headers = parseHeaders(lines.join(CRLF));
+      }
+      buf = buf.slice(he + 4);
       const cl = msg.headers['content-length'];
       const te = msg.headers['transfer-encoding'];
       chunked = false;
