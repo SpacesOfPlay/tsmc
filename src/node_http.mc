@@ -388,6 +388,8 @@ function serveConnection(server, socket) {
   let csize = 0;
   let received = 0;
   let trailerBytes = 0;
+  // The response has ended while the request's body is still arriving.
+  let answered = false;
   // The deadline: when it falls on the Date.now() clock (0 for none) and
   // what runs then. One timer serves it. A deadline moved later leaves the
   // timer as it is, and the timer, firing early, waits out the rest; so a
@@ -445,18 +447,42 @@ function serveConnection(server, socket) {
 
   // The request is read, answered, and only then is the next one looked
   // at: two responses interleaved on one socket is not a response at all.
+  // A response that ends before its request's body has all arrived waits
+  // for the rest, which is read and delivered as before: whatever comes
+  // after the head is the body's up to its declared end, and taking the
+  // remainder for the next request would serve a body as a request.
   function onDone() {
     if (state === 'done') { stopTimer(); return; }
+    if (state === 'body') { answered = true; return; }
+    afterAnswer();
+  }
+
+  // The next request on a connection that stays; on one that does not,
+  // nothing more is read.
+  function afterAnswer() {
     if (res === null || !res._keepAlive) {
       state = 'done';
       stopTimer();
       return;
     }
+    nextRequest();
+  }
+
+  function nextRequest() {
     msg = null;
     res = null;
+    answered = false;
     state = 'head';
     awaitNext();
     pump();
+  }
+
+  // The request's body is complete.
+  function bodyDone() {
+    clearDeadline();
+    state = 'reply';
+    msg._end();
+    if (answered && state === 'reply') afterAnswer();
   }
 
   // The next request's time starts once the answer has left: a client
@@ -611,7 +637,7 @@ function serveConnection(server, socket) {
     }
     if (state === 'body') {
       if (chunked) {
-        if (readChunked()) { clearDeadline(); state = 'reply'; msg._end(); }
+        if (readChunked()) bodyDone();
         return;
       }
       if (remaining > 0 && buf.length > 0) {
@@ -620,7 +646,7 @@ function serveConnection(server, socket) {
         buf = buf.slice(take);
         remaining -= take;
       }
-      if (remaining <= 0) { clearDeadline(); state = 'reply'; msg._end(); }
+      if (remaining <= 0) bodyDone();
     }
   }
 

@@ -1,0 +1,24 @@
+a body holding a request, with a length:
+  request POST /form
+  end of POST /form 35 bytes
+  request GET /last
+  end of GET /last 0 bytes
+  HTTP/1.1 200 OK | answer /formHTTP/1.1 200 OK | answer /last
+the same, chunked:
+  request POST /form
+  end of POST /form 35 bytes
+  request GET /last
+  end of GET /last 0 bytes
+  HTTP/1.1 200 OK | answer /formHTTP/1.1 200 OK | answer /last
+the body after the answer:
+  request POST /form
+  end of POST /form 35 bytes
+  request GET /last
+  end of GET /last 0 bytes
+  HTTP/1.1 200 OK | answer /formHTTP/1.1 200 OK | answer /last
+two at once:
+  request GET /one
+  end of GET /one 0 bytes
+  request GET /last
+  end of GET /last 0 bytes
+  HTTP/1.1 200 OK | answer /oneHTTP/1.1 200 OK | answer /last
