@@ -286,6 +286,7 @@ struct TlsSession {
     i64 send_off;             // flushed prefix of sendbuf
     ptls_buffer_t recvbuf;    // decrypted plaintext accumulated for the reader
     i64 recv_off;             // consumed prefix of recvbuf
+    void* server;             // the TlsServerCtx a server session holds, or null
     u8* cipher_in;            // inbound ciphertext picotls has not taken, or null
     i32 cipher_in_len;
     i32 cipher_in_cap;
@@ -330,6 +331,7 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
 void tls_session_free(TlsSession* s) {
     if s == null { return; }
     if s.tls != null { ptls_free(s.tls); }
+    if s.server != null { tls_server_ctx_release(cast(TlsServerCtx*, s.server)); }
     s.sendbuf.off = cast(u64, 0);
     s.recvbuf.off = cast(u64, 0);
     tls_buf_release(&s.sendbuf);
@@ -842,6 +844,10 @@ struct TlsServerCtx {
     u8* cert_der;             // owned copy of the whole chain, concatenated
     u64 cert_len;
     i32 n_certs;
+    // Sessions made from it, which read it until they are freed, and
+    // whether the server has let it go; it is freed when both are done.
+    i32 sessions;
+    bool closed;
 }
 
 // Enough for a leaf plus the intermediates any public CA issues under.
@@ -896,6 +902,8 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     for i32 i = 0; i < total; i++ { sc.cert_der[i] = cert_blob[i]; }
     sc.cert_len = cast(u64, total);
     sc.n_certs = n_certs;
+    sc.sessions = 0;
+    sc.closed = false;
     i32 off = 0;
     for i32 i = 0; i < n_certs; i++ {
         sc.certs[i] = ptls_iovec_init(sc.cert_der + off, cast(u64, cert_lens[i]));
@@ -963,13 +971,25 @@ i32 tls_server_ctx_cert_len(i32 id, i32 i) {
     return cast(i32, sc.certs[i].len);
 }
 
+// The server is done with a context: its id goes, and the context with
+// it once the last session made from it is freed.
 void tls_server_ctx_free(i32 id) {
     if id < 0 || id >= TLS_SERVER_CTX_MAX { return; }
     TlsServerCtx* sc = g_server_ctxs[id];
     if sc == null { return; }
+    g_server_ctxs[id] = null;
+    sc.closed = true;
+    if sc.sessions == 0 { tls_server_ctx_destroy(sc); }
+}
+
+private void tls_server_ctx_destroy(TlsServerCtx* sc) {
     free(cast(void*, sc.cert_der));
     free(cast(void*, sc));
-    g_server_ctxs[id] = null;
+}
+
+private void tls_server_ctx_release(TlsServerCtx* sc) {
+    sc.sessions--;
+    if sc.closed && sc.sessions == 0 { tls_server_ctx_destroy(sc); }
 }
 
 // A server-side session for an already-accepted fd, using the shared context.
@@ -981,6 +1001,8 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(&sc.ctx, 1);   // is_server = 1
     if s.tls == null { free(s); return null; }
+    s.server = cast(void*, sc);
+    sc.sessions++;
     ptls_buffer_init(&s.sendbuf, "", 0);
     ptls_buffer_init(&s.recvbuf, "", 0);
     s.send_off = 0;
