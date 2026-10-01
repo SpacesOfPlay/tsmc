@@ -277,16 +277,18 @@ void tls_set_ecdsa_pin(u8* spki32) {
 
 // --- session ---------------------------------------------------------------
 
+// The buffers hold heap memory only while they hold bytes, so an idle
+// session is the struct and picotls's state: a server keeps thousands of
+// idle connections.
 struct TlsSession {
     ptls_t* tls;
     ptls_buffer_t sendbuf;    // outbound ciphertext (handshake + app data)
-    u8[1024] send_small;
     i64 send_off;             // flushed prefix of sendbuf
     ptls_buffer_t recvbuf;    // decrypted plaintext accumulated for the reader
     i64 recv_off;             // consumed prefix of recvbuf
-    u8[8192] recv_small;
-    u8[16384] cipher_in;      // inbound ciphertext awaiting decrypt
+    u8* cipher_in;            // inbound ciphertext picotls has not taken, or null
     i32 cipher_in_len;
+    i32 cipher_in_cap;
     i32 chain_err;            // X509_V_* when the failure was cert validation
     i32 tls_err;              // the picotls result that failed the handshake
     bool checked_connect;     // confirmed the non-blocking TCP connect
@@ -300,7 +302,7 @@ struct TlsSession {
 
 TlsSession* tls_session_new(u8* sni, bool insecure) {
     tls_ctx_init();
-    TlsSession* s = alloc<TlsSession>(1);
+    TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(insecure ? &g_ctx_insecure : &g_ctx, 0);
     if s.tls == null { free(s); return null; }
     if sni != null {
@@ -308,11 +310,13 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
         while *(sni + slen) != cast(u8, 0) { slen++; }
         ptls_set_server_name(s.tls, sni, cast(u64, slen));
     }
-    ptls_buffer_init(&s.sendbuf, &s.send_small[0], 1024);
-    ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
+    ptls_buffer_init(&s.sendbuf, "", 0);
+    ptls_buffer_init(&s.recvbuf, "", 0);
     s.send_off = 0;
     s.recv_off = 0;
+    s.cipher_in = null;
     s.cipher_in_len = 0;
+    s.cipher_in_cap = 0;
     s.chain_err = 0;
     s.checked_connect = false;
     s.started = false;
@@ -326,15 +330,81 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
 void tls_session_free(TlsSession* s) {
     if s == null { return; }
     if s.tls != null { ptls_free(s.tls); }
-    ptls_buffer_dispose(&s.sendbuf);
-    ptls_buffer_dispose(&s.recvbuf);
+    s.sendbuf.off = cast(u64, 0);
+    s.recvbuf.off = cast(u64, 0);
+    tls_buf_release(&s.sendbuf);
+    tls_buf_release(&s.recvbuf);
+    free(s.cipher_in);
     free(s);
 }
 
-// Drop `n` consumed bytes off the front of cipher_in.
+// Drained buffers wait here for the next session that writes or reads:
+// a busy connection takes one back instead of allocating and growing a
+// new one for each record, and an idle connection holds none. Sessions
+// are driven from the reactor's thread only.
+const i32 TLS_SPARES = 16;
+const u64 TLS_SPARE_MAX = 65536;
+private u8*[16] g_spare_base;
+private u64[16] g_spare_cap;
+private i32 g_spares = 0;
+
+// A drained buffer goes to the spares, or back to the heap.
+private void tls_buf_release(ptls_buffer_t* b) {
+    if b.is_allocated == 0 { return; }
+    if g_spares < TLS_SPARES && b.capacity <= TLS_SPARE_MAX && b.align_bits == cast(u8, 0) {
+        g_spare_base[g_spares] = b.base;
+        g_spare_cap[g_spares] = b.capacity;
+        g_spares++;
+    } else {
+        free(b.base);
+    }
+    ptls_buffer_init(b, "", 0);
+}
+
+// An empty buffer about to be written takes a spare, if there is one.
+private void tls_buf_take(ptls_buffer_t* b) {
+    if b.is_allocated != 0 || g_spares == 0 { return; }
+    g_spares--;
+    b.base = g_spare_base[g_spares];
+    b.capacity = g_spare_cap[g_spares];
+    b.off = cast(u64, 0);
+    b.is_allocated = cast(u8, 1);
+}
+
+// Most ciphertext picotls can take: two records' worth.
+const i32 TLS_CIPHER_IN_MAX = 32768;
+
+// Keep the `n` bytes at `p` that picotls did not take in cipher_in, in
+// front of whatever is there. False when that would pass the limit.
+private bool tls_keep(TlsSession* s, u8* p, i32 n) {
+    if n <= 0 { return true; }
+    i32 need = s.cipher_in_len + n;
+    if need > TLS_CIPHER_IN_MAX { return false; }
+    if need > s.cipher_in_cap {
+        i32 cap = s.cipher_in_cap < 4096 ? 4096 : s.cipher_in_cap;
+        while cap < need { cap = cap * 2; }
+        u8* q = alloc<u8>(cap);
+        if s.cipher_in_len > 0 { memcpy(q, s.cipher_in, cast(i64, s.cipher_in_len)); }
+        free(s.cipher_in);
+        s.cipher_in = q;
+        s.cipher_in_cap = cap;
+    }
+    memcpy(s.cipher_in + s.cipher_in_len, p, cast(i64, n));
+    s.cipher_in_len = need;
+    return true;
+}
+
+// Drop `n` consumed bytes off the front of cipher_in; an emptied one is freed.
 private void tls_shift(TlsSession* s, i32 n) {
     if n <= 0 { return; }
     i32 rem = s.cipher_in_len - n;
+    if rem <= 0 {
+        free(s.cipher_in);
+        s.cipher_in = null;
+        s.cipher_in_len = 0;
+        s.cipher_in_cap = 0;
+        return;
+    }
     for i32 i = 0; i < rem; i++ { s.cipher_in[i] = s.cipher_in[n + i]; }
     s.cipher_in_len = rem;
 }
@@ -344,17 +414,17 @@ private void tls_shift(TlsSession* s, i32 n) {
 // that is not speaking TLS -- most often a browser sent to http:// on an
 // https:// port. Answering that with a TLS alert is worse than useless: the
 // browser renders the alert bytes as the page. Close instead, as node does.
-private bool tls_looks_like_tls(TlsSession* s) {
-    if s.cipher_in_len < 1 { return true; }
-    u8 c = s.cipher_in[0];
+private bool tls_looks_like_tls(u8 c) {
     return c >= cast(u8, 20) && c <= cast(u8, 23);
 }
 
-private i32 tls_feed(TlsSession* s) {
+// Step picotls over the `len` bytes at `p`; `*used` is what it took.
+private i32 tls_step(TlsSession* s, u8* p, i32 len, i32* used) {
     i32 flags = 0;
-    if s.is_server && !s.saw_input && s.cipher_in_len > 0 {
+    *used = 0;
+    if s.is_server && !s.saw_input && len > 0 {
         s.saw_input = true;
-        if !tls_looks_like_tls(s) {
+        if !tls_looks_like_tls(*p) {
             s.failed = true;
             s.tls_err = TLS_ERR_NOT_TLS;
             // deliberately without stepping picotls, so no alert is generated
@@ -362,9 +432,11 @@ private i32 tls_feed(TlsSession* s) {
             return TLS_ERR;
         }
     }
-    while s.cipher_in_len > 0 && !s.failed {
-        u64 consumed = cast(u64, s.cipher_in_len);
-        void* input = cast(void*, &s.cipher_in[0]);
+    tls_buf_take(&s.sendbuf);
+    tls_buf_take(&s.recvbuf);
+    while *used < len && !s.failed {
+        u64 consumed = cast(u64, len - *used);
+        void* input = cast(void*, p + *used);
         if !s.established {
             i32 r = ptls_handshake(s.tls, &s.sendbuf, input, &consumed, null);
             if r != 0 && r != 514 {
@@ -374,13 +446,13 @@ private i32 tls_feed(TlsSession* s) {
                 if g_last_chain_err != 0 { s.chain_err = g_last_chain_err; g_last_chain_err = 0; }
                 return flags | TLS_ERR;
             }
-            tls_shift(s, cast(i32, consumed));
+            *used = *used + cast(i32, consumed);
             // r==0 means the step succeeded, NOT that the handshake is done;
             // completion is signalled only by ptls_handshake_is_complete.
             if ptls_handshake_is_complete(s.tls) != 0 { s.established = true; flags = flags | TLS_HANDSHAKE_DONE; }
         } else {
             i32 r = ptls_receive(s.tls, &s.recvbuf, input, &consumed);
-            tls_shift(s, cast(i32, consumed));
+            *used = *used + cast(i32, consumed);
             // any code other than ok/in-progress ends the stream cleanly
             // (close_notify) — keep the plaintext already decrypted
             if r != 0 && r != 514 {
@@ -391,7 +463,31 @@ private i32 tls_feed(TlsSession* s) {
         }
         if consumed == 0 { break; }   // picotls needs more than we have
     }
+    return flags;
+}
+
+// Feed `n` newly read bytes at `p` (none for n == 0): straight to picotls
+// when nothing is waiting before them, else behind what is in cipher_in.
+// What picotls does not take stays in cipher_in.
+private i32 tls_feed(TlsSession* s, u8* p, i32 n) {
+    i32 flags = 0;
+    i32 used = 0;
+    if s.cipher_in_len == 0 {
+        if n > 0 {
+            flags = tls_step(s, p, n, &used);
+            if !s.failed && !s.eof && !tls_keep(s, p + used, n - used) {
+                s.failed = true;
+                flags = flags | TLS_ERR;
+            }
+        }
+    } else {
+        if !tls_keep(s, p, n) { s.failed = true; return TLS_ERR; }
+        flags = tls_step(s, s.cipher_in, s.cipher_in_len, &used);
+        tls_shift(s, used);
+    }
     if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
+    if s.recvbuf.off == cast(u64, 0) { tls_buf_release(&s.recvbuf); }
+    if s.sendbuf.off == cast(u64, 0) { tls_buf_release(&s.sendbuf); }
     return flags;
 }
 
@@ -410,6 +506,7 @@ private bool tls_flush(TlsSession* s, i64 fd) {
     }
     s.sendbuf.off = cast(u64, 0);
     s.send_off = 0;
+    tls_buf_release(&s.sendbuf);
     return true;
 }
 
@@ -460,21 +557,16 @@ i32 tls_pump(TlsSession* s, i64 fd) {
             // leave the socket readable forever with nothing to read and
             // nothing reported. What arrived before it is still decrypted
             // for the reader; then the session fails.
-            flags = flags | tls_feed(s);
+            flags = flags | tls_feed(s, null, 0);
             s.failed = true;
             s.tls_err = TLS_ERR_READ;
             flags = flags | TLS_ERR;
-        } else if n > 0 {
-            if s.cipher_in_len + n > 16384 {
-                flags = flags | tls_feed(s);
-                if s.cipher_in_len + n > 16384 { s.failed = true; return flags | TLS_ERR; }
-            }
-            for i32 i = 0; i < n; i++ { s.cipher_in[s.cipher_in_len + i] = tmp[i]; }
-            s.cipher_in_len += n;
-            more = true;
         }
         i64 q1 = handshaking ? qpc() : 0;
-        flags = flags | tls_feed(s);
+        if n > 0 {
+            flags = flags | tls_feed(s, &tmp[0], n);
+            more = true;
+        }
         i64 q2 = handshaking ? qpc() : 0;
         if !tls_flush(s, fd) { s.failed = true; flags = flags | TLS_ERR; }
         i64 q3 = handshaking ? qpc() : 0;
@@ -493,6 +585,12 @@ i32 tls_pump(TlsSession* s, i64 fd) {
 // Encrypt+queue plaintext for sending. Returns false on a picotls error.
 bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) {
     if s.failed { return false; }
+    // The records' room in one allocation: grown from empty by doubling,
+    // the buffer would copy what it holds at each step. A record adds 22
+    // bytes (header, content type, tag) to at most 16 KB.
+    u64 records = cast(u64, len) / 16384 + 1;
+    tls_buf_take(&s.sendbuf);
+    if ptls_buffer_reserve(&s.sendbuf, cast(u64, len) + records * 32) != 0 { s.failed = true; return false; }
     i32 r = ptls_send(s.tls, &s.sendbuf, cast(void*, data), cast(u64, len));
     if r != 0 { s.failed = true; return false; }
     return tls_flush(s, fd);
@@ -540,6 +638,7 @@ i32 tls_read(TlsSession* s, u8* out, i32 max) {
     if s.recv_off >= cast(i64, s.recvbuf.off) {
         s.recvbuf.off = cast(u64, 0);
         s.recv_off = 0;
+        tls_buf_release(&s.recvbuf);
     }
     return n;
 }
@@ -879,14 +978,16 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     tls_server_ctxs_init();
     TlsServerCtx* sc = g_server_ctxs[ctx_id];
     if sc == null { return null; }
-    TlsSession* s = alloc<TlsSession>(1);
+    TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(&sc.ctx, 1);   // is_server = 1
     if s.tls == null { free(s); return null; }
-    ptls_buffer_init(&s.sendbuf, &s.send_small[0], 1024);
-    ptls_buffer_init(&s.recvbuf, &s.recv_small[0], 8192);
+    ptls_buffer_init(&s.sendbuf, "", 0);
+    ptls_buffer_init(&s.recvbuf, "", 0);
     s.send_off = 0;
     s.recv_off = 0;
+    s.cipher_in = null;
     s.cipher_in_len = 0;
+    s.cipher_in_cap = 0;
     s.chain_err = 0;
     s.checked_connect = false;
     s.started = false;
