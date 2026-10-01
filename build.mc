@@ -621,6 +621,41 @@ void run_unit_tests() {
         }
     }
     dir_list_free(&tests);
+    when arch(x64) {
+        if cpu_has_avx2() { run_gcm_wide(); }
+    }
+    return;
+}
+
+// The 256-bit AES-GCM arm (CIFRA_HW_256) is built only for an -avx2
+// target: test_gcm_hw again as one, on a host that can run it. Where the
+// CPU has no VAES or VPCLMULQDQ it tests the 128-bit arm again.
+void run_gcm_wide() {
+    str target = "windows-avx2";
+    when os(linux) { target = "linux-avx2"; }
+    string exe = join_named("build/unit", "test_gcm_hw_wide", EXE_SUFFIX);
+    defer free(exe);
+    ProcCmd c = { .args = { cc(), "test/unit/test_gcm_hw.mc", "--target", target, "-DCIFRA_HW_256" }, .capture = true };
+    proc_arg(&c, "-o");
+    proc_arg(&c, str_from(exe.data, exe.len));
+    ProcResult cr = proc_run(&c);
+    if cr.exit_code != 0 {
+        fail("test_gcm_hw_wide", " (compile)");
+        out(str_from(cr.out.data, cr.out.len));
+        proc_result_free(&cr);
+        return;
+    }
+    proc_result_free(&cr);
+    ProcCmd t = { .args = { str_from(exe.data, exe.len) }, .capture = true };
+    ProcResult r = proc_run(&t);
+    if r.exit_code != 0 {
+        fail("test_gcm_hw_wide", " (nonzero exit)");
+        out("      ");
+        outln(str_from(r.out.data, r.out.len));
+    } else {
+        pass("test_gcm_hw_wide");
+    }
+    proc_result_free(&r);
     return;
 }
 
