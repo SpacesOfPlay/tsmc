@@ -31,6 +31,9 @@ const server = https.createServer(opts, (req: any, res: any) => {
   if (u === '/big') { res.end('Z'.repeat(20000)); return; }
   if (u === '/utf8body') { res.end('h' + String.fromCharCode(233) + 'llo'); return; }
   if (u === '/written') { res.write('a'); res.end('b'); return; }
+  if (u === '/surrogate') { res.end('a' + String.fromCharCode(0xD800) + 'b'); return; }
+  if (u === '/latin1') { res.end('caf' + String.fromCharCode(233), 'latin1'); return; }
+  if (u === '/mixedclose') { res.setHeader('Connection', 'Keep-Alive, CLOSE'); res.end('x'); return; }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('hello ' + req.method);
 });
@@ -59,7 +62,8 @@ async function main() {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
   for (const [m, u] of [['GET', '/'], ['HEAD', '/'], ['GET', '/204'], ['GET', '/304'], ['GET', '/cookies'],
-                        ['GET', '/close'], ['GET', '/utf8hdr'], ['GET', '/big'], ['GET', '/utf8body'], ['GET', '/written']]) {
+                        ['GET', '/close'], ['GET', '/utf8hdr'], ['GET', '/big'], ['GET', '/utf8body'], ['GET', '/written'],
+                        ['GET', '/surrogate'], ['GET', '/latin1'], ['GET', '/mixedclose']]) {
     console.log('--- ' + m + ' ' + u);
     console.log(show(await exchange(port, req(m, u, true))));
   }

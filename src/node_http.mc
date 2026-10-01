@@ -101,6 +101,35 @@ function parseHeaders(text) {
   return headers;
 }
 
+// What a request head says, as bits: the native parse returns the same.
+const F_LENGTH = 1;
+const F_CODING = 2;
+const F_CHUNKED = 4;
+const F_KEEP = 8;
+const F_UPGRADE = 16;
+const F_HTTP10 = 32;
+
+function headFacts(m) {
+  const h = m.headers;
+  let f = 0;
+  if (h['content-length'] !== undefined) f |= F_LENGTH;
+  const te = h['transfer-encoding'];
+  if (te !== undefined) {
+    f |= F_CODING;
+    // Only chunked, applied last, says where the body ends.
+    const codings = String(te).toLowerCase().split(',');
+    if (codings[codings.length - 1].trim() === 'chunked') f |= F_CHUNKED;
+  }
+  const c = String(h['connection'] || '').toLowerCase();
+  const http10 = m.httpVersion === '1.0';
+  if (http10) f |= F_HTTP10;
+  // HTTP/1.1 keeps the connection unless told otherwise; 1.0 is the
+  // other way round and has to ask.
+  if (c.indexOf('close') < 0 && (!http10 || c.indexOf('keep-alive') >= 0)) f |= F_KEEP;
+  if (h['upgrade'] !== undefined && c.indexOf('upgrade') >= 0) f |= F_UPGRADE;
+  return f;
+}
+
 function toBuf(chunk, enc) {
   if (chunk == null) return Buffer.alloc(0);
   if (typeof chunk === 'string') return Buffer.from(chunk, enc || 'utf8');
@@ -108,17 +137,11 @@ function toBuf(chunk, enc) {
 }
 
 class IncomingMessage extends EventEmitter {
+  // headers {}, method and url null, statusCode 0, statusMessage '',
+  // httpVersion '1.1', complete and upgrade false, _encoding null
   constructor() {
     super();
-    this.headers = {};
-    this.method = null;
-    this.url = null;
-    this.statusCode = 0;
-    this.statusMessage = '';
-    this.httpVersion = '1.1';
-    this.complete = false;
-    this.upgrade = false;
-    this._encoding = null;
+    __http_init(this, 0);
   }
   setEncoding(enc) { this._encoding = enc; return this; }
   pause() { return this; }
@@ -135,25 +158,16 @@ class IncomingMessage extends EventEmitter {
 }
 
 class ServerResponse extends EventEmitter {
+  // socket; _method, which decides whether a body may be sent at all
+  // (method or 'GET'); statusCode 200; statusMessage ''; headersSent,
+  // finished and writableEnded false; _headers {}; _keepAlive false, set
+  // by the server for a request whose connection may be reused (a
+  // response built any other way closes); _http10 false (on HTTP/1.0 a
+  // body of unknown length cannot be chunked); _chunked false; _onDone
+  // null.
   constructor(socket, method) {
     super();
-    this.socket = socket;
-    // the request method decides whether a body may be sent at all
-    this._method = method || 'GET';
-    this.statusCode = 200;
-    this.statusMessage = '';
-    this.headersSent = false;
-    this.finished = false;
-    this.writableEnded = false;
-    this._headers = {};
-    // Set by the server for a request whose connection may be reused. A
-    // response built any other way closes, which is what this did before
-    // there was a choice.
-    this._keepAlive = false;
-    // An HTTP/1.0 request: a body of unknown length cannot be chunked.
-    this._http10 = false;
-    this._chunked = false;
-    this._onDone = null;
+    __http_init(this, 1, socket, method);
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
   getHeader(k) { return this._headers[k.toLowerCase()]; }
@@ -169,7 +183,11 @@ class ServerResponse extends EventEmitter {
     this.statusCode = status;
     if (typeof reason === 'string') this.statusMessage = reason;
     else headers = reason;
-    if (headers) for (const k in headers) this.setHeader(k, headers[k]);
+    // The headers go in at once unless setHeader has been replaced, in
+    // which case each goes through it.
+    if (headers && (this.setHeader !== setHeaderOwn || !__http_set_headers(this._headers, headers))) {
+      for (const k in headers) this.setHeader(k, headers[k]);
+    }
     return this;
   }
   // A response to HEAD, and a 204 or 304, carry no body -- the headers
@@ -283,22 +301,20 @@ class ServerResponse extends EventEmitter {
     else if (typeof enc === 'function') { cb = enc; enc = undefined; }
     if (this.finished) return this;
     if (typeof cb === 'function') this.once('finish', cb);
-    const data = toBuf(chunk, enc);
-    let sent = false;
     // Nothing written yet: the whole body is here, and its length known.
     // A socket that takes a whole response at once (a TLS socket with
-    // nothing queued) gets the head and the body in one call.
-    if (!this.headersSent) {
-      this._frame(data.length);
-      if (!this._chunked && this.socket._sendWhole !== undefined) {
-        const reason = this.statusMessage || statusText(this.statusCode);
-        sent = this.socket._sendWhole(this.statusCode, reason, this._headers, this._bodyAllowed() ? data : null);
-        if (sent) this.headersSent = true;
-      }
+    // nothing queued) gets the framing, the head and the body in one call.
+    let sent = false;
+    if (!this.headersSent && this.socket._sendResponse !== undefined) {
+      sent = this.socket._sendResponse(this, this.statusMessage || statusText(this.statusCode), chunk, enc);
     }
     if (!sent) {
+      const data = toBuf(chunk, enc);
       const out = [];
-      if (!this.headersSent) out.push(this._headBytes());
+      if (!this.headersSent) {
+        this._frame(data.length);
+        out.push(this._headBytes());
+      }
       this._framed(data, out);
       if (this._chunked) out.push(Buffer.from('0' + CRLF + CRLF, 'latin1'));
       this._send(out);
@@ -312,6 +328,8 @@ class ServerResponse extends EventEmitter {
     return this;
   }
 }
+
+const setHeaderOwn = ServerResponse.prototype.setHeader;
 
 // What a client may send before it has said anything we agreed to. The
 // head is buffered whole because it cannot be understood in pieces, so
@@ -456,15 +474,6 @@ function serveConnection(server, socket) {
     deadline(HEAD_MS);
   }
 
-  function wantsKeepAlive(m) {
-    const c = String(m.headers['connection'] || '').toLowerCase();
-    if (c.indexOf('close') >= 0) return false;
-    // HTTP/1.1 keeps the connection unless told otherwise; 1.0 is the
-    // other way round and has to ask.
-    if (m.httpVersion === '1.0') return c.indexOf('keep-alive') >= 0;
-    return true;
-  }
-
   // Answer, then hang up. A client that has already gone past a limit is
   // not going to be talked out of it, and leaving the socket open leaves
   // the thing being defended against in place.
@@ -551,7 +560,9 @@ function serveConnection(server, socket) {
       scanned = 0;
       if (he > MAX_HEAD) { refuse(431, 'Request header too large'); return; }
       msg = new IncomingMessage();
-      if (__http_parse_head(buf, he, msg) !== true) {
+      msg.socket = socket;
+      let facts = __http_parse_head(buf, he, msg);
+      if (facts === undefined) {
         const text = buf.slice(0, he).toString('utf8');
         const lines = text.split(CRLF);
         const first = lines.shift().split(' ');
@@ -559,26 +570,24 @@ function serveConnection(server, socket) {
         msg.url = first[1];
         msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
         msg.headers = parseHeaders(lines.join(CRLF));
+        facts = headFacts(msg);
       }
       buf = buf.slice(he + 4);
-      const cl = msg.headers['content-length'];
-      const te = msg.headers['transfer-encoding'];
       chunked = false;
-      if (te !== undefined) {
+      if ((facts & F_CODING) !== 0) {
         // A length and a coding together can be read two ways, and a
         // proxy in front may read the other one: that is how a request is
         // smuggled past it. Refused, as node refuses it.
-        if (cl !== undefined) { refuse(400, 'Bad request'); return; }
+        if ((facts & F_LENGTH) !== 0) { refuse(400, 'Bad request'); return; }
         // Only chunked, applied last, says where the body ends.
-        const codings = String(te).toLowerCase().split(',');
-        if (codings[codings.length - 1].trim() !== 'chunked') { refuse(400, 'Bad request'); return; }
+        if ((facts & F_CHUNKED) === 0) { refuse(400, 'Bad request'); return; }
         chunked = true;
         cstate = 'size';
         csize = 0;
         received = 0;
         trailerBytes = 0;
       }
-      remaining = cl !== undefined ? parseInt(cl, 10) : 0;
+      remaining = (facts & F_LENGTH) !== 0 ? parseInt(msg.headers['content-length'], 10) : 0;
       // A length that is absent, negative or not a number is none. A
       // declared one past the ceiling is refused before a byte of it is
       // kept, which is the point of it being declared.
@@ -586,9 +595,7 @@ function serveConnection(server, socket) {
       if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
       // An upgrade is only one when somebody is there to take it; otherwise
       // the request is served like any other.
-      if (msg.headers['upgrade'] !== undefined &&
-          String(msg.headers['connection'] || '').toLowerCase().indexOf('upgrade') >= 0 &&
-          server.listenerCount('upgrade') > 0) {
+      if ((facts & F_UPGRADE) !== 0 && server.listenerCount('upgrade') > 0) {
         handOver();
         return;
       }
@@ -597,8 +604,8 @@ function serveConnection(server, socket) {
       if (remaining > 0 || chunked) deadline(BODY_MS); else clearDeadline();
       state = 'body';
       res = new ServerResponse(socket, msg.method);
-      res._keepAlive = wantsKeepAlive(msg);
-      res._http10 = msg.httpVersion === '1.0';
+      res._keepAlive = (facts & F_KEEP) !== 0;
+      res._http10 = (facts & F_HTTP10) !== 0;
       res._onDone = onDone;
       server.emit('request', msg, res);
     }
@@ -809,6 +816,7 @@ class ClientRequest extends EventEmitter {
         const lines = text.split(CRLF);
         const first = lines.shift().split(' ');
         res = new IncomingMessage();
+        res.socket = self.socket;
         res.httpVersion = (first[0] || 'HTTP/1.1').split('/')[1] || '1.1';
         res.statusCode = parseInt(first[1], 10) || 0;
         res.statusMessage = first.slice(2).join(' ');

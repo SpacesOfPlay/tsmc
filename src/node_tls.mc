@@ -228,11 +228,12 @@ class TLSSocket extends EventEmitter {
     this._flush();
     return ok;
   }
-  // A whole HTTP response, head and body, into the session in one call
-  // when nothing is queued ahead of it. False leaves it to write().
-  _sendWhole(code, reason, headers, body) {
+  // An HTTP response's end, framing, head and body, into the session in
+  // one call when nothing is queued ahead of it. False leaves it to
+  // write().
+  _sendResponse(res, reason, body, enc) {
     if (this._wq.length !== 0 || this._corked !== 0 || this._connecting || this.destroyed || this._ending) return false;
-    const n = __tls_respond(this._id, code, reason, headers, body);
+    const n = __tls_respond(this._id, res, reason, body, enc);
     if (n === undefined) return false;
     if (n < 0) { this._fail('write EIO', 'EPIPE'); return true; }
     if (__tls_pending(this._id) >= HWM) this._needDrain = true;

@@ -13098,13 +13098,70 @@ private void http_set(VM* vm, Value obj, str name, Value v) {
     vm_pop(vm);
 }
 
+// What a request head says about the request, as the http module's
+// headFacts computes it: a Content-Length; a Transfer-Encoding, and whether
+// its last coding is chunked; whether the connection stays (Connection
+// without "close", and on HTTP/1.0 with "keep-alive"); an upgrade (an
+// Upgrade header and "upgrade" in Connection); HTTP/1.0.
+const i32 HTTP_F_LENGTH = 1;
+const i32 HTTP_F_CODING = 2;
+const i32 HTTP_F_CHUNKED = 4;
+const i32 HTTP_F_KEEP = 8;
+const i32 HTTP_F_UPGRADE = 16;
+const i32 HTTP_F_HTTP10 = 32;
+
+// True when `hay`, lowercased, contains `needle` (lowercase ASCII).
+private bool http_contains_ci(str hay, str needle) {
+    for i32 i = 0; i + needle.len <= hay.len; i++ {
+        bool same = true;
+        for i32 j = 0; j < needle.len; j++ {
+            u8 c = *(hay.data + i + j);
+            if c >= cast(u8, 65) && c <= cast(u8, 90) { c = cast(u8, c + 32); }
+            if c != *(needle.data + j) { same = false; break; }
+        }
+        if same { return true; }
+    }
+    return false;
+}
+
+// The text of header `name` in the headers object, or none (false).
+private bool http_header_text(VM* vm, JsObject* h, str name, str* out) {
+    Value* v = props_get(&h.props, bi_atom(vm, name));
+    if v == null || !value_is_string(*v) { return false; }
+    *out = sview(*v);
+    return true;
+}
+
+private i32 http_head_facts(VM* vm, JsObject* h, str version) {
+    i32 f = 0;
+    str t;
+    if props_get(&h.props, bi_atom(vm, "content-length")) != null { f = f | HTTP_F_LENGTH; }
+    if http_header_text(vm, h, "transfer-encoding", &t) {
+        f = f | HTTP_F_CODING;
+        // the last of the comma-separated codings, trimmed
+        i32 comma = t.len;
+        while comma > 0 && *(t.data + comma - 1) != cast(u8, 44) { comma--; }
+        str last = http_trim(str_from(t.data + comma, t.len - comma));
+        if last.len == 7 && http_contains_ci(last, "chunked") { f = f | HTTP_F_CHUNKED; }
+    }
+    str conn = "";
+    ignore http_header_text(vm, h, "connection", &conn);
+    bool http10 = str_equal(version, "1.0");
+    if http10 { f = f | HTTP_F_HTTP10; }
+    if !http_contains_ci(conn, "close") && (!http10 || http_contains_ci(conn, "keep-alive")) { f = f | HTTP_F_KEEP; }
+    if props_get(&h.props, bi_atom(vm, "upgrade")) != null && http_contains_ci(conn, "upgrade") {
+        f = f | HTTP_F_UPGRADE;
+    }
+    return f;
+}
+
 // __http_parse_head(buf, end, msg): the request line and the header lines
 // in buf[0, end) into msg.method, msg.url, msg.httpVersion and
 // msg.headers. The request line splits at spaces; the version is what
 // follows the first '/' of its third word, 1.1 when that is absent or
 // empty. Header names are trimmed and lowercased and values trimmed; a
 // repeated header's values join with ", ", except Set-Cookie, whose values
-// form an array. True, or undefined with msg untouched.
+// form an array. The HTTP_F_* facts, or undefined with msg untouched.
 private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value bv = arg_at(args, argc, 0);
@@ -13150,9 +13207,9 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
         while v1 < word[2].len && *(word[2].data + v1) != cast(u8, 47) { v1++; }
         if v0 < word[2].len && v1 > v0 { version = str_from(word[2].data + v0, v1 - v0); }
     }
-    http_set(vm, msgv, "method", new_str(vm, word[0]));
+    http_set(vm, msgv, "method", str_equal(word[0], "GET") ? http_str(vm, HTTP_S_GET) : new_str(vm, word[0]));
     http_set(vm, msgv, "url", words > 1 ? new_str(vm, word[1]) : value_undefined());
-    http_set(vm, msgv, "httpVersion", new_str(vm, version));
+    http_set(vm, msgv, "httpVersion", str_equal(version, "1.1") ? http_str(vm, HTTP_S_V11) : new_str(vm, version));
 
     JsObject* h = js_new_object(&vm.heap, vm.object_proto);
     Value hv = value_cell(&h.head);
@@ -13201,8 +13258,97 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
         vm_pop(vm);
     }
     http_set(vm, msgv, "headers", hv);
+    i32 facts = http_head_facts(vm, h, version);
     vm_pop(vm);
+    return value_number(cast(f64, facts));
+}
+
+// __http_set_headers(dst, src): dst[name.toLowerCase()] = value for each
+// own enumerable property of the plain object src, in for-in order, as
+// writeHead's loop over setHeader does. False, with dst untouched, for a
+// src that is not a plain object, a name outside ASCII or one that
+// lowercases to __proto__, or a getter.
+private Value nat_http_set_headers(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value dv = arg_at(args, argc, 0);
+    Value sv = arg_at(args, argc, 1);
+    i32 odd = OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY;
+    if !value_is_object(dv) || !value_is_object(sv) { return value_bool(false); }
+    JsObject* d = value_as_object(dv);
+    JsObject* src = value_as_object(sv);
+    if (d.obj_flags & odd) != 0 || (src.obj_flags & odd) != 0 || src.proto != vm.object_proto || src.elen != 0 {
+        return value_bool(false);
+    }
+    PropList* props = &src.props;
+    vm_props_order(vm, props);
+    for i32 i = 0; i < props.len; i++ {
+        Prop* pr = props.items + i;
+        if !prop_enumerable(vm, pr) { continue; }
+        if value_is_accessor(pr.val) { return value_bool(false); }
+        str k = atom_name(&vm.atoms, pr.key);
+        for i32 j = 0; j < k.len; j++ {
+            if *(k.data + j) >= cast(u8, 128) { return value_bool(false); }
+        }
+        if http_is_proto(k) { return value_bool(false); }
+    }
+    u8[256] lower;
+    for i32 i = 0; i < props.len; i++ {
+        Prop* pr = props.items + i;
+        if !prop_enumerable(vm, pr) { continue; }
+        str k = atom_name(&vm.atoms, pr.key);
+        u8* kb = k.len <= 256 ? &lower[0] : alloc<u8>(k.len);
+        bool same = true;
+        for i32 j = 0; j < k.len; j++ {
+            u8 c = *(k.data + j);
+            if c >= cast(u8, 65) && c <= cast(u8, 90) { c = cast(u8, c + 32); same = false; }
+            *(kb + j) = c;
+        }
+        u32 key = same ? pr.key : vm_atom_dyn(vm, str_from(kb, k.len));
+        if kb != &lower[0] { free(kb); }
+        props_set_desc(&d.props, key, pr.val, PROP_DEFAULT);
+    }
     return value_bool(true);
+}
+
+// __http_init(obj, kind, socket, method): the fields an IncomingMessage
+// (kind 0) or a ServerResponse (kind 1) starts with, in the order their
+// constructors set them.
+private Value nat_http_init(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    Value ov = arg_at(args, argc, 0);
+    if !value_is_object(ov) { return value_undefined(); }
+    JsObject* o = value_as_object(ov);
+    Value no = value_bool(false);
+    JsObject* h = js_new_object(&vm.heap, vm.object_proto);
+    Value hv = value_cell(&h.head);
+    vm_push(vm, hv);
+    if to_int_arg(arg_at(args, argc, 1)) == 0 {
+        http_set_field(vm, o, "headers", hv);
+        http_set_field(vm, o, "method", value_null());
+        http_set_field(vm, o, "url", value_null());
+        http_set_field(vm, o, "statusCode", value_number(0.0));
+        http_set_field(vm, o, "statusMessage", http_str(vm, HTTP_S_EMPTY));
+        http_set_field(vm, o, "httpVersion", http_str(vm, HTTP_S_V11));
+        http_set_field(vm, o, "complete", no);
+        http_set_field(vm, o, "upgrade", no);
+        http_set_field(vm, o, "_encoding", value_null());
+    } else {
+        Value method = arg_at(args, argc, 3);
+        http_set_field(vm, o, "socket", arg_at(args, argc, 2));
+        http_set_field(vm, o, "_method", js_truthy(method) ? method : http_str(vm, HTTP_S_GET));
+        http_set_field(vm, o, "statusCode", value_number(200.0));
+        http_set_field(vm, o, "statusMessage", http_str(vm, HTTP_S_EMPTY));
+        http_set_field(vm, o, "headersSent", no);
+        http_set_field(vm, o, "finished", no);
+        http_set_field(vm, o, "writableEnded", no);
+        http_set_field(vm, o, "_headers", hv);
+        http_set_field(vm, o, "_keepAlive", no);
+        http_set_field(vm, o, "_http10", no);
+        http_set_field(vm, o, "_chunked", no);
+        http_set_field(vm, o, "_onDone", value_null());
+    }
+    vm_pop(vm);
+    return value_undefined();
 }
 
 // Appends the ASCII text of a string or number header value; false for any
@@ -13286,35 +13432,126 @@ private Value nat_http_head_bytes(void* vmp, Value callee, Value thisv, Value* a
     return r;
 }
 
-// __tls_respond(id, code, reason, headers, body): a whole response, the
-// head and then `body` (a Buffer, or null for none), into the TLS session
-// as one record and on to the socket. The bytes taken, -1 when the
-// session failed, or undefined for a response it leaves to the
-// JavaScript: one past a record, one the head formatter refuses, or a
-// session with a record's worth or more still queued.
+// The http natives' constant strings, each made once and kept by the VM.
+const i32 HTTP_S_EMPTY = 0;
+const i32 HTTP_S_V11 = 1;
+const i32 HTTP_S_GET = 2;
+const i32 HTTP_S_KEEP = 3;
+const i32 HTTP_S_CLOSE = 4;
+
+private Value http_str(VM* vm, i32 which) {
+    if vm.http_strs[which] == null {
+        str t = "";
+        if which == HTTP_S_V11 { t = "1.1"; }
+        if which == HTTP_S_GET { t = "GET"; }
+        if which == HTTP_S_KEEP { t = "keep-alive"; }
+        if which == HTTP_S_CLOSE { t = "close"; }
+        vm.http_strs[which] = gc_new_string(&vm.heap, t);
+    }
+    return value_cell(&vm.http_strs[which].head);
+}
+
+// A property of a response object by name, or undefined.
+private Value http_field(VM* vm, JsObject* o, str name) {
+    Value* v = props_get(&o.props, bi_atom(vm, name));
+    return v == null ? value_undefined() : *v;
+}
+
+private void http_set_field(VM* vm, JsObject* o, str name, Value v) {
+    props_set_desc(&o.props, bi_atom(vm, name), v, PROP_DEFAULT);
+}
+
+// The bytes of a string as Buffer.from(s, 'utf8') gives them, when they
+// are the string's own: a lone surrogate (ED A0-BF) is spelled otherwise.
+private bool http_utf8_view(Value v, u8** p, i32* n) {
+    str t = sview(v);
+    for i32 i = 0; i + 1 < t.len; i++ {
+        if *(t.data + i) == cast(u8, 0xED) && *(t.data + i + 1) >= cast(u8, 0xA0) { return false; }
+    }
+    *p = t.data;
+    *n = t.len;
+    return true;
+}
+
+// __tls_respond(id, res, reason, body, enc): ServerResponse.end's whole
+// response in one call. The framing that res._frame settles (a
+// Content-Length when there is none and the status allows one, a
+// Connection header, and the keep-alive a "close" in it ends), then the
+// head and `body` (a Buffer, a string in UTF-8, or none for null and
+// undefined), into the TLS session as one record and on to the socket;
+// res.headersSent is set. The bytes taken, -1 when the session failed, or
+// undefined for a response left to the JavaScript: a chunked coding, a
+// Connection or coding that is not a string, another encoding, a body
+// past a record, a session with a record's worth queued, or a head the
+// formatter refuses; the last two after the framing, which _frame then
+// finds settled.
 private Value nat_tls_respond(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     i32 id = to_int_arg(arg_at(args, argc, 0));
     i64 fd = vm_handle_fd(vm, id);
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
     if s == null || fd < 0 || tls_pending(s) >= 16384 { return value_undefined(); }
-    Value bodyv = arg_at(args, argc, 4);
+    Value resv = arg_at(args, argc, 1);
+    if !value_is_object(resv) { return value_undefined(); }
+    JsObject* res = value_as_object(resv);
+    Value hv = http_field(vm, res, "_headers");
+    Value codev = http_field(vm, res, "statusCode");
+    Value methodv = http_field(vm, res, "_method");
+    if !value_is_object(hv) || !value_is_number(codev) || !value_is_string(methodv) { return value_undefined(); }
+    JsObject* h = value_as_object(hv);
+    if (h.obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 { return value_undefined(); }
+
+    // the body, as end's toBuf would make it
+    Value bodyv = arg_at(args, argc, 3);
+    Value encv = arg_at(args, argc, 4);
     u8* bp = null;
     i32 bn = 0;
-    if !value_is_null(bodyv) && !value_is_undefined(bodyv) {
+    if value_is_string(bodyv) {
+        if !value_is_undefined(encv) {
+            if !value_is_string(encv) { return value_undefined(); }
+            str e = sview(encv);
+            if !str_equal(e, "utf8") && !str_equal(e, "utf-8") { return value_undefined(); }
+        }
+        if !http_utf8_view(bodyv, &bp, &bn) { return value_undefined(); }
+    } else if !value_is_null(bodyv) && !value_is_undefined(bodyv) {
         if !is_bytes_like(bodyv) { return value_undefined(); }
         bp = buf_ptr(value_as_object(bodyv), &bn);
         if bp == null && bn > 0 { return value_undefined(); }
     }
     if bn > 16384 { return value_undefined(); }
+
+    // the framing, as _frame(bn): nothing changes before every refusal
+    // that could follow it has been ruled out
+    Value tev = http_field(vm, h, "transfer-encoding");
+    if !value_is_undefined(tev) && !value_is_null(tev) {
+        if !value_is_string(tev) { return value_undefined(); }
+        if http_contains_ci(sview(tev), "chunked") { return value_undefined(); }
+    }
+    Value connv = http_field(vm, h, "connection");
+    if !value_is_undefined(connv) && !value_is_string(connv) { return value_undefined(); }
+    i32 code = cast(i32, js_to_number(codev));
+    bool no_length = code == 204 || code == 304 || (code >= 100 && code < 200);
+    if !no_length && value_is_undefined(http_field(vm, h, "content-length")) {
+        http_set_field(vm, h, "content-length", value_number(cast(f64, bn)));
+    }
+    bool keep = js_truthy(http_field(vm, res, "_keepAlive"));
+    if value_is_undefined(connv) {
+        http_set_field(vm, h, "connection", http_str(vm, keep ? HTTP_S_KEEP : HTTP_S_CLOSE));
+    } else if http_contains_ci(sview(connv), "close") {
+        http_set_field(vm, res, "_keepAlive", value_bool(false));
+    }
+    bool body_allowed = !str_equal(sview(methodv), "HEAD") && !no_length;
+    if !body_allowed { bn = 0; }
+
     str_buf sb;
     str_buf_init(&sb);
     defer str_buf_free(&sb);
-    if !http_head_build(vm, &sb, arg_at(args, argc, 1), arg_at(args, argc, 2), arg_at(args, argc, 3)) {
+    if !http_head_build(vm, &sb, codev, arg_at(args, argc, 2), hv) {
         return value_undefined();
     }
     if sb.len + bn > 16384 { return value_undefined(); }
     if bn > 0 { str_buf_add_bytes(&sb, bp, bn); }
+    http_set_field(vm, res, "headersSent", value_bool(true));
     if !tls_write(s, fd, sb.data, sb.len) { return value_int(-1); }
     // ciphertext the socket did not take waits for it to become writable
     if tls_wants_write(s) {
@@ -13334,6 +13571,8 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__http_head_end", &nat_http_head_end);
     ignore def_global_fn(vm, "__http_parse_head", &nat_http_parse_head);
     ignore def_global_fn(vm, "__http_head_bytes", &nat_http_head_bytes);
+    ignore def_global_fn(vm, "__http_set_headers", &nat_http_set_headers);
+    ignore def_global_fn(vm, "__http_init", &nat_http_init);
     ignore def_global_fn(vm, "__tls_respond", &nat_tls_respond);
     ignore def_global_fn(vm, "__tls_read", &nat_tls_read);
     ignore def_global_fn(vm, "__tls_write", &nat_tls_write);

@@ -220,6 +220,7 @@ struct VM {
     StrMap<i32> regex_cache;    // "flags\nsource" -> index into regexps
     Vec<str> regex_keys;        // owned keys of regex_cache
     GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
+    GcString*[8] http_strs;     // the http natives' constant strings, made when first used
     u32 atom_rx;
     u32 atom_source;
     u32 atom_flags;
@@ -396,6 +397,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
     for i32 c = 0; c < 128; c++ {
         if vm.ascii_chars[c] != null { gc_mark_cell(h, &vm.ascii_chars[c].head); }
+    }
+    for i32 c = 0; c < 8; c++ {
+        if vm.http_strs[c] != null { gc_mark_cell(h, &vm.http_strs[c].head); }
     }
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
@@ -4070,6 +4074,7 @@ void vm_init(VM* vm) {
     vm.url_proto = null;
     vm.usp_proto = null;
     vm.require_cache = null;
+    for i32 c = 0; c < 8; c++ { vm.http_strs[c] = null; }
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     strmap_init<i32>(&vm.regex_cache);
     vec_init<str>(&vm.regex_keys, 8);
