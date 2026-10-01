@@ -3996,17 +3996,19 @@ private Value struct_clone(VM* vm, Value v, Vec<u64>* keys, Vec<Value>* clones) 
         gc_root(&vm.heap, rv);
         vec_push(keys, id);
         vec_push(clones, rv);
+        m.pinned++;
         for i32 i = 0; i < m.len; i++ {
             if !*(m.live + i) { continue; }
             Value k = struct_clone(vm, *(m.keys + i), keys, clones);
-            if vm.has_pending { return value_undefined(); }
+            if vm.has_pending { m.pinned--; return value_undefined(); }
             Value val = k;
             if !m.is_set {
                 val = struct_clone(vm, *(m.vals + i), keys, clones);
-                if vm.has_pending { return value_undefined(); }
+                if vm.has_pending { m.pinned--; return value_undefined(); }
             }
             map_put(r, k, val);
         }
+        m.pinned--;
         return rv;
     }
     if value_is_object(v) {
@@ -6974,7 +6976,7 @@ private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* arg
     VM* vm = as_vm(vmp);
     JsNative* me = value_as_native(callee);
     JsMap* mp = value_as_map(me.env0);
-    i32 i = value_as_int(me.env1);
+    i32 i = map_iter_pos(mp, value_as_int(me.env1), js_to_number(me.env3));
     while i < mp.len && !*(mp.live + i) { i++; }
     JsObject* r = js_new_object(&vm.heap, vm.object_proto);
     vm_push(vm, value_cell(&r.head));
@@ -6986,6 +6988,7 @@ private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* arg
         Value key = *(mp.keys + i);
         Value val = mp.is_set ? key : *(mp.vals + i);
         me.env1 = value_int(i + 1);
+        me.env3 = value_number(cast(f64, *(mp.seqs + i)));
         i32 kind = value_as_int(me.env2);
         Value out = key;
         if kind == 1 { out = val; }
@@ -7011,6 +7014,7 @@ private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
     nx.env0 = value_cell(&mp.head);
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
+    nx.env3 = value_number(-1.0);
     js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
@@ -7073,7 +7077,7 @@ private i32 index_iter_len(VM* vm, Value src, bool* ok) {
 // `entries` still builds the pair it yields, but no result object around it.
 private i32 map_iter_step(VM* vm, JsNative* nx, Value* val, bool* done) {
     JsMap* mp = value_as_map(nx.env0);
-    i32 i = value_as_int(nx.env1);
+    i32 i = map_iter_pos(mp, value_as_int(nx.env1), js_to_number(nx.env3));
     while i < mp.len && !*(mp.live + i) { i++; }
     if i >= mp.len {
         nx.env1 = value_int(i);
@@ -7084,6 +7088,7 @@ private i32 map_iter_step(VM* vm, JsNative* nx, Value* val, bool* done) {
     Value key = *(mp.keys + i);
     Value v = mp.is_set ? key : *(mp.vals + i);
     nx.env1 = value_int(i + 1);
+    nx.env3 = value_number(cast(f64, *(mp.seqs + i)));
     *done = false;
     i32 kind = value_as_int(nx.env2);
     if kind == 0 { *val = key; return 1; }
@@ -7954,9 +7959,11 @@ private void map_index_put(JsMap* mp, Value key, i32 at) {
 private void map_reindex(JsMap* mp) {
     i32 want = 16;
     while want < mp.len * 2 { want = want + want; }
-    if mp.index != null { free(mp.index); }
-    mp.index = alloc<i32>(want);
-    mp.icap = want;
+    if mp.index == null || mp.icap != want {
+        if mp.index != null { free(mp.index); }
+        mp.index = alloc<i32>(want);
+        mp.icap = want;
+    }
     for i32 i = 0; i < want; i++ { *(mp.index + i) = 0 - 1; }
     for i32 i = 0; i < mp.len; i++ {
         if *(mp.live + i) { map_index_put(mp, *(mp.keys + i), i); }
@@ -7997,6 +8004,8 @@ private void map_put(JsMap* mp, Value key, Value val) {
     *(mp.keys + mp.len) = key;
     *(mp.vals + mp.len) = val;
     *(mp.live + mp.len) = true;
+    *(mp.seqs + mp.len) = mp.next_seq;
+    mp.next_seq++;
     i32 slot = mp.len;
     mp.len++;
     mp.count++;
@@ -8007,6 +8016,47 @@ private void map_put(JsMap* mp, Value key, Value val) {
     }
     if mp.len * 2 >= mp.icap { map_reindex(mp); return; }
     map_index_put(mp, key, slot);
+}
+
+// Drops the tombstones once they are three quarters of the slots and at
+// least 16, unless a native walk over the slots is under way: the storage
+// stays within four times what is live, and a compaction, which rebuilds
+// the index, comes once per three deletes a live entry. Live entries keep
+// their order and their numbers.
+private void map_maybe_compact(JsMap* mp) {
+    i32 dead = mp.len - mp.count;
+    if mp.pinned != 0 || dead < 16 || dead < 3 * mp.count { return; }
+    i32 j = 0;
+    for i32 i = 0; i < mp.len; i++ {
+        if !*(mp.live + i) { continue; }
+        *(mp.keys + j) = *(mp.keys + i);
+        *(mp.vals + j) = *(mp.vals + i);
+        *(mp.seqs + j) = *(mp.seqs + i);
+        *(mp.live + j) = true;
+        j++;
+    }
+    mp.len = j;
+    // the index keeps its size, which the slots grow back into
+    if mp.index != null {
+        for i32 i = 0; i < mp.icap; i++ { *(mp.index + i) = 0 - 1; }
+        for i32 i = 0; i < mp.len; i++ { map_index_put(mp, *(mp.keys + i), i); }
+    }
+}
+
+// Where an iterator that stopped before slot `p`, having returned the entry
+// numbered `last` (-1 for none), goes on: at p if the slot before it still
+// holds that entry, else, the slots having moved, at the first entry
+// numbered after it.
+private i32 map_iter_pos(JsMap* mp, i32 p, f64 last) {
+    if p == 0 && last < 0.0 { return 0; }
+    if p > 0 && p - 1 < mp.len && cast(f64, *(mp.seqs + p - 1)) == last { return p; }
+    i32 lo = 0;
+    i32 hi = mp.len;
+    while lo < hi {
+        i32 mid = lo + (hi - lo) / 2;
+        if cast(f64, *(mp.seqs + mid)) <= last { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
 }
 
 // The collection's storage. A `class X extends Set` instance is an ordinary
@@ -8233,14 +8283,16 @@ private Value set_combine(void* vmp, Value thisv, Value* args, i32 argc, i32 op)
     // that side's order, which is what node does.
     bool other_first = op == 1 && other.size < cast(f64, mp.count);
     if !other_first {
+        mp.pinned++;
         for i32 i = 0; i < mp.len; i++ {
             if !*(mp.live + i) { continue; }
             Value k = *(mp.keys + i);
             bool inb = setlike_has(vm, &other, k);
-            if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+            if vm.has_pending { mp.pinned--; gc_root_reset(&vm.heap, rm); return value_undefined(); }
             bool keep = op == 0 || (op == 1 && inb) || (op >= 2 && !inb);
             if keep { map_put(out, k, value_undefined()); }
         }
+        mp.pinned--;
     }
     if op != 2 {
         JsObject* ks = setlike_keys(vm, &other);
@@ -8295,13 +8347,15 @@ private Value set_relate(void* vmp, Value thisv, Value* args, i32 argc, i32 op) 
     } else {
         if op == 0 && cast(f64, mp.count) > other.size { result = false; }
         else {
+            mp.pinned++;
             for i32 i = 0; i < mp.len; i++ {
                 if !*(mp.live + i) { continue; }
                 bool inb = setlike_has(vm, &other, *(mp.keys + i));
-                if vm.has_pending { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+                if vm.has_pending { mp.pinned--; gc_root_reset(&vm.heap, rm); return value_undefined(); }
                 if op == 0 && !inb { result = false; }
                 if op == 2 && inb { result = false; }
             }
+            mp.pinned--;
         }
     }
     gc_root_reset(&vm.heap, rm);
@@ -8617,6 +8671,7 @@ private Value nat_map_delete(void* vmp, Value callee, Value thisv, Value* args, 
     if at < 0 { return value_bool(false); }
     *(mp.live + at) = false;
     mp.count--;
+    map_maybe_compact(mp);
     return value_bool(true);
 }
 
@@ -8726,6 +8781,7 @@ private Value nat_map_foreach(void* vmp, Value callee, Value thisv, Value* args,
     }
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, thisv);
+    mp.pinned++;
     for i32 i = 0; i < mp.len; i++ {
         if !*(mp.live + i) { continue; }
         Value key = *(mp.keys + i);
@@ -8734,6 +8790,8 @@ private Value nat_map_foreach(void* vmp, Value callee, Value thisv, Value* args,
         ignore vm_call_value(vm, fun, arg_at(args, argc, 1), &ca[0], 3);
         if vm.has_pending { break; }
     }
+    mp.pinned--;
+    map_maybe_compact(mp);
     gc_root_reset(&vm.heap, rm);
     return value_undefined();
 }
