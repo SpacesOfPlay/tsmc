@@ -93,9 +93,10 @@ struct IoHandle {
     i32 kind;       // 0 = none (M32: listener / connecting / connected)
     i16 interest;   // poll readiness mask (NET_POLLIN/OUT); 0 = not polled
     bool reffed;    // does this handle keep the loop alive?
-    bool alive;     // false once closed; slots are cleared between runs
+    bool alive;     // false once closed; the slot is then reused
     Value owner;    // JS Socket/Server object; GC-marked, dispatch target
     void* ext;      // native side-state (e.g. a TLS session); not GC-traced
+    i32 gen;        // how many times the slot has been taken, as ids carry it
 }
 
 // Called by the reactor for each ready handle: (vm, handle index, revents).
@@ -234,6 +235,7 @@ struct VM {
     i32 next_timer_id;
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
+    Vec<i32> handle_free;        // closed slots, taken again before the table grows
     ReactorHook reactor_hook;   // net module's ready-handle dispatcher, or null
     DynImportHook dynimport_hook;   // module layer's import(spec), or null
     void* esm_loader;           // persistent ESM Loader for dynamic import, or null
@@ -4098,6 +4100,7 @@ void vm_init(VM* vm) {
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
+    vec_init<i32>(&vm.handle_free, 4);
     vm.reactor_hook = null;
     vm.dynimport_hook = null;
     vm.esm_loader = null;
@@ -7191,13 +7194,43 @@ Value vm_agen_request(VM* vm, Value genv, Value input, i32 kind) {
 
 // --- I/O handles -------------------------------------------------------------------
 //
-// The handle table is the reactor's set of live OS resources. In M31
-// nothing registers a handle; the API and its ref-count exist so the loop
-// exit condition and GC rooting are in place for the socket work in M32.
+// The handle table is the reactor's set of live OS resources. A closed
+// handle's slot is taken again by the next one, so the table, which the
+// reactor walks on every turn, stays as large as the most handles open at
+// once rather than growing with every connection a server has had. A
+// handle's id is its slot and the slot's generation, so an id kept after
+// its handle closed matches no later handle in the same slot: every
+// accessor resolves ids through vm_handle_at.
+const i32 HANDLE_SLOT_BITS = 20;
+const i32 HANDLE_SLOT_MASK = 1048575;
+const i32 HANDLE_GENS = 2048;      // the generation wraps here, ids staying positive i32s
 
-// Registers a handle (reffed + alive) and returns its slot index as id.
+private i32 vm_handle_id(i32 slot, i32 gen) { return slot | (gen << HANDLE_SLOT_BITS); }
+
+// The handle an id names, or null for an id no current handle has.
+private IoHandle* vm_handle_at(VM* vm, i32 id) {
+    if id < 0 { return null; }
+    i32 slot = id & HANDLE_SLOT_MASK;
+    if slot >= vm.handles.len { return null; }
+    IoHandle* h = vm.handles.data + slot;
+    if h.gen != (id >> HANDLE_SLOT_BITS) { return null; }
+    return h;
+}
+
+// Registers a handle (reffed + alive) and returns its id.
 i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
-    IoHandle h;
+    i32 slot;
+    i32 gen = 0;
+    if vm.handle_free.len > 0 {
+        slot = vec_pop(&vm.handle_free);
+        gen = ((vm.handles.data + slot).gen + 1) % HANDLE_GENS;
+    } else {
+        IoHandle blank;
+        blank.gen = 0;
+        vec_push(&vm.handles, blank);
+        slot = vm.handles.len - 1;
+    }
+    IoHandle* h = vm.handles.data + slot;
     h.fd = fd;
     h.kind = kind;
     h.interest = 0;
@@ -7205,8 +7238,8 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
     h.alive = true;
     h.owner = owner;
     h.ext = null;
-    vec_push(&vm.handles, h);
-    return vm.handles.len - 1;
+    h.gen = gen;
+    return vm_handle_id(slot, gen);
 }
 
 // Marks a handle closed once its descriptor is. The descriptor number is
@@ -7214,21 +7247,26 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
 // opens, and a close, send or read that reached this handle later (a
 // second close on another path, a write queued before the close) would
 // act on that other connection.
+// The slot is free for the next handle once closed; the owner is let go.
 void vm_handle_close(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len {
-        IoHandle* h = vm.handles.data + idx;
-        h.alive = false;
-        h.fd = -1;
-        h.interest = 0;
-    }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h == null || !h.alive { return; }
+    h.alive = false;
+    h.fd = -1;
+    h.interest = 0;
+    h.reffed = false;
+    h.owner = value_undefined();
+    vec_push(&vm.handle_free, idx & HANDLE_SLOT_MASK);
 }
 
 void vm_handle_ref(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).reffed = true; }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h != null && h.alive { h.reffed = true; }
 }
 
 void vm_handle_unref(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).reffed = false; }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h != null { h.reffed = false; }
 }
 
 // True while any open handle is still keeping the process alive.
@@ -7242,36 +7280,39 @@ bool vm_handles_alive(VM* vm) {
 
 // Which readiness a handle waits on (NET_POLLIN / NET_POLLOUT); 0 = none.
 void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).interest = events; }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h != null && h.alive { h.interest = events; }
 }
 
 i16 vm_handle_interest(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).interest; }
-    return 0;
+    IoHandle* h = vm_handle_at(vm, idx);
+    return h != null ? h.interest : cast(i16, 0);
 }
 
 // The handle's descriptor, or -1 once it is closed.
 i64 vm_handle_fd(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len && (vm.handles.data + idx).alive { return (vm.handles.data + idx).fd; }
-    return -1;
+    IoHandle* h = vm_handle_at(vm, idx);
+    return h != null && h.alive ? h.fd : -1;
 }
 
 Value vm_handle_owner(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).owner; }
-    return value_undefined();
+    IoHandle* h = vm_handle_at(vm, idx);
+    return h != null ? h.owner : value_undefined();
 }
 
 void vm_handle_set_owner(VM* vm, i32 idx, Value owner) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).owner = owner; }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h != null && h.alive { h.owner = owner; }
 }
 
 void vm_handle_set_ext(VM* vm, i32 idx, void* ext) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).ext = ext; }
+    IoHandle* h = vm_handle_at(vm, idx);
+    if h != null { h.ext = ext; }
 }
 
 void* vm_handle_ext(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).ext; }
-    return null;
+    IoHandle* h = vm_handle_at(vm, idx);
+    return h != null ? h.ext : null;
 }
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
@@ -7423,7 +7464,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
             (pf + k).fd = h.fd;
             (pf + k).events = h.interest;
             (pf + k).revents = 0;
-            *(hidx + k) = i;
+            *(hidx + k) = vm_handle_id(i, h.gen);
             k++;
         }
     }
@@ -7435,8 +7476,9 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;
-            // dispatch by index; the hook re-reads vm.handles, so a
-            // vec_push growing the table mid-loop is safe
+            // dispatch by id; the hook re-reads vm.handles, so a
+            // vec_push growing the table mid-loop is safe, and a handle
+            // closed by an earlier dispatch is not reached
             if re != 0 {
                 vm.reactor_hook(vm, *(hidx + j), re);
                 if vm.has_pending { break; }
@@ -7587,6 +7629,7 @@ i32 vm_run_event_loop(VM* vm) {
     vm.timers.len = 0;
     vm.timers_dead = 0;
     vm.handles.len = 0;
+    vm.handle_free.len = 0;
     return 0;
 }
 

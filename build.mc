@@ -805,16 +805,16 @@ void run_golden_tests(str exe, DirList* scripts) {
     return;
 }
 
-// Nine golden tests need what the sandbox does not have: an environment
+// Ten golden tests need what the sandbox does not have: an environment
 // (process) and sockets (tls_plaintext_reply, tls_reset_after_data,
 // http_body_limit, http_heads, https_heads, http_no_body,
-// https_close_open, http_early_answer).
+// https_close_open, http_early_answer, net_handle_reuse).
 private bool wasm_skips(str stem) {
     return str_equal(stem, "process") || str_equal(stem, "tls_plaintext_reply")
         || str_equal(stem, "tls_reset_after_data") || str_equal(stem, "http_body_limit")
         || str_equal(stem, "http_heads") || str_equal(stem, "https_heads")
         || str_equal(stem, "http_no_body") || str_equal(stem, "https_close_open")
-        || str_equal(stem, "http_early_answer");
+        || str_equal(stem, "http_early_answer") || str_equal(stem, "net_handle_reuse");
 }
 
 // The module is cross-compiled on every test run, so it cannot rot
