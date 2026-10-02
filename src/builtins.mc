@@ -17511,6 +17511,12 @@ private JsObject* build_util_module(VM* vm) {
 private u32 sha_rotr(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }
 
 private void sha256_block(u8* block, u32* state, u32* k) {
+    when arch(x64) || arch(arm64) {
+        if sha256_hw_on() {
+            sha256_compress(state, block, 1);
+            return;
+        }
+    }
     u32[64] w;
     for i32 i = 0; i < 16; i++ {
         i32 off = i * 4;
@@ -17561,6 +17567,12 @@ private void sha256_hash(u8* data, i32 len, u8* out) {
         0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
     };
     i32 pos = 0;
+    when arch(x64) || arch(arm64) {
+        if sha256_hw_on() && len >= 64 {
+            pos = (len / 64) * 64;
+            sha256_compress(&state[0], data, cast(i64, len / 64));
+        }
+    }
     while pos + 64 <= len {
         sha256_block(data + pos, &state[0], &k[0]);
         pos = pos + 64;
@@ -18031,6 +18043,60 @@ private Value nat_crypto_get_hashes(void* vmp, Value callee, Value thisv, Value*
     return r;
 }
 
+// A Hash or Hmac keeps what update() gave it in "%buf", a Buffer with room
+// to spare, and the bytes used in "%len": appending copies, and the room
+// doubles when it runs out, so a large input costs its own size once.
+private void hash_acc_init(VM* vm, JsObject* h) {
+    JsObject* b = buf_new(vm, 256);
+    Value bv = value_cell(&b.head);
+    vm_push(vm, bv);
+    props_set_desc(&h.props, bi_atom(vm, "%buf"), bv, 0);
+    props_set_desc(&h.props, bi_atom(vm, "%len"), value_number(0.0), 0);
+    vm_pop(vm);
+}
+
+// The accumulated bytes and their count, or null.
+private u8* hash_acc_bytes(VM* vm, JsObject* h, i32* n) {
+    *n = 0;
+    Value bufv;
+    Value lenv;
+    if !js_get_prop(h, bi_atom(vm, "%buf"), &bufv) || !value_is_object(bufv) { return null; }
+    if !js_get_prop(h, bi_atom(vm, "%len"), &lenv) || !value_is_number(lenv) { return null; }
+    i32 cap;
+    u8* p = ta_bytes(value_as_object(bufv), &cap);
+    if p == null { return null; }
+    *n = cast(i32, value_as_f64(lenv));
+    return p;
+}
+
+private void hash_acc_append(VM* vm, JsObject* h, u8* data, i32 n) {
+    if n <= 0 { return; }
+    i32 len;
+    u8* p = hash_acc_bytes(vm, h, &len);
+    if p == null { return; }
+    Value bufv;
+    ignore js_get_prop(h, bi_atom(vm, "%buf"), &bufv);
+    i32 cap;
+    ignore ta_bytes(value_as_object(bufv), &cap);
+    if len + n > cap {
+        i32 ncap = cap < 256 ? 256 : cap;
+        while ncap < len + n { ncap = ncap * 2; }
+        JsObject* nb = buf_new(vm, ncap);
+        Value nbv = value_cell(&nb.head);
+        vm_push(vm, nbv);
+        i32 got;
+        u8* q = ta_bytes(nb, &got);
+        // the old buffer, found again: buf_new may have collected
+        u8* old = hash_acc_bytes(vm, h, &len);
+        if len > 0 { memcpy(q, old, cast(i64, len)); }
+        props_set_desc(&h.props, bi_atom(vm, "%buf"), nbv, 0);
+        vm_pop(vm);
+        p = q;
+    }
+    memcpy(p + len, data, cast(i64, n));
+    props_set_desc(&h.props, bi_atom(vm, "%len"), value_number(cast(f64, len + n)), 0);
+}
+
 private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
@@ -18043,11 +18109,8 @@ private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value
     }
     JsObject* h = js_new_object(&vm.heap, vm.crypto_hash_proto);
     vm_push(vm, value_cell(&h.head));
-    Value accbuf = value_cell(&js_new_array(&vm.heap, vm.array_proto).head);
-    vm_push(vm, accbuf);
-    props_set_desc(&h.props, bi_atom(vm, "%buf"), accbuf, 0);
+    hash_acc_init(vm, h);
     props_set_desc(&h.props, bi_atom(vm, "%algo"), value_number(cast(f64, id)), 0);
-    vm_pop(vm);   // accbuf
     vm_pop(vm);   // h
     vm_pop(vm);   // algv
     return value_cell(&h.head);
@@ -18062,16 +18125,26 @@ private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args,
         vm_throw_error(vm, ERR_ERROR, "Digest already called");
         return value_undefined();
     }
-    Value bufv;
-    if !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv) || !value_is_array(bufv) {
-        return thisv;
-    }
-    JsObject* acc = value_as_object(bufv);
+    JsObject* self = value_as_object(thisv);
+    i32 have;
+    if hash_acc_bytes(vm, self, &have) == null { return thisv; }
     Value data = arg_at(args, argc, 0);
     if is_bytes_like(data) {
         JsObject* b = value_as_object(data);
-        i32 n = buf_len(b);
-        for i32 i = 0; i < n; i++ { js_array_set(acc, acc.elen, value_number(cast(f64, buf_byte(b, i)))); }
+        i32 n;
+        u8* p = buf_ptr(b, &n);
+        if p != null {
+            // copied first: growing the accumulator may collect
+            u8* tmp = alloc<u8>(n > 0 ? n : 1);
+            if n > 0 { memcpy(tmp, p, cast(i64, n)); }
+            hash_acc_append(vm, self, tmp, n);
+            free(tmp);
+        } else {
+            u8* tmp = alloc<u8>(n > 0 ? n : 1);
+            for i32 i = 0; i < n; i++ { *(tmp + i) = cast(u8, buf_byte(b, i)); }
+            hash_acc_append(vm, self, tmp, n);
+            free(tmp);
+        }
     } else {
         i32 enc = buf_parse_enc(arg_at(args, argc, 1), ENC_UTF8);
         Value s = js_to_string_value(vm, data);
@@ -18079,7 +18152,7 @@ private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args,
         str_buf sb;
         str_buf_init(&sb);
         str_to_bytes(&sb, sview(s), enc);
-        for i32 i = 0; i < sb.len; i++ { js_array_set(acc, acc.elen, value_number(cast(f64, *(sb.data + i)))); }
+        hash_acc_append(vm, self, sb.data, sb.len);
         str_buf_free(&sb);
         vm_pop(vm);
     }
@@ -18093,25 +18166,18 @@ private Value nat_hash_digest(void* vmp, Value callee, Value thisv, Value* args,
         return value_undefined();
     }
     crypto_mark_spent(vm, thisv);
-    Value bufv;
-    if !value_is_object(thisv)
-        || !js_get_prop(value_as_object(thisv), bi_atom(vm, "%buf"), &bufv)
-        || !value_is_array(bufv) {
-        return value_undefined();
-    }
+    if !value_is_object(thisv) { return value_undefined(); }
     JsObject* self = value_as_object(thisv);
+    i32 n;
+    u8* acc = hash_acc_bytes(vm, self, &n);
+    if acc == null { return value_undefined(); }
     i32 id = 32;
     Value algov;
     if js_get_prop(self, bi_atom(vm, "%algo"), &algov) && value_is_number(algov) {
         id = cast(i32, value_as_f64(algov));
     }
-    JsObject* acc = value_as_object(bufv);
-    i32 n = acc.elen;
-    u8* data = alloc<u8>(n > 0 ? n : 1);
-    for i32 i = 0; i < n; i++ { *(data + i) = cast(u8, buf_byte(acc, i)); }
     u8[64] digest;
-    crypto_algo_hash(id, data, n, &digest[0]);
-    free(data);
+    crypto_algo_hash(id, acc, n, &digest[0]);
     return crypto_finalize_digest(vm, &digest[0], id, arg_at(args, argc, 0));
 }
 
@@ -18131,12 +18197,9 @@ private Value nat_crypto_create_hmac(void* vmp, Value callee, Value thisv, Value
     vm_push(vm, keybuf);
     JsObject* h = js_new_object(&vm.heap, vm.crypto_hmac_proto);
     vm_push(vm, value_cell(&h.head));
-    Value accbuf = value_cell(&js_new_array(&vm.heap, vm.array_proto).head);
-    vm_push(vm, accbuf);
-    props_set_desc(&h.props, bi_atom(vm, "%buf"), accbuf, 0);
+    hash_acc_init(vm, h);
     props_set_desc(&h.props, bi_atom(vm, "%algo"), value_number(cast(f64, id)), 0);
     props_set_desc(&h.props, bi_atom(vm, "%key"), keybuf, 0);
-    vm_pop(vm);   // accbuf
     vm_pop(vm);   // h
     vm_pop(vm);   // keybuf
     vm_pop(vm);   // algv
@@ -18149,21 +18212,20 @@ private Value nat_hmac_digest(void* vmp, Value callee, Value thisv, Value* args,
     // is still there, so node answers rather than refusing.
     if !value_is_object(thisv) { return value_undefined(); }
     JsObject* self = value_as_object(thisv);
-    Value bufv;
     Value keyv;
-    if !js_get_prop(self, bi_atom(vm, "%buf"), &bufv) || !value_is_array(bufv) { return value_undefined(); }
+    i32 mlen;
+    u8* macc = hash_acc_bytes(vm, self, &mlen);
+    if macc == null { return value_undefined(); }
     if !js_get_prop(self, bi_atom(vm, "%key"), &keyv) || !is_bytes_like(keyv) { return value_undefined(); }
     i32 id = 32;
     Value algov;
     if js_get_prop(self, bi_atom(vm, "%algo"), &algov) && value_is_number(algov) {
         id = cast(i32, value_as_f64(algov));
     }
-    JsObject* msg = value_as_object(bufv);
     JsObject* key = value_as_object(keyv);
-    i32 mlen = buf_len(msg);
     i32 klen = buf_len(key);
     u8* mbytes = alloc<u8>(mlen > 0 ? mlen : 1);
-    for i32 i = 0; i < mlen; i++ { *(mbytes + i) = cast(u8, buf_byte(msg, i)); }
+    if mlen > 0 { memcpy(mbytes, macc, cast(i64, mlen)); }
     u8* kbytes = alloc<u8>(klen > 0 ? klen : 1);
     for i32 i = 0; i < klen; i++ { *(kbytes + i) = cast(u8, buf_byte(key, i)); }
     u8[64] out;
