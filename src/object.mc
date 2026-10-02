@@ -319,6 +319,7 @@ struct JsNative {
     Value env0;            // bound target / wrapper state
     Value env1;
     Value env2;
+    Value env3;
     u8 synth_off;          // as on JsFunction
     u8 fn_nonext;          // as on JsFunction
 }
@@ -336,6 +337,13 @@ struct JsMap {
     Value* keys;
     Value* vals;
     bool* live;
+    // Each entry's number in the order of insertion. A delete leaves a
+    // tombstone, and once tombstones are three quarters of the slots they are dropped
+    // and the live entries move down; an iterator finds its place again by
+    // the number of the entry it returned last.
+    i64* seqs;
+    i64 next_seq;
+    i32 pinned;   // native walks over the slots under way: no compaction
     i32 len;      // slots used, including tombstones
     i32 cap;
     i32 count;    // live entries
@@ -419,7 +427,9 @@ struct JsGenerator {
 
 private void mark_props(GcHeap* h, PropList* p) {
     for i32 i = 0; i < p.len; i++ {
-        gc_mark_value(h, (p.items + i).val);
+        Prop* pr = p.items + i;
+        gc_mark_value(h, pr.val);
+        if pr.key < cast(u32, h.key_marks_len) { *(h.key_marks + pr.key) = cast(u8, 1); }
     }
 }
 
@@ -453,6 +463,7 @@ void js_trace(GcHeap* h, GcCell* c) {
         gc_mark_value(h, n.env0);
         gc_mark_value(h, n.env1);
         gc_mark_value(h, n.env2);
+        gc_mark_value(h, n.env3);
         return;
     }
     if c.kind == GC_BOX {
@@ -533,6 +544,7 @@ void js_finalize(GcCell* c) {
         if mp.keys != null { free(mp.keys); }
         if mp.vals != null { free(mp.vals); }
         if mp.live != null { free(mp.live); }
+        if mp.seqs != null { free(mp.seqs); }
         if mp.index != null { free(mp.index); }
         return;
     }
@@ -597,6 +609,7 @@ JsNative* js_new_native(GcHeap* h, NativeFn fun, str name) {
     n.env0 = value_undefined();
     n.env1 = value_undefined();
     n.env2 = value_undefined();
+    n.env3 = value_undefined();
     return n;
 }
 
@@ -652,12 +665,15 @@ void map_reserve(JsMap* mp) {
     Value* nk = alloc<Value>(ncap);
     Value* nv = alloc<Value>(ncap);
     bool* nl = alloc<bool>(ncap);
+    i64* ns = alloc<i64>(ncap);
     for i32 i = 0; i < mp.len; i++ {
         *(nk + i) = *(mp.keys + i);
         *(nv + i) = *(mp.vals + i);
         *(nl + i) = *(mp.live + i);
+        *(ns + i) = *(mp.seqs + i);
     }
-    if mp.keys != null { free(mp.keys); free(mp.vals); free(mp.live); }
+    if mp.keys != null { free(mp.keys); free(mp.vals); free(mp.live); free(mp.seqs); }
+    mp.seqs = ns;
     mp.keys = nk;
     mp.vals = nv;
     mp.live = nl;

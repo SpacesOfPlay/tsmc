@@ -1,0 +1,28 @@
+--- GET /
+HTTP/1.1 200 OK | Content-Type: text/plain | Content-Length: 9 | Connection: close |  | hello GET
+--- HEAD /
+HTTP/1.1 200 OK | Content-Type: text/plain | Content-Length: 10 | Connection: close |  | 
+--- GET /204
+HTTP/1.1 204 No Content | Connection: close |  | 
+--- GET /304
+HTTP/1.1 304 Not Modified | Etag: x | Connection: close |  | 
+--- GET /cookies
+HTTP/1.1 200 OK | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Num: 7 | Content-Length: 1 | Connection: close |  | c
+--- GET /close
+HTTP/1.1 200 OK | Connection: close | Content-Length: 3 |  | bye
+--- GET /utf8hdr
+HTTP/1.1 200 OK | X-Name: café | Content-Length: 1 | Connection: close |  | u
+--- GET /big
+HTTP/1.1 200 OK | Content-Length: 20000 | Connection: close |  | <20000 bytes>
+--- GET /utf8body
+HTTP/1.1 200 OK | Content-Length: 6 | Connection: close |  | héllo
+--- GET /written
+HTTP/1.1 200 OK | Transfer-Encoding: chunked | Connection: close |  | 1 | a | 1 | b | 0 |  | 
+--- GET /surrogate
+HTTP/1.1 200 OK | Content-Length: 5 | Connection: close |  | a���b
+--- GET /latin1
+HTTP/1.1 200 OK | Content-Length: 4 | Connection: close |  | caf�
+--- GET /mixedclose
+HTTP/1.1 200 OK | Connection: Keep-Alive, CLOSE | Content-Length: 1 |  | x
+--- two on one connection
+HTTP/1.1 200 OK | Content-Type: text/plain | Content-Length: 9 | Connection: keep-alive |  | hello GETHTTP/1.1 200 OK | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Num: 7 | Content-Length: 1 | Connection: close |  | c

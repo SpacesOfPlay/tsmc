@@ -12,6 +12,17 @@ const T_EOF = 4;
 const T_ERR = 8;
 const T_WANT_WRITE = 16;
 
+// Bytes a write() may leave queued before it answers false and a 'drain'
+// is owed: plaintext still queued here plus ciphertext the session holds.
+const HWM = 16384;
+// Ciphertext the session may hold before the plaintext queue waits for the
+// socket to take some of it.
+const CIPHER_CAP = 65536;
+// Small queued pieces are joined up to this many bytes before encryption:
+// each write is a record, with its own overhead on the wire and in the
+// cipher.
+const GATHER = 16384;
+
 function asBuffer(data, enc) {
   if (typeof data === 'string') return Buffer.from(data, enc || 'utf8');
   return data;
@@ -22,15 +33,58 @@ class TLSSocket extends EventEmitter {
     super();
     this._id = -1;
     this._connecting = true;
-    this._pending = [];
+    this._wq = [];
+    this._wqBytes = 0;
+    this._needDrain = false;
+    this._corked = 0;
+    this._paused = false;
+    this._pushback = [];
     this._ending = false;
+    this._sentAlert = false;
+    this._sentFin = false;
+    this._peerEnded = false;
     this.destroyed = false;
     this.encrypted = true;
+    this.readable = false;
+    this.writable = true;
+    const self = this;
+    this._writableState = { get length() { return self._queued(); }, get finished() { return self._sentFin; } };
+    this._readableState = { endEmitted: false, get ended() { return this.endEmitted; } };
   }
+  // Bytes accepted by write() that the peer has not been sent: plaintext
+  // queued here plus ciphertext the session still holds.
+  _queued() {
+    return this._wqBytes + (this._id >= 0 && !this.destroyed ? __tls_pending(this._id) : 0);
+  }
+  get writableLength() { return this._queued(); }
+  get writableHighWaterMark() { return HWM; }
   __onReady(revents) {
     if (this.destroyed) return;
-    const st = __tls_pump(this._id);
+    const st = __tls_pump(this._id, this._paused);
+    // The common case: data, and nothing queued, pending or ending. What
+    // the reader does with it decides whether a flush follows.
+    if (st === HAS_DATA && !this._paused && !this._connecting && this._wq.length === 0 &&
+        !this._needDrain && !this._ending) {
+      this._readAll();
+      if (this.destroyed) return;
+      if (this._wq.length !== 0 || this._needDrain || this._ending) {
+        this._flush();
+        if (this.destroyed) return;
+        this._maybeShutdown();
+      }
+      return;
+    }
     if (st & T_ERR) {
+      // A read that failed: what arrived before it is delivered first, as a
+      // plain socket delivers it, and the error is a socket error.
+      if (__tls_error_name(this._id) === 'EIO') {
+        if ((st & HAS_DATA) && !this._paused) {
+          this._readAll();
+          if (this.destroyed) return;
+        }
+        this._fail('read EIO', 'EIO');
+        return;
+      }
       const why = __tls_verify_error(this._id);
       if (why) this._fail('certificate verify failed: ' + why);
       else {
@@ -41,58 +95,186 @@ class TLSSocket extends EventEmitter {
     }
     if (this._connecting && __tls_established(this._id)) {
       this._connecting = false;
+      this.readable = true;
       this.emit('secureConnect');
       this.emit('connect');
-      const q = this._pending;
-      this._pending = [];
-      for (let i = 0; i < q.length; i++) this._sendBuf(q[i]);
+      if (this.destroyed) return;
     }
-    if (st & HAS_DATA) {
-      let b;
-      while ((b = __tls_read(this._id)) !== null) {
-        this.emit('data', b);
-        if (this.destroyed) return;
-      }
+    if ((st & HAS_DATA) && !this._paused) {
+      this._readAll();
+      if (this.destroyed) return;
     }
-    if (st & T_EOF) { this.emit('end'); this._finish(); return; }
-    // an end()ed socket closes once its outbound ciphertext has drained, so the
-    // peer sees EOF (a Connection: close response would otherwise hang)
-    this._maybeFinish();
+    if ((st & T_EOF) && !this._peerEnded) {
+      // the peer is done sending: what is queued here still goes out, then
+      // the socket closes
+      this.readable = false;
+      this._readableState.endEmitted = true;
+      this._peerEnded = true;
+      __net_want_read(this._id, false);
+      this.emit('end');
+      if (this.destroyed) return;
+      this._ending = true;
+      this.writable = false;
+    }
+    if (!this._connecting) this._flush();
+    if (this.destroyed) return;
+    this._maybeShutdown();
   }
-  _maybeFinish() {
-    if (this._ending && !this.destroyed && !this._connecting && !__tls_wants_write(this._id)) {
-      this._finish();
+  _readAll() {
+    let b;
+    while (!this._paused && (b = __tls_read(this._id)) !== null) {
+      this.emit('data', b);
+      if (this.destroyed) return;
     }
   }
-  _sendBuf(buf) {
-    let off = 0;
-    while (off < buf.length) {
-      const n = __tls_write(this._id, buf, off);
-      if (n <= 0) break;
-      off += n;
+  _drainPushback() {
+    while (this._pushback.length > 0 && !this._paused && !this.destroyed) {
+      this.emit('data', this._pushback.shift());
     }
+  }
+  unshift(chunk) {
+    if (chunk == null || chunk.length === 0) return;
+    this._pushback.push(asBuffer(chunk));
+    queueMicrotask(() => this._drainPushback());
+  }
+  // What a pull would find: the bytes put back by unshift(), or nothing.
+  // Everything else has already gone out as 'data'.
+  read() {
+    if (this._pushback.length === 0) return null;
+    const out = Buffer.concat(this._pushback);
+    this._pushback = [];
+    return out;
+  }
+  // Paused, nothing is read from the socket: the session only flushes what
+  // it already holds, and the peer's writes back up onto the peer.
+  pause() {
+    this._paused = true;
+    if (this._id >= 0 && !this._connecting && !this.destroyed) __net_want_read(this._id, false);
+    return this;
+  }
+  resume() {
+    if (!this._paused) return this;
+    this._paused = false;
+    queueMicrotask(() => {
+      if (this.destroyed || this._paused) return;
+      this._drainPushback();
+      if (this.destroyed || this._paused || this._connecting) return;
+      __net_want_read(this._id, true);
+      this._readAll();
+    });
+    return this;
+  }
+  // An end()ed socket half-closes, as a plain socket does: a close_notify
+  // goes out behind the queued plaintext, the FIN once the ciphertext has
+  // drained, and the socket stays open to read until the peer's own EOF.
+  _maybeShutdown() {
+    if (!this._ending || this.destroyed || this._connecting) return;
+    if (!this._sentAlert && this._wq.length === 0) {
+      this._sentAlert = true;
+      if (!__tls_shutdown(this._id)) { this._fail('write EIO', 'EPIPE'); return; }
+    }
+    if (this._sentAlert && !this._sentFin && !__tls_wants_write(this._id)) {
+      this._sentFin = true;
+      __net_shutdown(this._id);
+      this.emit('finish');
+    }
+    if (this._peerEnded && this._sentFin) this._finish();
+  }
+  // Encrypt queued plaintext while the session has room for the ciphertext.
+  // Past the cap it waits: the native write arms the socket for writable,
+  // and the pump that follows flushes and returns here.
+  // Several small pieces at the head of the queue go out as one: a frame is
+  // often written as its header and its payload, and each send is a system
+  // call. Up to GATHER bytes are joined before sending.
+  _coalesce() {
+    if (this._wq.length < 2) return;
+    let n = 0;
+    let k = 0;
+    while (k < this._wq.length && n < GATHER) {
+      const it = this._wq[k];
+      n += it.buf.length - it.off;
+      k++;
+    }
+    if (k < 2) return;
+    const parts = [];
+    for (let i = 0; i < k; i++) {
+      const it = this._wq[i];
+      parts.push(it.off > 0 ? it.buf.subarray(it.off) : it.buf);
+    }
+    this._wq.splice(0, k, { buf: Buffer.concat(parts, n), off: 0 });
+  }
+  _flush() {
+    if (this._connecting || this.destroyed || this._corked > 0) return;
+    while (this._wq.length > 0) {
+      if (__tls_pending(this._id) >= CIPHER_CAP) return;
+      this._coalesce();
+      const it = this._wq[0];
+      const n = __tls_write(this._id, it.buf, it.off);
+      if (n < 0) { this._fail('write EIO', 'EPIPE'); return; }
+      it.off += n;
+      this._wqBytes -= n;
+      if (it.off >= it.buf.length) this._wq.shift();
+    }
+    if (this._needDrain && !__tls_wants_write(this._id)) {
+      this._needDrain = false;
+      queueMicrotask(() => { if (!this.destroyed) this.emit('drain'); });
+    }
+    if (this._ending) this._maybeShutdown();
   }
   write(data, enc, cb) {
     if (typeof enc === 'function') { cb = enc; enc = undefined; }
-    if (!this.destroyed) {
+    if (!this.destroyed && !this._ending) {
       const buf = asBuffer(data, enc);
-      if (this._connecting) this._pending.push(buf);
-      else this._sendBuf(buf);
+      // Nothing queued ahead and room in the session: a record's worth
+      // goes to the session at once, without a queue entry.
+      if (this._wq.length === 0 && this._corked === 0 && !this._connecting &&
+          buf.length <= GATHER && __tls_pending(this._id) < CIPHER_CAP) {
+        if (buf.length > 0 && __tls_write(this._id, buf, 0) < 0) this._fail('write EIO', 'EPIPE');
+      } else {
+        this._wq.push({ buf: buf, off: 0 });
+        this._wqBytes += buf.length;
+      }
     }
     if (typeof cb === 'function') queueMicrotask(cb);
+    const ok = this._queued() < HWM;
+    if (!ok) this._needDrain = true;
+    this._flush();
+    return ok;
+  }
+  // An HTTP response's end, framing, head and body, into the session in
+  // one call when nothing is queued ahead of it. False leaves it to
+  // write().
+  _sendResponse(res, reason, body, enc) {
+    if (this._wq.length !== 0 || this._corked !== 0 || this._connecting || this.destroyed || this._ending) return false;
+    const pending = __tls_respond(this._id, res, reason, body, enc);
+    if (pending === undefined) return false;
+    if (pending < 0) { this._fail('write EIO', 'EPIPE'); return true; }
+    if (pending >= HWM) this._needDrain = true;
     return true;
   }
-  end(data, enc) {
+  end(data, enc, cb) {
+    if (typeof data === 'function') { cb = data; data = null; }
+    else if (typeof enc === 'function') { cb = enc; enc = undefined; }
     if (data != null) this.write(data, enc);
+    if (typeof cb === 'function') this.once('finish', cb);
     this._ending = true;
-    // close once the queued ciphertext has flushed; if it already has (the
-    // common small-response case, no reactor event pending) close now
-    if (!this._connecting) queueMicrotask(() => this._maybeFinish());
+    this.writable = false;
+    this._corked = 0;
+    if (!this._connecting) { this._flush(); queueMicrotask(() => this._maybeShutdown()); }
     return this;
+  }
+  // Writes between cork() and uncork() are held and go out together.
+  cork() { this._corked++; }
+  uncork() {
+    if (this._corked === 0) return;
+    this._corked--;
+    if (this._corked === 0 && !this._connecting) this._flush();
   }
   _finish() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.readable = false;
+    this.writable = false;
     __tls_close(this._id);
     this.emit('close');
   }

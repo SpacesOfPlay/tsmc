@@ -20,7 +20,7 @@ Run everything with `minc test`
   rule live in `diff/early_valid.js`.
 - **wasm** — the module is cross-compiled on every run. With node
   present, the golden tests also run through it (`tools/wasm_run.js`),
-  except the two that need an environment or a socket; then the package
+  except those that need an environment or a socket; then the package
   view against a registry faked in `tools/cdn_fs_check.js`; then the
   playground's examples that import no package, through
   `tools/examples_check.js`. Each example block in `web/index.html`

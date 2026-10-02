@@ -301,8 +301,7 @@ private { void aesgcm_pl_encrypt_v(ptls_aead_context_t* base, void* output, ptls
     u8* tmp = alloc<u8>(total);
     u64 off = 0;
     for u64 i = 0; i < incnt; i++ {
-        u8* src = input[i].base;
-        for u64 j = 0; j < input[i].len; j++ { *(tmp + off + j) = src[j]; }
+        memcpy(tmp + off, input[i].base, cast(i64, input[i].len));
         off = off + input[i].len;
     }
     aesgcm_pl_encrypt(base, output, cast(void*, tmp), total, seq, aad, aadlen, null);
@@ -448,8 +447,7 @@ private { void chapoly_pl_encrypt_v(ptls_aead_context_t* base, void* output, ptl
     u8* tmp = alloc<u8>(total);
     u64 off = 0;
     for u64 i = 0; i < incnt; i++ {
-        u8* src = input[i].base;
-        for u64 j = 0; j < input[i].len; j++ { *(tmp + off + j) = src[j]; }
+        memcpy(tmp + off, input[i].base, cast(i64, input[i].len));
         off = off + input[i].len;
     }
     chapoly_pl_encrypt(base, output, cast(void*, tmp), total, seq, aad, aadlen, null);
@@ -531,6 +529,16 @@ u8* malloc_copy(u8* src, u64 n) {
 }
 }
 
+// LOCAL (tsmc): the public key for a fresh secret. The secret is clamped here, as
+// crypto_x25519 clamps it, so the fixed-base comb of dirty_fast gives
+// the ladder's key (its low-order term is zero for a clamped scalar) in
+// half the time.
+private void x25519_keygen(u8* pk, u8* sk) {
+    sk[0] = sk[0] & 248;
+    sk[31] = (sk[31] & 127) | 64;
+    crypto_x25519_dirty_fast(pk, sk);
+}
+
 i32 x25519_pl_exchange(ptls_key_exchange_algorithm_t* algo,
                        ptls_iovec_t* pubkey, ptls_iovec_t* secret,
                        ptls_iovec_t peerkey) {
@@ -538,7 +546,7 @@ i32 x25519_pl_exchange(ptls_key_exchange_algorithm_t* algo,
     u8[32] sk;
     mc_csprng_bytes(cast(void*, &sk[0]), cast(u64, 32));
     u8[32] pk_local;
-    crypto_x25519_public_key(&pk_local[0], &sk[0]);
+    x25519_keygen(&pk_local[0], &sk[0]);
     u8[32] secret_local;
     crypto_x25519(&secret_local[0], &sk[0], peerkey.base);
     *pubkey = ptls_iovec_init(malloc_copy(&pk_local[0], 32), 32);
@@ -577,7 +585,7 @@ i32 x25519_pl_create(ptls_key_exchange_algorithm_t* algo,
     ctx.super.on_exchange = x25519_pl_on_exchange;
     mc_csprng_bytes(cast(void*, &ctx.secret_key[0]), cast(u64, 32));
     u8[32] pk_local;
-    crypto_x25519_public_key(&pk_local[0], &ctx.secret_key[0]);
+    x25519_keygen(&pk_local[0], &ctx.secret_key[0]);
     ctx.super.pubkey = ptls_iovec_init(malloc_copy(&pk_local[0], 32), 32);
     *out_ctx = cast(ptls_key_exchange_context_t*, &ctx.super);
     return 0;

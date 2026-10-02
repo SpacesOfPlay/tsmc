@@ -5,6 +5,7 @@ import cstdlib_shim;
 import cfile_shim;
 import cvararg_shim;
 import picotls_shim;
+import cifra_hw;
 
 // transminc: C stdlib constants referenced by source
 const i32 UINT8_MAX = 255;
@@ -1167,10 +1168,17 @@ struct cf_prp {
  * .. c:member:: cf_aes_context.ks
  * 
  * Expanded key material.  Filled in by :c:func:`cf_aes_init`.
+ *
+ * .. c:member:: cf_aes_context.hw
+ *
+ * Nonzero when the CPU's AES instructions encrypt with this key, using
+ * the round keys in :c:member:`cf_aes_context.hwks`.
  */
 struct cf_aes_context {
     u32 rounds;
     u32[16 / 4 * (14 + 1)] ks;
+    u32 hw;
+    u8[16 * (14 + 1)] hwks;
 }
 
 /**
@@ -18398,9 +18406,41 @@ void cf_sha224_init(cf_sha256_context* ctx) {
     ctx.H[7] = 0xbefa4fa4;
 }
 
+// LOCAL (tsmc): SHA-256 on the CPU's instructions (sha256_compress:
+// SHA-NI, FEAT_SHA256) where it has them, cifra's code otherwise. The CPU
+// is asked once; sha256_hw_force switches the path, for tests that
+// compare the two.
+i32 g_sha256_hw = -1;            // -1 not asked yet, 0 software, 1 hardware
+
+bool sha256_hw_on() {
+    if g_sha256_hw < 0 {
+        g_sha256_hw = 0;
+        when arch(x64) || arch(arm64) {
+            if cpu_has_sha256() { g_sha256_hw = 1; }
+        }
+    }
+    return g_sha256_hw == 1;
+}
+
+// on: 0 for cifra's code, 1 for the instructions where the CPU has them.
+// Returns whether the instructions are now in use.
+bool sha256_hw_force(i32 on) {
+    g_sha256_hw = -1;
+    if on == 0 { g_sha256_hw = 0; }
+    return sha256_hw_on();
+}
+
 private {
 void sha256_update_block(void* vctx, u8* inp) {
     cf_sha256_context* ctx = vctx;
+    // LOCAL (tsmc): the instructions, where the CPU has them.
+    when arch(x64) || arch(arm64) {
+        if sha256_hw_on() {
+            sha256_compress(&ctx.H[0], inp, 1);
+            ctx.blocks++;
+            return;
+        }
+    }
     noinit u32[16] W;
     u32 a = ctx.H[0];
     u32 b = ctx.H[1];
@@ -18445,6 +18485,17 @@ void sha256_update_block(void* vctx, u8* inp) {
 }
 
 void cf_sha256_update(cf_sha256_context* ctx, void* data, u64 nbytes) {
+    // LOCAL (tsmc): whole blocks go to the instructions in one call when
+    // nothing is buffered.
+    when arch(x64) || arch(arm64) {
+        if ctx.npartial == 0 && nbytes >= 64 && sha256_hw_on() {
+            u64 nb = nbytes / 64;
+            sha256_compress(&ctx.H[0], cast(u8*, data), cast(i64, nb));
+            ctx.blocks += cast(u32, nb);
+            data = cast(void*, cast(u8*, data) + nb * 64);
+            nbytes = nbytes - nb * 64;
+        }
+    }
     cf_blockwise_accumulate(ctx.partial, &ctx.npartial, cast(u64, sizeof(ctx.partial)), data, nbytes, sha256_update_block, ctx);
 }
 
@@ -18948,6 +18999,7 @@ void cf_aes_init(cf_aes_context* ctx, u8* key, u64 nkey) {
             abort();
         }
     }
+    ctx.hw = cast(u32, cf_aes_hw_init(ctx.ks, ctx.rounds, ctx.hwks));
 }
 
 private {
@@ -19003,6 +19055,10 @@ void cf_aes_encrypt(cf_aes_context* ctx, u8* in, u8* out) {
             abort();
         }
         if !(0 != 0) { break; }
+    }
+    if ctx.hw != 0 {
+        cf_aes_hw_encrypt(ctx.hwks, ctx.rounds, in, out);
+        return;
     }
     u32[4] state = {read32_be(in + 0), read32_be(in + 4), read32_be(in + 8), read32_be(in + 12)};
     u32* round_keys = ctx.ks;
@@ -19307,6 +19363,12 @@ void cf_gcm_encrypt_final(cf_gcm_ctx* gcmctx, u8* tag, u64 ntag) {
 
 void cf_gcm_encrypt(cf_prp* prp, void* prpctx, u8* plain, u64 nplain, u8* header, u64 nheader, u8* nonce, u64 nnonce, u8* cipher, u8* tag, u64 ntag) {
     noinit cf_gcm_ctx gcmctx;
+    if prp == &cf_aes && nnonce == 12 && cast(cf_aes_context*, prpctx).hw {
+        cf_aes_context* aes = prpctx;
+        if cf_gcm_hw_seal(aes.hwks, aes.rounds, plain, nplain, header, nheader, nonce, cipher, tag, ntag) != 0 {
+            return;
+        }
+    }
     cf_gcm_encrypt_init(prp, prpctx, &gcmctx, header, nheader, nonce, nnonce);
     cf_gcm_encrypt_update(&gcmctx, plain, nplain, cipher);
     cf_gcm_encrypt_final(&gcmctx, tag, ntag);
@@ -19314,18 +19376,13 @@ void cf_gcm_encrypt(cf_prp* prp, void* prpctx, u8* plain, u64 nplain, u8* header
 
 i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* header, u64 nheader, u8* nonce, u64 nnonce, u8* tag, u64 ntag, u8* plain) {
     u8[16] H;
-    u8[16] Y0;
-    ghash_ctx gh;
-    u8[16] e_Y0;
-    cf_ctr ctr;
-    u8[16] full_tag;
-    defer {
-        mem_clean(H, cast(u64, sizeof(H)));
-        mem_clean(Y0, cast(u64, sizeof(Y0)));
-        mem_clean(e_Y0, cast(u64, sizeof(e_Y0)));
-        mem_clean(full_tag, cast(u64, sizeof(full_tag)));
-        mem_clean(&gh, cast(u64, sizeof(gh)));
-        mem_clean(&ctr, cast(u64, sizeof(ctr)));
+    noinit u8[16] Y0;
+    if prp == &cf_aes && nnonce == 12 && cast(cf_aes_context*, prpctx).hw {
+        cf_aes_context* aes = prpctx;
+        i32 r = cf_gcm_hw_open(aes.hwks, aes.rounds, cipher, ncipher, header, nheader, nonce, tag, ntag, plain);
+        if r >= 0 {
+            return r;
+        }
     }
     prp.encrypt(prpctx, H, H);
     if nnonce == 12 {
@@ -19340,12 +19397,16 @@ i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* heade
         ghash_add_cipher(&gh, nonce, nnonce);
         ghash_final(&gh, Y0);
     }
+    noinit ghash_ctx gh;
     ghash_init(&gh, H);
     ghash_add_aad(&gh, header, nheader);
+    u8[16] e_Y0;
+    noinit cf_ctr ctr;
     cf_ctr_init(&ctr, prp, prpctx, Y0);
     cf_ctr_custom_counter(&ctr, 12, 4);
     cf_ctr_cipher(&ctr, e_Y0, e_Y0, cast(u64, sizeof(e_Y0)));
     ghash_add_cipher(&gh, cipher, ncipher);
+    noinit u8[16] full_tag;
     ghash_final(&gh, full_tag);
     while true {
         if (ntag > 1 && ntag <= 16) == 0 {
@@ -19356,10 +19417,22 @@ i32 cf_gcm_decrypt(cf_prp* prp, void* prpctx, u8* cipher, u64 ncipher, u8* heade
     xor_bb(full_tag, full_tag, e_Y0, ntag);
     i32 err = 1;
     if mem_eq(full_tag, tag, ntag) == 0 {
+        mem_clean(H, cast(u64, sizeof(H)));
+        mem_clean(Y0, cast(u64, sizeof(Y0)));
+        mem_clean(e_Y0, cast(u64, sizeof(e_Y0)));
+        mem_clean(full_tag, cast(u64, sizeof(full_tag)));
+        mem_clean(&gh, cast(u64, sizeof(gh)));
+        mem_clean(&ctr, cast(u64, sizeof(ctr)));
         return err;
     }
     cf_ctr_cipher(&ctr, cipher, plain, ncipher);
     err = 0;
+    mem_clean(H, cast(u64, sizeof(H)));
+    mem_clean(Y0, cast(u64, sizeof(Y0)));
+    mem_clean(e_Y0, cast(u64, sizeof(e_Y0)));
+    mem_clean(full_tag, cast(u64, sizeof(full_tag)));
+    mem_clean(&gh, cast(u64, sizeof(gh)));
+    mem_clean(&ctr, cast(u64, sizeof(ctr)));
     return err;
 }
 
@@ -19427,6 +19500,9 @@ void cf_gf128_add(u32* x, u32* y, u32* out) {
 
 /* out = xy.  Arguments may alias. */
 void cf_gf128_mul(u32* x, u32* y, u32* out) {
+    if cf_gf128_hw_mul(x, y, out) != 0 {
+        return;
+    }
     cf_gf128 zero;
     noinit cf_gf128 Z;
     noinit cf_gf128 V;

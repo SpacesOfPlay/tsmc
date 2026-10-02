@@ -105,5 +105,6 @@ T('literal-getter-over-data', () => { const d = Object.getOwnPropertyDescriptor(
 T('define-over-readonly-configurable', () => { const o = {}; Object.defineProperty(o, 'x', { value: 1, configurable: true }); return D({ ...o, x: 2 }, 'x'); });
 T('static-field-over-fn-name', () => { class C { static name = 'x'; } return [C.name, D(C, 'name')]; });
 T('class-field-over-getter', () => { class C { get a() { return 1; } } class E extends C { a = 2; } return [new E().a, D(new E(), 'a')]; });
+T('generic-descriptor-keeps-accessor', () => { class C { get a() { return 1; } set a(v) {} } Object.defineProperty(C.prototype, 'a', { enumerable: true }); const d = Object.getOwnPropertyDescriptor(C.prototype, 'a'); return [new C().a, typeof d.get, typeof d.set, d.enumerable, 'value' in d]; });
 
 console.log(rows.join('\n'));

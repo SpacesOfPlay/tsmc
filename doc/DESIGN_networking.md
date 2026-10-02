@@ -101,7 +101,20 @@ acceptable → `accept`, wrap the new fd, emit `'connection'`. `.ref()`/
 Above `net`: an HTTP/1.1 codec (request writer + streaming response
 parser with chunked transfer-encoding and keep-alive). `http`/`https`
 expose `request`/`get`, `ClientRequest`, `IncomingMessage`, and
-`createServer`. `fetch` + `Headers`/`Request`/`Response` wrap the client
+`createServer`. A server response goes out as it is written: the head
+with the first write, then each write, chunked when no Content-Length is
+set (on HTTP/1.0 the body ends with the connection instead); a body that
+`end()` sends whole gets a Content-Length. `write` returns false when the
+connection holds more than it wants and `'drain'` follows, and a response
+hears `'close'` if its connection goes before it ends.
+A request body arrives by Content-Length or chunked, handed to the
+request as it comes; extensions and trailers are read past. A request
+with both, or a coding that does not end in chunked, is refused (400) as
+a smuggling attempt, and a body past 1 MB either way is refused (413);
+a refused connection reads and drops what the client still sends for
+two seconds before it closes, so that the answer is not overtaken by
+the reset a close with unread data causes.
+`fetch` + `Headers`/`Request`/`Response` wrap the client
 codec and resolve a Promise with a `Response` whose body is available as
 `.text()`/`.json()`/`.arrayBuffer()`. `https` is exactly `http` over a
 TLS handle (§4).
@@ -229,8 +242,8 @@ Stages 1–5 shipped (M31–M37).
 5. **Servers.** `net.Server` + `http.createServer` (accept loop in the
    reactor) landed in M32/M33. The TLS server uses picotls server mode
    with an **ECDSA-P256** (M37) or **RSA** (M38) certificate, auto-
-   detected from the key: `sign_certificate` bridges over the vendored
-   `uECC_sign` (ECDSA) and a tsmc-added RSASSA-PSS signer (a big-exponent
+   detected from the key: `sign_certificate` bridges over `p256_sign`
+   (ECDSA with a fixed-base table, `src/tls/p256_sign.mc`) and a tsmc-added RSASSA-PSS signer (a big-exponent
    modexp + PSS encode, CRT-accelerated when the key carries
    `p/q/dP/dQ/qInv`, M39), private-key parsing (EC SEC1/PKCS#8, RSA
    PKCS#1/PKCS#8), a per-server context, and `tls.createServer` /

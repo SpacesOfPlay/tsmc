@@ -8,13 +8,14 @@ import file;
 import vm;
 import builtins;
 import module;
+import prof;
 import version;
 
 const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
 
 private void print_usage() {
-    print("usage: tsmc [--gc-stress] <script.ts>\n");
+    print("usage: tsmc [--gc-stress] [--prof] <script.ts>\n");
     print("       tsmc --version\n");
 }
 
@@ -25,6 +26,7 @@ private void print_usage() {
 i32 tsmc_main() {
     // Optional flags precede the script path.
     bool gc_stress = false;
+    bool profile = false;
     i32 i = 1;
     while i < get_argc() {
         str a = str_from_cstr(get_arg(i));
@@ -39,6 +41,8 @@ i32 tsmc_main() {
         // collect-on-every-allocation; a slow but thorough check for
         // use-after-free / missing GC roots.
         if str_equal(a, "--gc-stress") { gc_stress = true; i++; continue; }
+        // a sampling profile of the run and its counts, on stderr at exit
+        if str_equal(a, "--prof") { profile = true; i++; continue; }
         break;
     }
     // the first non-flag argument is the script; anything after it is
@@ -64,8 +68,17 @@ i32 tsmc_main() {
     VM m;
     vm_init(&m);
     m.heap.stress = gc_stress;
+    if profile {
+        if !PROF_ON {
+            eprint("tsmc: --prof needs a profiling build (build/build.exe build --prof)\n");
+            vm_destroy(&m);
+            return EXIT_USAGE;
+        }
+        m.prof = prof_new();
+    }
     builtins_install(&m);
     i32 status = module_run_entry(&m, source, arg);
+    if m.prof != null { prof_report(m.prof, m.heap.n_collections); }
     vm_destroy(&m);
     return status;
 }

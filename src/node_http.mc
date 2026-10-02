@@ -15,15 +15,33 @@ const LF = 10;
 const CRLF = String.fromCharCode(CR, LF);
 
 const STATUS = {
-  200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
-  301: 'Moved Permanently', 302: 'Found', 303: 'See Other',
-  304: 'Not Modified', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
-  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
-  404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
-  413: 'Payload Too Large', 429: 'Too Many Requests',
-  431: 'Request Header Fields Too Large',
+  100: 'Continue', 101: 'Switching Protocols', 102: 'Processing',
+  103: 'Early Hints',
+  200: 'OK', 201: 'Created', 202: 'Accepted',
+  203: 'Non-Authoritative Information', 204: 'No Content',
+  205: 'Reset Content', 206: 'Partial Content', 207: 'Multi-Status',
+  208: 'Already Reported', 226: 'IM Used',
+  300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Found',
+  303: 'See Other', 304: 'Not Modified', 305: 'Use Proxy',
+  307: 'Temporary Redirect', 308: 'Permanent Redirect',
+  400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required',
+  403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed',
+  406: 'Not Acceptable', 407: 'Proxy Authentication Required',
+  408: 'Request Timeout', 409: 'Conflict', 410: 'Gone',
+  411: 'Length Required', 412: 'Precondition Failed',
+  413: 'Payload Too Large', 414: 'URI Too Long',
+  415: 'Unsupported Media Type', 416: 'Range Not Satisfiable',
+  417: 'Expectation Failed', 421: 'Misdirected Request',
+  422: 'Unprocessable Entity', 423: 'Locked', 424: 'Failed Dependency',
+  425: 'Too Early', 426: 'Upgrade Required', 428: 'Precondition Required',
+  429: 'Too Many Requests', 431: 'Request Header Fields Too Large',
+  451: 'Unavailable For Legal Reasons',
   500: 'Internal Server Error', 501: 'Not Implemented',
-  502: 'Bad Gateway', 503: 'Service Unavailable',
+  502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout',
+  505: 'HTTP Version Not Supported', 506: 'Variant Also Negotiates',
+  507: 'Insufficient Storage', 508: 'Loop Detected',
+  509: 'Bandwidth Limit Exceeded', 510: 'Not Extended',
+  511: 'Network Authentication Required',
 };
 
 // Set apart from the table above: the reason phrase carries an apostrophe,
@@ -42,8 +60,13 @@ function canon(name) {
   return parts.join('-');
 }
 
-function findHeaderEnd(buf) {
-  for (let i = 0; i + 3 < buf.length; i++) {
+// The scan, the request head's parse and the response head's format are
+// natives (__http_*); the JavaScript beside each is what they return
+// undefined to.
+function findHeaderEnd(buf, from) {
+  const e = __http_head_end(buf, from || 0);
+  if (e !== undefined) return e;
+  for (let i = from || 0; i + 3 < buf.length; i++) {
     if (buf[i] === CR && buf[i + 1] === LF && buf[i + 2] === CR && buf[i + 3] === LF) return i;
   }
   return -1;
@@ -78,6 +101,35 @@ function parseHeaders(text) {
   return headers;
 }
 
+// What a request head says, as bits: the native parse returns the same.
+const F_LENGTH = 1;
+const F_CODING = 2;
+const F_CHUNKED = 4;
+const F_KEEP = 8;
+const F_UPGRADE = 16;
+const F_HTTP10 = 32;
+
+function headFacts(m) {
+  const h = m.headers;
+  let f = 0;
+  if (h['content-length'] !== undefined) f |= F_LENGTH;
+  const te = h['transfer-encoding'];
+  if (te !== undefined) {
+    f |= F_CODING;
+    // Only chunked, applied last, says where the body ends.
+    const codings = String(te).toLowerCase().split(',');
+    if (codings[codings.length - 1].trim() === 'chunked') f |= F_CHUNKED;
+  }
+  const c = String(h['connection'] || '').toLowerCase();
+  const http10 = m.httpVersion === '1.0';
+  if (http10) f |= F_HTTP10;
+  // HTTP/1.1 keeps the connection unless told otherwise; 1.0 is the
+  // other way round and has to ask.
+  if (c.indexOf('close') < 0 && (!http10 || c.indexOf('keep-alive') >= 0)) f |= F_KEEP;
+  if (h['upgrade'] !== undefined && c.indexOf('upgrade') >= 0) f |= F_UPGRADE;
+  return f;
+}
+
 function toBuf(chunk, enc) {
   if (chunk == null) return Buffer.alloc(0);
   if (typeof chunk === 'string') return Buffer.from(chunk, enc || 'utf8');
@@ -85,18 +137,15 @@ function toBuf(chunk, enc) {
 }
 
 class IncomingMessage extends EventEmitter {
+  // headers {}, method and url null, statusCode 0, statusMessage '',
+  // httpVersion '1.1', complete and upgrade false, _encoding null
   constructor() {
     super();
-    this.headers = {};
-    this.method = null;
-    this.url = null;
-    this.statusCode = 0;
-    this.statusMessage = '';
-    this.httpVersion = '1.1';
-    this.complete = false;
-    this._encoding = null;
+    __http_init(this, 0);
   }
   setEncoding(enc) { this._encoding = enc; return this; }
+  pause() { return this; }
+  resume() { return this; }
   _data(buf) {
     if (buf.length === 0) return;
     this.emit('data', this._encoding ? buf.toString(this._encoding) : buf);
@@ -109,22 +158,16 @@ class IncomingMessage extends EventEmitter {
 }
 
 class ServerResponse extends EventEmitter {
+  // socket; _method, which decides whether a body may be sent at all
+  // (method or 'GET'); statusCode 200; statusMessage ''; headersSent,
+  // finished and writableEnded false; _headers {}; _keepAlive false, set
+  // by the server for a request whose connection may be reused (a
+  // response built any other way closes); _http10 false (on HTTP/1.0 a
+  // body of unknown length cannot be chunked); _chunked false; _onDone
+  // null.
   constructor(socket, method) {
     super();
-    this.socket = socket;
-    // the request method decides whether a body may be sent at all
-    this._method = method || 'GET';
-    this.statusCode = 200;
-    this.statusMessage = '';
-    this.headersSent = false;
-    this.finished = false;
-    this._headers = {};
-    this._body = [];
-    // Set by the server for a request whose connection may be reused. A
-    // response built any other way closes, which is what this did before
-    // there was a choice.
-    this._keepAlive = false;
-    this._onDone = null;
+    __http_init(this, 1, socket, method);
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
   getHeader(k) { return this._headers[k.toLowerCase()]; }
@@ -140,30 +183,67 @@ class ServerResponse extends EventEmitter {
     this.statusCode = status;
     if (typeof reason === 'string') this.statusMessage = reason;
     else headers = reason;
-    if (headers) for (const k in headers) this.setHeader(k, headers[k]);
+    // The headers go in at once unless setHeader has been replaced, in
+    // which case each goes through it.
+    if (headers && (this.setHeader !== setHeaderOwn || !__http_set_headers(this._headers, headers))) {
+      for (const k in headers) this.setHeader(k, headers[k]);
+    }
     return this;
   }
-  write(chunk, enc) { this._body.push(toBuf(chunk, enc)); return true; }
-  end(chunk, enc) {
-    if (this.finished) return this;
-    if (chunk != null) this.write(chunk, enc);
-    const body = Buffer.concat(this._body);
-    const reason = this.statusMessage || statusText(this.statusCode);
-    if (this._headers['content-length'] === undefined) this._headers['content-length'] = body.length;
-    if (this._headers['connection'] === undefined) {
-      this._headers['connection'] = this._keepAlive ? 'keep-alive' : 'close';
+  // A response to HEAD, and a 204 or 304, carry no body -- the headers
+  // still describe what a GET would return. Sending one anyway leaves the
+  // client reading it as the start of the next response.
+  _bodyAllowed() {
+    return this._method !== 'HEAD' && !this._noLength();
+  }
+  // A 1xx or 204 must not carry a Content-Length, and a 304's would have
+  // to be the length a GET is answered with, which is not known here: none
+  // is added (one the handler set stays).
+  _noLength() {
+    const c = this.statusCode;
+    return c === 204 || c === 304 || (c >= 100 && c < 200);
+  }
+  // The head, which also settles how the body is framed. `whole` is the
+  // length of a body that end() sends in one piece, or -1 when writes
+  // send it as it comes. A body of unknown length is chunked; an HTTP/1.0
+  // client knows no chunks, so its body ends with the connection.
+  _head(whole) {
+    this._frame(whole);
+    return this._headBytes();
+  }
+  // The framing half of _head: the headers that say how the body ends and
+  // whether the connection stays.
+  _frame(whole) {
+    const h = this._headers;
+    const te = h['transfer-encoding'];
+    if (te && String(te).toLowerCase().indexOf('chunked') >= 0) {
+      this._chunked = this._bodyAllowed();
+    } else if (h['content-length'] === undefined && !this._noLength()) {
+      if (whole >= 0) h['content-length'] = whole;
+      else if (this._bodyAllowed()) {
+        if (this._http10) this._keepAlive = false;
+        else { h['transfer-encoding'] = 'chunked'; this._chunked = true; }
+      }
     }
     // A handler that asked to close outranks the server's willingness to
     // keep going, and what goes on the wire has to be what happens.
-    const connHdr = String(this._headers['connection']).toLowerCase();
-    const persist = this._keepAlive && connHdr.indexOf('close') < 0;
-    this._keepAlive = persist;
+    if (h['connection'] === undefined) h['connection'] = this._keepAlive ? 'keep-alive' : 'close';
+    else if (String(h['connection']).toLowerCase().indexOf('close') >= 0) this._keepAlive = false;
+  }
+  _headBytes() {
+    const h = this._headers;
+    const reason = this.statusMessage || statusText(this.statusCode);
+    const bytes = __http_head_bytes(this.statusCode, reason, h);
+    if (bytes !== undefined) {
+      this.headersSent = true;
+      return bytes;
+    }
     let head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + CRLF;
     // An array value means one header line per element, not one line holding a
     // comma-joined list: that is how Set-Cookie sends several cookies, and
     // folding them produces a single cookie no client can take apart.
-    for (const k in this._headers) {
-      const v = this._headers[k];
+    for (const k in h) {
+      const v = h[k];
       if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) head += canon(k) + ': ' + v[i] + CRLF;
       } else {
@@ -172,20 +252,84 @@ class ServerResponse extends EventEmitter {
     }
     head += CRLF;
     this.headersSent = true;
+    return Buffer.from(head, 'utf8');
+  }
+  // `data` as it goes on the wire: as a chunk when chunked, nothing when
+  // this response has no body.
+  _framed(data, out) {
+    if (data.length === 0 || !this._bodyAllowed()) return;
+    if (this._chunked) out.push(Buffer.from(data.length.toString(16) + CRLF, 'latin1'), data, Buffer.from(CRLF, 'latin1'));
+    else out.push(data);
+  }
+  // Writes the pieces. Small ones go in one write: over TLS each write is
+  // a record and a segment of its own, and a reply in two segments is
+  // twice as likely to lose one. A large one is not copied.
+  _send(parts) {
+    if (parts.length === 0) return true;
+    let n = 0;
+    for (let i = 0; i < parts.length; i++) n += parts[i].length;
+    if (parts.length === 1) return this.socket.write(parts[0]);
+    if (n <= 16384) return this.socket.write(Buffer.concat(parts));
+    let ok = true;
+    for (let i = 0; i < parts.length; i++) ok = this.socket.write(parts[i]);
+    return ok;
+  }
+  // Sends the head now, before any of the body.
+  flushHeaders() {
+    if (!this.headersSent && !this.finished) this._send([this._head(-1)]);
+  }
+  // Sends `chunk` now, the head first if it has not gone. Returns false
+  // when the connection holds more than it wants to (wait for 'drain').
+  write(chunk, enc, cb) {
+    if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (this.finished) {
+      const e = new Error('write after end');
+      e.code = 'ERR_STREAM_WRITE_AFTER_END';
+      if (typeof cb === 'function') queueMicrotask(() => cb(e));
+      if (this.listenerCount('error') > 0) queueMicrotask(() => this.emit('error', e));
+      return false;
+    }
+    const out = [];
+    if (!this.headersSent) out.push(this._head(-1));
+    this._framed(toBuf(chunk, enc), out);
+    const ok = this._send(out);
+    if (typeof cb === 'function') queueMicrotask(cb);
+    return ok;
+  }
+  end(chunk, enc, cb) {
+    if (typeof chunk === 'function') { cb = chunk; chunk = null; }
+    else if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (this.finished) return this;
+    if (typeof cb === 'function') this.once('finish', cb);
+    // Nothing written yet: the whole body is here, and its length known.
+    // A socket that takes a whole response at once (a TLS socket with
+    // nothing queued) gets the framing, the head and the body in one call.
+    let sent = false;
+    if (!this.headersSent && this.socket._sendResponse !== undefined) {
+      sent = this.socket._sendResponse(this, this.statusMessage || statusText(this.statusCode), chunk, enc);
+    }
+    if (!sent) {
+      const data = toBuf(chunk, enc);
+      const out = [];
+      if (!this.headersSent) {
+        this._frame(data.length);
+        out.push(this._headBytes());
+      }
+      this._framed(data, out);
+      if (this._chunked) out.push(Buffer.from('0' + CRLF + CRLF, 'latin1'));
+      this._send(out);
+    }
     this.finished = true;
-    this.socket.write(Buffer.from(head, 'utf8'));
-    // A response to HEAD, and a 204 or 304, carry no body -- the headers
-    // still describe what a GET would return. Sending one anyway leaves the
-    // client reading it as the start of the next response.
-    const bodyAllowed = this._method !== 'HEAD'
-      && this.statusCode !== 204 && this.statusCode !== 304;
-    if (body.length && bodyAllowed) this.socket.write(body);
-    if (!persist) this.socket.end();
+    this.writableEnded = true;
+    if (!this._keepAlive) this.socket.end();
     this.emit('finish');
+    this.emit('close');
     if (this._onDone) this._onDone();
     return this;
   }
 }
+
+const setHeaderOwn = ServerResponse.prototype.setHeader;
 
 // What a client may send before it has said anything we agreed to. The
 // head is buffered whole because it cannot be understood in pieces, so
@@ -204,6 +348,9 @@ const MAX_HEAD = 16 * 1024;
 // the length arrives as a request with no body rather than as an
 // unbounded one.
 const MAX_BODY = 1024 * 1024;
+// The longest chunk-size line, extensions included. A size needs eight
+// hex digits at most; the rest is extensions, which are ignored.
+const MAX_CHUNK_LINE = 1024;
 
 // A connection that is answered and kept costs one slot for as long as it
 // is held, and the machine has a small fixed number of them. Closing every
@@ -215,69 +362,156 @@ const MAX_BODY = 1024 * 1024;
 // resets is defeated by one byte every so often: sixteen kilobytes of
 // header, one byte at a time, held a slot for days. What a client is
 // given is a fixed time to deliver a complete request head -- from the
-// connection opening, or from the end of the previous answer -- and then
-// a fixed time to deliver the body it declared. nginx calls the same two
-// numbers client_header_timeout and client_body_timeout.
+// connection opening, or from when the previous answer has left this
+// process -- and then a fixed time to deliver the body it declared. nginx
+// calls the same two numbers client_header_timeout and
+// client_body_timeout.
 const HEAD_MS = 15000;
+// How long a refused connection keeps reading, and dropping, what the
+// client still sends before it is closed (refuse).
+const LINGER_MS = 2000;
 const BODY_MS = 30000;
 
 function serveConnection(server, socket) {
   let buf = Buffer.alloc(0);
+  // How much of buf the search for the head's end has been through.
+  let scanned = 0;
   let msg = null;
   let res = null;
   let state = 'head';
   let remaining = 0;
+  // A chunked request body: where the reader is (size, data, crlf,
+  // trailer), what is left of the chunk, what the body has come to, and
+  // the bytes of trailer lines so far.
+  let chunked = false;
+  let cstate = 'size';
+  let csize = 0;
+  let received = 0;
+  let trailerBytes = 0;
+  // The response has ended while the request's body is still arriving.
+  let answered = false;
+  // The deadline: when it falls on the Date.now() clock (0 for none) and
+  // what runs then. One timer serves it. A deadline moved later leaves the
+  // timer as it is, and the timer, firing early, waits out the rest; so a
+  // request on a kept-alive connection moves a number and touches no
+  // timer. Only an earlier deadline re-arms it.
+  let due = 0;
+  let onDue = null;
   let timer = null;
+  let timerAt = 0;
 
-  function clearDeadline() {
-    if (timer) { clearTimeout(timer); timer = null; }
+  function clearDeadline() { due = 0; }
+
+  // The connection is over: no deadline, and no timer holding the loop.
+  function stopTimer() {
+    due = 0;
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  }
+
+  function arm(ms, fn) {
+    due = Date.now() + ms;
+    onDue = fn;
+    if (timer !== null) {
+      if (timerAt <= due) return;
+      clearTimeout(timer);
+    }
+    timerAt = due;
+    timer = setTimeout(onTimer, ms);
+  }
+
+  function onTimer() {
+    timer = null;
+    if (due === 0) return;
+    const left = due - Date.now();
+    if (left > 0) {
+      timerAt = due;
+      timer = setTimeout(onTimer, left);
+      return;
+    }
+    due = 0;
+    onDue();
   }
 
   // The client's time is up. While an answer is being written there is
   // no deadline at all: that is the server's turn, and a long answer must
   // not be cut off for being slow to write.
   function onDeadline() {
-    timer = null;
     if (state === 'done' || state === 'reply') return;
     state = 'done';
+    stopTimer();
     socket.end();
     socket.destroy();
   }
 
-  function deadline(ms) {
-    clearDeadline();
-    timer = setTimeout(onDeadline, ms);
-  }
+  function deadline(ms) { arm(ms, onDeadline); }
 
   // The request is read, answered, and only then is the next one looked
   // at: two responses interleaved on one socket is not a response at all.
+  // A response that ends before its request's body has all arrived waits
+  // for the rest, which is read and delivered as before: whatever comes
+  // after the head is the body's up to its declared end, and taking the
+  // remainder for the next request would serve a body as a request.
   function onDone() {
-    if (state === 'done') { clearDeadline(); return; }
+    if (state === 'done') { stopTimer(); return; }
+    if (state === 'body') { answered = true; return; }
+    afterAnswer();
+  }
+
+  // The next request on a connection that stays; on one that does not,
+  // nothing more is read.
+  function afterAnswer() {
     if (res === null || !res._keepAlive) {
       state = 'done';
-      clearDeadline();
+      stopTimer();
       return;
     }
+    nextRequest();
+  }
+
+  function nextRequest() {
     msg = null;
     res = null;
+    answered = false;
     state = 'head';
-    deadline(HEAD_MS);
+    awaitNext();
     pump();
   }
 
-  function wantsKeepAlive(m) {
-    const c = String(m.headers['connection'] || '').toLowerCase();
-    if (c.indexOf('close') >= 0) return false;
-    // HTTP/1.1 keeps the connection unless told otherwise; 1.0 is the
-    // other way round and has to ask.
-    if (m.httpVersion === '1.0') return c.indexOf('keep-alive') >= 0;
-    return true;
+  // The request's body is complete.
+  function bodyDone() {
+    clearDeadline();
+    state = 'reply';
+    msg._end();
+    if (answered && state === 'reply') afterAnswer();
+  }
+
+  // The next request's time starts once the answer has left: a client
+  // reads an answer before it sends again, and one reading a large answer
+  // slowly would otherwise lose the connection in the middle of it. While
+  // the answer is still queued here, and the client has not begun its
+  // next request, the check comes back every second.
+  function awaitNext() {
+    clearDeadline();
+    if (state !== 'head') return;
+    if (socket.writableLength > 0 && buf.length === 0) {
+      arm(1000, awaitNext);
+      return;
+    }
+    deadline(HEAD_MS);
   }
 
   // Answer, then hang up. A client that has already gone past a limit is
   // not going to be talked out of it, and leaving the socket open leaves
   // the thing being defended against in place.
   function refuse(code, reason) {
+    // A reply already under way cannot take a status line in its middle:
+    // the connection just ends.
+    if (res !== null && res.headersSent) {
+      state = 'done';
+      stopTimer();
+      socket.destroy();
+      return;
+    }
     try {
       const body = reason + String.fromCharCode(10);
       socket.write(Buffer.from(
@@ -287,19 +521,53 @@ function serveConnection(server, socket) {
         'Connection: close' + CRLF + CRLF + body, 'utf8'));
     } catch (e) { /* the peer may already be gone */ }
     state = 'done';
-    clearDeadline();
     socket.end();
-    socket.destroy();
+    // A client still sending its body would have its data unread at the
+    // close, and the system answers that with a reset, which can reach
+    // the client before the answer does. So the connection reads on for
+    // a while, dropping what comes (pump does in state done), and then
+    // closes.
+    arm(LINGER_MS, () => socket.destroy());
   }
 
   deadline(HEAD_MS);
-  socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
-  socket.on('end', () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } });
+  const onData = (chunk) => { buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]); pump(); };
+  const onEnd = () => { if (msg && state !== 'done') { msg._end(); state = 'done'; } };
   // A connection that breaks mid-request is that connection's problem: report
   // it as 'clientError' and drop the socket. Left unhandled, 'error' would
   // throw out of the event loop and end the server.
-  socket.on('error', (e) => { clearDeadline(); server.emit('clientError', e, socket); socket.destroy(); });
-  socket.on('close', () => { clearDeadline(); state = 'done'; });
+  const onError = (e) => { stopTimer(); server.emit('clientError', e, socket); socket.destroy(); };
+  // A response that has not ended hears that its connection is gone, so a
+  // handler writing as things happen can stop; one waiting to write more
+  // hears that it may.
+  const onClose = () => {
+    stopTimer();
+    state = 'done';
+    if (res !== null && !res.finished) res.emit('close');
+  };
+  const onDrain = () => { if (res !== null) res.emit('drain'); };
+  socket.on('data', onData);
+  socket.on('drain', onDrain);
+  socket.on('end', onEnd);
+  socket.on('error', onError);
+  socket.on('close', onClose);
+
+  // The protocol is changing under the request: the parser steps aside and
+  // whoever listens gets the socket as it is, with whatever followed the
+  // head. Nothing here touches the socket again.
+  function handOver() {
+    stopTimer();
+    socket.removeListener('data', onData);
+    socket.removeListener('end', onEnd);
+    socket.removeListener('error', onError);
+    socket.removeListener('close', onClose);
+    socket.removeListener('drain', onDrain);
+    state = 'done';
+    const head = buf;
+    buf = Buffer.alloc(0);
+    msg.upgrade = true;
+    server.emit('upgrade', msg, socket, head);
+  }
 
   function pump() {
     if (state === 'done') { buf = Buffer.alloc(0); return; }
@@ -307,49 +575,142 @@ function serveConnection(server, socket) {
     // waits in the buffer, which MAX_HEAD still bounds.
     if (state === 'reply') { return; }
     if (state === 'head') {
-      const he = findHeaderEnd(buf);
+      let he = __http_head_end(buf, scanned);
+      if (he === undefined) he = findHeaderEnd(buf, scanned);
       if (he < 0) {
+        scanned = Math.max(0, buf.length - 3);
         if (buf.length > MAX_HEAD) {
           refuse(431, 'Request header too large');
         }
         return;
       }
+      scanned = 0;
       if (he > MAX_HEAD) { refuse(431, 'Request header too large'); return; }
-      const text = buf.slice(0, he).toString('utf8');
-      buf = buf.slice(he + 4);
-      const lines = text.split(CRLF);
-      const first = lines.shift().split(' ');
       msg = new IncomingMessage();
-      msg.method = first[0];
-      msg.url = first[1];
-      msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
-      msg.headers = parseHeaders(lines.join(CRLF));
-      const cl = msg.headers['content-length'];
-      remaining = cl !== undefined ? parseInt(cl, 10) : 0;
+      msg.socket = socket;
+      let facts = __http_parse_head(buf, he, msg);
+      if (facts === undefined) {
+        const text = buf.slice(0, he).toString('utf8');
+        const lines = text.split(CRLF);
+        const first = lines.shift().split(' ');
+        msg.method = first[0];
+        msg.url = first[1];
+        msg.httpVersion = (first[2] || 'HTTP/1.1').split('/')[1] || '1.1';
+        msg.headers = parseHeaders(lines.join(CRLF));
+        facts = headFacts(msg);
+      }
+      buf = buf.slice(he + 4);
+      chunked = false;
+      if ((facts & F_CODING) !== 0) {
+        // A length and a coding together can be read two ways, and a
+        // proxy in front may read the other one: that is how a request is
+        // smuggled past it. Refused, as node refuses it.
+        if ((facts & F_LENGTH) !== 0) { refuse(400, 'Bad request'); return; }
+        // Only chunked, applied last, says where the body ends.
+        if ((facts & F_CHUNKED) === 0) { refuse(400, 'Bad request'); return; }
+        chunked = true;
+        cstate = 'size';
+        csize = 0;
+        received = 0;
+        trailerBytes = 0;
+      }
+      remaining = (facts & F_LENGTH) !== 0 ? parseInt(msg.headers['content-length'], 10) : 0;
       // A length that is absent, negative or not a number is none. A
       // declared one past the ceiling is refused before a byte of it is
       // kept, which is the point of it being declared.
       if (!(remaining > 0)) remaining = 0;
       if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
+      // An upgrade is only one when somebody is there to take it; otherwise
+      // the request is served like any other.
+      if ((facts & F_UPGRADE) !== 0 && server.listenerCount('upgrade') > 0) {
+        handOver();
+        return;
+      }
       // The head arrived in time. A body gets its own budget; none
       // expected means it is the server's turn and the clock stops.
-      if (remaining > 0) deadline(BODY_MS); else clearDeadline();
+      if (remaining > 0 || chunked) deadline(BODY_MS);
       state = 'body';
       res = new ServerResponse(socket, msg.method);
-      res._keepAlive = wantsKeepAlive(msg);
+      res._keepAlive = (facts & F_KEEP) !== 0;
+      res._http10 = (facts & F_HTTP10) !== 0;
       res._onDone = onDone;
       server.emit('request', msg, res);
     }
     if (state === 'body') {
+      if (chunked) {
+        if (readChunked()) bodyDone();
+        return;
+      }
       if (remaining > 0 && buf.length > 0) {
         const take = Math.min(remaining, buf.length);
         msg._data(buf.slice(0, take));
         buf = buf.slice(take);
         remaining -= take;
       }
-      if (remaining <= 0) { clearDeadline(); state = 'reply'; msg._end(); }
+      if (remaining <= 0) bodyDone();
     }
   }
+
+  // Reads a chunked body as far as it has arrived, handing each piece to
+  // the request as it comes rather than a whole chunk at a time. True at
+  // the body's end. Chunk extensions are ignored, and trailer lines are
+  // read and dropped. A size that is not hex, a line past its limit or a
+  // chunk not followed by CRLF is refused (400); a body past MAX_BODY too
+  // (413), as a declared length past it is.
+  function readChunked() {
+    for (;;) {
+      if (cstate === 'size') {
+        const ln = findLine(buf);
+        if (ln < 0 || ln > MAX_CHUNK_LINE) {
+          if (ln > MAX_CHUNK_LINE || buf.length > MAX_CHUNK_LINE) refuse(400, 'Bad request');
+          return false;
+        }
+        let line = buf.slice(0, ln).toString('latin1');
+        const semi = line.indexOf(';');
+        if (semi >= 0) line = line.slice(0, semi);
+        line = line.trim();
+        if (line.length === 0 || line.length > 8 || !isHex(line)) { refuse(400, 'Bad request'); return false; }
+        csize = parseInt(line, 16);
+        buf = buf.slice(ln + 2);
+        if (csize === 0) { cstate = 'trailer'; continue; }
+        if (received + csize > MAX_BODY) { refuse(413, 'Payload too large'); return false; }
+        cstate = 'data';
+      } else if (cstate === 'data') {
+        if (buf.length === 0) return false;
+        const take = Math.min(csize, buf.length);
+        msg._data(buf.slice(0, take));
+        buf = buf.slice(take);
+        csize -= take;
+        received += take;
+        if (state === 'done') return false;     // the handler ended the connection
+        if (csize > 0) return false;
+        cstate = 'crlf';
+      } else if (cstate === 'crlf') {
+        if (buf.length < 2) return false;
+        if (buf[0] !== CR || buf[1] !== LF) { refuse(400, 'Bad request'); return false; }
+        buf = buf.slice(2);
+        cstate = 'size';
+      } else {
+        const ln = findLine(buf);
+        if (ln < 0) {
+          if (trailerBytes + buf.length > MAX_HEAD) refuse(431, 'Request header too large');
+          return false;
+        }
+        trailerBytes += ln + 2;
+        if (trailerBytes > MAX_HEAD) { refuse(431, 'Request header too large'); return false; }
+        buf = buf.slice(ln + 2);
+        if (ln === 0) return true;
+      }
+    }
+  }
+}
+
+function isHex(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) return false;
+  }
+  return true;
 }
 
 class Server extends EventEmitter {
@@ -409,6 +770,7 @@ class ClientRequest extends EventEmitter {
     }
     this.socket.on('connect', () => this._trySend());
     this.socket.on('error', (e) => this.emit('error', e));
+    this.socket.on('close', () => this.emit('close'));
     this._parse();
   }
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
@@ -449,14 +811,29 @@ class ClientRequest extends EventEmitter {
     let chunked = false;
     let cstate = 'size';
     let cn = 0;
-    this.socket.on('data', (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); });
-    this.socket.on('close', () => {
+    const onData = (chunk) => { buf = Buffer.concat([buf, chunk]); pump(); };
+    const onClose = () => {
       if (res && state !== 'done') {
         if (remaining < 0 && !chunked && buf.length) { res._data(buf); buf = Buffer.alloc(0); }
         res._end();
         state = 'done';
       }
-    });
+    };
+    this.socket.on('data', onData);
+    this.socket.on('close', onClose);
+    // The server agreed to change protocols. With an 'upgrade' listener the
+    // socket is handed over with whatever followed the head, and no
+    // 'response' is emitted; without one the socket is dropped.
+    function handOver() {
+      self.socket.removeListener('data', onData);
+      self.socket.removeListener('close', onClose);
+      state = 'done';
+      const head = buf;
+      buf = Buffer.alloc(0);
+      if (self.listenerCount('upgrade') === 0) { self.socket.destroy(); return; }
+      res.upgrade = true;
+      self.emit('upgrade', res, self.socket, head);
+    }
     function pump() {
       if (state === 'head') {
         const he = findHeaderEnd(buf);
@@ -466,13 +843,22 @@ class ClientRequest extends EventEmitter {
         const lines = text.split(CRLF);
         const first = lines.shift().split(' ');
         res = new IncomingMessage();
+        res.socket = self.socket;
         res.httpVersion = (first[0] || 'HTTP/1.1').split('/')[1] || '1.1';
         res.statusCode = parseInt(first[1], 10) || 0;
         res.statusMessage = first.slice(2).join(' ');
         res.headers = parseHeaders(lines.join(CRLF));
+        if (res.statusCode === 101 || (res.headers['upgrade'] !== undefined &&
+            String(res.headers['connection'] || '').toLowerCase().indexOf('upgrade') >= 0)) {
+          handOver();
+          return;
+        }
         const te = res.headers['transfer-encoding'];
         const cl = res.headers['content-length'];
-        if (te && te.toLowerCase().indexOf('chunked') >= 0) chunked = true;
+        // A 204, a 304 and the answer to a HEAD have no body, whatever the
+        // headers say: a Content-Length there describes the GET's body.
+        if (self.method === 'HEAD' || res.statusCode === 204 || res.statusCode === 304) remaining = 0;
+        else if (te && te.toLowerCase().indexOf('chunked') >= 0) chunked = true;
         else if (cl !== undefined) remaining = parseInt(cl, 10);
         else remaining = -1;
         state = 'body';
@@ -513,9 +899,12 @@ class ClientRequest extends EventEmitter {
           buf = buf.slice(2);
           cstate = 'size';
         } else {
+          // Trailer lines, if any, then the empty line that ends the body;
+          // left in the buffer they would start the next response.
           const ln = findLine(buf);
           if (ln < 0) return;
           buf = buf.slice(ln + 2);
+          if (ln > 0) continue;
           state = 'done';
           res._end();
           return;

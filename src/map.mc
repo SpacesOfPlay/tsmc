@@ -82,7 +82,9 @@ private void strmap_grow<V>(StrMap<V>* m) {
     StrSlot<V>* old = m.slots;
     i32 old_cap = m.cap;
 
-    i32 new_cap = m.cap * 2;
+    // A table that is mostly tombstones is rehashed at its size, which
+    // drops them; only one at least half full of live entries doubles.
+    i32 new_cap = (m.count + 1) * 2 > m.cap ? m.cap * 2 : m.cap;
     if new_cap < 16 { new_cap = 16; }
     m.slots = alloc<StrSlot<V>>(new_cap);
     memset(cast(u8*, m.slots), 0, new_cap * sizeof(StrSlot<V>));
@@ -194,7 +196,8 @@ private void intmap_grow<V>(IntMap<V>* m) {
     IntSlot<V>* old = m.slots;
     i32 old_cap = m.cap;
 
-    i32 new_cap = m.cap * 2;
+    // as strmap_grow: a table of mostly tombstones keeps its size
+    i32 new_cap = (m.count + 1) * 2 > m.cap ? m.cap * 2 : m.cap;
     if new_cap < 16 { new_cap = 16; }
     m.slots = alloc<IntSlot<V>>(new_cap);
     memset(cast(u8*, m.slots), 0, new_cap * sizeof(IntSlot<V>));

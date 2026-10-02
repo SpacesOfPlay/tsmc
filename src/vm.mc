@@ -15,6 +15,7 @@ import object;
 import ustr;
 import bigint;
 import os_time;
+import prof;
 import uefi_host;
 import net;
 import bytecode;
@@ -114,6 +115,7 @@ type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 struct VM {
     GcHeap heap;
     AtomTable atoms;
+    Prof* prof;                // the `--prof` accounting, or null
     Value* stack;
     i32 sp;
     Frame* frames;
@@ -121,6 +123,9 @@ struct VM {
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     i32 pending_super_for;     // super_for for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
+    u64 loop_start_ns;         // when the event loop first ran, 0 before
+    u64 loop_idle_ns;          // time since then spent waiting for I/O or a timer
+    f64 last_poll_ms;          // when the sockets were last polled
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
     u32 sym_inspect_custom;    // key atom of Symbol.for(nodejs.util.inspect.custom)
@@ -153,6 +158,7 @@ struct VM {
     bool has_pending;
     bool unwind_return;   // the pending value is a return completion, not a throw
     bool quiet_errors;    // suppress diagnostic/uncaught printing (embedders running expected-failure sources)
+    i32 key_marks_cap;   // bytes behind heap.key_marks
     u32 atom_length;
     u32 atom_prototype;
     u32 atom_name;
@@ -214,6 +220,7 @@ struct VM {
     StrMap<i32> regex_cache;    // "flags\nsource" -> index into regexps
     Vec<str> regex_keys;        // owned keys of regex_cache
     GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
+    GcString*[8] http_strs;     // the http natives' constant strings, made when first used
     u32 atom_rx;
     u32 atom_source;
     u32 atom_flags;
@@ -222,7 +229,8 @@ struct VM {
     Vec<VmJob> jobs;         // microtask FIFO (head index avoids shifting)
     i32 job_head;
     Vec<Value> rejections;   // promises rejected with no handler at reject time
-    Vec<VmTimer> timers;
+    Vec<VmTimer> timers;     // in id order; dead ones until the next compaction
+    i32 timers_dead;
     i32 next_timer_id;
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
@@ -320,6 +328,9 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
 // collection. Runs before the sweep, while marks are still valid.
 private void vm_weak_sweep(GcHeap* h, void* ctx) {
     VM* vms = cast(VM*, ctx);
+    if h.key_marks_len > 0 {
+        ignore atoms_sweep(&vms.atoms, h.key_marks, h.key_marks_len, h.alloc_total);
+    }
     if !vms.any_weak { return; }
     GcCell* c = h.all;
     while c != null {
@@ -341,8 +352,24 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
     }
 }
 
+// The key marks for this collection: a byte per atom, when there are
+// dynamic atoms for atoms_sweep to consider.
+private void vm_key_marks_reset(GcHeap* h, VM* vm) {
+    h.key_marks_len = 0;
+    if vm.atoms.n_dynamic == 0 { return; }
+    i32 n = atom_count(&vm.atoms);
+    if n > vm.key_marks_cap {
+        if h.key_marks != null { free(h.key_marks); }
+        vm.key_marks_cap = n + n / 2;
+        h.key_marks = alloc<u8>(vm.key_marks_cap);
+    }
+    memset(h.key_marks, 0, cast(i64, n));
+    h.key_marks_len = n;
+}
+
 private void vm_mark_roots(GcHeap* h, void* ctx) {
     VM* vm = cast(VM*, ctx);
+    vm_key_marks_reset(h, vm);
     gc_mark_value(h, vm.pending_new_target);
     gc_mark_value(h, vm.util_inspect_fn);
     for i32 i = 0; i < vm.sp; i++ {
@@ -357,7 +384,10 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 i = 0; i < vm.globals.cap; i++ {
         IntSlot<Value>* sl = vm.globals.slots + i;
-        if sl.state == SLOT_USED { gc_mark_value(h, sl.val); }
+        if sl.state == SLOT_USED {
+            gc_mark_value(h, sl.val);
+            if sl.key < cast(u32, h.key_marks_len) { *(h.key_marks + sl.key) = cast(u8, 1); }
+        }
     }
     for i32 i = 0; i < vm.troots.len; i++ {
         mark_template(h, vec_get(&vm.troots, i));
@@ -367,6 +397,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
     for i32 c = 0; c < 128; c++ {
         if vm.ascii_chars[c] != null { gc_mark_cell(h, &vm.ascii_chars[c].head); }
+    }
+    for i32 c = 0; c < 8; c++ {
+        if vm.http_strs[c] != null { gc_mark_cell(h, &vm.http_strs[c].head); }
     }
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
@@ -2203,9 +2236,15 @@ private u32 key_to_atom(VM* vm, Value key) {
     Value s = js_to_string_value(vm, k);
     vm.sp--;
     vpush(vm, s);
-    u32 a = atom_intern(&vm.atoms, gc_string_view(value_as_string(s)));
+    u32 a = vm_atom_dyn(vm, gc_string_view(value_as_string(s)));
     vm.sp--;
     return a;
+}
+
+// The atom for a property name that arrives as data: the collector frees
+// it once nothing uses it (atom.mc).
+u32 vm_atom_dyn(VM* vm, str name) {
+    return atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
 }
 
 // a + b for two string values. When a high surrogate at the end of a
@@ -3395,16 +3434,17 @@ private bool inspect_special(VM* vm, str_buf* sb, JsObject* o, Value ov) {
         // node shows the bytes in hex, which is what makes a Buffer readable
         str hexd = "0123456789abcdef";
         str_buf_add(sb, "<Buffer");
-        i32 shown = o.elen < 50 ? o.elen : 50;
+        i32 bl = (o.obj_flags & OBJF_TYPEDARRAY) != 0 ? cast(JsTypedArray*, o).ta_len : 0;
+        i32 shown = bl < 50 ? bl : 50;
         for i32 i = 0; i < shown; i++ {
-            Value e = js_array_get(o, i);
+            Value e = vm_ta_get(vm, o, i);
             i32 by = value_is_number(e) ? (cast(i32, js_to_number(e)) & 255) : 0;
             str_buf_add(sb, " ");
             str_buf_add_byte(sb, *(hexd.data + (by >> 4)));
             str_buf_add_byte(sb, *(hexd.data + (by & 15)));
         }
-        if o.elen > shown {
-            string more = format(" ... {} more bytes", o.elen - shown);
+        if bl > shown {
+            string more = format(" ... {} more bytes", bl - shown);
             str_buf_add(sb, more);
             free(more);
         }
@@ -3707,9 +3747,11 @@ private void inspect_into(VM* vm, str_buf* sb, Value v, i32 depth, bool nested,
             string bl = format("byteLength: {}", blen);
             str_buf_add(&eb, bl);
             free(bl);
-        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
-            i32 kind = ta_prop_int(vm, o, vm.atom_ta_kind);
-            i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+        } else if (o.obj_flags & OBJF_TYPEDARRAY) != 0
+                && !(vm.buffer_proto != null && o.proto == vm.buffer_proto) {
+            // a Buffer is a typed array too, but shows as bytes further down
+            i32 kind = cast(JsTypedArray*, o).ta_kind;
+            i32 len = cast(JsTypedArray*, o).ta_len;
             if depth < 0 {
                 str_buf_add(sb, "[");
                 str_buf_add(sb, ta_kind_name(kind));
@@ -3939,8 +3981,12 @@ private void vm_install_globals(VM* vm) {
 // --- lifecycle -------------------------------------------------------------------------
 
 void vm_init(VM* vm) {
+    vm.prof = null;
     // process.uptime and performance.now count from here
     vm.start_ns = vm_clock_ns();
+    vm.loop_start_ns = 0;
+    vm.loop_idle_ns = 0;
+    vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
     vm.sym_inspect_custom = 0;
@@ -3953,6 +3999,7 @@ void vm_init(VM* vm) {
     vm.heap.weak_sweep = &vm_weak_sweep;
     vm.heap.mark_ctx = cast(void*, vm);
     atoms_init(&vm.atoms);
+    vm.key_marks_cap = 0;
     vm.stack = alloc<Value>(VM_STACK_MAX);
     vm.sp = 0;
     vm.frames = alloc<Frame>(VM_FRAMES_MAX);
@@ -4027,6 +4074,7 @@ void vm_init(VM* vm) {
     vm.url_proto = null;
     vm.usp_proto = null;
     vm.require_cache = null;
+    for i32 c = 0; c < 8; c++ { vm.http_strs[c] = null; }
     vec_init<RegexProgPtr>(&vm.regexps, 4);
     strmap_init<i32>(&vm.regex_cache);
     vec_init<str>(&vm.regex_keys, 8);
@@ -4046,6 +4094,7 @@ void vm_init(VM* vm) {
     vm.job_head = 0;
     vec_init<Value>(&vm.rejections, 4);
     vec_init<VmTimer>(&vm.timers, 4);
+    vm.timers_dead = 0;
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
@@ -4361,6 +4410,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
         }
         i32 op = *(code + ip);
         ip++;
+        when defined(TSMC_PROF) {
+            if vm.prof != null { prof_step(vm.prof, t, op); }
+        }
         switch op {
             case OP_CONST: {
                 vpush(vm, *(t.consts + rd_u16(code, ip)));
@@ -4871,7 +4923,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             r = true;
                         } else if idx >= 0 && (o.obj_flags & OBJF_TYPEDARRAY) != 0 {
                             // a view's elements are bytes, not properties
-                            r = idx < ta_prop_int(vm, o, vm.atom_ta_len);
+                            r = idx < cast(JsTypedArray*, o).ta_len;
                         } else if idx >= 0 {
                             r = js_array_has(o, idx) || chain_has(vm, o, a);
                         } else if (o.obj_flags & OBJF_GLOBAL) != 0 {
@@ -4969,6 +5021,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     thisv = vpeek(vm, argc);
                     if value_is_native(fnv) {
                         JsNative* na = value_as_native(fnv);
+                        when defined(TSMC_PROF) {
+                            if vm.prof != null { vm.prof.native_calls++; }
+                        }
                         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
                         if op == OP_NEW && !value_is_reference(res) { res = thisv; }
                         vm.sp -= argc + 2;
@@ -5015,6 +5070,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             else { nf.new_target = value_undefined(); }
                             nf.gen = null;
                             vm.fp++;
+                            when defined(TSMC_PROF) {
+                                if vm.prof != null { vm.prof.js_calls++; }
+                            }
                             gc_root_reset(&vm.heap, arm);
                             fr = nf;
                             t = ft;
@@ -5406,7 +5464,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             js_set_prop(d, a2, js_array_get(s, i));
                         }
                     } else if (s.obj_flags & OBJF_TYPEDARRAY) != 0 {
-                        i32 len = ta_prop_int(vm, s, vm.atom_ta_len);
+                        i32 len = cast(JsTypedArray*, s).ta_len;
                         for i32 i = 0; i < len; i++ {
                             string ks = format("{}", i);
                             u32 a2 = atom_intern(&vm.atoms, ks);
@@ -5840,7 +5898,7 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
     } else if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
         // typed arrays enumerate their indices as own keys
         JsObject* o = value_as_object(objv);
-        i32 len = ta_prop_int(vm, o, vm.atom_ta_len);
+        i32 len = cast(JsTypedArray*, o).ta_len;
         for i32 i = 0; i < len; i++ {
             string s = format("{}", i);
             GcString* g = gc_new_string(&vm.heap, s);
@@ -7151,8 +7209,18 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
     return vm.handles.len - 1;
 }
 
+// Marks a handle closed once its descriptor is. The descriptor number is
+// forgotten: the system hands the same number to the next socket it
+// opens, and a close, send or read that reached this handle later (a
+// second close on another path, a write queued before the close) would
+// act on that other connection.
 void vm_handle_close(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).alive = false; }
+    if idx >= 0 && idx < vm.handles.len {
+        IoHandle* h = vm.handles.data + idx;
+        h.alive = false;
+        h.fd = -1;
+        h.interest = 0;
+    }
 }
 
 void vm_handle_ref(VM* vm, i32 idx) {
@@ -7177,8 +7245,14 @@ void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
     if idx >= 0 && idx < vm.handles.len { (vm.handles.data + idx).interest = events; }
 }
 
+i16 vm_handle_interest(VM* vm, i32 idx) {
+    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).interest; }
+    return 0;
+}
+
+// The handle's descriptor, or -1 once it is closed.
 i64 vm_handle_fd(VM* vm, i32 idx) {
-    if idx >= 0 && idx < vm.handles.len { return (vm.handles.data + idx).fd; }
+    if idx >= 0 && idx < vm.handles.len && (vm.handles.data + idx).alive { return (vm.handles.data + idx).fd; }
     return -1;
 }
 
@@ -7243,28 +7317,64 @@ i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     return tm.id;
 }
 
-// Node's ref/unref/refresh, reached through the Timeout object.
-bool vm_timer_set_ref(VM* vm, i32 id, bool on) {
+// The live timer with this id, or null. Ids only grow and compaction
+// keeps the order, so the list is sorted by id and a lookup is a binary
+// search: a server that sets and clears a timer per request would
+// otherwise scan every timer it ever made on each clear.
+private VmTimer* vm_timer_find(VM* vm, i32 id) {
+    i32 lo = 0;
+    i32 hi = vm.timers.len - 1;
+    while lo <= hi {
+        i32 mid = lo + (hi - lo) / 2;
+        VmTimer* tm = vm.timers.data + mid;
+        if tm.id == id { return tm.alive ? tm : null; }
+        if tm.id < id { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return null;
+}
+
+// Ends a timer. Its callback and arguments are let go at once, so the
+// collector can take them before the entry itself goes.
+private void vm_timer_kill(VM* vm, VmTimer* tm) {
+    if !tm.alive { return; }
+    tm.alive = false;
+    tm.cb = value_undefined();
+    tm.args = value_undefined();
+    vm.timers_dead++;
+}
+
+// Drops dead timers once they are more than half the list, keeping the
+// rest in order. Called between turns of the loop, when no pointer into
+// the list is held.
+private void vm_timers_compact(VM* vm) {
+    if vm.timers_dead < 16 || vm.timers_dead * 2 < vm.timers.len { return; }
+    i32 k = 0;
     for i32 i = 0; i < vm.timers.len; i++ {
         VmTimer* tm = vm.timers.data + i;
-        if tm.id == id && tm.alive { tm.reffed = on; return true; }
+        if !tm.alive { continue; }
+        if k != i { *(vm.timers.data + k) = *tm; }
+        k++;
     }
-    return false;
+    vm.timers.len = k;
+    vm.timers_dead = 0;
+}
+
+// Node's ref/unref/refresh, reached through the Timeout object.
+bool vm_timer_set_ref(VM* vm, i32 id, bool on) {
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm == null { return false; }
+    tm.reffed = on;
+    return true;
 }
 
 bool vm_timer_has_ref(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id { return tm.alive && tm.reffed; }
-    }
-    return false;
+    VmTimer* tm = vm_timer_find(vm, id);
+    return tm != null && tm.reffed;
 }
 
 void vm_timer_refresh(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id && tm.alive { tm.due = vm_now_ms(vm) + tm.delay; }
-    }
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm != null { tm.due = vm_now_ms(vm) + tm.delay; }
 }
 
 // True while some live timer still holds the loop open.
@@ -7277,10 +7387,8 @@ bool vm_timers_reffed(VM* vm) {
 }
 
 void vm_clear_timer(VM* vm, i32 id) {
-    for i32 i = 0; i < vm.timers.len; i++ {
-        VmTimer* tm = vm.timers.data + i;
-        if tm.id == id { tm.alive = false; }
-    }
+    VmTimer* tm = vm_timer_find(vm, id);
+    if tm != null { vm_timer_kill(vm, tm); }
 }
 
 // The reactor. Drains microtasks, then either fires the earliest due
@@ -7294,13 +7402,16 @@ const i64 REACTOR_IDLE_MS = 5;
 // (-1 blocks until I/O), and dispatches every ready handle through the
 // reactor hook. If nothing is pollable, just sleeps out the deadline.
 private void reactor_poll(VM* vm, i64 timeout_ms) {
+    vm.last_poll_ms = vm_now_ms(vm);
     i32 npoll = 0;
     for i32 i = 0; i < vm.handles.len; i++ {
         IoHandle* h = vm.handles.data + i;
         if h.alive && h.interest != 0 && h.fd >= 0 { npoll++; }
     }
+    u64 w0 = vm_clock_ns();
     if npoll == 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
+        vm.loop_idle_ns += vm_clock_ns() - w0;
         return;
     }
     NetPollFd* pf = alloc<NetPollFd>(npoll);
@@ -7318,6 +7429,9 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     }
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
     i32 r = net_poll(pf, npoll, to);
+    // The wait counts as idle, as node counts the time in its poll: the
+    // event loop utilisation is the rest.
+    vm.loop_idle_ns += vm_clock_ns() - w0;
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;
@@ -7334,6 +7448,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
 }
 
 i32 vm_run_event_loop(VM* vm) {
+    if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
     while true {
         while vm.job_head < vm.jobs.len {
             VmJob j = vec_get(&vm.jobs, vm.job_head);
@@ -7377,6 +7492,7 @@ i32 vm_run_event_loop(VM* vm) {
         // turn, rather than at the end of the run: that is when node reports
         // it, and it is fatal there too unless a listener takes it.
         if vm.rejections.len > 0 && vm_report_unhandled(vm) != 0 { return 1; }
+        vm_timers_compact(vm);
         // earliest live timer by (deadline, insertion order)
         i32 best = -1;
         for i32 i = 0; i < vm.timers.len; i++ {
@@ -7429,13 +7545,28 @@ i32 vm_run_event_loop(VM* vm) {
             }
             continue;
         }
+        // A timer is due. The sockets are polled first, without waiting,
+        // when a millisecond has passed since they last were, as node polls
+        // between its timers and its immediates: a script that chains
+        // setImmediate or zero timeouts to split up long work would
+        // otherwise keep every socket waiting until the chain ends.
+        if vm.handles.len > 0 && now - vm.last_poll_ms >= 1.0 {
+            reactor_poll(vm, 0);
+            if vm.has_pending {
+                Value e = vm.pending;
+                vm.has_pending = false;
+                vm.pending = value_undefined();
+                if !vm_uncaught(vm, e) { return 1; }
+            }
+            continue;
+        }
         VmTimer* bt2 = vm.timers.data + best;
         Value cbfn = bt2.cb;
         Value extra = bt2.args;
         // a repeating timer is rearmed before it runs, so clearing it from
         // inside its own callback still takes effect
         if bt2.period > 0.0 { bt2.due = now + bt2.period; }
-        else { bt2.alive = false; }
+        else { vm_timer_kill(vm, bt2); }
         vpush(vm, cbfn);
         vpush(vm, extra);
         Value dummy = value_undefined();
@@ -7454,6 +7585,7 @@ i32 vm_run_event_loop(VM* vm) {
         }
     }
     vm.timers.len = 0;
+    vm.timers_dead = 0;
     vm.handles.len = 0;
     return 0;
 }

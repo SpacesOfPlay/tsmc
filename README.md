@@ -178,6 +178,9 @@ build/build.exe plugins            # -> build/tsmc-plugins[.exe]
 build/build.exe diff               # differential test vs a reference node
 build/build.exe t262               # ECMAScript conformance (test262), see below
 build/build.exe release            # -> build/release: a binary per platform
+build/build.exe build --prof       # a profiling build: tsmc --prof <script> then
+                                   # reports time per JS function, opcode mix and
+                                   # allocations on stderr
 ```
 
 `release` cross-compiles every published platform from whatever machine

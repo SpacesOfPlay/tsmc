@@ -61,19 +61,18 @@ for (const k of Object.keys(CONSTANTS)) {
   Object.defineProperty(DOMException.prototype, k, { value: CONSTANTS[k], enumerable: true });
 }
 
+// An event's fields default on the prototype, the way the standard keeps
+// them as accessors rather than own properties: a constructor sets the type
+// and whatever the options change, and dispatch sets the target.
 class Event {
   constructor(type, options) {
     if (type === undefined) throw new TypeError('The type argument must be specified');
-    const o = options === undefined || options === null ? {} : options;
-    this.type = String(type);
-    this.bubbles = !!o.bubbles;
-    this.cancelable = !!o.cancelable;
-    this.composed = !!o.composed;
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
-    this.eventPhase = 0;
-    this.isTrusted = false;
+    this.type = typeof type === 'string' ? type : String(type);
+    if (options !== undefined && options !== null) {
+      if (options.bubbles) this.bubbles = true;
+      if (options.cancelable) this.cancelable = true;
+      if (options.composed) this.composed = true;
+    }
   }
   preventDefault() {
     if (this.cancelable) this.defaultPrevented = true;
@@ -82,6 +81,15 @@ class Event {
   stopImmediatePropagation() { this._stopped = true; }
   composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
 }
+Event.prototype.bubbles = false;
+Event.prototype.cancelable = false;
+Event.prototype.composed = false;
+Event.prototype.defaultPrevented = false;
+Event.prototype.target = null;
+Event.prototype.currentTarget = null;
+Event.prototype.eventPhase = 0;
+Event.prototype.isTrusted = false;
+Event.prototype._stopped = false;
 tag(Event, 'Event');
 
 class CustomEvent extends Event {
@@ -92,6 +100,48 @@ class CustomEvent extends Event {
   }
 }
 tag(CustomEvent, 'CustomEvent');
+
+class MessageEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    if (options === undefined || options === null) return;
+    if (options.data !== undefined) this.data = options.data;
+    if (options.origin !== undefined) this.origin = String(options.origin);
+    if (options.lastEventId !== undefined) this.lastEventId = String(options.lastEventId);
+    if (options.source !== undefined) this.source = options.source;
+    if (options.ports !== undefined) this.ports = options.ports;
+  }
+}
+MessageEvent.prototype.data = null;
+MessageEvent.prototype.origin = '';
+MessageEvent.prototype.lastEventId = '';
+MessageEvent.prototype.source = null;
+MessageEvent.prototype.ports = Object.freeze([]);
+tag(MessageEvent, 'MessageEvent');
+
+class CloseEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    const o = options === undefined || options === null ? {} : options;
+    this.wasClean = !!o.wasClean;
+    this.code = o.code === undefined ? 0 : Number(o.code);
+    this.reason = o.reason === undefined ? '' : String(o.reason);
+  }
+}
+tag(CloseEvent, 'CloseEvent');
+
+class ErrorEvent extends Event {
+  constructor(type, options) {
+    super(type, options);
+    const o = options === undefined || options === null ? {} : options;
+    this.message = o.message === undefined ? '' : String(o.message);
+    this.filename = o.filename === undefined ? '' : String(o.filename);
+    this.lineno = o.lineno === undefined ? 0 : Number(o.lineno);
+    this.colno = o.colno === undefined ? 0 : Number(o.colno);
+    this.error = o.error === undefined ? null : o.error;
+  }
+}
+tag(ErrorEvent, 'ErrorEvent');
 
 // Listeners are kept in registration order. A listener removed while a
 // dispatch is running must not be called, so the walk checks the live list
@@ -148,7 +198,14 @@ class EventTarget {
     event.target = this;
     event.currentTarget = this;
     event.eventPhase = 2;
-    if (list) {
+    if (list && list.length === 1) {
+      // one listener: no snapshot to take, nothing to re-check
+      const entry = list[0];
+      if (entry.once) this.removeEventListener(event.type, entry.callback, { capture: entry.capture });
+      const cb = entry.callback;
+      if (typeof cb === 'function') cb.call(this, event);
+      else if (cb && typeof cb.handleEvent === 'function') cb.handleEvent(event);
+    } else if (list) {
       const snapshot = list.slice();
       for (const entry of snapshot) {
         if (list.indexOf(entry) < 0) continue;
@@ -244,6 +301,18 @@ tag(AbortController, 'AbortController');
 // resolution the monotonic clock has.
 const performance = {
   now() { return process.uptime() * 1000; },
+  // The share of the time since the event loop started that it spent
+  // running rather than waiting, as node reports it: with one earlier
+  // result, since that; with two, between them.
+  eventLoopUtilization(u1, u2) {
+    const t = process._loopTimes();
+    let idle = t[1], active = t[0] - t[1];
+    if (t[0] === 0) return { idle: 0, active: 0, utilization: 0 };
+    if (u1 && u2) { idle = u1.idle - u2.idle; active = u1.active - u2.active; }
+    else if (u1) { idle -= u1.idle; active -= u1.active; }
+    const total = idle + active;
+    return { idle: idle, active: active, utilization: total > 0 ? active / total : 0 };
+  },
   timeOrigin: Date.now() - process.uptime() * 1000,
   toJSON() { return { timeOrigin: this.timeOrigin, now: this.now() }; },
 };
@@ -252,6 +321,9 @@ module.exports = {
   DOMException: DOMException,
   Event: Event,
   CustomEvent: CustomEvent,
+  MessageEvent: MessageEvent,
+  CloseEvent: CloseEvent,
+  ErrorEvent: ErrorEvent,
   EventTarget: EventTarget,
   AbortSignal: AbortSignal,
   AbortController: AbortController,

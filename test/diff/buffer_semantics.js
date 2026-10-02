@@ -1,18 +1,10 @@
-// Buffer: construction, the encodings, the numeric accessors and the search
-// and comparison methods. Buffers are shown as hex so the output stays ASCII
-// and stable.
-//
-// NOT covered, because tsmc backs a Buffer with a JS array rather than a
-// Uint8Array over an ArrayBuffer. All of these follow from that one choice,
-// and doc/PLAN_M42_buffer_uint8array.md tracks the conversion -- re-add them
-// here as it lands, they are its acceptance criteria:
-//   - `b instanceof Uint8Array`, `ArrayBuffer.isView(b)`, and the
-//     `[object Uint8Array]` tag
-//   - assigning out of range truncates to a byte (`b[0] = 300` -> 44)
-//   - slice() and subarray() return views that share memory, not copies
-//   - `.buffer`, `.byteOffset`, `.byteLength`
-//   - `Buffer.from(arrayBuffer)`, which aliases its source
-//   - the BigInt64 accessors
+// Buffer: construction, the encodings, the numeric accessors, the search
+// and comparison methods, and what follows from a Buffer being a Uint8Array
+// over an ArrayBuffer: views that share memory, the byte-truncating store,
+// `.buffer`/`.byteOffset`/`.byteLength`, `Buffer.from(arrayBuffer)`, the
+// BigInt64 accessors. Buffers are shown as hex so the output stays ASCII and
+// stable. A small buffer's byteOffset is never printed: node carves those
+// out of a pool, so it is whatever the pool says.
 
 const out = [];
 
@@ -277,5 +269,88 @@ T('poolSize-exists', () => typeof Buffer.poolSize);
 T('isEncoding', () => typeof Buffer.isEncoding === 'function'
   ? [Buffer.isEncoding('utf8'), Buffer.isEncoding('hex'), Buffer.isEncoding('nope')]
   : 'missing');
+
+// --- a Uint8Array over an ArrayBuffer ---------------------------------------
+
+T('is-uint8array', () => {
+  const b = Buffer.from([1]);
+  return [b instanceof Uint8Array, ArrayBuffer.isView(b), Object.prototype.toString.call(b),
+          Array.isArray(b), b.constructor.name, Object.getPrototypeOf(Buffer.prototype) === Uint8Array.prototype];
+});
+T('store-truncates', () => { const b = Buffer.alloc(2); b[0] = 300; b[1] = -1; return [b[0], b[1]]; });
+T('length-not-own', () => { const b = Buffer.from([1, 2]); return [b.length, b.hasOwnProperty('length'), Object.keys(b)]; });
+T('slice-shares', () => {
+  const b = Buffer.from([1, 2, 3, 4]);
+  const s = b.slice(1, 3);
+  s[0] = 9;
+  b[2] = 8;
+  return [b, s, s.byteOffset - b.byteOffset, s.buffer === b.buffer];
+});
+T('subarray-shares', () => {
+  const b = Buffer.from([1, 2, 3, 4]);
+  const s = b.subarray(2);
+  s[1] = 7;
+  return [b, s, s.length, s instanceof Buffer];
+});
+T('byteLength-and-buffer', () => {
+  const b = Buffer.from([1, 2, 3]);
+  return [b.byteLength, b.buffer instanceof ArrayBuffer, b.buffer === b.buffer, typeof b.byteOffset];
+});
+T('from-arraybuffer-aliases', () => {
+  const ab = new ArrayBuffer(6);
+  const b = Buffer.from(ab, 2, 3);
+  b[0] = 5;
+  const view = new Uint8Array(ab);
+  view[3] = 6;
+  return [b, b.byteOffset, b.length, Array.from(view)];
+});
+T('from-arraybuffer-whole', () => {
+  const ab = new Uint8Array([7, 8, 9]).buffer;
+  return [Buffer.from(ab), Buffer.from(ab).buffer === ab];
+});
+T('from-arraybuffer-range', () => {
+  const ab = new ArrayBuffer(4);
+  return [(() => { try { Buffer.from(ab, 5); return 'no'; } catch (e) { return e.name; } })(),
+          (() => { try { Buffer.from(ab, 2, 3); return 'no'; } catch (e) { return e.name; } })()];
+});
+T('from-buffer-copies', () => { const a = Buffer.from([1, 2]); const b = Buffer.from(a); b[0] = 9; return [a, b]; });
+T('set-and-view', () => {
+  // the shape a frame parser uses: set() a piece, then a view over the bytes
+  const dst = Buffer.alloc(5);
+  dst.set(Buffer.from([1, 2]), 1);
+  const src = Buffer.from([7, 8, 9, 10]);
+  dst.set(new Uint8Array(src.buffer, src.byteOffset + 1, 2), 3);
+  return dst;
+});
+T('copy-overlap', () => { const b = Buffer.from([1, 2, 3, 4, 5]); b.copy(b, 1, 0, 4); return b; });
+T('concat-typed', () => Buffer.concat([Buffer.from([1]), new Uint8Array([2, 3])]));
+T('bigint-accessors', () => {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64BE(BigInt('18446744073709551615'), 0);
+  const r1 = [b, b.readBigUInt64BE(0), b.readBigInt64BE(0)];
+  b.writeBigInt64LE(BigInt(-2), 0);
+  const r2 = [b, b.readBigInt64LE(0), b.readBigUInt64LE(0)];
+  b.writeBigUInt64LE(BigInt(2) ** BigInt(40) + BigInt(5), 0);
+  const r3 = [b, b.readBigUInt64LE(0), b.readBigUInt64BE(0)];
+  return [r1, r2, r3];
+});
+T('bigint-accessor-errors', () => [
+  (() => { try { Buffer.alloc(8).writeBigUInt64BE(1, 0); return 'no'; } catch (e) { return e.name; } })(),
+  (() => { try { Buffer.alloc(7).readBigUInt64BE(0); return 'no'; } catch (e) { return e.name; } })(),
+]);
+T('text-encoder-is-uint8array', () => {
+  const u = new TextEncoder().encode('hi');
+  return [u instanceof Uint8Array, Buffer.isBuffer(u), Array.from(u)];
+});
+T('deep-equal', () => {
+  const assert = require('assert');
+  const ok = (f) => { try { f(); return true; } catch (e) { return false; } };
+  return [ok(() => assert.deepStrictEqual(Buffer.from([1, 2]), Buffer.from([1, 2]))),
+          ok(() => assert.deepStrictEqual(Buffer.from([1, 2]), Buffer.from([1, 3])))];
+});
+T('typed-array-methods-on-buffer', () => {
+  const b = Buffer.from([3, 1, 2]);
+  return [b.map((x) => x * 2), Array.from(b.subarray(1)), b.at(-1), b.includes(2), b.join('-')];
+});
 
 console.log(out.join('\n'));

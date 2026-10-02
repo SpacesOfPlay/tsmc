@@ -34,6 +34,24 @@ a plugin built against an older table is refused rather than run. A compile
 error comes back as a catchable JS exception carrying the compiler's
 diagnostics.
 
+`bytes` gives a native the storage behind a typed array or Buffer, so a
+batch of numbers crosses as one array instead of one Value each.
+
+## Compiled into the program
+
+A program that embeds tsmc, where no compiler runs at `require()` time, can
+compile a plugin in instead. The plugin defines its register function
+under its own name (`demo_register` here) and the two looked-up symbols
+only when `TSMC_STATIC_PLUGINS` is not defined; the embedder includes the
+source, sets `@define "TSMC_STATIC_PLUGINS"`, and calls
+
+```c
+tsmc_plugin_static("demo.mc", demo_register);
+```
+
+before the script runs. `require()` of a path ending in `demo.mc` then
+registers it from that table, whether or not the file exists.
+
 ## Rooting
 
 A Value the plugin holds across a call that can allocate has to be pushed on

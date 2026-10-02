@@ -51,9 +51,47 @@ class Headers {
   [Symbol.iterator]() { return this.entries(); }
 }
 
+// An immutable bag of bytes with a MIME type. Parts are strings, buffers,
+// views or other blobs; the bytes are copied in once.
+class Blob {
+  constructor(parts, options) {
+    const list = [];
+    if (parts !== undefined && parts !== null) {
+      for (const p of parts) list.push(bodyToBuffer(p));
+    }
+    Object.defineProperty(this, '_buf', { value: Buffer.concat(list), writable: false, enumerable: false, configurable: true });
+    let type = options !== undefined && options !== null && options.type !== undefined ? String(options.type) : '';
+    for (let i = 0; i < type.length; i++) {
+      const c = type.charCodeAt(i);
+      if (c < 0x20 || c > 0x7e) { type = ''; break; }
+    }
+    Object.defineProperty(this, '_type', { value: type.toLowerCase(), writable: false, enumerable: false, configurable: true });
+  }
+  get size() { return this._buf.length; }
+  get type() { return this._type; }
+  slice(start, end, contentType) {
+    const n = this._buf.length;
+    let s = start === undefined ? 0 : Math.trunc(Number(start)) || 0;
+    let e = end === undefined ? n : Math.trunc(Number(end)) || 0;
+    if (s < 0) s = Math.max(n + s, 0); else if (s > n) s = n;
+    if (e < 0) e = Math.max(n + e, 0); else if (e > n) e = n;
+    if (e < s) e = s;
+    return new Blob([this._buf.subarray(s, e)], { type: contentType === undefined ? '' : contentType });
+  }
+  arrayBuffer() {
+    const ab = new ArrayBuffer(this._buf.length);
+    new Uint8Array(ab).set(this._buf);
+    return Promise.resolve(ab);
+  }
+  bytes() { return Promise.resolve(new Uint8Array(Buffer.from(this._buf))); }
+  text() { return Promise.resolve(this._buf.toString('utf8')); }
+}
+Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: 'Blob', configurable: true });
+
 function bodyToBuffer(body) {
   if (body === undefined || body === null) return Buffer.alloc(0);
   if (Buffer.isBuffer(body)) return body;
+  if (body instanceof Blob) return body._buf;
   if (body instanceof ArrayBuffer) return Buffer.from(new Uint8Array(body));
   if (ArrayBuffer.isView(body)) return Buffer.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
   return Buffer.from(String(body), 'utf8');
@@ -72,6 +110,11 @@ class Body {
     return Promise.resolve(ab);
   }
   bytes() { this.bodyUsed = true; return Promise.resolve(new Uint8Array(this._buf)); }
+  blob() {
+    this.bodyUsed = true;
+    const type = this.headers instanceof Headers ? (this.headers.get('content-type') || '') : '';
+    return Promise.resolve(new Blob([this._buf], { type: type }));
+  }
 }
 
 class Response extends Body {
@@ -117,6 +160,6 @@ class Request extends Body {
   clone() { return new Request(this); }
 }
 
-module.exports = { Headers: Headers, Request: Request, Response: Response };
+module.exports = { Headers: Headers, Request: Request, Response: Response, Blob: Blob };
 ";
 }

@@ -28,7 +28,10 @@ import node_net;
 import node_http;
 import node_fetch;
 import node_webapi;
+import node_websocket;
 import node_querystring;
+import node_url;
+import node_bufferutil;
 import node_strdec;
 import node_punycode;
 import node_webevents;
@@ -384,8 +387,9 @@ private str builtin_name(str spec) {
         || str_equal(s, "tls") || str_equal(s, "https")
         || str_equal(s, "tty") || str_equal(s, "_fetch") || str_equal(s, "_webapi")
         || str_equal(s, "querystring") || str_equal(s, "string_decoder")
+        || str_equal(s, "url") || str_equal(s, "bufferutil") || str_equal(s, "utf-8-validate")
         || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
-        || str_equal(s, "_webevents") || str_equal(s, "_eventsx")
+        || str_equal(s, "_webevents") || str_equal(s, "_eventsx") || str_equal(s, "_websocket")
         || str_equal(s, "_webcrypto")
         || str_equal(s, "timers/promises") { return s; }
     str none;
@@ -1515,9 +1519,13 @@ private str builtin_js_source(str name) {
     if str_equal(name, "_webapi") { return node_webapi_source(); }
     if str_equal(name, "timers/promises") { return node_timers_promises_source(); }
     if str_equal(name, "querystring") { return node_querystring_source(); }
+    if str_equal(name, "url") { return node_url_source(); }
+    if str_equal(name, "bufferutil") { return node_bufferutil_source(); }
+    if str_equal(name, "utf-8-validate") { return node_utf8validate_source(); }
     if str_equal(name, "string_decoder") { return node_strdec_source(); }
     if str_equal(name, "punycode") { return node_punycode_source(); }
     if str_equal(name, "_webevents") { return node_webevents_source(); }
+    if str_equal(name, "_websocket") { return node_websocket_source(); }
     if str_equal(name, "perf_hooks") { return node_perf_hooks_source(); }
     if str_equal(name, "_eventsx") { return node_events_extra_source(); }
     if str_equal(name, "_webcrypto") { return node_webcrypto_source(); }
@@ -1637,6 +1645,35 @@ private bool path_is_mc_ext(str p) {
         && *(p.data + p.len - 1) == 'c';
 }
 
+// Registers static plugin `si` once, cached under "static:<name>", and
+// returns its exports.
+private Value require_static_plugin(VM* vm, i32 si) {
+    str_buf kb;
+    str_buf_init(&kb);
+    str_buf_add(&kb, "static:");
+    str_buf_add(&kb, builtins_static_plugin_name(si));
+    u32 key = atom_intern(&vm.atoms, str_buf_to_str(&kb));
+    str_buf_free(&kb);
+    u32 exports_atom = atom_intern(&vm.atoms, "exports");
+    JsObject* cache = require_cache(vm);
+    Value cached;
+    if js_get_prop(cache, key, &cached) {
+        Value ex;
+        if value_is_object(cached) && vm_get_prop_value(vm, cached, exports_atom, &ex) { return ex; }
+        return value_undefined();
+    }
+    i32 pm = gc_root_mark(&vm.heap);
+    Value ex = builtins_load_static_plugin(vm, si);
+    gc_root(&vm.heap, ex);
+    JsObject* pmod = js_new_object(&vm.heap, vm.object_proto);
+    Value pmv = value_cell(&pmod.head);
+    gc_root(&vm.heap, pmv);
+    js_set_prop(pmod, exports_atom, ex);
+    js_set_prop(cache, key, pmv);
+    gc_root_reset(&vm.heap, pm);
+    return ex;
+}
+
 Value module_require(VM* vm, str importer_path, str spec) {
     // 1. built-in module (fs / path / os / ..., incl. node: prefix)
     str bname = builtin_name(spec);
@@ -1650,6 +1687,13 @@ Value module_require(VM* vm, str importer_path, str spec) {
         // JS-source built-in (e.g. stream)
         str jsrc = builtin_js_source(bname);
         if jsrc.data != null { return run_js_builtin(vm, bname, jsrc); }
+    }
+    // 1b. a plugin compiled into the program: found by its file name,
+    //     before the file system, since there may be no file and no
+    //     compiler to build one.
+    if path_is_mc_ext(spec) {
+        i32 si = builtins_static_plugin(spec);
+        if si >= 0 { return require_static_plugin(vm, si); }
     }
     // 2. resolve (relative/absolute file, or a node_modules package)
     str resolved = resolve_require(vm, importer_path, spec, false);
@@ -1887,6 +1931,26 @@ private Value webapi_class(VM* vm, str which) {
     return cls;
 }
 
+// The `_websocket` module behind the WebSocket global, the same way.
+private Value websocket_class(VM* vm, str which) {
+    str none;
+    none.data = null;
+    none.len = 0;
+    i32 rm = gc_root_mark(&vm.heap);
+    Value impl = module_require(vm, none, "_websocket");
+    if vm.has_pending || !value_is_object(impl) { gc_root_reset(&vm.heap, rm); return value_undefined(); }
+    gc_root(&vm.heap, impl);
+    Value cls;
+    bool ok = vm_get_prop_value(vm, impl, atom_intern(&vm.atoms, which), &cls);
+    gc_root_reset(&vm.heap, rm);
+    if !ok { return value_undefined(); }
+    if value_is_callable(cls) {
+        vm_set_global(vm, which, cls);
+        vm_mirror_global(vm, which, false);
+    }
+    return cls;
+}
+
 // events.once, loaded on first call the way `fetch` is.
 private Value nat_events_once(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = cast(VM*, vmp);
@@ -2019,6 +2083,15 @@ private Value nat_g_performance(void* vmp, Value callee, Value thisv, Value* arg
 
 private Value nat_g_headers(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     return webapi_class(cast(VM*, vmp), "Headers");
+}
+private Value nat_g_blob(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webapi_class(cast(VM*, vmp), "Blob");
+}
+private Value nat_g_messageevent(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return webevents_class(cast(VM*, vmp), "MessageEvent");
+}
+private Value nat_g_websocket(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return websocket_class(cast(VM*, vmp), "WebSocket");
 }
 
 private Value nat_g_request(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -2236,6 +2309,9 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vm_set_lazy_global(vm, "AbortController", &nat_g_abortcontroller);
     vm_set_lazy_global(vm, "performance", &nat_g_performance);
     vm_set_lazy_global(vm, "crypto", &nat_g_crypto);
+    vm_set_lazy_global(vm, "Blob", &nat_g_blob);
+    vm_set_lazy_global(vm, "MessageEvent", &nat_g_messageevent);
+    vm_set_lazy_global(vm, "WebSocket", &nat_g_websocket);
     // publish onto globalThis, whose snapshot predates all four
     vm_mirror_global(vm, "fetch", true);
     vm_mirror_global(vm, "Headers", false);
@@ -2249,6 +2325,9 @@ i32 module_run_entry(VM* vm, str src, str path) {
     vm_mirror_global(vm, "AbortController", false);
     vm_mirror_global(vm, "performance", false);
     vm_mirror_global(vm, "crypto", false);
+    vm_mirror_global(vm, "Blob", false);
+    vm_mirror_global(vm, "MessageEvent", false);
+    vm_mirror_global(vm, "WebSocket", false);
 
     // __filename / __dirname for the entry file (absolute, entry-scoped).
     str fname = canon_path(path);

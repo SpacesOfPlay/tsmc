@@ -48,13 +48,20 @@ private Value nat_point(void* vm, Value callee, Value thisv, Value* args, i32 ar
     return o;
 }
 
-// --- the two symbols tsmc looks up. Both must be public. ---
+// --- registration ---
 
-u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
-
-void tsmc_plugin_register(TsmcApi* a, void* reg) {
+// Under its own name, so a program that compiles several plugins in
+// (tsmc_plugin_static) can tell them apart.
+void demo_register(TsmcApi* a, void* reg) {
     api = a;
     a.export_fn(reg, "hello", &nat_hello);
     a.export_fn(reg, "sum", &nat_sum);
     a.export_fn(reg, "point", &nat_point);
+}
+
+// The two symbols tsmc looks up when it compiles this file at require()
+// time. Both must be exported: they are what the shared library offers.
+when !defined(TSMC_STATIC_PLUGINS) {
+    export u32 tsmc_plugin_abi_version() { return TSMC_PLUGIN_ABI; }
+    export void tsmc_plugin_register(TsmcApi* a, void* reg) { demo_register(a, reg); }
 }

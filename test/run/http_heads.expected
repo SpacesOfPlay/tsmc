@@ -1,0 +1,14 @@
+--- folding
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 172 | Connection: close |  | {"method":"GET","url":"/a?b=1","version":"1.1","headers":{"host":"x","x-dup":"1, 2","set-cookie":["c=1","d=2"],"spaced name":"v","":"empty","tab":"x","connection":"close"}}
+--- http/1.0
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 75 | Connection: close |  | {"method":"GET","url":"/","version":"1.0","headers":{"connection":"close"}}
+--- no version
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 76 | Connection: close |  | {"method":"GET","url":"/x","version":"1.1","headers":{"connection":"close"}}
+--- odd line
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 74 | Connection: close |  | {"method":"GET","url":"","version":"two","headers":{"connection":"close"}}
+--- utf-8
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | X-Reply: café | Content-Type: application/json | Content-Length: 93 | Connection: close |  | {"method":"GET","url":"/","version":"1.1","headers":{"x-reply":"café","connection":"close"}}
+--- proto
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 89 | Connection: close |  | {"method":"GET","url":"/","version":"1.1","headers":{"x-after":"y","connection":"close"}}
+--- a byte at a time
+HTTP/1.1 201 Created | Set-Cookie: a=1 | Set-Cookie: b=2 | X-Count: 42 | X-Multi-Part-Name: v | Content-Type: application/json | Content-Length: 112 | Connection: close |  | {"method":"POST","url":"/slow","version":"1.1","headers":{"host":"y","content-length":"0","connection":"close"}}

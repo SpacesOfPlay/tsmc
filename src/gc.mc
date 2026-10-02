@@ -56,6 +56,12 @@ struct GcHeap {
     GcWeakSweepFn weak_sweep; // drops dead-keyed weak entries
     void* mark_ctx;
     GcCell*[GC_CLASS_COUNT] free_cells;   // dead cells by size class, reused first
+    i64 alloc_total;      // bytes allocated since the heap began: a clock
+    // A byte per property key, set during marking for each key a live
+    // property list holds (the embedder sizes it, and reads it after);
+    // keys at or past key_marks_len are not recorded.
+    u8* key_marks;
+    i32 key_marks_len;
 }
 
 // --- cell allocator ------------------------------------------------
@@ -120,6 +126,9 @@ void gc_init(GcHeap* h) {
     h.weak_sweep = null;
     h.mark_ctx = null;
     for i32 i = 0; i < GC_CLASS_COUNT; i++ { h.free_cells[i] = null; }
+    h.alloc_total = 0;
+    h.key_marks = null;
+    h.key_marks_len = 0;
 }
 
 void gc_destroy(GcHeap* h) {
@@ -145,6 +154,7 @@ void gc_destroy(GcHeap* h) {
     }
     vec_free(&h.roots);
     vec_free(&h.mark_stack);
+    if h.key_marks != null { free(h.key_marks); h.key_marks = null; }
 }
 
 // --- roots ---------------------------------------------------------
@@ -201,6 +211,10 @@ private void gc_trace(GcHeap* h, GcCell* c) {
 // report: a pause here is a pause in everything the runtime serves.
 i64 gc_stat_collections = 0;
 i64 gc_stat_ticks = 0;
+// allocations by kind, counted only while a profile is being taken, in a
+// profiling build
+bool gc_stat_on = false;
+i64[16] gc_stat_allocs;
 
 void gc_collect(GcHeap* h) {
     i64 gc_t0 = qpc();
@@ -277,9 +291,13 @@ void gc_report_poison() {
 }
 
 GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
+    when defined(TSMC_PROF) {
+        if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
+    }
     if h.stress || h.bytes_live >= h.next_gc {
         gc_collect(h);
     }
+    h.alloc_total += size;
     i32 cls = gc_class_of(size);
     i64 block = cls >= 0 ? gc_class_size(cls) : size;
     GcCell* c = null;
