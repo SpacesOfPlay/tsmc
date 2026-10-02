@@ -12668,7 +12668,7 @@ private Value nat_net_recv(void* vmp, Value callee, Value thisv, Value* args, i3
     VM* vm = as_vm(vmp);
     i64 fd = vm_handle_fd(vm, to_int_arg(arg_at(args, argc, 0)));
     if fd < 0 { return value_int(-1); }
-    u8[16384] buf;
+    noinit u8[16384] buf;
     i32 n = net_try_recv(fd, &buf[0], 16384);
     if n > 0 { return buf_from_bytes(vm, &buf[0], n); }
     if n == 0 { return value_int(0); }            // clean EOF
@@ -12692,7 +12692,7 @@ private Value nat_net_send(void* vmp, Value callee, Value thisv, Value* args, i3
     if p != null { return value_int(net_try_send(fd, p + off, len - off)); }
     i32 chunk = len - off;
     if chunk > 16384 { chunk = 16384; }
-    u8[16384] tmp;
+    noinit u8[16384] tmp;
     for i32 i = 0; i < chunk; i++ { tmp[i] = cast(u8, buf_byte(o, off + i)); }
     return value_int(net_try_send(fd, &tmp[0], chunk));
 }
@@ -12717,7 +12717,7 @@ private Value nat_net_send2(void* vmp, Value callee, Value thisv, Value* args, i
     if aoff > an { aoff = an; }
     i32 arest = an - aoff;
     if arest + bn > 65536 { return value_int(-3); }
-    u8[65536] tmp;
+    noinit u8[65536] tmp;
     if arest > 0 { memcpy(&tmp[0], ap + aoff, cast(i64, arest)); }
     if bn > 0 { memcpy(&tmp[arest], bp, cast(i64, bn)); }
     return value_int(net_try_send(fd, &tmp[0], arest + bn));
@@ -12904,7 +12904,7 @@ private Value nat_tls_write(void* vmp, Value callee, Value thisv, Value* args, i
     // one record's worth at a time keeps the ciphertext queue bounded
     i32 chunk = len - off;
     if chunk > 16384 { chunk = 16384; }
-    u8[16384] tmp;
+    noinit u8[16384] tmp;
     if p == null {
         for i32 i = 0; i < chunk; i++ { tmp[i] = cast(u8, buf_byte(o, off + i)); }
         p = &tmp[0];

@@ -545,7 +545,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     bool handshaking = !s.established;
     while more {
         more = false;
-        u8[8192] tmp;
+        noinit u8[8192] tmp;
         // The clock is read only for the handshake statistics: on some
         // machines each read is a trap to the hypervisor.
         i64 q0 = handshaking ? qpc() : 0;
