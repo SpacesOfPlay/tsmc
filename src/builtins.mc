@@ -10739,10 +10739,16 @@ private JsObject* ta_buffer(VM* vm, JsObject* o) {
 
 // Allocates a fresh ArrayBuffer of nbytes zeroed bytes.
 private JsObject* ab_new(VM* vm, i32 nbytes) {
+    return ab_new_with(vm, nbytes, true);
+}
+
+// An ArrayBuffer whose bytes are zeroed, or (zeroed false) left for the
+// caller to write in full before anything reads them.
+private JsObject* ab_new_with(VM* vm, i32 nbytes, bool zeroed) {
     if nbytes < 0 { nbytes = 0; }
     JsObject* ab = js_new_object(&vm.heap, vm.arraybuffer_proto);
     vm_push(vm, value_cell(&ab.head));
-    GcBytes* gb = js_new_bytes(&vm.heap, nbytes);
+    GcBytes* gb = zeroed ? js_new_bytes(&vm.heap, nbytes) : js_new_bytes_raw(&vm.heap, nbytes);
     vm_push(vm, value_cell(&gb.head));
     js_array_set(ab, 0, value_cell(&gb.head));   // elems[0] roots the bytes
     vm.sp -= 2;
@@ -10952,8 +10958,18 @@ private void buf_set_byte(JsObject* o, i32 i, i32 by) {
 
 // A zero-filled Buffer of `len` bytes over its own ArrayBuffer.
 private JsObject* buf_new(VM* vm, i32 len) {
+    return buf_new_with(vm, len, true);
+}
+
+// A Buffer of `len` bytes the caller fills in full before anything reads
+// them: not zeroed first.
+private JsObject* buf_new_raw(VM* vm, i32 len) {
+    return buf_new_with(vm, len, false);
+}
+
+private JsObject* buf_new_with(VM* vm, i32 len, bool zeroed) {
     if len < 0 { len = 0; }
-    JsObject* ab = ab_new(vm, len);
+    JsObject* ab = ab_new_with(vm, len, zeroed);
     vm_push(vm, value_cell(&ab.head));
     Value r = ta_make_as(vm, TA_KIND_U8, ab, 0, len, vm.buffer_proto);
     vm_pop(vm);
@@ -10961,7 +10977,7 @@ private JsObject* buf_new(VM* vm, i32 len) {
 }
 
 private Value buf_from_bytes(VM* vm, u8* data, i32 len) {
-    JsObject* b = buf_new(vm, len);
+    JsObject* b = data != null ? buf_new_raw(vm, len) : buf_new(vm, len);
     i32 n;
     u8* p = ta_bytes(b, &n);
     if p != null && data != null && n > 0 { memcpy(p, data, cast(i64, n)); }
@@ -12881,10 +12897,11 @@ private Value nat_tls_read(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 avail = tls_available(s);
     if avail <= 0 { return value_null(); }
     if avail > 65536 { avail = 65536; }
-    JsObject* b = buf_new(vm, avail);
+    // not zeroed: tls_read fills all `avail` bytes
+    JsObject* b = buf_new_raw(vm, avail);
     i32 cap;
     u8* p = ta_bytes(b, &cap);
-    if p == null || tls_read(s, p, avail) <= 0 { return value_null(); }
+    if p == null || tls_read(s, p, avail) != avail { return value_null(); }
     return value_cell(&b.head);
 }
 
@@ -13272,7 +13289,7 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
     JsObject* h = js_new_object(&vm.heap, vm.object_proto);
     Value hv = value_cell(&h.head);
     vm_push(vm, hv);
-    u8[256] lower;
+    noinit u8[256] lower;
     u32 cookie = bi_atom(vm, "set-cookie");
     while at < end {
         str line = http_line(p, end, &at);
@@ -13349,7 +13366,7 @@ private Value nat_http_set_headers(void* vmp, Value callee, Value thisv, Value* 
         }
         if http_is_proto(k) { return value_bool(false); }
     }
-    u8[256] lower;
+    noinit u8[256] lower;
     for i32 i = 0; i < props.len; i++ {
         Prop* pr = props.items + i;
         if !prop_enumerable(vm, pr) { continue; }
@@ -17517,7 +17534,7 @@ private void sha256_block(u8* block, u32* state, u32* k) {
             return;
         }
     }
-    u32[64] w;
+    noinit u32[64] w;
     for i32 i = 0; i < 16; i++ {
         i32 off = i * 4;
         u32 b0 = cast(u32, *(block + off));
@@ -17687,7 +17704,7 @@ private void md5_hash(u8* data, i32 len, u8* out) {
 private u32 sha1_lrot(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
 
 private void sha1_block(u8* block, u32* h) {
-    u32[80] w;
+    noinit u32[80] w;
     for i32 i = 0; i < 16; i++ {
         i32 off = i * 4;
         u32 b0 = cast(u32, *(block + off));

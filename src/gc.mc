@@ -291,6 +291,13 @@ void gc_report_poison() {
 }
 
 GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
+    return gc_alloc_zeroing(h, kind, size, -1);
+}
+
+// gc_alloc with only the first `zero` bytes cleared (-1: the whole
+// block): for a cell whose rest the caller writes in full before anything
+// reads it, such as the bytes of a Buffer a socket read fills.
+GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     when defined(TSMC_PROF) {
         if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
     }
@@ -307,7 +314,7 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
     } else {
         c = cast(GcCell*, alloc(block));
     }
-    memset(cast(u8*, c), 0, block);
+    memset(cast(u8*, c), 0, zero < 0 || zero > block ? block : zero);
     c.next = h.all;
     h.all = c;
     c.size = block;

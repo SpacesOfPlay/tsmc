@@ -276,11 +276,20 @@ struct GcBytes {
 
 u8* gb_data(GcBytes* g) { return cast(u8*, g) + sizeof(GcBytes); }
 
+// `len` zeroed bytes: gc_alloc clears the whole cell.
 GcBytes* js_new_bytes(GcHeap* h, i32 len) {
     i32 n = len > 0 ? len : 0;
     GcBytes* g = cast(GcBytes*, gc_alloc(h, GC_BYTES, sizeof(GcBytes) + cast(i64, n)));
     g.len = n;
-    memset(gb_data(g), 0, cast(i64, n));
+    return g;
+}
+
+// `len` bytes left as they are, for a caller that writes all of them
+// before anything reads them.
+GcBytes* js_new_bytes_raw(GcHeap* h, i32 len) {
+    i32 n = len > 0 ? len : 0;
+    GcBytes* g = cast(GcBytes*, gc_alloc_zeroing(h, GC_BYTES, sizeof(GcBytes) + cast(i64, n), sizeof(GcBytes)));
+    g.len = n;
     return g;
 }
 

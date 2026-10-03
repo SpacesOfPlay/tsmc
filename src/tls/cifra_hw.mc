@@ -438,7 +438,7 @@ when defined(CIFRA_HW_256) {
 // does. The powers are laid out in pairs first, high power in the low
 // lane, since `hp` holds them in ascending order.
 u64x2 cifra_hw_ghash16w(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
-    u8[512] hw;
+    noinit u8[512] hw;
     for i32 j = 0; j < 8; j++ {
         i8x16_store(cast(i8*, &hw[32 * j]), i8x16_load(cast(i8*, hp + 16 * (15 - 2 * j))));
         i8x16_store(cast(i8*, &hw[32 * j + 16]), i8x16_load(cast(i8*, hp + 16 * (14 - 2 * j))));
@@ -538,7 +538,7 @@ void cifra_hw_ctr(u8* rk, u32 rounds, u8* j0, u32 ctr, u8* in, u8* out, u64 n) {
     // arm is in use; the rest as below.
     when defined(CIFRA_HW_256) {
         if n >= 256 && cifra_hw_wide() {
-            u8[480] rk2;                                 // each round key twice
+            noinit u8[480] rk2;                                 // each round key twice
             for u32 r = 0; r <= rounds; r++ {
                 i8x16 k = i8x16_load(cast(i8*, rk + 16 * cast(u64, r)));
                 i8x32_store(cast(i8*, &rk2[32 * r]), i8x32_pack(k, k));
