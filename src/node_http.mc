@@ -342,12 +342,6 @@ const setHeaderOwn = ServerResponse.prototype.setHeader;
 // reason.
 const MAX_HEAD = 16 * 1024;
 
-// A body is refused on the length the client declares, before any of it
-// is buffered. Nothing gets around that by lying: this server reads a
-// body only when Content-Length gives one, so a request that withholds
-// the length arrives as a request with no body rather than as an
-// unbounded one.
-const MAX_BODY = 1024 * 1024;
 // The longest chunk-size line, extensions included. A size needs eight
 // hex digits at most; the rest is extensions, which are ignored.
 const MAX_CHUNK_LINE = 1024;
@@ -619,7 +613,7 @@ function serveConnection(server, socket) {
       // declared one past the ceiling is refused before a byte of it is
       // kept, which is the point of it being declared.
       if (!(remaining > 0)) remaining = 0;
-      if (remaining > MAX_BODY) { refuse(413, 'Payload too large'); return; }
+      if (remaining > server.maxBodySize) { refuse(413, 'Payload too large'); return; }
       // An upgrade is only one when somebody is there to take it; otherwise
       // the request is served like any other.
       if ((facts & F_UPGRADE) !== 0 && server.listenerCount('upgrade') > 0) {
@@ -655,8 +649,8 @@ function serveConnection(server, socket) {
   // the request as it comes rather than a whole chunk at a time. True at
   // the body's end. Chunk extensions are ignored, and trailer lines are
   // read and dropped. A size that is not hex, a line past its limit or a
-  // chunk not followed by CRLF is refused (400); a body past MAX_BODY too
-  // (413), as a declared length past it is.
+  // chunk not followed by CRLF is refused (400); a body past the server's
+  // maxBodySize too (413), as a declared length past it is.
   function readChunked() {
     for (;;) {
       if (cstate === 'size') {
@@ -673,7 +667,7 @@ function serveConnection(server, socket) {
         csize = parseInt(line, 16);
         buf = buf.slice(ln + 2);
         if (csize === 0) { cstate = 'trailer'; continue; }
-        if (received + csize > MAX_BODY) { refuse(413, 'Payload too large'); return false; }
+        if (received + csize > server.maxBodySize) { refuse(413, 'Payload too large'); return false; }
         cstate = 'data';
       } else if (cstate === 'data') {
         if (buf.length === 0) return false;
@@ -717,6 +711,12 @@ class Server extends EventEmitter {
   constructor(handler, connFactory) {
     super();
     if (typeof handler === 'function') this.on('request', handler);
+    // The longest request body served; a longer one is refused (413), a
+    // declared length before any of it is read. None by default, as in
+    // node: a body is handed to the request as it arrives and not kept
+    // here, and the body deadline bounds how long one may take. A
+    // handler that collects bodies in memory sets one.
+    this.maxBodySize = Infinity;
     // connFactory(onConn) yields a listen/address/close server whose
     // connections are handed to onConn. Plain net by default; https injects a
     // TLS one so the HTTP protocol runs unchanged over a TLSSocket.

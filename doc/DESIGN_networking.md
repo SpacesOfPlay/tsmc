@@ -110,7 +110,8 @@ hears `'close'` if its connection goes before it ends.
 A request body arrives by Content-Length or chunked, handed to the
 request as it comes; extensions and trailers are read past. A request
 with both, or a coding that does not end in chunked, is refused (400) as
-a smuggling attempt, and a body past 1 MB either way is refused (413);
+a smuggling attempt, and a body past the server's `maxBodySize` (none by
+default, as in node; a body is not kept here) either way is refused (413);
 a refused connection reads and drops what the client still sends for
 two seconds before it closes, so that the answer is not overtaken by
 the reset a close with unread data causes.
