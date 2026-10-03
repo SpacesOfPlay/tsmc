@@ -18114,6 +18114,52 @@ private void hash_acc_append(VM* vm, JsObject* h, u8* data, i32 n) {
     props_set_desc(&h.props, bi_atom(vm, "%len"), value_number(cast(f64, len + n)), 0);
 }
 
+// A SHA-2 Hash keeps the algorithm's state, a cifra context, in the
+// "%st" Buffer and hashes each update as it comes, as node does: a large
+// body is hashed as it arrives, in constant memory, where keeping it
+// until digest() grew a Buffer by doubling (zeroed, then copied into) and
+// held all of it. MD5 and SHA-1, one-shot here, and Hmac keep the input.
+private bool hash_streams(i32 id) { return id == 28 || id == 32 || id == 48 || id == 64; }
+
+private i32 hash_state_size(i32 id) {
+    if id <= 32 { return cast(i32, sizeof(cf_sha256_context)); }
+    return cast(i32, sizeof(cf_sha512_context));
+}
+
+private void hash_state_init(i32 id, u8* st) {
+    if id == 28 { cf_sha224_init(cast(cf_sha256_context*, st)); }
+    else if id == 32 { cf_sha256_init(cast(cf_sha256_context*, st)); }
+    else if id == 48 { cf_sha384_init(cast(cf_sha512_context*, st)); }
+    else { cf_sha512_init(cast(cf_sha512_context*, st)); }
+}
+
+private void hash_state_update(i32 id, u8* st, u8* data, i32 n) {
+    if n <= 0 { return; }
+    if id == 28 { cf_sha224_update(cast(cf_sha256_context*, st), cast(void*, data), cast(u64, n)); }
+    else if id == 32 { cf_sha256_update(cast(cf_sha256_context*, st), cast(void*, data), cast(u64, n)); }
+    else if id == 48 { cf_sha384_update(cast(cf_sha512_context*, st), cast(void*, data), cast(u64, n)); }
+    else { cf_sha512_update(cast(cf_sha512_context*, st), cast(void*, data), cast(u64, n)); }
+}
+
+private void hash_state_final(i32 id, u8* st, u8* out) {
+    if id == 28 { cf_sha224_digest_final(cast(cf_sha256_context*, st), out); }
+    else if id == 32 { cf_sha256_digest_final(cast(cf_sha256_context*, st), out); }
+    else if id == 48 { cf_sha384_digest_final(cast(cf_sha512_context*, st), out); }
+    else { cf_sha512_digest_final(cast(cf_sha512_context*, st), out); }
+}
+
+// The streaming state of a Hash and its algorithm, or null for one that
+// keeps its input.
+private u8* hash_state(VM* vm, JsObject* h, i32* id) {
+    Value stv;
+    if !js_get_prop(h, bi_atom(vm, "%st"), &stv) || !value_is_object(stv) { return null; }
+    Value algov;
+    if !js_get_prop(h, bi_atom(vm, "%algo"), &algov) || !value_is_number(algov) { return null; }
+    *id = cast(i32, value_as_f64(algov));
+    i32 cap;
+    return ta_bytes(value_as_object(stv), &cap);
+}
+
 private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value algv = js_to_string_value(vm, arg_at(args, argc, 0));
@@ -18126,7 +18172,16 @@ private Value nat_crypto_create_hash(void* vmp, Value callee, Value thisv, Value
     }
     JsObject* h = js_new_object(&vm.heap, vm.crypto_hash_proto);
     vm_push(vm, value_cell(&h.head));
-    hash_acc_init(vm, h);
+    if hash_streams(id) {
+        JsObject* st = buf_new(vm, hash_state_size(id));
+        vm_push(vm, value_cell(&st.head));     // storing the property may collect
+        i32 cap;
+        hash_state_init(id, ta_bytes(st, &cap));
+        props_set_desc(&h.props, bi_atom(vm, "%st"), value_cell(&st.head), 0);
+        vm_pop(vm);
+    } else {
+        hash_acc_init(vm, h);
+    }
     props_set_desc(&h.props, bi_atom(vm, "%algo"), value_number(cast(f64, id)), 0);
     vm_pop(vm);   // h
     vm_pop(vm);   // algv
@@ -18143,9 +18198,37 @@ private Value nat_hash_update(void* vmp, Value callee, Value thisv, Value* args,
         return value_undefined();
     }
     JsObject* self = value_as_object(thisv);
+    Value data = arg_at(args, argc, 0);
+    i32 sid = 0;
+    if hash_state(vm, self, &sid) != null {
+        // Nothing allocates between finding the state and hashing into it.
+        if is_bytes_like(data) {
+            JsObject* b = value_as_object(data);
+            i32 n;
+            u8* p = buf_ptr(b, &n);
+            if p != null {
+                hash_state_update(sid, hash_state(vm, self, &sid), p, n);
+            } else {
+                u8* tmp = alloc<u8>(n > 0 ? n : 1);
+                for i32 i = 0; i < n; i++ { *(tmp + i) = cast(u8, buf_byte(b, i)); }
+                hash_state_update(sid, hash_state(vm, self, &sid), tmp, n);
+                free(tmp);
+            }
+        } else {
+            i32 enc = buf_parse_enc(arg_at(args, argc, 1), ENC_UTF8);
+            Value s = js_to_string_value(vm, data);
+            vm_push(vm, s);
+            str_buf sb;
+            str_buf_init(&sb);
+            str_to_bytes(&sb, sview(s), enc);
+            hash_state_update(sid, hash_state(vm, self, &sid), sb.data, sb.len);
+            str_buf_free(&sb);
+            vm_pop(vm);
+        }
+        return thisv;
+    }
     i32 have;
     if hash_acc_bytes(vm, self, &have) == null { return thisv; }
-    Value data = arg_at(args, argc, 0);
     if is_bytes_like(data) {
         JsObject* b = value_as_object(data);
         i32 n;
@@ -18185,6 +18268,13 @@ private Value nat_hash_digest(void* vmp, Value callee, Value thisv, Value* args,
     crypto_mark_spent(vm, thisv);
     if !value_is_object(thisv) { return value_undefined(); }
     JsObject* self = value_as_object(thisv);
+    i32 sid = 0;
+    u8* st = hash_state(vm, self, &sid);
+    if st != null {
+        u8[64] sdigest;
+        hash_state_final(sid, st, &sdigest[0]);
+        return crypto_finalize_digest(vm, &sdigest[0], sid, arg_at(args, argc, 0));
+    }
     i32 n;
     u8* acc = hash_acc_bytes(vm, self, &n);
     if acc == null { return value_undefined(); }

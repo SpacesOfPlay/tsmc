@@ -48,3 +48,23 @@ for (const algo of algos) {
   h.update('ghij');
   console.log(algo, 'chunked-ok', h.digest('hex') === whole);
 }
+
+// Many updates of sizes that cross block boundaries, a large Buffer among
+// them, and a typed-array view: the SHA-2 hashes take each update as it
+// comes, so the state carried between them must come out the same.
+for (const algo of ['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512']) {
+  const h = crypto.createHash(algo);
+  const parts = [];
+  let seed = 7;
+  for (let i = 0; i < 40; i++) {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    const n = [1, 3, 63, 64, 65, 127, 128, 129, 1000, 70000][seed % 10];
+    const b = Buffer.alloc(n);
+    for (let k = 0; k < n; k++) b[k] = (seed + k * 31) & 0xff;
+    parts.push(b);
+    h.update(i % 7 === 3 ? new Uint8Array(b.buffer, b.byteOffset, b.length) : b);
+  }
+  h.update('tail ✓', 'utf8');
+  parts.push(Buffer.from('tail ✓', 'utf8'));
+  console.log(algo, 'many', h.digest('hex'), crypto.createHash(algo).update(Buffer.concat(parts)).digest('hex'));
+}
