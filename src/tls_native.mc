@@ -347,6 +347,20 @@ void tls_session_free(TlsSession* s) {
 const i32 TLS_SPARES = 16;
 const u64 TLS_SPARE_MAX = 65536;
 const i32 TLS_PUMP_BUDGET = 65536;
+
+// What one read of the socket takes. A record is up to 16 KB, and one
+// that a read splits picotls keeps and copies again whole: reads of 8 KB
+// split every record of a large transfer, reads of 64 KB one in four.
+const i32 TLS_PUMP_READ = 65536;
+private u8* g_pump_buf = null;
+
+// The pump's read buffer, one for all sessions: they are pumped from the
+// reactor's thread only, one at a time, and 64 KB is the whole of a
+// thread's stack on the metal.
+private u8* tls_pump_buf() {
+    if g_pump_buf == null { g_pump_buf = alloc<u8>(TLS_PUMP_READ); }
+    return g_pump_buf;
+}
 private u8*[16] g_spare_base;
 private u64[16] g_spare_cap;
 private i32 g_spares = 0;
@@ -374,8 +388,10 @@ private void tls_buf_take(ptls_buffer_t* b) {
     b.is_allocated = cast(u8, 1);
 }
 
-// Most ciphertext picotls can take: two records' worth.
-const i32 TLS_CIPHER_IN_MAX = 32768;
+// Most ciphertext kept for picotls: what one read leaves when picotls
+// stops part way, as at the end of a handshake, a read being up to
+// TLS_PUMP_READ.
+const i32 TLS_CIPHER_IN_MAX = 131072;
 
 // Keep the `n` bytes at `p` that picotls did not take in cipher_in, in
 // front of whatever is there. False when that would pass the limit.
@@ -552,11 +568,12 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     i32 budget = TLS_PUMP_BUDGET;
     while more && budget > 0 {
         more = false;
-        noinit u8[8192] tmp;
+        u8* tmp = tls_pump_buf();
+        if tmp == null { s.failed = true; return TLS_ERR; }
         // The clock is read only for the handshake statistics: on some
         // machines each read is a trap to the hypervisor.
         i64 q0 = handshaking ? qpc() : 0;
-        i32 n = net_try_recv(fd, &tmp[0], 8192);
+        i32 n = net_try_recv(fd, tmp, budget < TLS_PUMP_READ ? budget : TLS_PUMP_READ);
         if handshaking { tls_stat_hs_recv = tls_stat_hs_recv + (qpc() - q0); }
         if n == 0 {
             s.eof = true;
@@ -573,7 +590,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         }
         i64 q1 = handshaking ? qpc() : 0;
         if n > 0 {
-            flags = flags | tls_feed(s, &tmp[0], n);
+            flags = flags | tls_feed(s, tmp, n);
             more = true;
             budget = budget - n;
         }

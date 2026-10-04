@@ -72,6 +72,15 @@ struct VmJob {
     Value c;
 }
 
+// An entry of the timer heap: a timer's deadline and order when the entry
+// was made. One whose timer has gone or been given another deadline since
+// is stale, and dropped when it reaches the top.
+struct VmTimerKey {
+    f64 due;
+    i64 seq;
+    i32 id;
+}
+
 struct VmTimer {
     i32 id;
     bool alive;
@@ -232,6 +241,7 @@ struct VM {
     i32 job_head;
     Vec<Value> rejections;   // promises rejected with no handler at reject time
     Vec<VmTimer> timers;     // in id order; dead ones until the next compaction
+    Vec<VmTimerKey> timer_heap;   // the timers by deadline (vm_timer_next)
     i32 timers_dead;
     i32 next_timer_id;
     i64 timer_seq;
@@ -4109,6 +4119,7 @@ void vm_init(VM* vm) {
     vm.job_head = 0;
     vec_init<Value>(&vm.rejections, 4);
     vec_init<VmTimer>(&vm.timers, 4);
+    vec_init<VmTimerKey>(&vm.timer_heap, 4);
     vm.timers_dead = 0;
     vm.next_timer_id = 1;
     vm.timer_seq = 0;
@@ -4180,6 +4191,7 @@ void vm_destroy(VM* vm) {
     vec_free(&vm.jobs);
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
+    vec_free(&vm.timer_heap);
     vec_free(&vm.handles);
     vec_free(&vm.symbols);
     for i32 i = 0; i < vm.regexps.len; i++ {
@@ -7381,7 +7393,76 @@ i32 vm_add_timer_full(VM* vm, Value cbfn, f64 delay, f64 period, Value extra) {
     tm.cb = cbfn;
     tm.args = extra;
     vec_push(&vm.timers, tm);
+    vm_timer_heap_push(vm, tm.due, tm.seq, tm.id);
     return tm.id;
+}
+
+// --- the timer heap ---------------------------------------------------
+//
+// The earliest timer by (deadline, insertion order) is the top of a
+// binary heap of keys, where the loop found it by scanning every timer at
+// each turn: a server with a deadline per connection, 10,000 of them,
+// scanned 10,000 at each turn.
+
+private bool vm_timer_key_less(VmTimerKey* a, VmTimerKey* b) {
+    return a.due < b.due || (a.due == b.due && a.seq < b.seq);
+}
+
+private void vm_timer_heap_push(VM* vm, f64 due, i64 seq, i32 id) {
+    VmTimerKey k;
+    k.due = due;
+    k.seq = seq;
+    k.id = id;
+    vec_push(&vm.timer_heap, k);
+    i32 i = vm.timer_heap.len - 1;
+    VmTimerKey* h = vm.timer_heap.data;
+    while i > 0 {
+        i32 p = (i - 1) / 2;
+        if !vm_timer_key_less(h + i, h + p) { break; }
+        VmTimerKey t = *(h + i);
+        *(h + i) = *(h + p);
+        *(h + p) = t;
+        i = p;
+    }
+}
+
+private void vm_timer_heap_pop(VM* vm) {
+    i32 n = vm.timer_heap.len - 1;
+    VmTimerKey* h = vm.timer_heap.data;
+    *h = *(h + n);
+    vm.timer_heap.len = n;
+    i32 i = 0;
+    while true {
+        i32 l = 2 * i + 1;
+        if l >= n { break; }
+        i32 m = l;
+        if l + 1 < n && vm_timer_key_less(h + l + 1, h + l) { m = l + 1; }
+        if !vm_timer_key_less(h + m, h + i) { break; }
+        VmTimerKey t = *(h + i);
+        *(h + i) = *(h + m);
+        *(h + m) = t;
+        i = m;
+    }
+}
+
+// The earliest live timer, or null. Stale keys at the top are dropped on
+// the way; the list is built again from the live timers when stale keys
+// are most of it, so cleared timers far in the future do not pile up.
+private VmTimer* vm_timer_next(VM* vm) {
+    if vm.timer_heap.len > 64 && vm.timer_heap.len > 2 * (vm.timers.len - vm.timers_dead) {
+        vm.timer_heap.len = 0;
+        for i32 i = 0; i < vm.timers.len; i++ {
+            VmTimer* t = vm.timers.data + i;
+            if t.alive { vm_timer_heap_push(vm, t.due, t.seq, t.id); }
+        }
+    }
+    while vm.timer_heap.len > 0 {
+        VmTimerKey* k = vm.timer_heap.data;
+        VmTimer* tm = vm_timer_find(vm, k.id);
+        if tm != null && tm.due == k.due && tm.seq == k.seq { return tm; }
+        vm_timer_heap_pop(vm);
+    }
+    return null;
 }
 
 // The live timer with this id, or null. Ids only grow and compaction
@@ -7441,7 +7522,10 @@ bool vm_timer_has_ref(VM* vm, i32 id) {
 
 void vm_timer_refresh(VM* vm, i32 id) {
     VmTimer* tm = vm_timer_find(vm, id);
-    if tm != null { tm.due = vm_now_ms(vm) + tm.delay; }
+    if tm != null {
+        tm.due = vm_now_ms(vm) + tm.delay;
+        vm_timer_heap_push(vm, tm.due, tm.seq, tm.id);
+    }
 }
 
 // True while some live timer still holds the loop open.
@@ -7572,17 +7656,7 @@ i32 vm_run_event_loop(VM* vm) {
         if vm.rejections.len > 0 && vm_report_unhandled(vm) != 0 { return 1; }
         vm_timers_compact(vm);
         // earliest live timer by (deadline, insertion order)
-        i32 best = -1;
-        for i32 i = 0; i < vm.timers.len; i++ {
-            VmTimer* tm = vm.timers.data + i;
-            if !tm.alive { continue; }
-            if best < 0 {
-                best = i;
-                continue;
-            }
-            VmTimer* bt = vm.timers.data + best;
-            if tm.due < bt.due || (tm.due == bt.due && tm.seq < bt.seq) { best = i; }
-        }
+        VmTimer* next = vm_timer_next(vm);
         // An unreffed timer fires if the loop runs, but does not keep it
         // running on its own. Checked before firing, or an unreffed interval
         // would hold the process open forever.
@@ -7603,15 +7677,15 @@ i32 vm_run_event_loop(VM* vm) {
             continue;
         }
         f64 now = vm_now_ms(vm);
-        bool timer_due = best >= 0 && (vm.timers.data + best).due <= now;
+        bool timer_due = next != null && next.due <= now;
         if !timer_due {
             // nothing to fire yet — poll the sockets, bounded by the next
             // timer deadline (or block until I/O when only handles remain)
             i64 timeout;
-            if best < 0 {
+            if next == null {
                 timeout = -1;
             } else {
-                f64 d = (vm.timers.data + best).due - now;
+                f64 d = next.due - now;
                 timeout = d < 1.0 ? 1 : cast(i64, d);
             }
             reactor_poll(vm, timeout);
@@ -7638,13 +7712,17 @@ i32 vm_run_event_loop(VM* vm) {
             }
             continue;
         }
-        VmTimer* bt2 = vm.timers.data + best;
+        VmTimer* bt2 = next;
         Value cbfn = bt2.cb;
         Value extra = bt2.args;
         // a repeating timer is rearmed before it runs, so clearing it from
         // inside its own callback still takes effect
-        if bt2.period > 0.0 { bt2.due = now + bt2.period; }
-        else { vm_timer_kill(vm, bt2); }
+        if bt2.period > 0.0 {
+            bt2.due = now + bt2.period;
+            vm_timer_heap_push(vm, bt2.due, bt2.seq, bt2.id);
+        } else {
+            vm_timer_kill(vm, bt2);
+        }
         vpush(vm, cbfn);
         vpush(vm, extra);
         Value dummy = value_undefined();
@@ -7663,6 +7741,7 @@ i32 vm_run_event_loop(VM* vm) {
         }
     }
     vm.timers.len = 0;
+    vm.timer_heap.len = 0;
     vm.timers_dead = 0;
     vm.handles.len = 0;
     vm.handle_free.len = 0;
