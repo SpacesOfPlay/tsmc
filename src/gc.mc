@@ -351,8 +351,8 @@ void gc_collect(GcHeap* h) {
 // `value_is_kind` notices. That predicate runs several times per bytecode, so it
 // records the hit here instead of reporting it, and the collector reports what
 // has accumulated -- which in stress mode is the next allocation.
-i32 gc_poison_hits = 0;
-i32 gc_poison_last_kind = 0;
+threadlocal i32 gc_poison_hits = 0;
+threadlocal i32 gc_poison_last_kind = 0;
 
 void gc_report_poison() {
     if gc_poison_hits == 0 { return; }

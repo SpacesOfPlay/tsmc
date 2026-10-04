@@ -62,18 +62,18 @@ import "tls_chain.mc";
 
 // --- shared client contexts (built once; must outlive every session) ---
 
-private ptls_key_exchange_algorithm_t g_x25519;
-private ptls_aead_algorithm_t g_aes128;
-private ptls_cipher_suite_t g_cs128;
-private ptls_key_exchange_algorithm_t*[2] g_keyex;
-private ptls_cipher_suite_t*[2] g_cslist;
-private ptls_context_t g_ctx;            // secure default: chain validation
-private ptls_context_t g_ctx_insecure;   // opt-in: rejectUnauthorized false
-private ptls_verify_certificate_t g_chain_verify;
-private ptls_verify_certificate_t g_insecure_verify;
+private threadlocal ptls_key_exchange_algorithm_t g_x25519;
+private threadlocal ptls_aead_algorithm_t g_aes128;
+private threadlocal ptls_cipher_suite_t g_cs128;
+private threadlocal ptls_key_exchange_algorithm_t*[2] g_keyex;
+private threadlocal ptls_cipher_suite_t*[2] g_cslist;
+private threadlocal ptls_context_t g_ctx;            // secure default: chain validation
+private threadlocal ptls_context_t g_ctx_insecure;   // opt-in: rejectUnauthorized false
+private threadlocal ptls_verify_certificate_t g_chain_verify;
+private threadlocal ptls_verify_certificate_t g_insecure_verify;
 // signature schemes for CertificateVerify: ECDSA-P256/P-384 + RSA-PSS.
 private u16[6] g_leaf_algos = { 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0xffff };
-private bool g_inited = false;
+private threadlocal bool g_inited = false;
 
 // Real wall clock for the TLS stack (certificate validity needs actual time).
 private u64 tls_wall_time_cb(st_ptls_get_time_t* self) {
@@ -156,7 +156,7 @@ private i32 tls_arm_leaf(X509Cert* leaf, verify_sign_fn* out_verify_sign,
 
 // Last chain-validation failure; tls_pump moves it into the failing session
 // (the reactor is single-threaded, so the handoff is synchronous).
-private i32 g_last_chain_err = 0;
+private threadlocal i32 g_last_chain_err = 0;
 
 // Secure default: validate the presented chain against the bundled root
 // store and the SNI hostname at the real wall clock, then arm the
@@ -265,7 +265,7 @@ private void tls_ctx_init() {
 // SubjectPublicKeyInfo SHA-256 against `spki32` and verifies the handshake
 // signature. A stopgap until general cert trust (DESIGN §4.1); the pin is
 // process-global here.
-private pinned_verify_cert_t g_ecdsa_pin;
+private threadlocal pinned_verify_cert_t g_ecdsa_pin;
 
 void tls_set_ecdsa_pin(u8* spki32) {
     tls_ctx_init();
@@ -352,7 +352,7 @@ const i32 TLS_PUMP_BUDGET = 65536;
 // that a read splits picotls keeps and copies again whole: reads of 8 KB
 // split every record of a large transfer, reads of 64 KB one in four.
 const i32 TLS_PUMP_READ = 65536;
-private u8* g_pump_buf = null;
+private threadlocal u8* g_pump_buf = null;
 
 // The pump's read buffer, one for all sessions: they are pumped from the
 // reactor's thread only, one at a time, and 64 KB is the whole of a
@@ -361,9 +361,9 @@ private u8* tls_pump_buf() {
     if g_pump_buf == null { g_pump_buf = alloc<u8>(TLS_PUMP_READ); }
     return g_pump_buf;
 }
-private u8*[16] g_spare_base;
-private u64[16] g_spare_cap;
-private i32 g_spares = 0;
+private threadlocal u8*[16] g_spare_base;
+private threadlocal u64[16] g_spare_cap;
+private threadlocal i32 g_spares = 0;
 
 // A drained buffer goes to the spares, or back to the heap.
 private void tls_buf_release(ptls_buffer_t* b) {
@@ -879,8 +879,8 @@ struct TlsServerCtx {
 const i32 TLS_CHAIN_MAX = 4;
 
 private const i32 TLS_SERVER_CTX_MAX = 64;
-private TlsServerCtx*[64] g_server_ctxs;
-private bool g_server_ctxs_inited = false;
+private threadlocal TlsServerCtx*[64] g_server_ctxs;
+private threadlocal bool g_server_ctxs_inited = false;
 
 private void tls_server_ctxs_init() {
     if g_server_ctxs_inited { return; }

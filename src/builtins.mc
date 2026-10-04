@@ -5737,7 +5737,7 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
 // --- console additions ----------------------------------------------------------------------
 
 // console.group indents everything printed until groupEnd.
-private i32 g_console_group_depth = 0;
+private threadlocal i32 g_console_group_depth = 0;
 
 // Writes one formatted line, indented for any open group.
 private void console_emit(VM* vm, Value s, bool to_err) {
@@ -13998,8 +13998,8 @@ private Value nat_buf_mask(void* vmp, Value callee, Value thisv, Value* args, i3
 // in one step. Four key bytes go to out[hdr..hdr+4) and the payload, masked
 // with them, to out[hdr+4..). The keys come from a pool of random bytes
 // filled in bulk, one call to the system's generator per thousand frames.
-private u8[4096] g_mask_pool;
-private i32 g_mask_at = 4096;
+private threadlocal u8[4096] g_mask_pool;
+private threadlocal i32 g_mask_at = 4096;
 
 private Value nat_buf_mask_frame(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
@@ -15211,8 +15211,8 @@ private u8* plug_bytes(void* vmp, Value v, i64* len) {
     return p;
 }
 
-private TsmcApi g_plugin_api;
-private bool g_plugin_api_filled = false;
+private threadlocal TsmcApi g_plugin_api;
+private threadlocal bool g_plugin_api_filled = false;
 
 private TsmcApi* plugin_api() {
     if !g_plugin_api_filled {
