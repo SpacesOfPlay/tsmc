@@ -12782,6 +12782,9 @@ private Value nat_net_close(void* vmp, Value callee, Value thisv, Value* args, i
     VM* vm = as_vm(vmp);
     i32 id = to_int_arg(arg_at(args, argc, 0));
     i64 fd = vm_handle_fd(vm, id);
+    // The descriptor leaves the poller before it is closed: on Windows a
+    // closed one would stay in the list.
+    vm_handle_set_interest(vm, id, 0);
     if fd >= 0 { net_fd_close(fd); }
     vm_handle_close(vm, id);
     vm_handle_unref(vm, id);
@@ -12960,6 +12963,7 @@ private Value nat_tls_close(void* vmp, Value callee, Value thisv, Value* args, i
     TlsSession* s = cast(TlsSession*, vm_handle_ext(vm, id));
     if s != null { tls_session_free(s); vm_handle_set_ext(vm, id, null); }
     i64 fd = vm_handle_fd(vm, id);
+    vm_handle_set_interest(vm, id, 0);
     if fd >= 0 { net_fd_close(fd); }
     vm_handle_close(vm, id);
     vm_handle_unref(vm, id);

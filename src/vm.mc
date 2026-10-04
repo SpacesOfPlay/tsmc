@@ -256,6 +256,10 @@ struct VM {
     // server's time.
     Vec<NetPollFd> poll_set;
     Vec<i32> poll_ids;
+    // With NET_POLLER, the poller the handles are registered in (-1
+    // until the first), and the events one wait returns.
+    i64 poller;
+    void* poll_events;       // NetPollEvent[REACTOR_EVENTS], a type the compiler's net has not yet
     Vec<i16> poll_want;      // each entry's events, which a backend may rewrite
 
     bool poll_dirty;
@@ -4126,6 +4130,8 @@ void vm_init(VM* vm) {
     vec_init<IoHandle>(&vm.handles, 4);
     vec_init<i32>(&vm.handle_free, 4);
     vec_init<NetPollFd>(&vm.poll_set, 4);
+    vm.poller = -1;
+    vm.poll_events = null;
     vec_init<i32>(&vm.poll_ids, 4);
     vec_init<i16>(&vm.poll_want, 4);
     vm.poll_dirty = true;
@@ -7315,6 +7321,15 @@ void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
     IoHandle* h = vm_handle_at(vm, idx);
     if h == null || !h.alive || h.interest == events { return; }
     h.interest = events;
+    when defined(NET_POLLER) {
+        // Registered in the poller with its id as the token, which the
+        // wait hands back; removed with an interest of 0.
+        if h.fd >= 0 {
+            if vm.poller < 0 { vm.poller = net_poller_new(); }
+            if vm.poller >= 0 { ignore net_poller_set(vm.poller, h.fd, events, cast(i64, idx)); }
+        }
+        return;
+    }
     if events != 0 && h.pslot >= 0 && !vm.poll_dirty {
         *(vm.poll_want.data + h.pslot) = events;
     } else {
@@ -7552,6 +7567,38 @@ const i64 REACTOR_IDLE_MS = 5;
 // Builds a poll set from the pollable handles, waits up to timeout_ms
 // (-1 blocks until I/O), and dispatches every ready handle through the
 // reactor hook. If nothing is pollable, just sleeps out the deadline.
+// With NET_POLLER: a wait on the poller, which returns the ready handles
+// only, dispatched by the id each was registered with. Up to
+// REACTOR_EVENTS a turn; the rest are still ready at the next.
+const i32 REACTOR_EVENTS = 1024;
+
+when defined(NET_POLLER) {
+private void reactor_poll(VM* vm, i64 timeout_ms) {
+    vm.last_poll_ms = vm_now_ms(vm);
+    u64 w0 = vm_clock_ns();
+    if vm.poller < 0 {
+        vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
+        vm.loop_idle_ns += vm_clock_ns() - w0;
+        return;
+    }
+    if vm.poll_events == null { vm.poll_events = cast(void*, alloc<NetPollEvent>(REACTOR_EVENTS)); }
+    NetPollEvent* evs = cast(NetPollEvent*, vm.poll_events);
+    i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
+    i32 r = net_poller_wait(vm.poller, evs, REACTOR_EVENTS, to);
+    vm.loop_idle_ns += vm_clock_ns() - w0;
+    if r > 0 && vm.reactor_hook != null {
+        for i32 j = 0; j < r; j++ {
+            NetPollEvent* e = evs + j;
+            if e.revents != 0 {
+                vm.reactor_hook(vm, cast(i32, e.token), e.revents);
+                if vm.has_pending { break; }
+            }
+        }
+    }
+}
+}
+
+when !defined(NET_POLLER) {
 private void reactor_poll(VM* vm, i64 timeout_ms) {
     vm.last_poll_ms = vm_now_ms(vm);
     if vm.poll_dirty {
@@ -7607,6 +7654,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
             }
         }
     }
+}
 }
 
 i32 vm_run_event_loop(VM* vm) {
