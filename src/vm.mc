@@ -97,6 +97,7 @@ struct IoHandle {
     Value owner;    // JS Socket/Server object; GC-marked, dispatch target
     void* ext;      // native side-state (e.g. a TLS session); not GC-traced
     i32 gen;        // how many times the slot has been taken, as ids carry it
+    i32 pslot;      // its entry in vm.poll_set, or -1
 }
 
 // Called by the reactor for each ready handle: (vm, handle index, revents).
@@ -236,6 +237,18 @@ struct VM {
     i64 timer_seq;
     Vec<IoHandle> handles;   // live I/O handles; keep the reactor alive
     Vec<i32> handle_free;        // closed slots, taken again before the table grows
+    // What the reactor polls: an entry for each open handle with an
+    // interest, and the handle's id beside it. Kept from turn to turn and
+    // built again only when a handle that is in it closes, or a handle
+    // starts or stops waiting (poll_dirty); a changed interest is written
+    // into its entry. Building it at each turn walked every handle twice,
+    // which with thousands of idle connections was a tenth of a busy
+    // server's time.
+    Vec<NetPollFd> poll_set;
+    Vec<i32> poll_ids;
+    Vec<i16> poll_want;      // each entry's events, which a backend may rewrite
+
+    bool poll_dirty;
     ReactorHook reactor_hook;   // net module's ready-handle dispatcher, or null
     DynImportHook dynimport_hook;   // module layer's import(spec), or null
     void* esm_loader;           // persistent ESM Loader for dynamic import, or null
@@ -4101,6 +4114,10 @@ void vm_init(VM* vm) {
     vm.timer_seq = 0;
     vec_init<IoHandle>(&vm.handles, 4);
     vec_init<i32>(&vm.handle_free, 4);
+    vec_init<NetPollFd>(&vm.poll_set, 4);
+    vec_init<i32>(&vm.poll_ids, 4);
+    vec_init<i16>(&vm.poll_want, 4);
+    vm.poll_dirty = true;
     vm.reactor_hook = null;
     vm.dynimport_hook = null;
     vm.esm_loader = null;
@@ -7239,6 +7256,7 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
     h.owner = owner;
     h.ext = null;
     h.gen = gen;
+    h.pslot = -1;
     return vm_handle_id(slot, gen);
 }
 
@@ -7251,6 +7269,8 @@ i32 vm_handle_add(VM* vm, i64 fd, i32 kind, Value owner) {
 void vm_handle_close(VM* vm, i32 idx) {
     IoHandle* h = vm_handle_at(vm, idx);
     if h == null || !h.alive { return; }
+    if h.pslot >= 0 { vm.poll_dirty = true; }
+    h.pslot = -1;
     h.alive = false;
     h.fd = -1;
     h.interest = 0;
@@ -7281,7 +7301,13 @@ bool vm_handles_alive(VM* vm) {
 // Which readiness a handle waits on (NET_POLLIN / NET_POLLOUT); 0 = none.
 void vm_handle_set_interest(VM* vm, i32 idx, i16 events) {
     IoHandle* h = vm_handle_at(vm, idx);
-    if h != null && h.alive { h.interest = events; }
+    if h == null || !h.alive || h.interest == events { return; }
+    h.interest = events;
+    if events != 0 && h.pslot >= 0 && !vm.poll_dirty {
+        *(vm.poll_want.data + h.pslot) = events;
+    } else {
+        vm.poll_dirty = true;
+    }
 }
 
 i16 vm_handle_interest(VM* vm, i32 idx) {
@@ -7444,29 +7470,41 @@ const i64 REACTOR_IDLE_MS = 5;
 // reactor hook. If nothing is pollable, just sleeps out the deadline.
 private void reactor_poll(VM* vm, i64 timeout_ms) {
     vm.last_poll_ms = vm_now_ms(vm);
-    i32 npoll = 0;
-    for i32 i = 0; i < vm.handles.len; i++ {
-        IoHandle* h = vm.handles.data + i;
-        if h.alive && h.interest != 0 && h.fd >= 0 { npoll++; }
+    if vm.poll_dirty {
+        vm.poll_set.len = 0;
+        vm.poll_ids.len = 0;
+        vm.poll_want.len = 0;
+        for i32 i = 0; i < vm.handles.len; i++ {
+            IoHandle* h = vm.handles.data + i;
+            h.pslot = -1;
+            if h.alive && h.interest != 0 && h.fd >= 0 {
+                NetPollFd e;
+                e.fd = h.fd;
+                e.events = h.interest;
+                e.revents = 0;
+                h.pslot = vm.poll_set.len;
+                vec_push(&vm.poll_set, e);
+                vec_push(&vm.poll_ids, vm_handle_id(i, h.gen));
+                vec_push(&vm.poll_want, h.interest);
+            }
+        }
+        vm.poll_dirty = false;
     }
+    i32 npoll = vm.poll_set.len;
     u64 w0 = vm_clock_ns();
     if npoll == 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
         vm.loop_idle_ns += vm_clock_ns() - w0;
         return;
     }
-    NetPollFd* pf = alloc<NetPollFd>(npoll);
-    i32* hidx = alloc<i32>(npoll);
-    i32 k = 0;
-    for i32 i = 0; i < vm.handles.len; i++ {
-        IoHandle* h = vm.handles.data + i;
-        if h.alive && h.interest != 0 && h.fd >= 0 {
-            (pf + k).fd = h.fd;
-            (pf + k).events = h.interest;
-            (pf + k).revents = 0;
-            *(hidx + k) = vm_handle_id(i, h.gen);
-            k++;
-        }
+    NetPollFd* pf = vm.poll_set.data;
+    i32* hidx = vm.poll_ids.data;
+    // A backend may write revents for the ready entries only, and may
+    // rewrite events in its own terms: both are set again at each turn.
+    i16* want = vm.poll_want.data;
+    for i32 j = 0; j < npoll; j++ {
+        (pf + j).events = *(want + j);
+        (pf + j).revents = 0;
     }
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
     i32 r = net_poll(pf, npoll, to);
@@ -7485,8 +7523,6 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
             }
         }
     }
-    free(pf);
-    free(hidx);
 }
 
 i32 vm_run_event_loop(VM* vm) {
@@ -7630,6 +7666,10 @@ i32 vm_run_event_loop(VM* vm) {
     vm.timers_dead = 0;
     vm.handles.len = 0;
     vm.handle_free.len = 0;
+    vm.poll_set.len = 0;
+    vm.poll_ids.len = 0;
+    vm.poll_want.len = 0;
+    vm.poll_dirty = true;
     return 0;
 }
 
