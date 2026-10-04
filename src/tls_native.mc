@@ -346,6 +346,7 @@ void tls_session_free(TlsSession* s) {
 // are driven from the reactor's thread only.
 const i32 TLS_SPARES = 16;
 const u64 TLS_SPARE_MAX = 65536;
+const i32 TLS_PUMP_BUDGET = 65536;
 private u8*[16] g_spare_base;
 private u64[16] g_spare_cap;
 private i32 g_spares = 0;
@@ -543,7 +544,13 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
     bool more = true;
     bool handshaking = !s.established;
-    while more {
+    // One pump reads at most TLS_PUMP_BUDGET of ciphertext; the rest stays
+    // with the socket, which reports it readable again at the next turn.
+    // Reading all that had arrived let one turn of a server taking uploads
+    // decrypt each connection's whole receive window, megabytes, before a
+    // request on another connection was looked at.
+    i32 budget = TLS_PUMP_BUDGET;
+    while more && budget > 0 {
         more = false;
         noinit u8[8192] tmp;
         // The clock is read only for the handshake statistics: on some
@@ -568,6 +575,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         if n > 0 {
             flags = flags | tls_feed(s, &tmp[0], n);
             more = true;
+            budget = budget - n;
         }
         i64 q2 = handshaking ? qpc() : 0;
         if !tls_flush(s, fd) { s.failed = true; flags = flags | TLS_ERR; }
