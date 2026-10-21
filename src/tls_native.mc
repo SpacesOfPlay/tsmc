@@ -1044,4 +1044,29 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     s.eof = false;
     return s;
 }
+
+// A context for QUIC (RFC 9001): picotls gives each epoch's traffic
+// secret to `cb` instead of protecting records itself, and a client
+// omits EndOfEarlyData. server_id is a tls_server_ctx_new id, whose
+// certificates and key the copy uses while that context lives, or -1 for
+// a client (`insecure` as in tls_session_new). The caller frees the
+// copy with free() after the last ptls_t made from it. Null for an
+// unknown id.
+ptls_context_t* tls_quic_ctx(i32 server_id, bool insecure, ptls_update_traffic_key_t* cb) {
+    tls_ctx_init();
+    ptls_context_t* c = alloc<ptls_context_t>(1);
+    if server_id < 0 {
+        *c = insecure ? g_ctx_insecure : g_ctx;
+    } else {
+        tls_server_ctxs_init();
+        if server_id >= TLS_SERVER_CTX_MAX || g_server_ctxs[server_id] == null {
+            free(c);
+            return null;
+        }
+        *c = g_server_ctxs[server_id].ctx;
+    }
+    c.update_traffic_key = cb;
+    c.omit_end_of_early_data = 1;
+    return c;
+}
 }   // end !wasm native implementation
