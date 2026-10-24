@@ -47,6 +47,7 @@ when os(wasm) {
     i32 tls_chain_error(TlsSession* s) { return 0; }
     i32 tls_error_code(TlsSession* s) { return 0; }
     str tls_alert_str(i32 alert) { return ""; }
+    const i32 TLS_SERVER_CHAIN_MAX = 4;
     i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
                            u8* key_der, u64 key_len) { return -1; }
     void tls_server_ctx_free(i32 id) { }
@@ -865,7 +866,7 @@ struct TlsServerCtx {
     // leaf first, then each issuer above it. A client holds only root
     // certificates, so it can build a path to one only if the intermediates
     // travel with the leaf.
-    ptls_iovec_t[TLS_CHAIN_MAX] certs;
+    ptls_iovec_t[TLS_SERVER_CHAIN_MAX] certs;
     u8* cert_der;             // owned copy of the whole chain, concatenated
     u64 cert_len;
     i32 n_certs;
@@ -876,7 +877,7 @@ struct TlsServerCtx {
 }
 
 // Enough for a leaf plus the intermediates any public CA issues under.
-const i32 TLS_CHAIN_MAX = 4;
+const i32 TLS_SERVER_CHAIN_MAX = 4;
 
 private const i32 TLS_SERVER_CTX_MAX = 64;
 private threadlocal TlsServerCtx*[64] g_server_ctxs;
@@ -915,7 +916,7 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     }
     if slot < 0 { return 0 - 1; }
 
-    if n_certs < 1 || n_certs > TLS_CHAIN_MAX { return 0 - 1; }
+    if n_certs < 1 || n_certs > TLS_SERVER_CHAIN_MAX { return 0 - 1; }
     i32 total = 0;
     for i32 i = 0; i < n_certs; i++ {
         if cert_lens[i] <= 0 { return 0 - 1; }

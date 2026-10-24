@@ -5,8 +5,9 @@ minc-language port of [picotls](https://github.com/h2o/picotls) (TLS 1.3)
 with [cifra](https://github.com/ctz/cifra) (AEAD + hash) and
 [monocypher](https://monocypher.org/) (X25519 + Ed25519).
 
-- Snapshot: `transminc @ 59aba9d`, upstream picotls `3598470df012`,
-  built 2026-09-18 (see the upstream `VERSION`).
+- Snapshot: `transminc @ 063966ab`, upstream picotls `3598470df012`,
+  built 2026-10-23 (see the upstream `VERSION`). Merged against the
+  2026-10-02 snapshot (picotls-minc `9df23ee`, minc 0.9.16) as base.
 - Upstream: the `picotls-minc` project by Mattias Ljungström / Spaces Of
   Play. Regenerated from C via transminc.
 
@@ -24,7 +25,7 @@ update nearly lost the first of these by copying a file wholesale.
 | `p256_sign.mc` | the P-256 signer that path calls: a fixed-base table and its own field arithmetic |
 | `picotls_bridges_rsa.mc` | `rsa_sign_cert_ctx_t`, the same for RSA keys |
 | `picotls_bridges.mc` | `x25519_keygen`: a fresh key share's public key by `crypto_x25519_dirty_fast` on the clamped secret, the same key as the ladder in half the time. `mc_csprng_bytes`: a uefi/wasm arm over an installable source, `mc_csprng_fail()` on every failure upstream ignores, and a compile-time tripwire for an unhandled target. Upstream returns silently and leaves the buffer holding whatever it held, which is key material out of uninitialised memory |
-| `cvararg_shim.mc` | `puts` and `fwrite` for uefi, over the runtime's console |
+| `uefi_libc.mc` | `puts` and `fwrite` for uefi, over the runtime's console: ext_libc's printf/fprintf write through them and it has no uefi arm. A whole file of ours, not a merge |
 | `cifra_hw.mc` | the hardware AES-GCM behind cifra's `0002-hw-aes-gcm.patch`, from transminc's `ext/cifra_hw.mc`, ahead of it here: GHASH over sixteen powers with Karatsuba, counter blocks made in registers, and the 256-bit arm (VAES, VPCLMULQDQ) in an image built with `CIFRA_HW_256` for an -avx2 target |
 
 Each is marked `LOCAL (tsmc)` in the source. Grep for that before
@@ -46,10 +47,18 @@ Only the transport-agnostic TLS core and its crypto backends are copied:
 | `picotls_bridges.mc` | AEAD/hash/key-exchange vtables |
 | `picotls_bridges_p256.mc` | ECDSA-P256 cert verify |
 | `picotls_bridges_rsa.mc` | RSA-PSS cert verify |
-| `picotls_shim.mc` | picotls-specific glue |
-| `cstdlib_shim.mc` | libc stand-ins over the program allocator |
+| `picotls_shim.mc` | picotls-specific glue, plus the few libc helpers ext_libc lacks (`_picotls_*`) |
 | `cfile_shim.mc` | libc `FILE` stand-ins |
 | `picotls.mc` | **local** trimmed router (this repo) — imports only the above |
+
+The libc layer is **not** vendored: since the 2026-10-23 snapshot
+picotls-minc imports `ext_libc`, which the compiler ships in its `lib/`
+(it is the same libc subset, folded into one module by the sokol
+publish). The older `cstdlib_shim.mc` / `cvararg_shim.mc` copies were
+dropped with it; keeping them would collide with `ext_libc` in any
+program that also imports sokol. This ties the vendored code to the
+compiler's `ext_libc`, so the minimum minc version here follows
+picotls-minc's (`@minc_min_version` in its `build.mc` and `lib/picotls.mc`).
 
 The upstream `net.mc`, `thread.mc`, and `pico_https.mc` (blocking sockets
 + HTTP helper) are **deliberately excluded**: tsmc owns its non-blocking

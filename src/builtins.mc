@@ -13045,7 +13045,7 @@ private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
 private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     u8[16384] blob;
-    i32[TLS_CHAIN_MAX] lens;
+    i32[TLS_SERVER_CHAIN_MAX] lens;
     i32 n = 0;
     i32 used = 0;
     Value cv = arg_at(args, argc, 0);
@@ -13053,7 +13053,7 @@ private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* ar
     bool is_chain = value_is_array(cv);
     if is_chain {
         JsObject* a = value_as_object(cv);
-        if a.elen > TLS_CHAIN_MAX { return value_int(-1); }
+        if a.elen > TLS_SERVER_CHAIN_MAX { return value_int(-1); }
         for i32 i = 0; i < a.elen; i++ {
             i32 got = tls_js_bytes(vm, js_array_get(a, i), &blob[used], 16384 - used);
             if got <= 0 { return value_int(-1); }

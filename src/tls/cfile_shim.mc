@@ -1,5 +1,5 @@
 // Imports added on export so this module resolves standalone (LSP).
-import cstdlib_shim;
+import ext_libc;
 
 // cfile_shim — directory/stat/sleep externs.
 
