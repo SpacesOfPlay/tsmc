@@ -159,6 +159,26 @@ private i32 tls_arm_leaf(X509Cert* leaf, verify_sign_fn* out_verify_sign,
 // (the reactor is single-threaded, so the handoff is synchronous).
 private threadlocal i32 g_last_chain_err = 0;
 
+// The leaf the peer presented, as its SHA-256 in the session: what a
+// client can ask afterwards to tell one certificate from another.
+private void tls_note_leaf(ptls_t* tls, ptls_iovec_t leaf) {
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s == null { return; }
+    cf_sha256_context ctx;
+    cf_sha256_init(&ctx);
+    cf_sha256_update(&ctx, leaf.base, leaf.len);
+    cf_sha256_digest_final(&ctx, &s.peer_leaf[0]);
+    s.has_peer_leaf = true;
+}
+
+// The SHA-256 of the peer's leaf certificate into out32, once the
+// handshake has shown it; false before.
+bool tls_peer_leaf_sha256(TlsSession* s, u8* out32) {
+    if !s.has_peer_leaf { return false; }
+    for i32 i = 0; i < 32; i++ { *(out32 + i) = s.peer_leaf[i]; }
+    return true;
+}
+
 // Secure default: validate the presented chain against the bundled root
 // store and the SNI hostname at the real wall clock, then arm the
 // CertificateVerify check for the leaf key.
@@ -174,6 +194,7 @@ private i32 tls_chain_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
         return 0 - 1;
     }
     i32 n = cast(i32, num_certs);
+    tls_note_leaf(tls, certs[0]);
     u8*[8] ders;
     u64[8] lens;
     for i32 i = 0; i < n; i++ {
@@ -205,6 +226,7 @@ private i32 tls_insecure_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
                                    u8* server_name, verify_sign_fn* out_verify_sign,
                                    void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
     if num_certs == cast(u64, 0) { return 0 - 1; }
+    tls_note_leaf(tls, certs[0]);
     X509Cert leaf;
     if !x509_parse(certs[0].base, certs[0].len, &leaf) { return 0 - 1; }
     return tls_arm_leaf(&leaf, out_verify_sign, out_verify_data);
@@ -288,6 +310,8 @@ struct TlsSession {
     ptls_buffer_t recvbuf;    // decrypted plaintext accumulated for the reader
     i64 recv_off;             // consumed prefix of recvbuf
     void* server;             // the TlsServerCtx a server session holds, or null
+    u8[32] peer_leaf;         // SHA-256 of the peer's leaf certificate, once seen
+    bool has_peer_leaf;
     u8* cipher_in;            // inbound ciphertext picotls has not taken, or null
     i32 cipher_in_len;
     i32 cipher_in_cap;
@@ -307,6 +331,7 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
     TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(insecure ? &g_ctx_insecure : &g_ctx, 0);
     if s.tls == null { free(s); return null; }
+    *ptls_get_data_ptr(s.tls) = cast(void*, s);
     if sni != null {
         i32 slen = 0;
         while *(sni + slen) != cast(u8, 0) { slen++; }
@@ -882,10 +907,37 @@ const i32 TLS_SERVER_CHAIN_MAX = 4;
 private const i32 TLS_SERVER_CTX_MAX = 64;
 private threadlocal TlsServerCtx*[64] g_server_ctxs;
 private threadlocal bool g_server_ctxs_inited = false;
+private threadlocal ptls_on_client_hello_t g_on_client_hello;
+
+// The server's choice of context by the name the client asks for
+// (SNI): called on the session's thread with the name's bytes and
+// length, it returns a context id from tls_server_ctx_new, or -1 to
+// keep the one the session was made from. Null: every session keeps
+// its own.
+fn(u8*, i32): i32 tls_server_sni_hook = null;
+
+private i32 tls_on_client_hello_cb(st_ptls_on_client_hello_t* self, ptls_t* tls,
+                                   ptls_on_client_hello_parameters_t* params) {
+    if tls_server_sni_hook == null || params.server_name.base == null || params.server_name.len == cast(u64, 0) { return 0; }
+    i32 id = tls_server_sni_hook(params.server_name.base, cast(i32, params.server_name.len));
+    if id < 0 || id >= TLS_SERVER_CTX_MAX || g_server_ctxs[id] == null { return 0; }
+    TlsServerCtx* sc = g_server_ctxs[id];
+    ptls_set_context(tls, &sc.ctx);
+    // the session's reference moves to the context it will sign with
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s != null && s.server != cast(void*, sc) {
+        TlsServerCtx* old = cast(TlsServerCtx*, s.server);
+        sc.sessions++;
+        s.server = cast(void*, sc);
+        if old != null { tls_server_ctx_release(old); }
+    }
+    return 0;
+}
 
 private void tls_server_ctxs_init() {
     if g_server_ctxs_inited { return; }
     for i32 i = 0; i < TLS_SERVER_CTX_MAX; i++ { g_server_ctxs[i] = null; }
+    g_on_client_hello = ptls_on_client_hello_t{ .cb = tls_on_client_hello_cb };
     g_server_ctxs_inited = true;
 }
 
@@ -943,6 +995,7 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     sc.ctx.cipher_suites = &g_cslist[0];
     sc.ctx.certificates.list = &sc.certs[0];
     sc.ctx.certificates.count = cast(u64, n_certs);
+    sc.ctx.on_client_hello = &g_on_client_hello;
 
     if is_ec {
         sc.ec_sign = ecdsa_sign_cert_ctx_t{
@@ -1027,6 +1080,7 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(&sc.ctx, 1);   // is_server = 1
     if s.tls == null { free(s); return null; }
+    *ptls_get_data_ptr(s.tls) = cast(void*, s);
     s.server = cast(void*, sc);
     sc.sessions++;
     ptls_buffer_init(&s.sendbuf, "", 0);
