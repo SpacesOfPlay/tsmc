@@ -10034,10 +10034,12 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
         } else {
             append_replacement(vm, &sb, sview(rtmpl), s, caps, ng, prog);
         }
-        if me > pos {
+        if me > ms {
             pos = me;
         } else {
-            // zero-width match: emit one char and advance
+            // zero-width match, here or ahead of where the search began:
+            // the next search starts one past it, the char between kept
+            pos = ms;
             if pos < s.len {
                 str one;
                 one.data = s.data + pos;
