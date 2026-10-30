@@ -301,10 +301,28 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
 private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value tv = arg_at(args, argc, 0);
-    if !value_is_object(tv) {
-        vm_throw_error(vm, ERR_TYPE, "Object.assign target must be an object");
+    if value_is_function(tv) || value_is_native(tv) {
+        // a function is an object too: its own properties take the sources'
+        for i32 s = 1; s < argc; s++ {
+            Value sv2 = *(args + s);
+            if !value_is_object(sv2) { continue; }
+            JsObject* src = value_as_object(sv2);
+            vm_props_order(vm, &src.props);
+            for i32 i = 0; i < src.props.len; i++ {
+                if !prop_copyable(vm, src.props.items + i) { continue; }
+                u32 pk = (src.props.items + i).key;
+                Value pv = (src.props.items + i).val;
+                if value_is_accessor(pv) && !vm_get_prop_value(vm, sv2, pk, &pv) { return value_undefined(); }
+                if !vm_set_prop_value(vm, tv, pk, pv) { return value_undefined(); }
+            }
+        }
+        return tv;
+    }
+    if value_is_null(tv) || value_is_undefined(tv) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot convert undefined or null to object");
         return value_undefined();
     }
+    if !value_is_object(tv) { return tv; }
     JsObject* t = value_as_object(tv);
     for i32 s = 1; s < argc; s++ {
         Value sv2 = *(args + s);
@@ -1882,12 +1900,21 @@ private Value nat_arr_splice(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    // concat does not spread a non-array `this` (IsConcatSpreadable), so it
-    // keeps the strict receiver rather than materializing an array-like.
-    JsObject* a = this_array(vm, thisv);
-    if a == null { return value_undefined(); }
-    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    // concat does not spread a non-array `this` (IsConcatSpreadable): it is
+    // the result's first element
+    if value_is_null(thisv) || value_is_undefined(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Array.prototype.concat called on null or undefined");
+        return value_undefined();
+    }
     i32 rm = gc_root_mark(&vm.heap);
+    JsObject* a;
+    if value_is_array(thisv) { a = value_as_object(thisv); }
+    else {
+        a = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&a.head));
+        js_array_set(a, 0, thisv);
+    }
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     gc_root(&vm.heap, value_cell(&r.head));
     i32 total = a.elen;
     for i32 s = 0; s < argc; s++ {

@@ -1662,6 +1662,13 @@ private bool chain_get(VM* vm, JsObject* o, u32 a, Value receiver, Value* out) {
             *out = *v;
             return true;
         }
+        // an array further up answers for its length and its elements, as
+        // for an object made with Object.create(array)
+        if cur != o && (cur.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { *out = value_int(cur.elen); return true; }
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 && idx < cur.elen && js_array_has(cur, idx) { *out = js_array_get(cur, idx); return true; }
+        }
         cur = cur.proto;
     }
     return false;
@@ -1674,6 +1681,11 @@ private bool chain_has(VM* vm, JsObject* o, u32 a) {
             return proxy_has(vm, cast(JsProxy*, cur), a);
         }
         if props_get(&cur.props, a) != null { return true; }
+        if cur != o && (cur.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { return true; }
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 && idx < cur.elen && js_array_has(cur, idx) { return true; }
+        }
         cur = cur.proto;
     }
     return false;
