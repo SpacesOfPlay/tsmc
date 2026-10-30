@@ -136,6 +136,11 @@ struct VM {
     u64 start_ns;              // monotonic clock at startup, for process.uptime
     u64 loop_start_ns;         // when the event loop first ran, 0 before
     u64 loop_idle_ns;          // time since then spent waiting for I/O or a timer
+    // An embedder's budget for one run of the event loop, in ms; 0 is
+    // none. With a budget the loop returns when it is spent, timers and
+    // handles still alive, and the embedder calls it again from its own
+    // loop. The CLI never sets it.
+    f64 loop_budget_ms;
     f64 last_poll_ms;          // when the sockets were last polled
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
@@ -4015,6 +4020,7 @@ void vm_init(VM* vm) {
     vm.start_ns = vm_clock_ns();
     vm.loop_start_ns = 0;
     vm.loop_idle_ns = 0;
+    vm.loop_budget_ms = 0.0;
     vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
@@ -7659,7 +7665,9 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
 
 i32 vm_run_event_loop(VM* vm) {
     if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
+    f64 deadline = vm.loop_budget_ms > 0.0 ? vm_now_ms(vm) + vm.loop_budget_ms : 0.0;
     while true {
+        if deadline > 0.0 && vm.job_head >= vm.jobs.len && vm_now_ms(vm) >= deadline { break; }
         while vm.job_head < vm.jobs.len {
             VmJob j = vec_get(&vm.jobs, vm.job_head);
             vm.job_head++;
@@ -7735,6 +7743,13 @@ i32 vm_run_event_loop(VM* vm) {
             } else {
                 f64 d = next.due - now;
                 timeout = d < 1.0 ? 1 : cast(i64, d);
+            }
+            if deadline > 0.0 {
+                // the wait ends at the budget; what is still pending then is
+                // left for the embedder's next call
+                f64 left = deadline - now;
+                if left <= 0.0 { break; }
+                if timeout < 0 || cast(f64, timeout) > left { timeout = left < 1.0 ? 1 : cast(i64, left); }
             }
             reactor_poll(vm, timeout);
             if vm.has_pending {
