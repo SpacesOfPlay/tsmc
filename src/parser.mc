@@ -1398,11 +1398,13 @@ private Node* try_arrow(Parser* p, i32 flags) {
     fun.span.start = start;
     fun.flags = NF_ARROW | flags;
     fun.kids = finish_kids(p, mark);
-    advance(p);   // =>
+    // the body's context is set before the token after `=>` is read,
+    // since reading it classifies `await` and `yield`
     i32 saved_async = p.in_async;
     i32 saved_gen = p.in_gen;
     p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
     p.in_gen = 0;
+    advance(p);   // =>
     p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
@@ -1426,13 +1428,14 @@ private Node* ident_arrow(Parser* p, i32 flags) {
     prm.a = id;
     vec_push(&p.scratch, prm);
     fun.kids = finish_kids(p, mark);
-    advance(p);   // =>
     // the body of an arrow is its own: a plain one is neither await nor
-    // yield context, however it is nested
+    // yield context, however it is nested. Set before the token after
+    // `=>` is read, since reading it classifies `await` and `yield`.
     i32 saved_async = p.in_async;
     i32 saved_gen = p.in_gen;
     p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
     p.in_gen = 0;
+    advance(p);   // =>
     p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
