@@ -143,8 +143,9 @@ struct VM {
     // handles still alive, and the embedder calls it again from its own
     // loop. The CLI never sets it.
     f64 loop_budget_ms;
-    // Set by vm_step: the loop runs what is due and returns rather than
-    // wait for a timer or a socket.
+    // Set by vm_step, or for good by an embedder that owns the loop: the
+    // loop runs what is due and returns rather than wait for a timer or a
+    // socket, so a script's run ends with its microtasks.
     bool loop_no_wait;
     // An embedder's report of an uncaught exception or an unhandled
     // rejection, or null. With one, neither ends the run: a browser
@@ -7396,10 +7397,11 @@ void vm_set_dynimport_hook(VM* vm, DynImportHook h) { vm.dynimport_hook = h; }
 f64 vm_step(VM* vm, f64 budget_ms) {
     if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
     f64 saved = vm.loop_budget_ms;
+    bool saved_no_wait = vm.loop_no_wait;
     vm.loop_budget_ms = budget_ms > 0.0 ? budget_ms : 0.001;
     vm.loop_no_wait = true;
     ignore vm_run_event_loop(vm);
-    vm.loop_no_wait = false;
+    vm.loop_no_wait = saved_no_wait;
     vm.loop_budget_ms = saved;
     if vm.job_head < vm.jobs.len { return 0.0; }
     vm_timers_compact(vm);
