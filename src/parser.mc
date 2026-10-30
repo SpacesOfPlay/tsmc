@@ -1097,7 +1097,7 @@ private bool try_type_args_call(Parser* p) {
         && (p.cur.kind == TOK_LPAREN || p.cur.kind == TOK_TEMPLATE_FULL
             || p.cur.kind == TOK_TEMPLATE_HEAD);
     diags_unmute(p.diags);
-    if !ok { prestore(p, st); }
+    if !ok { prestore(p, st); p.diags.n_suppressed = base; }
     return ok;
 }
 
@@ -1392,6 +1392,9 @@ private Node* try_arrow(Parser* p, i32 flags) {
     diags_unmute(p.diags);
     if !ok {
         prestore(p, st);
+        // what this attempt suppressed is forgotten with it: an arrow being
+        // tried around this one counts only its own
+        p.diags.n_suppressed = base;
         return null;
     }
     Node* fun = nnew(p, N_FUNCTION);
