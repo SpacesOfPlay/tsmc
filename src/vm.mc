@@ -118,6 +118,8 @@ type ReactorHook = fn(VM*, i32, i16): void;
 // there, so vm.mc stays free of the module/loader machinery. Takes (spec,
 // referrer path) and returns a promise of the module namespace.
 type DynImportHook = fn(VM*, Value, Value): Value;
+// An embedder's report of an uncaught error; `rejection` for an unhandled promise.
+type UncaughtHook = fn(VM*, Value, bool): void;
 
 // Builds the `arguments` object from a call's argument values, installed by
 // builtins so vm.mc's call sites stay free of the object/iterator builtins.
@@ -141,6 +143,13 @@ struct VM {
     // handles still alive, and the embedder calls it again from its own
     // loop. The CLI never sets it.
     f64 loop_budget_ms;
+    // Set by vm_step: the loop runs what is due and returns rather than
+    // wait for a timer or a socket.
+    bool loop_no_wait;
+    // An embedder's report of an uncaught exception or an unhandled
+    // rejection, or null. With one, neither ends the run: a browser
+    // reports the error and goes on.
+    UncaughtHook host_uncaught;
     f64 last_poll_ms;          // when the sockets were last polled
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
@@ -4021,6 +4030,8 @@ void vm_init(VM* vm) {
     vm.loop_start_ns = 0;
     vm.loop_idle_ns = 0;
     vm.loop_budget_ms = 0.0;
+    vm.loop_no_wait = false;
+    vm.host_uncaught = null;
     vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
@@ -4265,6 +4276,7 @@ bool vm_process_emit(VM* vm, str name, Value a, Value b, i32 nargs) {
 // An error nothing caught. A process listening for it takes over: node keeps
 // running afterwards, so this reports whether the run should carry on.
 bool vm_uncaught(VM* vm, Value e) {
+    if vm.host_uncaught != null { vm.host_uncaught(vm, e, false); return true; }
     if vm_process_emit(vm, "uncaughtException", e, value_undefined(), 1) { return true; }
     print_uncaught(vm, e);
     return false;
@@ -7376,6 +7388,26 @@ void* vm_handle_ext(VM* vm, i32 idx) {
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
 void vm_set_dynimport_hook(VM* vm, DynImportHook h) { vm.dynimport_hook = h; }
+
+// One turn of the loop for an embedder that owns its own: the jobs, then
+// the timers already due, for at most `budget_ms`, never waiting. Returns
+// the milliseconds to the next timer, 0 when due work is left, -1 when
+// nothing is scheduled.
+f64 vm_step(VM* vm, f64 budget_ms) {
+    if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
+    f64 saved = vm.loop_budget_ms;
+    vm.loop_budget_ms = budget_ms > 0.0 ? budget_ms : 0.001;
+    vm.loop_no_wait = true;
+    ignore vm_run_event_loop(vm);
+    vm.loop_no_wait = false;
+    vm.loop_budget_ms = saved;
+    if vm.job_head < vm.jobs.len { return 0.0; }
+    vm_timers_compact(vm);
+    VmTimer* next = vm_timer_next(vm);
+    if next == null { return -1.0; }
+    f64 d = next.due - vm_now_ms(vm);
+    return d < 0.0 ? 0.0 : d;
+}
 void* vm_esm_loader(VM* vm) { return vm.esm_loader; }
 void vm_set_esm_loader(VM* vm, void* p) { vm.esm_loader = p; }
 void vm_set_arguments_builder(VM* vm, ArgumentsBuilder b) { vm.arguments_builder = b; }
@@ -7719,7 +7751,7 @@ i32 vm_run_event_loop(VM* vm) {
         if !vm_timers_reffed(vm) && !vm_handles_alive(vm) {
             // Nothing left to do. A beforeExit listener may schedule more, in
             // which case the loop picks it up and asks again later.
-            if vm.before_exit_done { break; }
+            if vm.before_exit_done || vm.loop_no_wait { break; }
             vm.before_exit_done = true;
             if !vm_process_emit(vm, "beforeExit", value_int(0), value_undefined(), 1) { break; }
             if vm.has_pending {
@@ -7735,6 +7767,10 @@ i32 vm_run_event_loop(VM* vm) {
         f64 now = vm_now_ms(vm);
         bool timer_due = next != null && next.due <= now;
         if !timer_due {
+            if vm.loop_no_wait {
+                if vm.handles.len > 0 { reactor_poll(vm, 0); }
+                break;
+            }
             // nothing to fire yet — poll the sockets, bounded by the next
             // timer deadline (or block until I/O when only handles remain)
             i64 timeout;
@@ -7833,6 +7869,10 @@ i32 vm_report_unhandled(VM* vm) {
         js_set_prop(p, vm.atom_phandled, value_bool(true));
         Value* rv = props_get(&p.props, vm.atom_pvalue);
         Value reason = rv != null ? *rv : value_undefined();
+        if vm.host_uncaught != null {
+            vm.host_uncaught(vm, reason, true);
+            continue;
+        }
         if vm_process_emit(vm, "unhandledRejection", reason, value_cell(&p.head), 2) {
             continue;
         }

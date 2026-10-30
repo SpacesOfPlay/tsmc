@@ -146,6 +146,12 @@ struct Module {
 
 type ModulePtr = Module*;
 
+// An embedder's module sources: resolves `spec` against `referrer` into
+// *url (owned, empty when it does not resolve) and hands over the source
+// in *data and *len when the embedder has it. False when it does not,
+// which the run reports as missing so the embedder can fetch and retry.
+type ModuleSource = fn(void*, str, str, string*, u8**, i64*): bool;
+
 private void module_links_init(Module* mod) {
     links_init(&mod.links);
     vec_init<str>(&mod.specs, 4);
@@ -168,6 +174,10 @@ struct Loader {
     // Keys are owned here; a package's files ask this once per directory.
     StrMap<i32> pkg_type;
     Vec<str> pkg_dirs;
+    // Set for an embedder's loader: every import goes to host_src, by URL.
+    ModuleSource host_src;
+    void* host_ctx;
+    i32 host_missing;    // imports the embedder has no source for yet
 }
 
 // --- path handling -----------------------------------------------------------
@@ -538,6 +548,44 @@ private i32 load_cjs_module(Loader* ld, str importer, str spec, str canon) {
     return register_module(ld, mod, false);
 }
 
+// An import in an embedder's loader: by URL, through host_src. A module
+// already loaded is shared; one whose source the embedder lacks counts as
+// missing and fails the load.
+private i32 host_dep(Loader* ld, str referrer, str spec) {
+    string url = string("");
+    u8* data = null;
+    i64 len = 0;
+    bool have = ld.host_src(ld.host_ctx, referrer, spec, &url, &data, &len);
+    if url.len == 0 {
+        eprint("tsmc: cannot resolve '{}' from '{}'\n", spec, referrer);
+        ld.failed = true;
+        free(url);
+        if data != null { free(data); }
+        return -1;
+    }
+    str u = str_from(url.data, url.len);
+    i32* known = strmap_get(&ld.by_path, u);
+    if known != null {
+        i32 k = *known;
+        free(url);
+        if data != null { free(data); }
+        if vec_get(&ld.mods, k).state == MOD_NEW { ld.failed = true; }
+        return k;
+    }
+    if !have {
+        ld.host_missing++;
+        ld.failed = true;
+        free(url);
+        return -1;
+    }
+    FileData fd;
+    fd.data = data;
+    fd.len = len;
+    i32 r = load_module_from(ld, u, owned_str(u), fd);
+    free(url);
+    return r;
+}
+
 // Loads path (and its deps) into the loader; returns the module index
 // or -1 on failure.
 private i32 load_module(Loader* ld, str path) {
@@ -628,6 +676,10 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     // resolve and load dependencies (specifier views live in the arena)
     for i32 i = 0; i < mod.specs.len; i++ {
         str spec = vec_get(&mod.specs, i);
+        if ld.host_src != null {
+            vec_push(&mod.dep_idx, host_dep(ld, mod.path, spec));
+            continue;
+        }
         // built-in modules (fs / path, incl. node: prefix) bind directly
         str bname = builtin_name(spec);
         if bname.data != null {
@@ -733,7 +785,10 @@ private i32 eval_module(Loader* ld, i32 idx) {
     // A top-level-await module runs as a coroutine; drain the event loop so
     // its body (and thus its exports) completes before dependents evaluate.
     if st == 0 && mod.tmpl.is_async {
-        st = vm_run_event_loop(ld.vm);
+        // an embedder's loop is its own: the body goes as far as the jobs
+        // already queued take it and finishes on the embedder's steps
+        if ld.host_src != null { ignore vm_step(ld.vm, 50.0); }
+        else { st = vm_run_event_loop(ld.vm); }
     }
     if st == 0 { prune_star_exports(ld, idx); }
     return st;
@@ -2405,4 +2460,133 @@ i32 module_run_entry(VM* vm, str src, str path) {
 
     free(fname.data);
     return rc;
+}
+
+// --- modules for an embedder -------------------------------------------------
+//
+// A browser runs a page's module scripts in one realm with one module map,
+// fetches the sources itself and owns the loop. Its loader lives as long as
+// the realm, takes every source from a ModuleSource by URL, and never
+// touches the file system or Node's globals.
+
+void* module_host_new(VM* vm, ModuleSource src, void* ctx) {
+    Loader* ld = new(Loader);
+    ld.vm = vm;
+    vec_init<ModulePtr>(&ld.mods, 8);
+    diags_init(&ld.diags);
+    strmap_init<i32>(&ld.by_canon);
+    strmap_init<i32>(&ld.by_path);
+    strmap_init<i32>(&ld.pkg_type);
+    vec_init<str>(&ld.pkg_dirs, 1);
+    ld.host_src = src;
+    ld.host_ctx = ctx;
+    vm_set_esm_loader(vm, cast(void*, ld));
+    return cast(void*, ld);
+}
+
+void module_host_free(void* h) {
+    Loader* ld = cast(Loader*, h);
+    if ld == null { return; }
+    if vm_esm_loader(ld.vm) == h { vm_set_esm_loader(ld.vm, null); }
+    strmap_free(&ld.by_canon);
+    strmap_free(&ld.by_path);
+    strmap_free(&ld.pkg_type);
+    vec_free(&ld.pkg_dirs);
+    for i32 i = 0; i < ld.mods.len; i++ { module_free(vec_get(&ld.mods, i)); }
+    vec_free(&ld.mods);
+    diags_free(&ld.diags);
+    free(ld);
+}
+
+// Drops the modules a failed load registered after `mark`, so the retry
+// once the missing sources are in loads them again.
+private void host_rollback(Loader* ld, i32 mark) {
+    for i32 i = ld.mods.len - 1; i >= mark; i-- {
+        Module* mod = vec_get(&ld.mods, i);
+        ignore strmap_remove(&ld.by_canon, mod.canon);
+        ignore strmap_remove(&ld.by_path, mod.path);
+        module_free(mod);
+    }
+    ld.mods.len = mark;
+}
+
+// The modules a load is still missing: 0 when none.
+i32 module_host_missing(void* h) { return cast(Loader*, h).host_missing; }
+
+// Runs a module script whose source the embedder has, under `url`. 0 ran,
+// 1 threw (reported), 2 did not compile or link (reported), 3 imports
+// missing: nothing ran, and the call is made again once they are in.
+i32 module_host_run(void* h, str src, str url) {
+    Loader* ld = cast(Loader*, h);
+    i32 mark = ld.mods.len;
+    ld.failed = false;
+    ld.host_missing = 0;
+    i32 errors = ld.diags.n_errors;
+    i32 entry;
+    i32* known = strmap_get(&ld.by_path, url);
+    if known != null {
+        entry = *known;
+    } else {
+        FileData fd;
+        fd.data = alloc<u8>(src.len > 0 ? src.len : 1);
+        if src.len > 0 { memcpy(fd.data, src.data, src.len); }
+        fd.len = src.len;
+        entry = load_module_from(ld, url, owned_str(url), fd);
+    }
+    if ld.host_missing > 0 {
+        host_rollback(ld, mark);
+        return 3;
+    }
+    if ld.failed || ld.diags.n_errors > errors || entry < 0 { return 2; }
+    string msg = string("");
+    if !link_check(ld, entry, &msg) {
+        eprint("SyntaxError: {}\n", msg);
+        free(msg);
+        return 2;
+    }
+    free(msg);
+    return eval_module(ld, entry);
+}
+
+// import(spec) from `referrer` in an embedder's loader: the namespace, or
+// *ok false with the rejection in *err, or *missing when a source is not in
+// yet (nothing was run; the embedder fetches and asks again).
+Value module_host_import(void* h, str spec, str referrer, bool* ok, Value* err, bool* missing) {
+    Loader* ld = cast(Loader*, h);
+    VM* vm = ld.vm;
+    *ok = false;
+    *missing = false;
+    i32 mark = ld.mods.len;
+    bool saved = ld.failed;
+    ld.failed = false;
+    ld.host_missing = 0;
+    i32 errors = ld.diags.n_errors;
+    i32 idx = host_dep(ld, referrer, spec);
+    if ld.host_missing > 0 {
+        host_rollback(ld, mark);
+        ld.failed = saved;
+        *missing = true;
+        return value_undefined();
+    }
+    bool bad = ld.failed || ld.diags.n_errors > errors || idx < 0;
+    ld.failed = saved;
+    if bad {
+        *err = make_reject_error(vm, ERR_SYNTAX, "error loading dynamically imported module");
+        return value_undefined();
+    }
+    string msg = string("");
+    if !link_check(ld, idx, &msg) {
+        str lm = msg;
+        *err = make_reject_error(vm, ERR_SYNTAX, lm);
+        free(msg);
+        return value_undefined();
+    }
+    free(msg);
+    Value everr = value_undefined();
+    if !dyn_eval(ld, idx, &everr) {
+        *err = everr;
+        return value_undefined();
+    }
+    *ok = true;
+    return value_cell(&vec_get(&ld.mods, idx).ns.head);
 }
