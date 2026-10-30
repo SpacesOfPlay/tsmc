@@ -397,7 +397,16 @@ private Value proto_of_value(VM* vm, Value v) {
         if value_is_null(fp) { return value_null(); }
         return proto_cell(vm.function_proto);
     }
-    if value_is_native(v) { return proto_cell(vm.function_proto); }
+    if value_is_native(v) {
+        // the native error constructors inherit from Error, as TypeError's [[Prototype]] is Error
+        NativeFn f = value_as_native(v).fun;
+        if f == &nat_typeerror_ctor || f == &nat_rangeerror_ctor || f == &nat_referror_ctor || f == &nat_syntaxerror_ctor
+            || f == &nat_evalerror_ctor || f == &nat_urierror_ctor || f == &nat_aggregateerror_ctor {
+            Value e;
+            if vm_get_prop_value(vm, value_cell(&vm.global_obj.head), bi_atom(vm, "Error"), &e) && value_is_native(e) { return e; }
+        }
+        return proto_cell(vm.function_proto);
+    }
     if value_is_string(v) { return proto_cell(vm.string_proto); }
     if value_is_symbol(v) { return proto_cell(vm.symbol_proto); }
     if value_is_bigint(v) { return proto_cell(vm.bigint_proto); }
