@@ -151,6 +151,11 @@ struct VM {
     // browser's do: a script's top-level declarations bind globals, so
     // the next script sees them (vm_run_source).
     bool script_globals;
+    // An embedder's deadline on the monotonic clock, 0 for none: a loop
+    // still running past it throws, as a browser stops a script that
+    // hangs its page. Checked on backward jumps, every 4096 of them.
+    u64 deadline_ns;
+    i32 deadline_tick;
     // An embedder's report of an uncaught exception or an unhandled
     // rejection, or null. With one, neither ends the run: a browser
     // reports the error and goes on.
@@ -4050,6 +4055,8 @@ void vm_init(VM* vm) {
     vm.loop_no_wait = false;
     vm.host_uncaught = null;
     vm.script_globals = false;
+    vm.deadline_ns = 0;
+    vm.deadline_tick = 0;
     vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
@@ -5032,7 +5039,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm_throw_error(vm, ERR_TYPE, "Cannot use 'in' to search for a private field in a non-object");
                 }
             }
-            case OP_JUMP: { ip = rd_u16(code, ip); }
+            case OP_JUMP: {
+                i32 target = rd_u16(code, ip);
+                if target < ip && vm.deadline_ns != 0 {
+                    vm.deadline_tick++;
+                    if (vm.deadline_tick & 4095) == 0 && vm_clock_ns() > vm.deadline_ns {
+                        // once: a catch around the loop gets to run
+                        vm.deadline_ns = 0;
+                        vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
+                    }
+                }
+                ip = target;
+            }
             case OP_JUMPF: {
                 i32 target = rd_u16(code, ip);
                 ip += 2;
