@@ -7701,7 +7701,8 @@ i32 vm_run_event_loop(VM* vm) {
     if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
     f64 deadline = vm.loop_budget_ms > 0.0 ? vm_now_ms(vm) + vm.loop_budget_ms : 0.0;
     while true {
-        if deadline > 0.0 && vm.job_head >= vm.jobs.len && vm_now_ms(vm) >= deadline { break; }
+        // the budget spent: what is alive stays for the embedder's next call
+        if deadline > 0.0 && vm.job_head >= vm.jobs.len && vm_now_ms(vm) >= deadline { return 0; }
         while vm.job_head < vm.jobs.len {
             VmJob j = vec_get(&vm.jobs, vm.job_head);
             vm.job_head++;
@@ -7771,7 +7772,7 @@ i32 vm_run_event_loop(VM* vm) {
         if !timer_due {
             if vm.loop_no_wait {
                 if vm.handles.len > 0 { reactor_poll(vm, 0); }
-                break;
+                return 0;
             }
             // nothing to fire yet — poll the sockets, bounded by the next
             // timer deadline (or block until I/O when only handles remain)
@@ -7786,7 +7787,7 @@ i32 vm_run_event_loop(VM* vm) {
                 // the wait ends at the budget; what is still pending then is
                 // left for the embedder's next call
                 f64 left = deadline - now;
-                if left <= 0.0 { break; }
+                if left <= 0.0 { return 0; }
                 if timeout < 0 || cast(f64, timeout) > left { timeout = left < 1.0 ? 1 : cast(i64, left); }
             }
             reactor_poll(vm, timeout);
