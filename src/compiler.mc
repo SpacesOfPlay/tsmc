@@ -34,6 +34,7 @@ struct CBind {
     bool is_const;
     bool tdz;
     bool exported;   // module-scope binding with a live export
+    bool global;     // a script's top-level declaration bound on the global object
 }
 
 struct CUp {
@@ -174,6 +175,7 @@ struct ExportName {
 }
 
 struct Compiler {
+    bool script_globals;   // a script's top-level declarations bind globals (VM.script_globals)
     DiagList* diags;
     GcHeap* heap;
     AtomTable* atoms;
@@ -341,10 +343,32 @@ private i32 alloc_slot(FScope* fs) {
     return s;
 }
 
+// A declaration that binds the global object: a script's own top level
+// when the embedder shares one global scope across its scripts. The
+// compiler's own bindings (this, the hidden %names) stay slots.
+private bool binds_global(Compiler* co, FScope* fs, str name) {
+    // depth 0 is where vars hoist, 1 the script's own statement list
+    if !co.script_globals || co.in_module || fs.parent != null || fs.depth > 1 { return false; }
+    if name.len == 0 || *(name.data) == '%' { return false; }
+    return !str_equal(name, "this") && !str_equal(name, "arguments");
+}
+
 private i32 declare(Compiler* co, str name, bool is_const, bool tdz) {
     FScope* fs = co.cur;
     CBind b;
     b.name = name;
+    b.global = binds_global(co, fs, name);
+    if b.global {
+        // no slot: every read and write goes to the global object
+        b.slot = -1;
+        b.depth = 0;
+        b.is_cell = false;
+        b.is_const = false;
+        b.tdz = false;
+        b.exported = false;
+        vec_push(&fs.binds, b);
+        return fs.binds.len - 1;
+    }
     b.slot = alloc_slot(fs);
     b.depth = fs.depth;
     b.is_cell = strmap_get<i32>(&fs.inner, name) != null;
@@ -356,7 +380,19 @@ private i32 declare(Compiler* co, str name, bool is_const, bool tdz) {
     return fs.binds.len - 1;
 }
 
+// A binding of this scope by name; a global one is not, its reads and
+// writes resolve to the global object.
 private i32 find_local(FScope* fs, str name) {
+    for i32 i = fs.binds.len - 1; i >= 0; i-- {
+        CBind b = vec_get(&fs.binds, i);
+        if str_equal(b.name, name) { return b.global ? -1 : i; }
+    }
+    return -1;
+}
+
+// A declaration of this scope by name, global ones included: what the
+// statement that declares it initializes.
+private i32 find_decl(FScope* fs, str name) {
     for i32 i = fs.binds.len - 1; i >= 0; i-- {
         CBind b = vec_get(&fs.binds, i);
         if str_equal(b.name, name) { return i; }
@@ -716,6 +752,7 @@ private void declare_lexical(Compiler* co, Node* at, str name, bool is_const) {
     if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, is_const, true);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global { return; }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_HOLE, b.slot);
     } else {
@@ -730,6 +767,7 @@ private void declare_plain_const(Compiler* co, Node* at, str name, bool is_const
     if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, is_const, false);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global { return; }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
     }
@@ -784,10 +822,17 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
 private void hoist_declare_var(Compiler* co, Node* id) {
     FScope* fs = co.cur;
     check_strict_binding(co, id, id.name);
-    i32 li = find_local(fs, id.name);
+    i32 li = find_decl(fs, id.name);
     if li >= 0 { return; }   // var redeclaration shares the binding
     i32 bi = declare(co, id.name, false, false);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global {
+        // the global exists from here on, keeping a value it had: `var x = x || {}`
+        ch_op_u16(&fs.ch, OP_GETGLOBAL_SOFT, name_const(co, id.name));
+        ch_op_u16(&fs.ch, OP_DEFGLOBAL, name_const(co, id.name));
+        ch_op(&fs.ch, OP_POP);
+        return;
+    }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
     }
@@ -1208,6 +1253,11 @@ private void emit_store_ident_static(Compiler* co, Node* n) {
 private void emit_init_binding(Compiler* co, i32 bind_idx) {
     FScope* fs = co.cur;
     CBind b = vec_get(&fs.binds, bind_idx);
+    if b.global {
+        ch_op_u16(&fs.ch, OP_DEFGLOBAL, name_const(co, b.name));
+        ch_op(&fs.ch, OP_POP);
+        return;
+    }
     ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
     if b.exported { emit_export_writes(co, b.name, null); }
     ch_op(&fs.ch, OP_POP);
@@ -1351,7 +1401,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
     i32 k = pat.kind;
     if k == N_IDENT {
         if declare_mode {
-            i32 li = find_local(co.cur, pat.name);
+            i32 li = find_decl(co.cur, pat.name);
             if li < 0 {
                 cerror(co, pat, "unresolved binding");
                 ch_op(ch, OP_POP);
@@ -3568,7 +3618,7 @@ private void compile_var_stmt(Compiler* co, Node* n) {
     for i32 i = 0; i < n.kids.len; i++ {
         Node* d = *(n.kids.items + i);
         if d.a.kind == N_IDENT {
-            i32 li = find_local(co.cur, d.a.name);
+            i32 li = find_decl(co.cur, d.a.name);
             if li < 0 {
                 cerror(co, d, "unresolved declaration");
                 continue;
@@ -3683,7 +3733,7 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     for i32 i = 0; i < list.len; i++ {
         Node* f = function_decl_of(*(list.items + i));
         if f != null {
-            i32 li = find_local(fs, f.name);
+            i32 li = find_decl(fs, f.name);
             compile_function(co, f, false);
             emit_init_binding(co, li);
         }
@@ -4320,7 +4370,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             for i32 s = 0; s < cl.len; s++ {
                 Node* st = function_decl_of(*(cl.items + s));
                 if st != null {
-                    i32 li = find_local(fs, st.name);
+                    i32 li = find_decl(fs, st.name);
                     compile_function(co, st, false);
                     emit_init_binding(co, li);
                 }
@@ -4394,7 +4444,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     }
     if k == N_CLASS {
         if n.name.len > 0 {
-            i32 li = find_local(fs, n.name);
+            i32 li = find_decl(fs, n.name);
             compile_class_expr(co, n);
             if li >= 0 {
                 emit_init_binding(co, li);

@@ -167,7 +167,9 @@ enum Op {
     // frozen, so a tag cannot alter what a later evaluation of the same site
     // sees.
     OP_FREEZE,       // [obj] -> [obj]; freezes in place
-    OP_REGEX         // u16 source const, u16 flags const -> RegExp object
+    OP_REGEX,        // u16 source const, u16 flags const -> RegExp object
+    OP_DEFGLOBAL     // u16 const idx; keeps value: a script's top-level
+                     // declaration made a global, never a strict-mode error
 }
 
 struct TmplUpval {

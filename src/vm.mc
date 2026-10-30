@@ -147,6 +147,10 @@ struct VM {
     // loop runs what is due and returns rather than wait for a timer or a
     // socket, so a script's run ends with its microtasks.
     bool loop_no_wait;
+    // Set by an embedder whose scripts share one global scope, as a
+    // browser's do: a script's top-level declarations bind globals, so
+    // the next script sees them (vm_run_source).
+    bool script_globals;
     // An embedder's report of an uncaught exception or an unhandled
     // rejection, or null. With one, neither ends the run: a browser
     // reports the error and goes on.
@@ -4033,6 +4037,7 @@ void vm_init(VM* vm) {
     vm.loop_budget_ms = 0.0;
     vm.loop_no_wait = false;
     vm.host_uncaught = null;
+    vm.script_globals = false;
     vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
@@ -4603,6 +4608,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_SETEXPORT: {
                 ip += 2;
                 set_export(vm, t, rd_u16(code, ip - 2));
+            }
+            case OP_DEFGLOBAL: {
+                ip += 2;
+                ignore set_global(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    vpeek(vm, 0), false);
             }
             case OP_WITH_OBJ: { op_with_obj(vm); }
             case OP_WITH_HAS: {
@@ -8314,6 +8325,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         Compiler co;
         compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
         compiler_set_source(&co, src, src_name);
+        co.script_globals = vm.script_globals;
         FnTemplate* t = compile_program(&co, prog);
         vec_push(&vm.troots, t);
         gc_root_reset(&vm.heap, rmark);
