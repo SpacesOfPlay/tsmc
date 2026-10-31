@@ -5126,7 +5126,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else if value_is_function(fnv) {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
-                        if (ft.not_ctor || ft.is_class) && call_kind_error(vm, ft, op) {
+                        if ft.lazy != null && !vm_lazy_compile(vm, ft) {
+                            // threw: its body does not compile
+                        } else if (ft.not_ctor || ft.is_class) && call_kind_error(vm, ft, op) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
@@ -7995,6 +7997,11 @@ Value vm_call_stack(VM* vm, i32 argc) {
     }
     JsFunction* f = value_as_function(fnv);
     FnTemplate* ft = f.tmpl;
+    if ft.lazy != null && !vm_lazy_compile(vm, ft) {
+        vm.pending_super_for = 0 - 1;
+        vm.sp = entry_sp;
+        return value_undefined();
+    }
     vm.pending_super_for = ft.is_gen || ft.is_async ? 0 - 1 : vm.pending_super_for;
     if ft.is_gen { return make_generator_from_call(vm, f, argc); }
     if ft.is_async { return make_async_from_call(vm, f, argc); }
@@ -8334,6 +8341,43 @@ else {
 }
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.
+// A lazy function's first call: reparsed from its source and compiled
+// into its template. False with a SyntaxError thrown when it does not.
+bool vm_lazy_compile(VM* vm, FnTemplate* t) {
+    LazyFn* lz = t.lazy;
+    LazySource* s = lz.source;
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    Parser p;
+    parser_init_at(&p, s.src, &d, &arena, lz.start, lz.strict);
+    Node* f = parse_function_at(&p, lz.method);
+    bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if ok { lower_function(&lw, &f); ok = d.n_errors == 0; }
+    if ok {
+        i32 rmark = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_lazy_source(&co, s);
+        co.script_globals = vm.script_globals;
+        ok = compile_lazy(&co, f, t);
+        gc_root_reset(&vm.heap, rmark);
+    }
+    if !ok {
+        str msg = d.n_errors > 0 ? d.list.data[0].message : "a function could not be compiled";
+        using string m = str_concat("", msg);
+        vm_throw_error(vm, ERR_SYNTAX, str_from(m.data, m.len));
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    return ok;
+}
+
 i32 vm_run_source(VM* vm, str src, str src_name) {
     DiagList d;
     diags_init(&d);

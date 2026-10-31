@@ -202,6 +202,9 @@ struct Compiler {
     StrMap<i32> export_heads;        // local name -> first ExportName
     Vec<ExportName> export_names;
     Vec<PrivScope> priv_scopes;      // enclosing class bodies, innermost last
+    bool lazy_ok;           // a large source: plain functions compile on their first call
+    LazySource* lazy_src;   // shared by the lazy functions of this compile
+    FnTemplate* prefill;    // a lazy function being compiled: its closures' upvalues, in order
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
     i32* line_starts;   // byte offset where each line of src begins
@@ -209,6 +212,9 @@ struct Compiler {
 }
 
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
+    co.lazy_ok = false;
+    co.lazy_src = null;
+    co.prefill = null;
     co.diags = diags;
     co.heap = heap;
     co.atoms = atoms;
@@ -259,6 +265,42 @@ void compiler_set_source(Compiler* co, str src, str src_name) {
     }
     co.line_starts = starts;
     co.n_lines = n;
+    co.lazy_ok = src.len >= LAZY_MIN_SOURCE;
+}
+
+// A lazy function's compile: the source it came from, its line table
+// kept, and in a module its imports and exports as the module had them.
+void compiler_set_lazy_source(Compiler* co, LazySource* s) {
+    co.src = s.src;
+    co.src_name = s.src_name;
+    co.line_starts = s.line_starts;
+    co.n_lines = s.n_lines;
+    co.lazy_ok = true;
+    co.lazy_src = s;
+    if !s.module { return; }
+    co.in_module = true;
+    co.ns_name = s.ns_name;
+    strmap_free<ModImport>(&co.mod_imports);
+    strmap_init<ModImport>(&co.mod_imports);
+    for i32 i = 0; i < s.n_imports; i++ {
+        LazyImport* m = s.imports + i;
+        ModImport mi = ModImport{};
+        mi.slot_name = m.slot_name;
+        mi.prop = m.prop;
+        mi.spec = m.spec;
+        mi.msg = value_undefined();
+        mi.has_msg = false;
+        strmap_set<ModImport>(&co.mod_imports, m.name, mi);
+    }
+    for i32 i = 0; i < s.n_exports; i++ {
+        LazyExport* e = s.exports + i;
+        i32* head = strmap_get<i32>(&co.export_heads, e.local);
+        ExportName en = ExportName{};
+        en.exported = e.exported;
+        en.next = head != null ? *head : -1;
+        vec_push(&co.export_names, en);
+        strmap_set<i32>(&co.export_heads, e.local, co.export_names.len - 1);
+    }
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
@@ -405,11 +447,12 @@ private i32 find_decl(FScope* fs, str name) {
 }
 
 private i32 resolve_upval(FScope* fs, str name) {
-    if fs.parent == null { return -1; }
+    // a lazy function's scope has its upvalues from the start and no parent
     for i32 i = 0; i < fs.ups.len; i++ {
         CUp u = vec_get(&fs.ups, i);
         if str_equal(u.name, name) { return i; }
     }
+    if fs.parent == null { return -1; }
     i32 li = find_local(fs.parent, name);
     if li >= 0 {
         CBind b = vec_get(&fs.parent.binds, li);
@@ -2881,6 +2924,21 @@ private void bind_params_in_order(Compiler* co, FScope* fs, Node* f, i32 n_param
 private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields, bool self_name) {
     FScope fs;
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
+    if co.prefill != null {
+        // a lazy function: the upvalues its closures captured, in their order
+        FnTemplate* lt = co.prefill;
+        co.prefill = null;
+        for i32 i = 0; i < lt.lazy.n_ups; i++ {
+            LazyUp* lu = lt.lazy.ups + i;
+            CUp u;
+            u.name = lu.name;
+            u.is_const = lu.is_const;
+            u.tdz = lu.tdz;
+            u.exported = lu.exported;
+            vec_push(&fs.ups, u);
+            vec_push(&fs.ch.upvals, *(lt.upvals + i));
+        }
+    }
     fs.is_gen = (f.flags & NF_GENERATOR) != 0;
     fs.is_async = (f.flags & NF_ASYNC) != 0;
     fs.super_call_ok = co.next_is_derived_ctor;
@@ -3082,9 +3140,268 @@ private void compile_function(Compiler* co, Node* f, bool self_name) {
     // A method's name is its property key, not a binding: `{ f() { f() } }`
     // calls the outer f. Only a named function expression sees itself.
     if (f.flags & NF_METHOD) != 0 { self_name = false; }
-    FnTemplate* t = compile_function_tmpl(co, f, null, 0, self_name);
+    FnTemplate* t = lazy_eligible(co, f) ? lazy_template(co, f, self_name) : compile_function_tmpl(co, f, null, 0, self_name);
     vec_push(&co.cur.ch.subs, t);
     ch_op_u16(&co.cur.ch, OP_CLOSURE, co.cur.ch.subs.len - 1);
+}
+
+// --- lazy functions ----------------------------------------------------------------
+//
+// In a large source a plain function's body is compiled on its first
+// call: a bundle defines far more than one page runs. The closure site
+// resolves every name the function mentions as an upvalue, now, as an
+// eager compile would (an extra one costs a capture); on the first call
+// the function is parsed again from its `function` keyword and compiled
+// against those upvalues, by name, with no enclosing scope. An arrow
+// captures `this`, `arguments` and `new.target` the same way, and a
+// method written as a plain key and its parameters is reparsed from the
+// key. Accessors, generators and async functions stay eager, as does a
+// function that calls eval, uses with or names super, and an arrow in a
+// static block. The source's early errors are
+// the parse's, which still covers the whole source; the few the
+// compiler reports surface on the first call instead.
+
+const i32 LAZY_MIN_SOURCE = 65536;
+const i32 LAZY_MIN_FN = 256;
+
+private bool has_eval_or_with(Node* n) {
+    if n == null { return false; }
+    // super and #names need the class around the function
+    if n.kind == N_WITH || n.kind == N_SUPER || n.kind == N_PRIVATE_IDENT || (n.flags & NF_PRIVATE) != 0 { return true; }
+    if n.kind == N_IDENT && str_equal(n.name, "eval") { return true; }
+    if has_eval_or_with(n.a) || has_eval_or_with(n.b) || has_eval_or_with(n.c) || has_eval_or_with(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if has_eval_or_with(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+// A method written as `key(`: a name, a number or a plain string, then
+// its parameters; get, set, async, *, a computed key and anything
+// before the key (static, a modifier) keep it eager.
+private bool plain_method_text(str s, i32 at) {
+    i32 i = at;
+    if i >= s.len { return false; }
+    u8 c = *(s.data + i);
+    if c == '"' || c == 39 {
+        i++;
+        while i < s.len && *(s.data + i) != c { if *(s.data + i) == 92 || *(s.data + i) == '
+' { return false; } i++; }
+        if i >= s.len { return false; }
+        i++;
+    } else {
+        i32 k0 = i;
+        while i < s.len {
+            u8 d = *(s.data + i);
+            if !((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9') || d == '_' || d == '$' || d >= 0x80) { break; }
+            i++;
+        }
+        if i == k0 { return false; }
+        str key = str_slice(s, k0, i);
+        if str_equal(key, "get") || str_equal(key, "set") || str_equal(key, "async") || str_equal(key, "static") { 
+            // `get(`, `set(` are methods of those names; anything else after them is not
+            i32 j = i;
+            while j < s.len && (*(s.data + j) == ' ' || *(s.data + j) == '	') { j++; }
+            if j >= s.len || *(s.data + j) != '(' { return false; }
+        }
+    }
+    while i < s.len && (*(s.data + i) == ' ' || *(s.data + i) == '	' || *(s.data + i) == '
+' || *(s.data + i) == '
+') { i++; }
+    return i < s.len && *(s.data + i) == '(';
+}
+
+private bool lazy_eligible(Compiler* co, Node* f) {
+    if !co.lazy_ok || co.cur == null || co.in_params || co.in_static_block { return false; }
+    // inside a with body its names resolve against the object, at run time
+    if co.cur.withs.len > 0 { return false; }
+    if (f.flags & (NF_GENERATOR | NF_ASYNC | NF_SIGNATURE | NF_GETTER | NF_SETTER)) != 0 { return false; }
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    bool method = (f.flags & NF_METHOD) != 0;
+    if f.a == null || (!arrow && f.a.kind != N_BLOCK) { return false; }
+    if arrow && co.static_this { return false; }
+    if f.span.end - f.span.start < LAZY_MIN_FN || f.span.end > co.src.len { return false; }
+    if method && !plain_method_text(co.src, f.span.start) { return false; }
+    if !arrow && !method && !str_starts_with(str_slice(co.src, f.span.start, co.src.len), "function") { return false; }
+    return !has_eval_or_with(f);
+}
+
+private LazySource* lazy_source(Compiler* co) {
+    if co.lazy_src != null { return co.lazy_src; }
+    LazySource* s = new(LazySource);
+    s.src = co.src;
+    s.src_name = co.src_name;
+    s.n_lines = co.n_lines;
+    s.line_starts = alloc<i32>(co.n_lines > 0 ? co.n_lines : 1);
+    memcpy(cast(u8*, s.line_starts), cast(u8*, co.line_starts), cast(i64, co.n_lines) * 4);
+    s.refs = 0;
+    s.module = co.in_module;
+    if co.in_module {
+        s.ns_name = lazy_str(co.ns_name);
+        // the imports and exports are all known before the body compiles
+        s.n_imports = co.mod_imports.count;
+        s.imports = s.n_imports > 0 ? alloc<LazyImport>(s.n_imports) : null;
+        i32 k = 0;
+        for i32 i = 0; i < co.mod_imports.cap && k < s.n_imports; i++ {
+            StrSlot<ModImport>* sl = co.mod_imports.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            LazyImport* m = s.imports + k;
+            m.name = lazy_str(sl.key);
+            m.slot_name = lazy_str(sl.val.slot_name);
+            m.prop = lazy_str(sl.val.prop);
+            m.spec = lazy_str(sl.val.spec);
+            k++;
+        }
+        s.n_imports = k;
+        s.n_exports = 0;
+        for i32 i = 0; i < co.export_heads.cap; i++ {
+            StrSlot<i32>* sl = co.export_heads.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            i32 e = sl.val;
+            while e >= 0 { s.n_exports++; e = vec_get(&co.export_names, e).next; }
+        }
+        s.exports = s.n_exports > 0 ? alloc<LazyExport>(s.n_exports) : null;
+        k = 0;
+        for i32 i = 0; i < co.export_heads.cap; i++ {
+            StrSlot<i32>* sl = co.export_heads.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            i32 e = sl.val;
+            while e >= 0 {
+                ExportName en = vec_get(&co.export_names, e);
+                (s.exports + k).local = lazy_str(sl.key);
+                (s.exports + k).exported = lazy_str(en.exported);
+                k++;
+                e = en.next;
+            }
+        }
+    }
+    co.lazy_src = s;
+    return s;
+}
+
+private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    FScope fs;
+    fscope_init(&fs, co.cur, arrow);
+    // what the function declares itself is its own, not the scope's around it
+    Vec<str> own = vec_new<str>(16);
+    for i32 i = 0; i < f.kids.len; i++ { collect_pattern_names((*(f.kids.items + i)).a, &own); }
+    // the body's vars are its own too, unless a default value in the
+    // parameters can see past them to the names outside
+    bool simple = true;
+    for i32 i = 0; i < f.kids.len; i++ { Node* prm = *(f.kids.items + i); if prm.b != null || prm.a == null || prm.a.kind != N_IDENT { simple = false; } }
+    if simple && f.a.kind == N_BLOCK { for i32 i = 0; i < f.a.kids.len; i++ { collect_var_names(*(f.a.kids.items + i), &own); } }
+    StrMap<i32> mine;
+    strmap_init<i32>(&mine);
+    for i32 i = 0; i < own.len; i++ { strmap_set<i32>(&mine, vec_get(&own, i), 1); }
+    StrMap<i32> names;
+    strmap_init<i32>(&names);
+    scan_all_names(&names, f);
+    for i32 i = 0; i < names.cap; i++ {
+        StrSlot<i32>* sl = names.slots + i;
+        if sl.state != SLOT_USED { continue; }
+        str nm = sl.key;
+        // a plain function has these of its own; an arrow takes them from around it
+        if !arrow && (str_equal(nm, "this") || str_equal(nm, "arguments") || str_equal(nm, "%newtarget")) { continue; }
+        if str_equal(nm, "%super") { continue; }
+        if strmap_get<i32>(&mine, nm) != null { continue; }
+        // an import is read through its dependency's namespace binding
+        if co.in_module {
+            ModImport* mi = strmap_get<ModImport>(&co.mod_imports, nm);
+            if mi != null { ignore resolve_upval(&fs, mi.slot_name); continue; }
+        }
+        ignore resolve_upval(&fs, nm);
+    }
+    // a store to an exported binding writes the module's namespace too
+    if co.in_module && co.ns_name.len > 0 { ignore resolve_upval(&fs, co.ns_name); }
+    LazyFn* lz = new(LazyFn);
+    lz.source = lazy_source(co);
+    lz.source.refs++;
+    lz.start = f.span.start;
+    lz.strict = co.strict;
+    lz.self_name = self_name;
+    lz.method = (f.flags & NF_METHOD) != 0;
+    lz.name_inferred = (f.flags & NF_NAME_INFERRED) != 0;
+    lz.n_ups = fs.ups.len;
+    lz.ups = lz.n_ups > 0 ? alloc<LazyUp>(lz.n_ups) : null;
+    for i32 i = 0; i < lz.n_ups; i++ {
+        CUp u = vec_get(&fs.ups, i);
+        LazyUp* lu = lz.ups + i;
+        lu.name.data = alloc<u8>(u.name.len > 0 ? u.name.len : 1);
+        memcpy(lu.name.data, u.name.data, u.name.len);
+        lu.name.len = u.name.len;
+        lu.is_const = u.is_const;
+        lu.tdz = u.tdz;
+        lu.exported = u.exported;
+    }
+    bool has_rest = f.kids.len > 0 && ((*(f.kids.items + f.kids.len - 1)).flags & NF_REST) != 0;
+    FnTemplate* t = chunk_finish(&fs.ch, f.name, f.kids.len, 0, has_rest, false, false);
+    t.lazy = lz;
+    t.not_ctor = arrow || lz.method;
+    // what compile_function_tmpl would have taken for itself
+    co.next_static_home = false;
+    co.next_is_derived_ctor = false;
+    t.sloppy = !(co.strict || (f.a.kind == N_BLOCK && has_use_strict(&f.a.kids)));
+    t.src_name = co.src_name;
+    t.src_text = co.src;
+    t.src_start = f.span.start;
+    t.src_end = f.span.end;
+    i32 arity = 0;
+    for i32 i = 0; i < f.kids.len; i++ {
+        Node* prm = *(f.kids.items + i);
+        if (prm.flags & NF_REST) != 0 || prm.b != null { break; }
+        arity++;
+    }
+    t.arity = arity;
+    strmap_free<i32>(&names);
+    strmap_free<i32>(&mine);
+    vec_free(&own);
+    fscope_free(&fs);
+    return t;
+}
+
+// A lazy function's body, from its reparsed node `f`: compiled against
+// the upvalues its closures hold, into the template they point at.
+// False on a compile error, which the diagnostics hold.
+bool compile_lazy(Compiler* co, Node* f, FnTemplate* t) {
+    LazyFn* lz = t.lazy;
+    co.strict = lz.strict;
+    // an empty scope around it, so it is a function and not the top level;
+    // its names resolve to its upvalues, else to globals
+    FScope top;
+    fscope_init(&top, null, false);
+    co.cur = &top;
+    co.prefill = t;
+    if lz.name_inferred { f.flags |= NF_NAME_INFERRED; }
+    f.name = t.name;
+    FnTemplate* nt = compile_function_tmpl(co, f, null, 0, lz.self_name);
+    co.prefill = null;
+    co.cur = null;
+    fscope_free(&top);
+    if co.diags.n_errors > 0 || nt.n_upvals != t.n_upvals {
+        template_free(nt);
+        return false;
+    }
+    t.n_params = nt.n_params;
+    t.n_slots = nt.n_slots;
+    t.has_rest = nt.has_rest;
+    t.needs_arguments = nt.needs_arguments;
+    t.sloppy = nt.sloppy;
+    t.code = nt.code;
+    t.code_len = nt.code_len;
+    t.consts = nt.consts;
+    t.n_consts = nt.n_consts;
+    t.subs = nt.subs;
+    t.n_subs = nt.n_subs;
+    t.pos = nt.pos;
+    t.n_pos = nt.n_pos;
+    // the shell goes; what it held is the lazy template's now
+    if nt.upvals != null { free(nt.upvals); }
+    if nt.name.data != null { free(nt.name.data); }
+    free(nt);
+    lazy_free(lz);
+    t.lazy = null;
+    return true;
 }
 
 // --- classes -----------------------------------------------------------------------

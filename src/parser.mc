@@ -59,6 +59,47 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
+// A parser that starts at `offset` of `src`, for one function reparsed
+// on its first call; positions stay those of the whole source.
+void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset, bool strict) {
+    lexer_init(&p.lx, src, diags);
+    p.lx.pos = offset;
+    p.diags = diags;
+    p.arena = arena;
+    p.prev_end = offset;
+    p.no_in = 0;
+    p.strict = strict ? 1 : 0;
+    p.single = 0;
+    vec_init<NodePtr>(&p.scratch, 64);
+    vec_init<str>(&p.labels, 4);
+    p.label_floor = 0;
+    p.in_async = 0;
+    p.in_gen = 0;
+    p.fn_depth = 0;
+    p.module_top = false;
+    p.cur = contextualize(p, lexer_next(&p.lx));
+}
+
+// The function at the parser's start: a `function`, declaration or
+// expression alike, an arrow, or with `method` a method from its key;
+// null when the text there is none of them.
+Node* parse_function_at(Parser* p, bool method) {
+    if method {
+        i32 start = p.cur.start;
+        ignore prop_name(p);
+        if !at(p, TOK_LPAREN) { return null; }
+        return parse_callable(p, NF_METHOD, start);
+    }
+    if p.cur.kind == TOK_KW_FUNCTION {
+        i32 fstart = p.cur.start;
+        advance(p);
+        return parse_function_rest(p, 0, false, fstart);
+    }
+    Node* n = parse_assign(p);
+    if n == null || n.kind != N_FUNCTION || (n.flags & NF_ARROW) == 0 { return null; }
+    return n;
+}
+
 void parser_destroy(Parser* p) {
     vec_free(&p.scratch);
     vec_free(&p.labels);

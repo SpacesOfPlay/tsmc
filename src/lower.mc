@@ -33,6 +33,9 @@ void lower_program(Lower* lw, Node* program) {
     lower_stmt_list(lw, &program.kids);
 }
 
+// One function on its own (a lazy one reparsed).
+void lower_function(Lower* lw, Node** f) { lower_slot(lw, f); }
+
 // --- node builders ----------------------------------------------------
 
 private Node* mk(Lower* lw, i32 kind) {

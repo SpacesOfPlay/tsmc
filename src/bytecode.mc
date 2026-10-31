@@ -177,6 +177,86 @@ struct TmplUpval {
     i32 index;
 }
 
+// A function compiled on its first call (compiler.mc, lazy_template): the
+// source it is reparsed from, shared by every lazy function of one
+// compile, and the upvalues its closures already capture, by name.
+// A module's names a lazy function may reach: its imports, read
+// through the dependency namespaces, and its exports, written through
+// to its own namespace. Strings owned.
+struct LazyImport {
+    str name;
+    str slot_name;
+    str prop;
+    str spec;
+}
+
+struct LazyExport {
+    str local;
+    str exported;
+}
+
+struct LazySource {
+    str src;             // borrowed: the source outlives its templates
+    str src_name;
+    i32* line_starts;    // owned
+    i32 n_lines;
+    i32 refs;
+    bool module;
+    str ns_name;         // owned; the module's namespace binding
+    LazyImport* imports;
+    i32 n_imports;
+    LazyExport* exports;
+    i32 n_exports;
+}
+
+str lazy_str(str s) {
+    str o;
+    o.data = alloc<u8>(s.len > 0 ? s.len : 1);
+    memcpy(o.data, s.data, s.len);
+    o.len = s.len;
+    return o;
+}
+
+private void lazy_source_free(LazySource* s) {
+    free(s.line_starts);
+    if s.ns_name.data != null { free(s.ns_name.data); }
+    for i32 i = 0; i < s.n_imports; i++ {
+        LazyImport* m = s.imports + i;
+        free(m.name.data); free(m.slot_name.data); free(m.prop.data); free(m.spec.data);
+    }
+    if s.imports != null { free(s.imports); }
+    for i32 i = 0; i < s.n_exports; i++ { free((s.exports + i).local.data); free((s.exports + i).exported.data); }
+    if s.exports != null { free(s.exports); }
+    free(s);
+}
+
+struct LazyUp {
+    str name;            // owned
+    bool is_const;
+    bool tdz;
+    bool exported;
+}
+
+struct LazyFn {
+    LazySource* source;
+    i32 start;           // the `function` keyword's offset in the source
+    bool strict;         // the code around it is strict
+    bool self_name;      // a named expression, which binds its own name
+    bool method;         // a method: its key comes first
+    bool name_inferred;
+    LazyUp* ups;
+    i32 n_ups;
+}
+
+void lazy_free(LazyFn* lz) {
+    for i32 i = 0; i < lz.n_ups; i++ { free((lz.ups + i).name.data); }
+    if lz.ups != null { free(lz.ups); }
+    LazySource* s = lz.source;
+    s.refs--;
+    if s.refs == 0 { lazy_source_free(s); }
+    free(lz);
+}
+
 struct FnTemplate {
     str name;            // owned copy
     i32 n_params;
@@ -209,6 +289,8 @@ struct FnTemplate {
     str src_text;
     i32 src_start;
     i32 src_end;
+    // not compiled yet: what compiling it on the first call needs; null after
+    LazyFn* lazy;
     // what `--prof` charges to this function
     i64 prof_ops;
     i64 prof_ns;
@@ -419,6 +501,7 @@ void tmpl_pos(FnTemplate* t, i32 code_off, i32* line, i32* col) {
 }
 
 void template_free(FnTemplate* t) {
+    if t.lazy != null { lazy_free(t.lazy); t.lazy = null; }
     for i32 i = 0; i < t.n_subs; i++ {
         template_free(*(t.subs + i));
     }
