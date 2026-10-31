@@ -92,6 +92,8 @@ struct FScope {
     bool is_async;
     bool needs_arguments;   // references `arguments`; build it at call time
     bool super_call_ok;     // a derived class constructor: super() is allowed
+    Node** ctor_fields;     // a derived constructor's fields, defined where super() returns
+    i32 n_ctor_fields;
     bool static_home;       // a static member: `super.x` is the parent class
     i32 loop_floor;         // loops below this index belong to an enclosing
                             // scope a break or continue may not reach
@@ -303,6 +305,8 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.is_async = false;
     fs.needs_arguments = false;
     fs.super_call_ok = false;
+    fs.ctor_fields = null;
+    fs.n_ctor_fields = 0;
     // an arrow has no home object of its own; it uses the one around it
     fs.static_home = is_arrow && parent != null ? parent.static_home : false;
     fs.loop_floor = 0;
@@ -2053,6 +2057,14 @@ private void compile_call(Compiler* co, Node* n) {
         i32 c = compile_args(co, &n.kids);
         // both super forms forward new.target to the base constructor
         if c >= 0 { ch_op_u16(ch, OP_SUPERCALL, c); } else { ch_op(ch, OP_SUPERCALL_ARRAY); }
+        // the fields go on the object super() returned, as soon as it returns
+        if co.cur.ctor_fields != null {
+            // once: a super() inside an initializer is an error reported elsewhere
+            Node** fields = co.cur.ctor_fields;
+            co.cur.ctor_fields = null;
+            emit_field_inits(co, fields, co.cur.n_ctor_fields);
+            co.cur.ctor_fields = fields;
+        }
         return;
     }
     if (callee.kind == N_MEMBER || callee.kind == N_INDEX) && callee.a.kind == N_SUPER {
@@ -3204,6 +3216,25 @@ private bool contains_super_call(Node* n) {
     return false;
 }
 
+// Whether super() is called from an arrow inside `n`.
+private bool arrow_super_call(Node* n) {
+    if n == null { return false; }
+    if n.kind == N_FUNCTION { return (n.flags & NF_ARROW) != 0 && contains_super_call(n); }
+    if arrow_super_call(n.a) || arrow_super_call(n.b)
+        || arrow_super_call(n.c) || arrow_super_call(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if arrow_super_call(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+private bool arrow_super_call_list(NodeList* list) {
+    for i32 i = 0; i < list.len; i++ {
+        if arrow_super_call(*(list.items + i)) { return true; }
+    }
+    return false;
+}
+
 // A field initializer or static block is not a function of its own: it may
 // not mention `arguments`, and may not call super().
 private void class_init_rules(Compiler* co, Node* at, Node* body) {
@@ -3740,6 +3771,13 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     }
 
     bool injected = n_fields == 0;
+    // a derived constructor defines them at its super() call instead,
+    // unless that call is in an arrow, where `this` is the arrow's
+    if !injected && co.cur.super_call_ok && !arrow_super_call_list(list) {
+        co.cur.ctor_fields = fields;
+        co.cur.n_ctor_fields = n_fields;
+        injected = true;
+    }
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if function_decl_of(s) != null { continue; }
