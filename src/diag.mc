@@ -50,10 +50,19 @@ void diags_free(DiagList* d) {
     d.n_errors = 0;
 }
 
+// Past this many a source's diagnostics are counted, not kept: a
+// garbage script has one every few bytes, and each one printed finds
+// its line from the start.
+const i32 DIAG_KEEP_MAX = 100;
+
 // The message is copied; callers keep ownership of theirs.
 void diag_add(DiagList* d, i32 severity, Span span, str message) {
     if d.muted > 0 {
         d.n_suppressed++;
+        return;
+    }
+    if d.list.len >= DIAG_KEEP_MAX {
+        if severity == DIAG_ERROR { d.n_errors++; }
         return;
     }
     u8* copy = alloc<u8>(message.len + 1);

@@ -27,6 +27,8 @@ struct Parser {
     i32 in_async;      // > 0 where `await` is a keyword
     i32 in_gen;        // > 0 where `yield` is a keyword
     i32 fn_depth;      // functions entered; 0 is the top level
+    i32 depth;         // parse_assign, parse_unary, parse_statement open
+    bool too_deep;     // past PARSE_DEPTH_MAX: the rest skipped, its errors not said
     bool module_top;   // the top level is a module's, where `await` is a
                        // keyword; in a script it is an ordinary name
     DiagList* diags;
@@ -60,6 +62,8 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.in_async = 0;
     p.in_gen = 0;
     p.fn_depth = 0;
+    p.depth = 0;
+    p.too_deep = false;
     p.module_top = false;
     p.arrow_fail = null;
     p.cur = contextualize(p, lexer_next(&p.lx));
@@ -82,6 +86,8 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.in_async = 0;
     p.in_gen = 0;
     p.fn_depth = 0;
+    p.depth = 0;
+    p.too_deep = false;
     p.module_top = false;
     p.arrow_fail = null;
     p.cur = contextualize(p, lexer_next(&p.lx));
@@ -91,19 +97,21 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
 // expression alike, an arrow, or with `method` a method from its key;
 // null when the text there is none of them.
 Node* parse_function_at(Parser* p, bool method) {
+    Node* n = null;
     if method {
         i32 start = p.cur.start;
         ignore prop_name(p);
         if !at(p, TOK_LPAREN) { return null; }
-        return parse_callable(p, NF_METHOD, start);
-    }
-    if p.cur.kind == TOK_KW_FUNCTION {
+        n = parse_callable(p, NF_METHOD, start);
+    } else if p.cur.kind == TOK_KW_FUNCTION {
         i32 fstart = p.cur.start;
         advance(p);
-        return parse_function_rest(p, 0, false, fstart);
+        n = parse_function_rest(p, 0, false, fstart);
+    } else {
+        n = parse_assign(p);
+        if n == null || n.kind != N_FUNCTION || (n.flags & NF_ARROW) == 0 { return null; }
     }
-    Node* n = parse_assign(p);
-    if n == null || n.kind != N_FUNCTION || (n.flags & NF_ARROW) == 0 { return null; }
+    if n != null && tree_deeper_than(n, AST_DEPTH_MAX) { diag_add(p.diags, DIAG_ERROR, n.span, "Nesting too deep"); }
     return n;
 }
 
@@ -112,6 +120,64 @@ void parser_destroy(Parser* p) {
     vec_free(&p.scratch);
     vec_free(&p.labels);
     lexer_destroy(&p.lx);
+}
+
+// --- nesting limits -------------------------------------------------
+
+// The parser recurses per level of nesting, and lowering and the
+// compiler per level of the tree, which a left-deep chain (a+b+c...,
+// f()()..., a.b.c...) deepens without the parser recursing. Past these
+// the source is a SyntaxError, as an engine's stack limit makes it,
+// rather than the end of the program's stack. A wasm module's stack is
+// a sixth of a native thread's: 600 parentheses overflow it.
+when os(wasm) {
+    const i32 PARSE_DEPTH_MAX = 500;
+    const i32 AST_DEPTH_MAX = 500;
+}
+when !os(wasm) {
+    const i32 PARSE_DEPTH_MAX = 3000;
+    const i32 AST_DEPTH_MAX = 3000;
+}
+
+// Whether some path from `root` is longer than `max` nodes, without
+// recursing.
+bool tree_deeper_than(Node* root, i32 max) {
+    Vec<NodePtr> nodes;
+    vec_init<NodePtr>(&nodes, 64);
+    defer vec_free(&nodes);
+    Vec<i32> depths;
+    vec_init<i32>(&depths, 64);
+    defer vec_free(&depths);
+    vec_push(&nodes, root);
+    vec_push(&depths, 1);
+    while nodes.len > 0 {
+        nodes.len--;
+        depths.len--;
+        Node* n = nodes.data[nodes.len];
+        i32 d = depths.data[depths.len];
+        if n == null { continue; }
+        if d > max { return true; }
+        Node*[4] sub = { n.a, n.b, n.c, n.d };
+        for i32 i = 0; i < 4; i++ {
+            if sub[i] != null { vec_push(&nodes, sub[i]); vec_push(&depths, d + 1); }
+        }
+        for i32 i = 0; i < n.kids.len; i++ {
+            vec_push(&nodes, n.kids.items[i]);
+            vec_push(&depths, d + 1);
+        }
+    }
+    return false;
+}
+
+// The rest of the source skipped, once the nesting is past the limit:
+// every caller up the stack then meets the end and returns.
+private Node* too_deep(Parser* p) {
+    perror(p, "Nesting too deep");
+    p.too_deep = true;
+    Node* n = nnew(p, N_ERROR);
+    p.lx.pos = p.lx.src.len;
+    advance(p);
+    return nfin(p, n);
 }
 
 // --- core helpers ---------------------------------------------------
@@ -193,6 +259,8 @@ private bool eat(Parser* p, i32 k) {
 }
 
 private void perror(Parser* p, str msg) {
+    // each level the skip unwinds would say what it missed
+    if p.too_deep { return; }
     diag_add(p.diags, DIAG_ERROR, Span{p.cur.start, p.cur.end}, msg);
 }
 
@@ -1302,6 +1370,14 @@ private Node* parse_postfix(Parser* p) {
 }
 
 private Node* parse_unary(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_unary_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_unary_in(Parser* p) {
     i32 k = p.cur.kind;
     if k == TOK_BANG || k == TOK_TILDE || k == TOK_PLUS || k == TOK_MINUS
         || k == TOK_KW_TYPEOF || k == TOK_KW_VOID || k == TOK_KW_DELETE {
@@ -1519,6 +1595,14 @@ private Node* ident_arrow(Parser* p, i32 flags) {
 }
 
 Node* parse_assign(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_assign_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_assign_in(Parser* p) {
     i32 k = p.cur.kind;
     if k == TOK_KW_YIELD {
         if p.cur.escaped { perror(p, "Keyword must not contain escaped characters"); }
@@ -2279,6 +2363,14 @@ private void refuse_function_in_single(Parser* p, i32 single, bool gen, bool asy
 }
 
 Node* parse_statement(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_statement_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_statement_in(Parser* p) {
     i32 single = p.single;
     p.single = 0;
     i32 k = p.cur.kind;
@@ -2480,5 +2572,11 @@ Node* parse_program(Parser* p) {
         }
     }
     n.kids = finish_kids(p, mark);
+    // lowering runs on the tree whatever the errors: a tree too deep for
+    // it is not handed on
+    if !p.too_deep && tree_deeper_than(n, AST_DEPTH_MAX) {
+        diag_add(p.diags, DIAG_ERROR, Span{0, 0}, "Nesting too deep");
+        n.kids.len = 0;
+    }
     return nfin(p, n);
 }
