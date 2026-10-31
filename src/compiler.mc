@@ -3229,8 +3229,8 @@ private bool lazy_eligible(Compiler* co, Node* f) {
 private LazySource* lazy_source(Compiler* co) {
     if co.lazy_src != null { return co.lazy_src; }
     LazySource* s = new(LazySource);
-    s.src = co.src;
-    s.src_name = co.src_name;
+    s.src = lazy_str(co.src);
+    s.src_name = lazy_str(co.src_name);
     s.n_lines = co.n_lines;
     s.line_starts = alloc<i32>(co.n_lines > 0 ? co.n_lines : 1);
     memcpy(cast(u8*, s.line_starts), cast(u8*, co.line_starts), cast(i64, co.n_lines) * 4);
@@ -3305,18 +3305,18 @@ private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
         if !arrow && (str_equal(nm, "this") || str_equal(nm, "arguments") || str_equal(nm, "%newtarget")) { continue; }
         if str_equal(nm, "%super") { continue; }
         if strmap_get<i32>(&mine, nm) != null { continue; }
-        // an import is read through its dependency's namespace binding
+        // a binding in scope first, as a load resolves it; else an import,
+        // read through its dependency's namespace binding
+        if resolve_upval(&fs, nm) >= 0 { continue; }
         if co.in_module {
             ModImport* mi = strmap_get<ModImport>(&co.mod_imports, nm);
-            if mi != null { ignore resolve_upval(&fs, mi.slot_name); continue; }
+            if mi != null { ignore resolve_upval(&fs, mi.slot_name); }
         }
-        ignore resolve_upval(&fs, nm);
     }
     // a store to an exported binding writes the module's namespace too
     if co.in_module && co.ns_name.len > 0 { ignore resolve_upval(&fs, co.ns_name); }
     LazyFn* lz = new(LazyFn);
     lz.source = lazy_source(co);
-    lz.source.refs++;
     lz.start = f.span.start;
     lz.strict = co.strict;
     lz.self_name = self_name;
@@ -3337,13 +3337,15 @@ private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
     bool has_rest = f.kids.len > 0 && ((*(f.kids.items + f.kids.len - 1)).flags & NF_REST) != 0;
     FnTemplate* t = chunk_finish(&fs.ch, f.name, f.kids.len, 0, has_rest, false, false);
     t.lazy = lz;
+    t.owner = lz.source;
+    t.owner.refs++;
     t.not_ctor = arrow || lz.method;
     // what compile_function_tmpl would have taken for itself
     co.next_static_home = false;
     co.next_is_derived_ctor = false;
     t.sloppy = !(co.strict || (f.a.kind == N_BLOCK && has_use_strict(&f.a.kids)));
-    t.src_name = co.src_name;
-    t.src_text = co.src;
+    t.src_name = lz.source.src_name;
+    t.src_text = lz.source.src;
     t.src_start = f.span.start;
     t.src_end = f.span.end;
     i32 arity = 0;

@@ -196,7 +196,7 @@ struct LazyExport {
 }
 
 struct LazySource {
-    str src;             // borrowed: the source outlives its templates
+    str src;             // owned copies: an embedder may free its text after the run
     str src_name;
     i32* line_starts;    // owned
     i32 n_lines;
@@ -218,6 +218,8 @@ str lazy_str(str s) {
 }
 
 private void lazy_source_free(LazySource* s) {
+    free(s.src.data);
+    free(s.src_name.data);
     free(s.line_starts);
     if s.ns_name.data != null { free(s.ns_name.data); }
     for i32 i = 0; i < s.n_imports; i++ {
@@ -251,9 +253,6 @@ struct LazyFn {
 void lazy_free(LazyFn* lz) {
     for i32 i = 0; i < lz.n_ups; i++ { free((lz.ups + i).name.data); }
     if lz.ups != null { free(lz.ups); }
-    LazySource* s = lz.source;
-    s.refs--;
-    if s.refs == 0 { lazy_source_free(s); }
     free(lz);
 }
 
@@ -291,6 +290,9 @@ struct FnTemplate {
     i32 src_end;
     // not compiled yet: what compiling it on the first call needs; null after
     LazyFn* lazy;
+    // a lazy function's source copy, which its text and its subs' point into;
+    // the last template that holds it frees it
+    LazySource* owner;
     // what `--prof` charges to this function
     i64 prof_ops;
     i64 prof_ns;
@@ -511,5 +513,7 @@ void template_free(FnTemplate* t) {
     if t.upvals != null { free(t.upvals); }
     if t.subs != null { free(t.subs); }
     if t.pos != null { free(t.pos); }
+    LazySource* owner = t.owner;
     free(t);
+    if owner != null { owner.refs--; if owner.refs == 0 { lazy_source_free(owner); } }
 }
