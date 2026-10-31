@@ -32,6 +32,11 @@ struct Parser {
     DiagList* diags;
     Bump* arena;
     Vec<NodePtr> scratch;
+    // per source position, the contexts an arrow attempt failed in
+    // (arrow_ctx): a '(' tried as an arrow head is tried once. Without it
+    // the parameter defaults, which try every '(' inside them again, make
+    // nested parentheses exponential (reCAPTCHA's bundle never finished).
+    u32* arrow_fail;
 }
 
 struct PState {
@@ -56,6 +61,7 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.in_gen = 0;
     p.fn_depth = 0;
     p.module_top = false;
+    p.arrow_fail = null;
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -77,6 +83,7 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.in_gen = 0;
     p.fn_depth = 0;
     p.module_top = false;
+    p.arrow_fail = null;
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -101,6 +108,7 @@ Node* parse_function_at(Parser* p, bool method) {
 }
 
 void parser_destroy(Parser* p) {
+    if p.arrow_fail != null { free(p.arrow_fail); }
     vec_free(&p.scratch);
     vec_free(&p.labels);
     lexer_destroy(&p.lx);
@@ -1407,9 +1415,20 @@ private Node* parse_yield(Parser* p) {
     return nfin(p, y);
 }
 
+// The context an arrow attempt's outcome depends on, as one bit of
+// arrow_fail.
+private u32 arrow_ctx(Parser* p, i32 flags) {
+    i32 b = ((flags & NF_ASYNC) != 0 ? 1 : 0) | (p.in_async > 0 ? 2 : 0) | (p.in_gen > 0 ? 4 : 0)
+        | (p.no_in > 0 ? 8 : 0) | (p.strict > 0 ? 16 : 0);
+    return cast(u32, 1) << cast(u32, b);
+}
+
 // Arrow attempt from '(' or '<'. Returns null (state restored) if the
 // tokens are not an arrow head.
 private Node* try_arrow(Parser* p, i32 flags) {
+    i32 at_pos = p.cur.start;
+    u32 ctx = arrow_ctx(p, flags);
+    if p.arrow_fail != null && at_pos >= 0 && at_pos < p.lx.src.len && (p.arrow_fail[at_pos] & ctx) != 0 { return null; }
     PState st = psave(p);
     i32 base = p.diags.n_suppressed;
     diags_mute(p.diags);
@@ -1436,6 +1455,13 @@ private Node* try_arrow(Parser* p, i32 flags) {
         // what this attempt suppressed is forgotten with it: an arrow being
         // tried around this one counts only its own
         p.diags.n_suppressed = base;
+        if at_pos >= 0 && at_pos < p.lx.src.len {
+            if p.arrow_fail == null {
+                p.arrow_fail = alloc<u32>(p.lx.src.len);
+                memset(cast(u8*, p.arrow_fail), 0, cast(i64, p.lx.src.len) * 4);
+            }
+            p.arrow_fail[at_pos] |= ctx;
+        }
         return null;
     }
     Node* fun = nnew(p, N_FUNCTION);
