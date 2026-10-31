@@ -9,13 +9,14 @@ import vm;
 import builtins;
 import module;
 import prof;
+import compiler;
 import version;
 
 const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
 
 private void print_usage() {
-    print("usage: tsmc [--gc-stress] [--prof] <script.ts>\n");
+    print("usage: tsmc [--gc-stress] [--prof] [--lazy] <script.ts>\n");
     print("       tsmc --version\n");
 }
 
@@ -43,6 +44,8 @@ i32 tsmc_main() {
         if str_equal(a, "--gc-stress") { gc_stress = true; i++; continue; }
         // a sampling profile of the run and its counts, on stderr at exit
         if str_equal(a, "--prof") { profile = true; i++; continue; }
+        // functions in a large source compiled on their first call
+        if str_equal(a, "--lazy") { lazy_functions = true; i++; continue; }
         break;
     }
     // the first non-flag argument is the script; anything after it is

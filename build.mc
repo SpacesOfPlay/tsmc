@@ -800,6 +800,8 @@ void run_golden_tests(str exe, DirList* scripts) {
             .capture = true,
             .split_stderr = true
         };
+        // the lazy_ tests run with lazy functions on, the way an embedder turns them on
+        if str_starts_with(name, "lazy_") { c.args[1] = "--lazy"; c.args[2] = str_from(src.data, src.len); }
         golden_check(path_stem(name), str_from(src.data, src.len), &c);
     }
     return;

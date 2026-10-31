@@ -205,6 +205,7 @@ struct Compiler {
     bool lazy_ok;           // a large source: plain functions compile on their first call
     LazySource* lazy_src;   // shared by the lazy functions of this compile
     FnTemplate* prefill;    // a lazy function being compiled: its closures' upvalues, in order
+    Node* eager_fn;         // a function about to be called where it is written
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
     i32* line_starts;   // byte offset where each line of src begins
@@ -215,6 +216,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.lazy_ok = false;
     co.lazy_src = null;
     co.prefill = null;
+    co.eager_fn = null;
     co.diags = diags;
     co.heap = heap;
     co.atoms = atoms;
@@ -265,7 +267,7 @@ void compiler_set_source(Compiler* co, str src, str src_name) {
     }
     co.line_starts = starts;
     co.n_lines = n;
-    co.lazy_ok = src.len >= LAZY_MIN_SOURCE;
+    co.lazy_ok = lazy_functions && src.len >= LAZY_MIN_SOURCE;
 }
 
 // A lazy function's compile: the source it came from, its line table
@@ -2074,6 +2076,9 @@ private void compile_delete_opt(Compiler* co, Node* t) {
 private void compile_call(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     Node* callee = n.a;
+    // a function called where it is written runs now: compiled now, not twice
+    if callee.kind == N_FUNCTION { co.eager_fn = callee; }
+    else if (callee.kind == N_MEMBER || callee.kind == N_INDEX) && callee.a != null && callee.a.kind == N_FUNCTION { co.eager_fn = callee.a; }
     if callee.kind == N_IMPORT_EXPR {
         // dynamic import(spec): compile the specifier, then hand it and this
         // module's path to the runtime loader (OP_DYNIMPORT -> a promise).
@@ -3159,7 +3164,17 @@ private void compile_function(Compiler* co, Node* f, bool self_name) {
 // function that calls eval, uses with or names super, and an arrow in a
 // static block. The source's early errors are
 // the parse's, which still covers the whole source; the few the
-// compiler reports surface on the first call instead.
+// compiler reports surface on the first call instead. A function called
+// where it is written, (function () { ... })(), runs at once and is
+// compiled at once.
+
+// Off unless the embedder turns it on: a function compiled lazily that
+// runs anyway is parsed twice, and the lazy functions inside it once more
+// per level, so a page that runs most of its bundle pays more than it
+// saves. Measured on the brmc corpus: 8 of 10 script-heavy pages slower,
+// the one that ships most code it never runs (165 modules) 10% faster.
+// A pre-parse that skips nested bodies is what would make it pay.
+bool lazy_functions = false;
 
 const i32 LAZY_MIN_SOURCE = 65536;
 const i32 LAZY_MIN_FN = 256;
@@ -3212,7 +3227,7 @@ private bool plain_method_text(str s, i32 at) {
 }
 
 private bool lazy_eligible(Compiler* co, Node* f) {
-    if !co.lazy_ok || co.cur == null || co.in_params || co.in_static_block { return false; }
+    if !co.lazy_ok || co.cur == null || co.in_params || co.in_static_block || f == co.eager_fn { return false; }
     // inside a with body its names resolve against the object, at run time
     if co.cur.withs.len > 0 { return false; }
     if (f.flags & (NF_GENERATOR | NF_ASYNC | NF_SIGNATURE | NF_GETTER | NF_SETTER)) != 0 { return false; }

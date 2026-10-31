@@ -129,6 +129,8 @@ struct VM {
     GcHeap heap;
     AtomTable atoms;
     Prof* prof;                // the `--prof` accounting, or null
+    i32 lazy_compiles;         // lazy functions compiled on their first call
+    i64 lazy_ns;               // and the time that took
     Value* stack;
     i32 sp;
     Frame* frames;
@@ -8344,6 +8346,8 @@ else {
 // A lazy function's first call: reparsed from its source and compiled
 // into its template. False with a SyntaxError thrown when it does not.
 bool vm_lazy_compile(VM* vm, FnTemplate* t) {
+    u64 t0 = vm_clock_ns();
+    defer vm_lazy_account(vm, t0);
     LazyFn* lz = t.lazy;
     LazySource* s = lz.source;
     DiagList d;
@@ -8376,6 +8380,11 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
     bump_destroy(&arena);
     diags_free(&d);
     return ok;
+}
+
+private void vm_lazy_account(VM* vm, u64 t0) {
+    vm.lazy_compiles++;
+    vm.lazy_ns += cast(i64, vm_clock_ns() - t0);
 }
 
 i32 vm_run_source(VM* vm, str src, str src_name) {
