@@ -4259,6 +4259,11 @@ void vm_destroy(VM* vm) {
 
 // --- dispatch loop -----------------------------------------------------------------------
 
+// A jump's target: four bytes (bytecode.mc, ch_target).
+private i32 rd_target(u8* code, i32 at) {
+    return cast(i32, cast(u32, *(code + at)) | (cast(u32, *(code + at + 1)) << 8) | (cast(u32, *(code + at + 2)) << 16) | (cast(u32, *(code + at + 3)) << 24));
+}
+
 private i32 rd_u16(u8* code, i32 at) {
     i32 lo = *(code + at);
     i32 hi = *(code + at + 1);
@@ -4915,9 +4920,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if r >= 0 { vpush(vm, value_bool(r == 1)); }
             }
             case OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF: {
-                ip += 2;
+                ip += 4;
                 i32 r = cmp_rel(vm, rel_base(op));
-                if r == 0 { ip = rd_u16(code, ip - 2); }
+                if r == 0 { ip = rd_target(code, ip - 4); }
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
                 // an object operand becomes a primitive first, which is how
@@ -5039,7 +5044,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JUMP: {
-                i32 target = rd_u16(code, ip);
+                i32 target = rd_target(code, ip);
                 if target < ip && vm.deadline_ns != 0 {
                     vm.deadline_tick++;
                     if (vm.deadline_tick & 4095) == 0 && vm_clock_ns() > vm.deadline_ns {
@@ -5051,8 +5056,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 ip = target;
             }
             case OP_JUMPF: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 // what a comparison leaves is a boolean, which needs no test
                 vm.sp--;
                 if value_is_bool(*(vm.stack + vm.sp)) {
@@ -5062,8 +5067,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JUMPT: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 vm.sp--;
                 if value_is_bool(*(vm.stack + vm.sp)) {
                     if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { ip = target; }
@@ -5072,18 +5077,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JF_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if !js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
             }
             case OP_JT_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
             }
             case OP_JNN_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if !is_nullish(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
             }
             case OP_CLOSURE: {
@@ -5412,8 +5417,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 op_delete_index(vm, !t.sloppy);
             }
             case OP_TRY_PUSH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if vm.hp >= VM_HANDLERS_MAX {
                     vm_throw_error(vm, ERR_RANGE, "too many nested try blocks");
                 } else {
@@ -5667,16 +5672,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JUMP_NULLISH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if is_nullish(vpeek(vm, 0)) {
                     vm.sp--;
                     ip = target;
                 }
             }
             case OP_JUMP_NULLISH_METH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_target(code, ip);
+                ip += 4;
                 if is_nullish(vpeek(vm, 1)) {
                     vm.sp -= 2;
                     ip = target;

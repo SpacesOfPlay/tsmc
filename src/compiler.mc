@@ -2730,7 +2730,7 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
-            ch_op_u16(ch, OP_JUMP, lstart);
+            ch_op_target(ch, OP_JUMP, lstart);
             ch_patch(ch, jdone);               // [res]: the delegate is done
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
@@ -2765,7 +2765,7 @@ private void compile_expr(Compiler* co, Node* n) {
             i32 jthrowdone = ch_jump(ch, OP_JUMPT);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
-            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jthrowdone);          // [res]
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
@@ -2807,7 +2807,7 @@ private void compile_expr(Compiler* co, Node* n) {
             i32 jretdone = ch_jump(ch, OP_JUMPT);
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
-            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jretdone);            // [res]
             ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
@@ -4263,7 +4263,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op(ch, OP_ADD);
     ch_op_u16(ch, OP_SETLOCAL, t_idx);
     ch_op(ch, OP_POP);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_patch(ch, jskip);
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -4352,7 +4352,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
 
     i32 lcont = ch_pos(ch);
     patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the result object under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -4432,7 +4432,7 @@ private void compile_for_of(Compiler* co, Node* n) {
 
     i32 lcont = ch_pos(ch);
     patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the final value under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -4497,7 +4497,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         compile_stmt(co, n.b);
         ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
-        ch_op_u16(ch, OP_JUMP, lcond);
+        ch_op_target(ch, OP_JUMP, lcond);
         ch_patch(ch, jend);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
@@ -4511,7 +4511,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 lcond = ch_pos(ch);
         patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
         compile_expr(co, n.b);
-        ch_op_u16(ch, OP_JUMPT, lstart);
+        ch_op_target(ch, OP_JUMPT, lstart);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
     }
@@ -4561,7 +4561,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             compile_expr(co, n.c);
             ch_op(ch, OP_POP);
         }
-        ch_op_u16(ch, OP_JUMP, lcond);
+        ch_op_target(ch, OP_JUMP, lcond);
         if jend >= 0 { ch_patch(ch, jend); }
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         fs.binds.len = saved_binds;

@@ -102,7 +102,7 @@ enum Op {
     OP_DELPROP,      // u16 const idx
     OP_DELINDEX,
 
-    OP_TRY_PUSH,     // u16 catch target
+    OP_TRY_PUSH,     // i32 catch target
     OP_TRY_POP,
     OP_CATCH_ENTER,  // at a catch target: re-throw a return completion instead
                      // of binding it, so only `finally` sees it
@@ -371,25 +371,37 @@ i32 ch_add_const(Chunk* ch, Value v) {
     return ch.consts.len - 1;
 }
 
+// A code position, as every jump carries it: four bytes, so a function's
+// code may pass 64 KB (a bundle's data literal in one function does).
+void ch_target(Chunk* ch, i32 v) {
+    vec_push(&ch.code, cast(u8, v));
+    vec_push(&ch.code, cast(u8, v >> 8));
+    vec_push(&ch.code, cast(u8, v >> 16));
+    vec_push(&ch.code, cast(u8, v >> 24));
+}
+
+// A jump to a position already known (a loop's start).
+void ch_op_target(Chunk* ch, i32 op, i32 target) {
+    ch_op(ch, op);
+    ch_target(ch, target);
+}
+
 // Emits a jump with a placeholder target; returns the patch position.
 i32 ch_jump(Chunk* ch, i32 op) {
     ch_op(ch, op);
     i32 at = ch.code.len;
-    ch_u16(ch, 0xFFFF);
+    ch_target(ch, -1);
     return at;
 }
 
-void ch_patch(Chunk* ch, i32 at) {
-    i32 target = ch.code.len;
-    if target > ch.max_target { ch.max_target = target; }
-    vec_set(&ch.code, at, cast(u8, target));
-    vec_set(&ch.code, at + 1, cast(u8, target >> 8));
-}
+void ch_patch(Chunk* ch, i32 at) { ch_patch_to(ch, at, ch.code.len); }
 
 void ch_patch_to(Chunk* ch, i32 at, i32 target) {
     if target > ch.max_target { ch.max_target = target; }
     vec_set(&ch.code, at, cast(u8, target));
     vec_set(&ch.code, at + 1, cast(u8, target >> 8));
+    vec_set(&ch.code, at + 2, cast(u8, target >> 16));
+    vec_set(&ch.code, at + 3, cast(u8, target >> 24));
 }
 
 i32 ch_pos(Chunk* ch) {
