@@ -932,9 +932,6 @@ Value js_to_string_value(VM* vm, Value v) {
         if value_is_true(v) { lit = "true"; } else { lit = "false"; }
         have = true;
     }
-    if value_is_function(v) || value_is_native(v) {
-        return vm_function_source(vm, v);
-    }
     if have {
         GcString* g = gc_new_string(&vm.heap, lit);
         return value_cell(&g.head);
