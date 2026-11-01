@@ -1664,10 +1664,17 @@ struct RxCtx {
     i32 len;
     i32* caps;
     i32 steps;
+    i32 depth;      // m's recursion, bounded by RX_DEPTH_LIMIT
     i32 look_end;   // target end position for the active lookbehind
 }
 
 const i32 RX_STEP_LIMIT = 2000000;
+// The matcher recurses once per alternative taken and per repetition of a
+// loop whose body is more than one atom; past this depth the path fails,
+// where it ended the stack before. A frame is about 150 bytes: the limit
+// stays well inside a 1 MB main stack on Windows, an 8 MB one elsewhere.
+when os(windows) { const i32 RX_DEPTH_LIMIT = 3000; }
+when !os(windows) { const i32 RX_DEPTH_LIMIT = 8000; }
 
 private u8 fold(u8 c) {
     if c >= 'A' && c <= 'Z' { return cast(u8, c + 32); }
@@ -1717,66 +1724,63 @@ private bool at_boundary(RxCtx* cx, i32 sp) {
     return before != after;
 }
 
+// One of the single-position atoms (a byte, `.`, a class) against sp:
+// the bytes it consumes, or -1 when it does not match there.
+private i32 atom_len(RxCtx* cx, RxInst* inst, i32 sp) {
+    i32 op = inst.op;
+    if sp >= cx.len { return -1; }
+    u8 c = *(cx.s + sp);
+    if op == I_CHAR {
+        return byte_eq(cx, c, cast(u8, inst.x)) ? 1 : -1;
+    }
+    if op == I_ANY {
+        if !cx.prog.dotall && (c == '\n' || c == '\r') { return -1; }
+        // u mode: `.` consumes a whole code point
+        if cx.prog.unicode && c >= 0x80 {
+            i32 sl = utf8_seq_len(c);
+            return sp + sl <= cx.len ? sl : 1;
+        }
+        return 1;
+    }
+    if cx.prog.unicode && c >= 0x80 {
+        // u mode: decode and test a full code point
+        i32 sl = utf8_seq_len(c);
+        i32 cp = c;
+        if sl == 2 && sp + 1 < cx.len {
+            cp = ((c & 0x1F) << 6) | (*(cx.s + sp + 1) & 0x3F);
+        } else if sl == 3 && sp + 2 < cx.len {
+            cp = ((c & 0x0F) << 12) | ((*(cx.s + sp + 1) & 0x3F) << 6) | (*(cx.s + sp + 2) & 0x3F);
+        } else if sl == 4 && sp + 3 < cx.len {
+            cp = ((c & 0x07) << 18) | ((*(cx.s + sp + 1) & 0x3F) << 12) | ((*(cx.s + sp + 2) & 0x3F) << 6) | (*(cx.s + sp + 3) & 0x3F);
+        }
+        return class_match(cx, inst.cls, cp) ? sl : -1;
+    }
+    return class_match(cx, inst.cls, cast(i32, c)) ? 1 : -1;
+}
+
+private bool is_atom(RxInst* inst) { return inst.op == I_CHAR || inst.op == I_ANY || inst.op == I_CLASS; }
+
 // Returns the end position, or -1 on failure.
 private i32 m(RxCtx* cx, i32 pc, i32 sp) {
+    if cx.depth >= RX_DEPTH_LIMIT { return -1; }
+    cx.depth++;
+    i32 r = m_in(cx, pc, sp);
+    cx.depth--;
+    return r;
+}
+
+private i32 m_in(RxCtx* cx, i32 pc, i32 sp) {
     while true {
         cx.steps++;
         if cx.steps > RX_STEP_LIMIT { return -1; }
         RxInst* inst = cx.prog.code + pc;
         i32 op = inst.op;
-        if op == I_CHAR {
-            if sp < cx.len && byte_eq(cx, *(cx.s + sp), cast(u8, inst.x)) {
-                pc++;
-                sp++;
-                continue;
-            }
-            return -1;
-        }
-        if op == I_ANY {
-            if sp < cx.len {
-                u8 c = *(cx.s + sp);
-                if cx.prog.dotall || (c != '\n' && c != '\r') {
-                    pc++;
-                    // u mode: `.` consumes a whole code point
-                    if cx.prog.unicode && c >= 0x80 {
-                        i32 sl = utf8_seq_len(c);
-                        if sp + sl <= cx.len { sp += sl; } else { sp++; }
-                    } else {
-                        sp++;
-                    }
-                    continue;
-                }
-            }
-            return -1;
-        }
-        if op == I_CLASS {
-            if sp < cx.len {
-                u8 c = *(cx.s + sp);
-                if cx.prog.unicode && c >= 0x80 {
-                    // u mode: decode and test a full code point
-                    i32 sl = utf8_seq_len(c);
-                    i32 cp = c;
-                    if sl == 2 && sp + 1 < cx.len {
-                        cp = ((c & 0x1F) << 6) | (*(cx.s + sp + 1) & 0x3F);
-                    } else if sl == 3 && sp + 2 < cx.len {
-                        cp = ((c & 0x0F) << 12) | ((*(cx.s + sp + 1) & 0x3F) << 6) | (*(cx.s + sp + 2) & 0x3F);
-                    } else if sl == 4 && sp + 3 < cx.len {
-                        cp = ((c & 0x07) << 18) | ((*(cx.s + sp + 1) & 0x3F) << 12) | ((*(cx.s + sp + 2) & 0x3F) << 6) | (*(cx.s + sp + 3) & 0x3F);
-                    }
-                    if class_match(cx, inst.cls, cp) {
-                        pc++;
-                        sp += sl;
-                        continue;
-                    }
-                    return -1;
-                }
-                if class_match(cx, inst.cls, cast(i32, c)) {
-                    pc++;
-                    sp++;
-                    continue;
-                }
-            }
-            return -1;
+        if op == I_CHAR || op == I_ANY || op == I_CLASS {
+            i32 n = atom_len(cx, inst, sp);
+            if n < 0 { return -1; }
+            pc++;
+            sp += n;
+            continue;
         }
         if op == I_MATCH { return sp; }
         if op == I_LOOK_DONE { return sp; }
@@ -1787,6 +1791,36 @@ private i32 m(RxCtx* cx, i32 pc, i32 sp) {
         }
         if op == I_JMP { pc = inst.x; continue; }
         if op == I_SPLIT {
+            // A greedy loop over one atom (a*, .*, [^x]+): the repetitions
+            // are counted and the continuation tried from the longest run
+            // back, one call deep. Taking the loop's branch recursively
+            // once per repetition ended the stack on a long subject.
+            RxInst* body = null;
+            if inst.x == pc + 1 && pc + 2 < cx.prog.code_len {
+                RxInst* j = cx.prog.code + pc + 2;
+                if j.op == I_JMP && j.x == pc { body = cx.prog.code + pc + 1; }
+            } else if pc >= 1 && inst.x == pc - 1 {
+                body = cx.prog.code + pc - 1;
+            }
+            if body != null && is_atom(body) {
+                i32 end = sp;
+                while true {
+                    cx.steps++;
+                    if cx.steps > RX_STEP_LIMIT { return -1; }
+                    i32 n = atom_len(cx, body, end);
+                    if n < 0 { break; }
+                    end += n;
+                }
+                i32 p = end;
+                while true {
+                    i32 r = m(cx, inst.y, p);
+                    if r >= 0 { return r; }
+                    if p <= sp { return -1; }
+                    // back one repetition: a code point in u mode, else a byte
+                    p--;
+                    if cx.prog.unicode { while p > sp && (*(cx.s + p) & 0xC0) == 0x80 { p--; } }
+                }
+            }
             i32 r = m(cx, inst.x, sp);
             if r >= 0 { return r; }
             pc = inst.y;
@@ -1877,6 +1911,7 @@ bool regex_exec(RegexProg* prog, str subject, i32 start, i32* caps) {
     cx.s = subject.data;
     cx.len = subject.len;
     cx.caps = caps;
+    cx.depth = 0;
     cx.look_end = -1;
     i32 base_i = start;
     if base_i < 0 { base_i = 0; }
