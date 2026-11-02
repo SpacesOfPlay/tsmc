@@ -2541,6 +2541,14 @@ private void host_refill(Loader* ld, i32 root) {
     }
 }
 
+// The sources the loader keeps, for a memory report: their bytes and count.
+void module_host_mem(void* h, i64* bytes, i32* n) {
+    Loader* ld = cast(Loader*, h);
+    *bytes = 0;
+    *n = ld.mods.len;
+    for i32 i = 0; i < ld.mods.len; i++ { *bytes += vec_get(&ld.mods, i).src_len; }
+}
+
 // The modules a load is still missing: 0 when none.
 i32 module_host_missing(void* h) { return cast(Loader*, h).host_missing; }
 
