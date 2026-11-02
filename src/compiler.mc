@@ -530,11 +530,25 @@ private i32 name_const(Compiler* co, str name) {
     return ch_add_const(&co.cur.ch, value_int(cast(i32, a)));
 }
 
-// import.meta.url as a file:// URL of the current module, built at compile
-// time from its path (backslashes normalized, a leading slash before a
-// Windows drive letter).
+// Whether the name starts with a URL scheme: letters, digits, + - or .,
+// then a colon, before any slash.
+private bool name_has_scheme(str p) {
+    for i32 i = 0; i < p.len; i++ {
+        u8 c = *(p.data + i);
+        if c == ':' { return i > 0; }
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'));
+        if !ok { return false; }
+    }
+    return false;
+}
+
+// import.meta.url: the module's name when it is a URL already, as an
+// embedder names a module fetched from the web (a bundler derives its
+// public path from it); else a file:// URL of its path (backslashes
+// normalized, a leading slash before a Windows drive letter).
 private i32 import_meta_url_const(Compiler* co) {
     str p = co.src_name;
+    if name_has_scheme(p) { return str_const(co, p); }
     str_buf sb;
     str_buf_init(&sb);
     str_buf_add(&sb, "file://");
