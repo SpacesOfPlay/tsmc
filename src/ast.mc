@@ -7,6 +7,7 @@
 import str;
 import diag;
 import lexer;
+import map;
 
 enum NodeKind {
     N_ERROR,
@@ -145,6 +146,7 @@ struct Node {
     Node* c;
     Node* d;
     NodeList kids;
+    StrMap<i32>* names;   // a function: the compiler's memo of every name its subtree mentions
 }
 
 str node_kind_name(i32 kind) {

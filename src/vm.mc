@@ -131,6 +131,8 @@ struct VM {
     Prof* prof;                // the `--prof` accounting, or null
     i32 lazy_compiles;         // lazy functions compiled on their first call
     i64 lazy_ns;               // and the time that took
+    i32 compiles;              // scripts and modules compiled
+    i64 compile_ns;            // their parse, lower and compile time
     Value* stack;
     i32 sp;
     Frame* frames;
@@ -8397,6 +8399,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
     diags_init(&d);
     Bump arena;
     bump_init(&arena);
+    u64 c0 = vm_clock_ns();
     Parser p;
     parser_init(&p, src, &d, &arena);
     Node* prog = parse_program(&p);
@@ -8414,6 +8417,8 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         FnTemplate* t = compile_program(&co, prog);
         vec_push(&vm.troots, t);
         gc_root_reset(&vm.heap, rmark);
+        vm.compiles++;
+        vm.compile_ns += cast(i64, vm_clock_ns() - c0);
         if d.n_errors == 0 {
             status = vm_run_template(vm, t);
             if status == 0 {

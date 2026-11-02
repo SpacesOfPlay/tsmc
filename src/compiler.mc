@@ -30,6 +30,7 @@ struct CBind {
     str name;
     i32 slot;
     i32 depth;
+    i32 prev;        // the binding of the same name this one shadows, -1 none
     bool is_cell;
     bool is_const;
     bool tdz;
@@ -81,6 +82,7 @@ struct FScope {
     FScope* parent;
     Chunk ch;
     Vec<CBind> binds;
+    StrMap<i32> index;   // name -> its newest binding in binds
     Vec<CUp> ups;
     StrMap<i32> inner;   // names mentioned inside nested functions
     i32 n_slots;
@@ -198,6 +200,7 @@ struct Compiler {
     bool in_static_block;       // directly inside a class static block
     bool in_params;             // compiling parameter defaults
     StrMap<ModImport> mod_imports;   // valid while in_module
+    Vec<NameSet> name_sets;          // the functions' name memos, freed with the compile
     str ns_name;                     // the module namespace binding
     StrMap<i32> export_heads;        // local name -> first ExportName
     Vec<ExportName> export_names;
@@ -212,7 +215,10 @@ struct Compiler {
     i32 n_lines;
 }
 
+type NameSet = StrMap<i32>*;
+
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
+    co.name_sets = vec_new<NameSet>(16);
     co.lazy_ok = false;
     co.lazy_src = null;
     co.prefill = null;
@@ -338,6 +344,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.parent = parent;
     chunk_init(&fs.ch);
     vec_init<CBind>(&fs.binds, 16);
+    strmap_init<i32>(&fs.index);
     vec_init<CUp>(&fs.ups, 4);
     strmap_init<i32>(&fs.inner);
     fs.n_slots = 0;
@@ -375,6 +382,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
 
 private void fscope_free(FScope* fs) {
     vec_free(&fs.binds);
+    strmap_free<i32>(&fs.index);
     vec_free(&fs.ups);
     strmap_free<i32>(&fs.inner);
     vec_free(&fs.break_jumps);
@@ -414,8 +422,7 @@ private i32 declare(Compiler* co, str name, bool is_const, bool tdz) {
         b.is_const = false;
         b.tdz = false;
         b.exported = false;
-        vec_push(&fs.binds, b);
-        return fs.binds.len - 1;
+        return bind_push(fs, b);
     }
     b.slot = alloc_slot(fs);
     b.depth = fs.depth;
@@ -424,28 +431,41 @@ private i32 declare(Compiler* co, str name, bool is_const, bool tdz) {
     b.tdz = tdz;
     b.exported = co.in_module && fs.parent == null && fs.depth == 0
         && strmap_get<i32>(&co.export_heads, name) != null;
+    return bind_push(fs, b);
+}
+
+// Bindings are pushed as scopes open and cut as they close, and the index
+// follows: the newest binding of a name, with the one it shadows behind it.
+private i32 bind_push(FScope* fs, CBind b) {
+    i32* old = strmap_get<i32>(&fs.index, b.name);
+    b.prev = old != null ? *old : -1;
     vec_push(&fs.binds, b);
+    strmap_set<i32>(&fs.index, b.name, fs.binds.len - 1);
     return fs.binds.len - 1;
 }
 
-// A binding of this scope by name; a global one is not, its reads and
-// writes resolve to the global object.
-private i32 find_local(FScope* fs, str name) {
-    for i32 i = fs.binds.len - 1; i >= 0; i-- {
+private void binds_cut(FScope* fs, i32 to) {
+    for i32 i = fs.binds.len - 1; i >= to; i-- {
         CBind b = vec_get(&fs.binds, i);
-        if str_equal(b.name, name) { return b.global ? -1 : i; }
+        if b.prev >= 0 { strmap_set<i32>(&fs.index, b.name, b.prev); }
+        else { ignore strmap_remove<i32>(&fs.index, b.name); }
     }
-    return -1;
+    fs.binds.len = to;
 }
 
 // A declaration of this scope by name, global ones included: what the
 // statement that declares it initializes.
 private i32 find_decl(FScope* fs, str name) {
-    for i32 i = fs.binds.len - 1; i >= 0; i-- {
-        CBind b = vec_get(&fs.binds, i);
-        if str_equal(b.name, name) { return i; }
-    }
-    return -1;
+    i32* i = strmap_get<i32>(&fs.index, name);
+    return i != null ? *i : -1;
+}
+
+// A binding of this scope by name; a global one is not, its reads and
+// writes resolve to the global object.
+private i32 find_local(FScope* fs, str name) {
+    i32 i = find_decl(fs, name);
+    if i < 0 { return -1; }
+    return vec_get(&fs.binds, i).global ? -1 : i;
 }
 
 private i32 resolve_upval(FScope* fs, str name) {
@@ -706,6 +726,64 @@ private str hidden_name(Compiler* co, str prefix, i32 n) {
 
 // --- inner-name scan ---------------------------------------------------------
 
+// Every name a function's subtree mentions, found once per function node
+// and kept on it: an enclosing function takes the set, not another walk of
+// the subtree, so a deep nest of functions is scanned once, not once per
+// level. The compiler frees the sets with its scopes.
+private StrMap<i32>* fn_names(Compiler* co, Node* f) {
+    if f.names != null { return f.names; }
+    StrMap<i32>* set = new(StrMap<i32>);
+    strmap_init<i32>(set);
+    names_into(co, set, f, true);
+    f.names = set;
+    vec_push(&co.name_sets, set);
+    return set;
+}
+
+private void names_merge(StrMap<i32>* set, StrMap<i32>* src) {
+    for i32 i = 0; i < src.cap; i++ {
+        StrSlot<i32>* sl = src.slots + i;
+        if sl.state == SLOT_USED { strmap_set<i32>(set, sl.key, 1); }
+    }
+}
+
+// The names n's subtree mentions, a nested function's through its memo.
+private void names_into(Compiler* co, StrMap<i32>* set, Node* n, bool root) {
+    if n == null { return; }
+    if n.kind == N_FUNCTION && !root {
+        names_merge(set, fn_names(co, n));
+        return;
+    }
+    if n.kind == N_IDENT && n.name.len > 0 {
+        strmap_set<i32>(set, n.name, 1);
+    }
+    if n.kind == N_THIS {
+        strmap_set<i32>(set, "this", 1);
+    }
+    if n.kind == N_NEW_TARGET {
+        strmap_set<i32>(set, "%newtarget", 1);
+    }
+    if n.kind == N_SUPER {
+        strmap_set<i32>(set, "%super", 1);
+    }
+    names_into(co, set, n.a, false);
+    names_into(co, set, n.b, false);
+    names_into(co, set, n.c, false);
+    names_into(co, set, n.d, false);
+    for i32 i = 0; i < n.kids.len; i++ {
+        names_into(co, set, *(n.kids.items + i), false);
+    }
+}
+
+private void names_free(Compiler* co) {
+    for i32 i = 0; i < co.name_sets.len; i++ {
+        StrMap<i32>* set = vec_get(&co.name_sets, i);
+        strmap_free<i32>(set);
+        free(set);
+    }
+    co.name_sets.len = 0;
+}
+
 private void scan_all_names(StrMap<i32>* set, Node* n) {
     if n == null { return; }
     if n.kind == N_IDENT && n.name.len > 0 {
@@ -730,10 +808,10 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
 }
 
 // Collects names used by nested functions of n (not n itself).
-private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
+private void scan_inner(Compiler* co, StrMap<i32>* set, Node* n, bool root) {
     if n == null { return; }
     if n.kind == N_FUNCTION && !root {
-        scan_all_names(set, n);
+        names_merge(set, fn_names(co, n));
         return;
     }
     // An instance field initializer is hoisted into the constructor, so its
@@ -742,16 +820,16 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
     // scope cellifies anything it closes over. Its computed key is evaluated
     // where the class is, so that is scanned as ordinary code.
     if n.kind == N_CLASS_MEMBER && member_is_field(n) {
-        scan_all_names(set, n.b);
-        if (n.flags & NF_COMPUTED) != 0 { scan_inner(set, n.a, false); }
+        names_into(co, set, n.b, false);
+        if (n.flags & NF_COMPUTED) != 0 { scan_inner(co, set, n.a, false); }
         return;
     }
-    scan_inner(set, n.a, false);
-    scan_inner(set, n.b, false);
-    scan_inner(set, n.c, false);
-    scan_inner(set, n.d, false);
+    scan_inner(co, set, n.a, false);
+    scan_inner(co, set, n.b, false);
+    scan_inner(co, set, n.c, false);
+    scan_inner(co, set, n.d, false);
     for i32 i = 0; i < n.kids.len; i++ {
-        scan_inner(set, *(n.kids.items + i), false);
+        scan_inner(co, set, *(n.kids.items + i), false);
     }
 }
 
@@ -761,12 +839,11 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
 // open and truncated as they close, so everything at the current depth sits at
 // the end of the list; `want_lexical` narrows the search to let/const/class.
 private bool bound_here(FScope* fs, str name, bool want_lexical) {
-    for i32 i = fs.binds.len - 1; i >= 0; i-- {
-        CBind b = vec_get(&fs.binds, i);
-        if b.depth < fs.depth { return false; }
-        if str_equal(b.name, name) { return !want_lexical || b.tdz; }
-    }
-    return false;
+    i32 i = find_decl(fs, name);
+    if i < 0 { return false; }
+    CBind b = vec_get(&fs.binds, i);
+    if b.depth < fs.depth { return false; }
+    return !want_lexical || b.tdz;
 }
 
 private void redeclared(Compiler* co, Node* at, str name) {
@@ -1150,7 +1227,7 @@ private void compile_with(Compiler* co, Node* n) {
     vec_push(&fs.withs, w);
     compile_stmt(co, n.b);
     fs.withs.len--;
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -2955,11 +3032,11 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     co.in_static_block = false;
     co.in_params = false;
     co.cur = &fs;
-    scan_inner(&fs.inner, f, true);
+    scan_inner(co, &fs.inner, f, true);
     for i32 i = 0; i < n_fields; i++ {
         // a private method's body was compiled with the class, not here
         if member_is_private_method(*(fields + i)) { continue; }
-        scan_inner(&fs.inner, *(fields + i), true);
+        scan_inner(co, &fs.inner, *(fields + i), true);
     }
 
     // A repeated parameter name is only tolerated in the simple parameter list
@@ -3397,6 +3474,7 @@ bool compile_lazy(Compiler* co, Node* f, FnTemplate* t) {
     fscope_free(&top);
     if co.diags.n_errors > 0 || nt.n_upvals != t.n_upvals {
         template_free(nt);
+        names_free(co);
         return false;
     }
     t.n_params = nt.n_params;
@@ -3418,6 +3496,7 @@ bool compile_lazy(Compiler* co, Node* f, FnTemplate* t) {
     free(nt);
     lazy_free(lz);
     t.lazy = null;
+    names_free(co);
     return true;
 }
 
@@ -3938,7 +4017,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
 
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     vec_free(&fields);
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
     co.strict = saved_strict;
@@ -4133,7 +4212,7 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
         emit_field_inits(co, fields, n_fields);
     }
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -4268,7 +4347,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_patch(ch, jskip);
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -4368,7 +4447,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -4449,7 +4528,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -4564,7 +4643,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         ch_op_target(ch, OP_JUMP, lcond);
         if jend >= 0 { ch_patch(ch, jend); }
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
-        fs.binds.len = saved_binds;
+        binds_cut(fs, saved_binds);
         fs.cur_slots = saved_slots;
         fs.depth--;
         return;
@@ -4692,7 +4771,7 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_op(ch, OP_POP);
             }
             compile_stmt(co, cat.b);
-            fs.binds.len = saved_binds;
+            binds_cut(fs, saved_binds);
             fs.cur_slots = saved_slots;
             fs.depth--;
             if fin != null {
@@ -4781,7 +4860,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             }
         }
         if default_idx < 0 { ch_patch(ch, jdefault); }
-        fs.binds.len = saved_binds;
+        binds_cut(fs, saved_binds);
         fs.cur_slots = saved_slots;
         fs.depth--;
         ignore vec_pop(&fs.loops);
@@ -4858,7 +4937,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     fscope_init(&fs, null, false);
     co.cur = &fs;
     co.strict = has_use_strict(&prog.kids);
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs.inner, prog, true);
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     // a script's top level binds function declarations the way a function
@@ -4876,6 +4955,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     co.strict = false;
     co.cur = null;
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 
@@ -4888,7 +4968,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     fscope_init(&fs, null, false);
     co.cur = &fs;
     co.strict = has_use_strict(&prog.kids);
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs.inner, prog, true);
     str[5] pnames = { "exports", "require", "module", "__dirname", "__filename" };
     for i32 i = 0; i < 5; i++ { strmap_set<i32>(&fs.inner, pnames[i], 1); }
     Vec<i32> pslots = vec_new<i32>(5);
@@ -4913,6 +4993,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     t.src_name = co.src_name;
     co.cur = null;
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 
@@ -5136,7 +5217,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs.inner, prog, true);
 
     // A module using top-level await compiles as an async function; its
     // body runs as a coroutine that the event loop drains.
@@ -5312,6 +5393,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     vec_free(&mod_names);
     strmap_free<i32>(&spec_slot);
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 

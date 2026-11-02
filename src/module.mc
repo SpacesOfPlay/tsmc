@@ -142,7 +142,12 @@ struct Module {
     Vec<str> specs;
     i32 link_state;
     string link_error;
+    i32 fill_gen;         // the refill walk that saw this module last
 }
+
+// A dependency the embedder had no source for when its importer loaded.
+// The importer stays, compiled, and the slot is filled on the next run.
+const i32 DEP_MISSING = -2;
 
 type ModulePtr = Module*;
 
@@ -178,6 +183,7 @@ struct Loader {
     ModuleSource host_src;
     void* host_ctx;
     i32 host_missing;    // imports the embedder has no source for yet
+    i32 fill_gen;        // counts the refill walks
 }
 
 // --- path handling -----------------------------------------------------------
@@ -576,7 +582,7 @@ private i32 host_dep(Loader* ld, str referrer, str spec) {
         ld.host_missing++;
         ld.failed = true;
         free(url);
-        return -1;
+        return DEP_MISSING;
     }
     FileData fd;
     fd.data = data;
@@ -631,6 +637,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     src.data = fd.data;
     src.len = cast(i32, fd.len);
 
+    u64 c0 = vm_clock_ns();
     Parser p;
     parser_init(&p, src, &ld.diags, &mod.arena);
     parser_set_module_top(&p, true);   // top-level await belongs to a module
@@ -658,6 +665,8 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     mod.tmpl = compile_module(&co, prog, &mod.specs, &mod.links);
     vm_add_template_root(ld.vm, mod.tmpl);
     gc_root_reset(&ld.vm.heap, rmark);
+    ld.vm.compiles++;
+    ld.vm.compile_ns += cast(i64, vm_clock_ns() - c0);
 
     // namespace object, rooted for the run
     mod.ns = vm_new_namespace(ld.vm);
@@ -2498,16 +2507,33 @@ void module_host_free(void* h) {
     free(ld);
 }
 
-// Drops the modules a failed load registered after `mark`, so the retry
-// once the missing sources are in loads them again.
-private void host_rollback(Loader* ld, i32 mark) {
-    for i32 i = ld.mods.len - 1; i >= mark; i-- {
-        Module* mod = vec_get(&ld.mods, i);
-        ignore strmap_remove(&ld.by_canon, mod.canon);
-        ignore strmap_remove(&ld.by_path, mod.path);
-        module_free(mod);
+// The graph under root, with the dependencies the embedder had no source
+// for when their importers loaded asked for again: a module compiles once,
+// however many fetches its imports take. The walk stays within the graph,
+// since another script's graph may still be waiting for sources of its own.
+private void host_refill(Loader* ld, i32 root) {
+    if root < 0 { return; }
+    ld.fill_gen++;
+    Vec<i32> stack = vec_new<i32>(16);
+    defer vec_free(&stack);
+    vec_push(&stack, root);
+    vec_get(&ld.mods, root).fill_gen = ld.fill_gen;
+    while stack.len > 0 {
+        i32 idx = vec_pop(&stack);
+        Module* mod = vec_get(&ld.mods, idx);
+        for i32 i = 0; i < mod.dep_idx.len; i++ {
+            i32 dep = vec_get(&mod.dep_idx, i);
+            if dep == DEP_MISSING {
+                dep = host_dep(ld, mod.path, vec_get(&mod.specs, i));
+                vec_set(&mod.dep_idx, i, dep);
+            }
+            if dep < 0 { continue; }
+            Module* d = vec_get(&ld.mods, dep);
+            if d.fill_gen == ld.fill_gen { continue; }
+            d.fill_gen = ld.fill_gen;
+            vec_push(&stack, dep);
+        }
     }
-    ld.mods.len = mark;
 }
 
 // The modules a load is still missing: 0 when none.
@@ -2518,7 +2544,6 @@ i32 module_host_missing(void* h) { return cast(Loader*, h).host_missing; }
 // missing: nothing ran, and the call is made again once they are in.
 i32 module_host_run(void* h, str src, str url) {
     Loader* ld = cast(Loader*, h);
-    i32 mark = ld.mods.len;
     ld.failed = false;
     ld.host_missing = 0;
     i32 errors = ld.diags.n_errors;
@@ -2533,10 +2558,8 @@ i32 module_host_run(void* h, str src, str url) {
         fd.len = src.len;
         entry = load_module_from(ld, url, owned_str(url), fd);
     }
-    if ld.host_missing > 0 {
-        host_rollback(ld, mark);
-        return 3;
-    }
+    host_refill(ld, entry);
+    if ld.host_missing > 0 { return 3; }
     if ld.failed || ld.diags.n_errors > errors || entry < 0 { return 2; }
     string msg = string("");
     if !link_check(ld, entry, &msg) {
@@ -2556,14 +2579,13 @@ Value module_host_import(void* h, str spec, str referrer, bool* ok, Value* err, 
     VM* vm = ld.vm;
     *ok = false;
     *missing = false;
-    i32 mark = ld.mods.len;
     bool saved = ld.failed;
     ld.failed = false;
     ld.host_missing = 0;
     i32 errors = ld.diags.n_errors;
     i32 idx = host_dep(ld, referrer, spec);
+    host_refill(ld, idx);
     if ld.host_missing > 0 {
-        host_rollback(ld, mark);
         ld.failed = saved;
         *missing = true;
         return value_undefined();
