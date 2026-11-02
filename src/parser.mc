@@ -111,7 +111,6 @@ Node* parse_function_at(Parser* p, bool method) {
         n = parse_assign(p);
         if n == null || n.kind != N_FUNCTION || (n.flags & NF_ARROW) == 0 { return null; }
     }
-    if n != null && tree_deeper_than(n, AST_DEPTH_MAX) { diag_add(p.diags, DIAG_ERROR, n.span, "Nesting too deep"); }
     return n;
 }
 
@@ -132,42 +131,11 @@ void parser_destroy(Parser* p) {
 // a sixth of a native thread's: 600 parentheses overflow it.
 when os(wasm) {
     const i32 PARSE_DEPTH_MAX = 500;
-    const i32 AST_DEPTH_MAX = 500;
 }
 when !os(wasm) {
     const i32 PARSE_DEPTH_MAX = 3000;
-    const i32 AST_DEPTH_MAX = 3000;
 }
 
-// Whether some path from `root` is longer than `max` nodes, without
-// recursing.
-bool tree_deeper_than(Node* root, i32 max) {
-    Vec<NodePtr> nodes;
-    vec_init<NodePtr>(&nodes, 64);
-    defer vec_free(&nodes);
-    Vec<i32> depths;
-    vec_init<i32>(&depths, 64);
-    defer vec_free(&depths);
-    vec_push(&nodes, root);
-    vec_push(&depths, 1);
-    while nodes.len > 0 {
-        nodes.len--;
-        depths.len--;
-        Node* n = nodes.data[nodes.len];
-        i32 d = depths.data[depths.len];
-        if n == null { continue; }
-        if d > max { return true; }
-        Node*[4] sub = { n.a, n.b, n.c, n.d };
-        for i32 i = 0; i < 4; i++ {
-            if sub[i] != null { vec_push(&nodes, sub[i]); vec_push(&depths, d + 1); }
-        }
-        for i32 i = 0; i < n.kids.len; i++ {
-            vec_push(&nodes, n.kids.items[i]);
-            vec_push(&depths, d + 1);
-        }
-    }
-    return false;
-}
 
 // The rest of the source skipped, once the nesting is past the limit:
 // every caller up the stack then meets the end and returns.
@@ -2572,11 +2540,5 @@ Node* parse_program(Parser* p) {
         }
     }
     n.kids = finish_kids(p, mark);
-    // lowering runs on the tree whatever the errors: a tree too deep for
-    // it is not handed on
-    if !p.too_deep && tree_deeper_than(n, AST_DEPTH_MAX) {
-        diag_add(p.diags, DIAG_ERROR, Span{0, 0}, "Nesting too deep");
-        n.kids.len = 0;
-    }
     return nfin(p, n);
 }

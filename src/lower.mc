@@ -17,12 +17,16 @@ struct Lower {
     Bump* arena;
     DiagList* diags;
     Vec<NodePtr> scratch;
+    i32 depth;        // of the walk: a tree past AST_DEPTH_MAX is refused here
+    bool too_deep;
 }
 
 void lower_init(Lower* lw, Bump* arena, DiagList* diags) {
     lw.arena = arena;
     lw.diags = diags;
     vec_init<NodePtr>(&lw.scratch, 32);
+    lw.depth = 0;
+    lw.too_deep = false;
 }
 
 void lower_destroy(Lower* lw) {
@@ -513,6 +517,12 @@ private void lower_stmt_list(Lower* lw, NodeList* list) {
 private void lower_slot(Lower* lw, Node** slot) {
     Node* n = *slot;
     if n == null { return; }
+    lw.depth++;
+    defer lw.depth--;
+    if lw.depth > AST_DEPTH_MAX {
+        if !lw.too_deep { lw.too_deep = true; diag_add(lw.diags, DIAG_ERROR, n.span, "Nesting too deep"); }
+        return;
+    }
     if n.kind == N_AS || n.kind == N_NONNULL {
         lower_slot(lw, &n.a);
         *slot = n.a;

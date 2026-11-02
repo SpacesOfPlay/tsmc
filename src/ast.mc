@@ -133,6 +133,12 @@ struct NodeList {
     i32 len;
 }
 
+// The deepest tree the lowering and the compiler recurse over: the
+// lowering, which walks every node, refuses a deeper one. A wasm
+// module's stack is a sixth of a native thread's.
+when os(wasm) { const i32 AST_DEPTH_MAX = 500; }
+when !os(wasm) { const i32 AST_DEPTH_MAX = 3000; }
+
 struct Node {
     i32 kind;
     i32 flags;

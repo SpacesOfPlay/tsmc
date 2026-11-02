@@ -4166,8 +4166,17 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     for i32 i = 0; i < co.outer_names.len; i++ { vec_push(&vnames, vec_get(&co.outer_names, i)); }
     co.outer_names.len = 0;
     co.outer_is_body = false;
-    for i32 i = 0; i < list.len; i++ {
-        collect_var_names(*(list.items + i), &vnames);
+    // the names are only asked for by a lexical declaration here: a block
+    // without one, the usual block, is not walked for them
+    bool lexical_here = false;
+    for i32 i = 0; i < list.len && !lexical_here; i++ {
+        Node* s = *(list.items + i);
+        if (s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0) || (s.kind == N_CLASS && s.name.len > 0) || function_decl_of(s) != null { lexical_here = true; }
+    }
+    if lexical_here {
+        for i32 i = 0; i < list.len; i++ {
+            collect_var_names(*(list.items + i), &vnames);
+        }
     }
     hoist_lexical_decls(co, list, &vnames);
     Vec<NodePtr> seen = vec_new<NodePtr>(4);

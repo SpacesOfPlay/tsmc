@@ -749,6 +749,11 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
 
     lower_destroy(&lw);
     parser_destroy(&p);
+    // the tree served its compile: what the module keeps, its template,
+    // its specifiers and its links, lives in the source, the heap and
+    // the atoms. A bundle's tree is many times its source.
+    bump_destroy(&mod.arena);
+    bump_init(&mod.arena);
     return my_idx;
 }
 

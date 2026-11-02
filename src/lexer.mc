@@ -239,17 +239,20 @@ private i32 utf8_encode(u8* dst, u32 cp) {
 // crossed, including inside a block comment — ASI input.
 private bool skip_trivia(Lexer* lx) {
     bool nl = false;
-    while lx.pos < lx.src.len {
-        u8 c = lx_cur(lx);
-        if c == ' ' || c == '\t' || c == 11 || c == 12 {   // \v \f
-            lx.pos++;
-            continue;
+    u8* d = lx.src.data;
+    i32 n = lx.src.len;
+    while lx.pos < n {
+        // the blanks and line ends, the common run, with the position in a local
+        i32 pos = lx.pos;
+        while pos < n {
+            u8 b = *(d + pos);
+            if b == ' ' || b == '\t' || b == 11 || b == 12 { pos++; continue; }   // \v \f
+            if b == '\n' || b == '\r' { nl = true; pos++; continue; }
+            break;
         }
-        if c == '\n' || c == '\r' {
-            nl = true;
-            lx.pos++;
-            continue;
-        }
+        lx.pos = pos;
+        if pos >= n { break; }
+        u8 c = *(d + pos);
         // U+2028 / U+2029 are line terminators; U+00A0 and a stray
         // BOM are whitespace.
         if c == 0xE2 && lx_at(lx, lx.pos + 1) == 0x80 {
@@ -551,8 +554,23 @@ private void scan_ident(Lexer* lx, Token* t) {
         ignore id_start_at(lx, lx.pos, &n);
         lx.pos += n;
     }
+    // the common run: ASCII name characters, no call per character
+    u8* d = lx.src.data;
+    i32 n = lx.src.len;
+    i32 pos = lx.pos;
+    while pos < n {
+        u8 c = *(d + pos);
+        if c >= 0x80 || !is_id_part(c) { break; }
+        pos++;
+    }
+    lx.pos = pos;
     while lx.pos < lx.src.len {
         u8 c = lx_cur(lx);
+        if c < 0x80 && c != '\\' {
+            if !is_id_part(c) { break; }
+            lx.pos++;
+            continue;
+        }
         if c == '\\' {
             i32 at = lx.pos;
             i32 v = scan_ident_escape(lx);
@@ -568,8 +586,14 @@ private void scan_ident(Lexer* lx, Token* t) {
     if esc { t.text = decode_ident(lx, a, lx.pos); }
     else { t.text = lx_view(lx, a, lx.pos); }
     // a keyword spelled with an escape is an identifier, which the parser
-    // refuses wherever the word could not have been one
-    i32* k = strmap_get<i32>(&lx.keywords, t.text);
+    // refuses wherever the word could not have been one. Every keyword is
+    // two to ten lowercase letters: a word shaped otherwise is not looked up.
+    i32* k = null;
+    if t.text.len >= 2 && t.text.len <= 10 {
+        u8 c0 = *(t.text.data);
+        u8 cl = *(t.text.data + t.text.len - 1);
+        if c0 >= 'a' && c0 <= 'z' && cl >= 'a' && cl <= 'z' { k = strmap_get<i32>(&lx.keywords, t.text); }
+    }
     if k != null && !esc {
         t.kind = *k;
     } else {
@@ -784,33 +808,39 @@ private void scan_string(Lexer* lx, Token* t) {
     lx.pos++;
     i32 a = lx.pos;
     bool needs = false;
+    u8* d = lx.src.data;
+    i32 n = lx.src.len;
+    i32 pos = lx.pos;
     while true {
-        if lx.pos >= lx.src.len {
+        if pos >= n {
+            lx.pos = pos;
             lex_error(lx, tok_start, lx.pos, "unterminated string literal");
             t.kind = TOK_ERROR;
             return;
         }
-        u8 c = lx_cur(lx);
+        u8 c = *(d + pos);
         if c == q { break; }
         if c == '\n' || c == '\r' {
+            lx.pos = pos;
             lex_error(lx, tok_start, lx.pos, "unterminated string literal");
             t.kind = TOK_ERROR;
             return;
         }
         if c == '\\' {
             needs = true;
-            lx.pos++;
-            if lx.pos < lx.src.len {
-                if lx_cur(lx) == '\r' && lx_at(lx, lx.pos + 1) == '\n' {
-                    lx.pos += 2;
+            pos++;
+            if pos < n {
+                if *(d + pos) == '\r' && pos + 1 < n && *(d + pos + 1) == '\n' {
+                    pos += 2;
                 } else {
-                    lx.pos++;
+                    pos++;
                 }
             }
             continue;
         }
-        lx.pos++;
+        pos++;
     }
+    lx.pos = pos;
     i32 b = lx.pos;
     lx.pos++;
     t.kind = TOK_STRING;
@@ -882,17 +912,20 @@ private void scan_punct(Lexer* lx, Token* t) {
     u8 c2 = lx_at(lx, lx.pos + 2);
     u8 c3 = lx_at(lx, lx.pos + 3);
 
-    if c == '{' { pk(lx, t, TOK_LBRACE, 1); return; }
-    if c == '}' { pk(lx, t, TOK_RBRACE, 1); return; }
-    if c == '(' { pk(lx, t, TOK_LPAREN, 1); return; }
-    if c == ')' { pk(lx, t, TOK_RPAREN, 1); return; }
-    if c == '[' { pk(lx, t, TOK_LBRACK, 1); return; }
-    if c == ']' { pk(lx, t, TOK_RBRACK, 1); return; }
-    if c == ';' { pk(lx, t, TOK_SEMI, 1); return; }
-    if c == ',' { pk(lx, t, TOK_COMMA, 1); return; }
-    if c == ':' { pk(lx, t, TOK_COLON, 1); return; }
-    if c == '@' { pk(lx, t, TOK_AT, 1); return; }
-    if c == '~' { pk(lx, t, TOK_TILDE, 1); return; }
+    switch c {
+        case '{': { pk(lx, t, TOK_LBRACE, 1); return; }
+        case '}': { pk(lx, t, TOK_RBRACE, 1); return; }
+        case '(': { pk(lx, t, TOK_LPAREN, 1); return; }
+        case ')': { pk(lx, t, TOK_RPAREN, 1); return; }
+        case '[': { pk(lx, t, TOK_LBRACK, 1); return; }
+        case ']': { pk(lx, t, TOK_RBRACK, 1); return; }
+        case ';': { pk(lx, t, TOK_SEMI, 1); return; }
+        case ',': { pk(lx, t, TOK_COMMA, 1); return; }
+        case ':': { pk(lx, t, TOK_COLON, 1); return; }
+        case '@': { pk(lx, t, TOK_AT, 1); return; }
+        case '~': { pk(lx, t, TOK_TILDE, 1); return; }
+        default: { }
+    }
     if c == '.' {
         if c1 == '.' && c2 == '.' { pk(lx, t, TOK_DOTDOTDOT, 3); return; }
         pk(lx, t, TOK_DOT, 1);
