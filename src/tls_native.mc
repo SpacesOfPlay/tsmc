@@ -284,6 +284,7 @@ private i32 tls_save_ticket_cb(st_ptls_save_ticket_t* self, ptls_t* tls, ptls_io
         g_tickets.len--;
     }
     vec_push(&g_tickets, t);
+    g_tickets_gen++;
     mutex_unlock(&g_tickets_mu);
     return 0;
 }
@@ -314,6 +315,72 @@ private bool tls_take_ticket(str host, u8** data, i32* len) {
     }
     mutex_unlock(&g_tickets_mu);
     return got;
+}
+
+private i64 g_tickets_gen = 0;
+
+// Counts the tickets saved, for a keeper that writes them out when they change.
+i64 tls_tickets_generation() { return g_tickets_gen; }
+
+private void put_u32(u8* p, u32 v) { memcpy(p, cast(u8*, &v), 4); }
+private void put_u64(u8* p, u64 v) { memcpy(p, cast(u8*, &v), 8); }
+private u32 get_u32(u8* p) { u32 v = 0; memcpy(cast(u8*, &v), p, 4); return v; }
+private u64 get_u64(u8* p) { u64 v = 0; memcpy(cast(u8*, &v), p, 8); return v; }
+
+// The tickets as bytes, for keeping across runs: each is its host's length
+// and bytes, the wall time it was saved (ms), its lifetime (s), and its
+// length and bytes. The caller owns the result; *len is 0 for none.
+u8* tls_tickets_export(i32* len) {
+    tls_tickets_init();
+    mutex_lock(&g_tickets_mu);
+    i32 total = 0;
+    for i32 i = 0; i < g_tickets.len; i++ { total += 4 + g_tickets.data[i].host.len + 8 + 4 + 4 + g_tickets.data[i].len; }
+    u8* out = alloc<u8>(total > 0 ? total : 1);
+    i32 at = 0;
+    for i32 i = 0; i < g_tickets.len; i++ {
+        TlsTicket* t = &g_tickets.data[i];
+        put_u32(out + at, cast(u32, t.host.len)); at += 4;
+        memcpy(out + at, t.host.data, t.host.len); at += t.host.len;
+        put_u64(out + at, t.saved_ms); at += 8;
+        put_u32(out + at, t.lifetime_s); at += 4;
+        put_u32(out + at, cast(u32, t.len)); at += 4;
+        memcpy(out + at, t.data, t.len); at += t.len;
+    }
+    mutex_unlock(&g_tickets_mu);
+    *len = total;
+    return out;
+}
+
+// Tickets kept by an earlier run, in tls_tickets_export's form: the ones
+// still in their lifetime join the store. Anything malformed ends the read.
+void tls_tickets_import(u8* data, i32 len) {
+    tls_tickets_init();
+    u64 now = tls_wall_time_cb(&g_tls_time);
+    i32 at = 0;
+    mutex_lock(&g_tickets_mu);
+    while at + 4 <= len {
+        i32 hl = cast(i32, get_u32(data + at)); at += 4;
+        if hl < 0 || hl > 255 || at + hl + 16 > len { break; }
+        str host = str_from(data + at, hl); at += hl;
+        u64 saved = get_u64(data + at); at += 8;
+        u32 life = get_u32(data + at); at += 4;
+        i32 tl = cast(i32, get_u32(data + at)); at += 4;
+        if tl <= 0 || tl > TLS_TICKET_MAX_LEN || at + tl > len { break; }
+        u64 life_ms = cast(u64, life) * 1000;
+        if life_ms == cast(u64, 0) || life_ms > cast(u64, 604800000) { life_ms = 604800000; }
+        if saved <= now && now - saved <= life_ms && g_tickets.len < TLS_TICKETS_MAX {
+            TlsTicket t = TlsTicket{};
+            t.host = str_concat("", host);
+            t.len = tl;
+            t.data = alloc<u8>(tl);
+            memcpy(t.data, data + at, tl);
+            t.saved_ms = saved;
+            t.lifetime_s = life;
+            vec_push(&g_tickets, t);
+        }
+        at += tl;
+    }
+    mutex_unlock(&g_tickets_mu);
 }
 
 private void tls_ctx_init() {
@@ -415,6 +482,7 @@ struct TlsSession {
     ptls_handshake_properties_t props;   // the ticket offered, through the handshake
     u8* ticket;               // the offered ticket's bytes, the session's own
     i32 ticket_len;
+    u64 max_early;            // the early data the offered ticket allows, once the ClientHello is out; 0 none
 }
 
 TlsSession* tls_session_new(u8* sni, bool insecure) {
@@ -431,6 +499,9 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
         // a ticket from an earlier session to the host: the pre-shared key offered
         if tls_take_ticket(str_from(s.host.data, s.host.len), &s.ticket, &s.ticket_len) {
             s.props.client.session_ticket = ptls_iovec_init(cast(void*, s.ticket), cast(u64, s.ticket_len));
+            // and early data with it, when the ticket allows it: the session's
+            // field receives the allowance as the ClientHello goes out
+            s.props.client.max_early_data_size = &s.max_early;
         }
     }
     ptls_buffer_init(&s.sendbuf, "", 0);
@@ -798,6 +869,20 @@ bool tls_established(TlsSession* s) { return s.established; }
 // whether the handshake resumed an earlier session with its ticket
 bool tls_resumed(TlsSession* s) { return s.established && ptls_is_psk_handshake(s.tls) != 0; }
 bool tls_offered_ticket(TlsSession* s) { return s.ticket != null; }
+// Whether application data may go out now as 0-RTT early data: the
+// ClientHello of a resumed handshake is out, its ticket allows early data,
+// and the handshake has not ended. What is written then reaches the
+// server before its first flight; tls_early_state says whether it took it.
+bool tls_early_ok(TlsSession* s) { return s.started && !s.established && !s.failed && s.max_early > cast(u64, 0); }
+// The early data the offered ticket allows, in bytes; 0 for none or no ticket.
+u64 tls_early_max(TlsSession* s) { return s.max_early; }
+// After the handshake: 0 no early data was sent, 1 the server rejected it
+// (what was written must be written again), 2 it was accepted.
+i32 tls_early_state(TlsSession* s) {
+    if s.max_early == cast(u64, 0) { return 0; }
+    if s.props.client.early_data_acceptance == PTLS_EARLY_DATA_ACCEPTED { return 2; }
+    return 1;
+}
 bool tls_failed(TlsSession* s) { return s.failed; }
 
 // X509_V_* code when the failure was certificate validation, else 0.
