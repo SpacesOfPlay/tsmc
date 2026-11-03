@@ -260,6 +260,9 @@ struct VM {
     Vec<RegexProgPtr> regexps;
     StrMap<i32> regex_cache;    // "flags\nsource" -> index into regexps
     Vec<str> regex_keys;        // owned keys of regex_cache
+    Vec<GcString*> regex_srcs;  // by program: the source and flags strings every object made from it shares
+    Vec<GcString*> regex_flgs;
+    Vec<GcString*> atom_strs;   // by atom: the string a pinned atom's name is handed out as (Object.keys, for-in), made once
     GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
     GcString*[8] http_strs;     // the http natives' constant strings, made when first used
     u32 atom_rx;
@@ -428,6 +431,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     for i32 i = 0; i < vm.sp; i++ {
         gc_mark_value(h, *(vm.stack + i));
     }
+    for i32 i = 0; i < vm.atom_strs.len; i++ { if vm.atom_strs.data[i] != null { gc_mark_cell(h, &vm.atom_strs.data[i].head); } }
+    for i32 i = 0; i < vm.regex_srcs.len; i++ { gc_mark_cell(h, &vm.regex_srcs.data[i].head); gc_mark_cell(h, &vm.regex_flgs.data[i].head); }
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.fun != null { gc_mark_cell(h, &fr.fun.head); }
@@ -4106,6 +4111,9 @@ void vm_init(VM* vm) {
     vm.global_obj = null;
     vm.any_weak = false;
     vec_init<JsMap*>(&vm.weak_maps, 4);
+    vec_init<GcString*>(&vm.regex_srcs, 8);
+    vec_init<GcString*>(&vm.regex_flgs, 8);
+    vec_init<GcString*>(&vm.atom_strs, 64);
     vm.iter_fast = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
@@ -4263,6 +4271,9 @@ void vm_destroy(VM* vm) {
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
     vec_free(&vm.weak_maps);
+    vec_free(&vm.regex_srcs);
+    vec_free(&vm.regex_flgs);
+    vec_free(&vm.atom_strs);
     vec_free(&vm.timer_heap);
     vec_free(&vm.handles);
     vec_free(&vm.symbols);
@@ -5990,6 +6001,24 @@ private JsObject* forin_keys(VM* vm, Value objv) {
     return out;
 }
 
+// The string for an atom's name: a pinned atom's is made once and kept
+// (a key that came from source is asked for by every Object.keys and
+// for-in over an object of its shape); a dynamic atom's, whose id may be
+// reused once it is swept, is made each time.
+GcString* vm_atom_string(VM* vm, u32 a) {
+    i32 i = cast(i32, a);
+    if i < vm.atoms.stamp.len && vec_get(&vm.atoms.stamp, i) == ATOM_PINNED {
+        while vm.atom_strs.len <= i { vec_push(&vm.atom_strs, cast(GcString*, null)); }
+        GcString* g = vm.atom_strs.data[i];
+        if g == null {
+            g = gc_new_string(&vm.heap, atom_name(&vm.atoms, a));
+            vm.atom_strs.data[i] = g;
+        }
+        return g;
+    }
+    return gc_new_string(&vm.heap, atom_name(&vm.atoms, a));
+}
+
 JsObject* vm_own_keys(VM* vm, Value objv) {
     if value_is_object(objv) && (value_as_object(objv).obj_flags & OBJF_PROXY) != 0 {
         // route through the ownKeys trap, keeping only string keys (for-in and
@@ -6043,7 +6072,7 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
         for i32 i = 0; i < props.len; i++ {
             if !prop_enumerable(vm, props.items + i) { continue; }
             u32 pk = (props.items + i).key;
-            GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, pk));
+            GcString* g = vm_atom_string(vm, pk);
             js_array_set(arr, n, value_cell(&g.head));
             n++;
         }
@@ -8186,16 +8215,16 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
         str owned = str_buf_to_str(&kb);   // the buffer's bytes become the key
         vec_push(&vm.regex_keys, owned);
         strmap_set(&vm.regex_cache, owned, idx);
+        // an empty pattern reports "(?:)" so String(re) stays a valid literal
+        vec_push(&vm.regex_srcs, gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)"));
+        vec_push(&vm.regex_flgs, gc_new_string(&vm.heap, flags));
     }
     RegexProg* prog = vec_get(&vm.regexps, idx);
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
     vpush(vm, value_cell(&re.head));
     props_set_desc(&re.props, vm.atom_rx, value_int(idx), 0);
-    // an empty pattern reports "(?:)" so String(re) stays a valid literal
-    GcString* src = gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)");
-    props_set_desc(&re.props, vm.atom_source, value_cell(&src.head), 0);
-    GcString* flg = gc_new_string(&vm.heap, flags);
-    props_set_desc(&re.props, vm.atom_flags, value_cell(&flg.head), 0);
+    props_set_desc(&re.props, vm.atom_source, value_cell(&vm.regex_srcs.data[idx].head), 0);
+    props_set_desc(&re.props, vm.atom_flags, value_cell(&vm.regex_flgs.data[idx].head), 0);
     props_set_desc(&re.props, vm.atom_lastindex, value_int(0), PROP_WRITABLE);
     // The flag set, one property per flag. All non-enumerable, so Object.keys
     // and JSON.stringify see a RegExp as the empty object node reports.

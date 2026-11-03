@@ -88,12 +88,12 @@ void props_init(PropList* p) {
 // one and never moves entries.
 void props_reserve(PropList* p, i32 n) {
     if p.cap > 0 || n <= 0 { return; }
-    p.items = alloc<Prop>(n);
+    p.items = cast(Prop*, pool_alloc(cast(i64, n) * sizeof(Prop)));
     p.cap = n;
 }
 
 void props_free(PropList* p) {
-    if p.items != null { free(p.items); }
+    if p.items != null { pool_free(cast(void*, p.items), cast(i64, p.cap) * sizeof(Prop)); }
     if p.idx != null {
         intmap_free<i32>(p.idx);
         free(p.idx);
@@ -142,11 +142,11 @@ private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
     if p.len >= p.cap {
         i32 ncap = p.cap * 2;
         if ncap < 4 { ncap = 4; }
-        Prop* ni = alloc<Prop>(ncap);
+        Prop* ni = cast(Prop*, pool_alloc(cast(i64, ncap) * sizeof(Prop)));
         for i32 i = 0; i < p.len; i++ {
             *(ni + i) = *(p.items + i);
         }
-        if p.items != null { free(p.items); }
+        if p.items != null { pool_free(cast(void*, p.items), cast(i64, p.cap) * sizeof(Prop)); }
         p.items = ni;
         p.cap = ncap;
     }
@@ -529,13 +529,13 @@ void js_finalize(GcCell* c) {
     if c.kind == GC_OBJECT {
         JsObject* o = cast(JsObject*, c);
         props_free(&o.props);
-        if o.elems != null { free(o.elems); }
+        if o.elems != null { pool_free(cast(void*, o.elems), cast(i64, o.ecap) * sizeof(Value)); }
         return;
     }
     if c.kind == GC_FUNCTION {
         JsFunction* f = cast(JsFunction*, c);
         props_free(&f.props);
-        if f.upvals != null { free(f.upvals); }
+        if f.upvals != null { pool_free(cast(void*, f.upvals), cast(i64, f.n_upvals) * sizeof(Value)); }
         return;
     }
     if c.kind == GC_NATIVE {
@@ -550,10 +550,10 @@ void js_finalize(GcCell* c) {
     }
     if c.kind == GC_MAP {
         JsMap* mp = cast(JsMap*, c);
-        if mp.keys != null { free(mp.keys); }
-        if mp.vals != null { free(mp.vals); }
-        if mp.live != null { free(mp.live); }
-        if mp.seqs != null { free(mp.seqs); }
+        if mp.keys != null { pool_free(cast(void*, mp.keys), cast(i64, mp.cap) * sizeof(Value)); }
+        if mp.vals != null { pool_free(cast(void*, mp.vals), cast(i64, mp.cap) * sizeof(Value)); }
+        if mp.live != null { pool_free(cast(void*, mp.live), cast(i64, mp.cap)); }
+        if mp.seqs != null { pool_free(cast(void*, mp.seqs), cast(i64, mp.cap) * 8); }
         if mp.index != null { free(mp.index); }
         return;
     }
@@ -600,7 +600,7 @@ JsFunction* js_new_function(GcHeap* h, FnTemplate* t, i32 n_upvals) {
     f.n_upvals = n_upvals;
     f.upvals = null;
     if n_upvals > 0 {
-        f.upvals = alloc<Value>(n_upvals);
+        f.upvals = cast(Value*, pool_alloc(cast(i64, n_upvals) * sizeof(Value)));
         for i32 i = 0; i < n_upvals; i++ {
             *(f.upvals + i) = value_undefined();
         }
@@ -671,17 +671,22 @@ void map_reserve(JsMap* mp) {
     if mp.len < mp.cap { return; }
     i32 ncap = mp.cap * 2;
     if ncap < 8 { ncap = 8; }
-    Value* nk = alloc<Value>(ncap);
-    Value* nv = alloc<Value>(ncap);
-    bool* nl = alloc<bool>(ncap);
-    i64* ns = alloc<i64>(ncap);
+    Value* nk = cast(Value*, pool_alloc(cast(i64, ncap) * sizeof(Value)));
+    Value* nv = cast(Value*, pool_alloc(cast(i64, ncap) * sizeof(Value)));
+    bool* nl = cast(bool*, pool_alloc(cast(i64, ncap)));
+    i64* ns = cast(i64*, pool_alloc(cast(i64, ncap) * 8));
     for i32 i = 0; i < mp.len; i++ {
         *(nk + i) = *(mp.keys + i);
         *(nv + i) = *(mp.vals + i);
         *(nl + i) = *(mp.live + i);
         *(ns + i) = *(mp.seqs + i);
     }
-    if mp.keys != null { free(mp.keys); free(mp.vals); free(mp.live); free(mp.seqs); }
+    if mp.keys != null {
+        pool_free(cast(void*, mp.keys), cast(i64, mp.cap) * sizeof(Value));
+        pool_free(cast(void*, mp.vals), cast(i64, mp.cap) * sizeof(Value));
+        pool_free(cast(void*, mp.live), cast(i64, mp.cap));
+        pool_free(cast(void*, mp.seqs), cast(i64, mp.cap) * 8);
+    }
     mp.seqs = ns;
     mp.keys = nk;
     mp.vals = nv;
@@ -826,11 +831,11 @@ void js_array_set(JsObject* o, i32 idx, Value v) {
         i32 ncap = o.ecap * 2;
         if ncap < 8 { ncap = 8; }
         if ncap <= idx { ncap = idx + 1; }
-        Value* ne = alloc<Value>(ncap);
+        Value* ne = cast(Value*, pool_alloc(cast(i64, ncap) * sizeof(Value)));
         for i32 i = 0; i < o.elen; i++ {
             *(ne + i) = *(o.elems + i);
         }
-        if o.elems != null { free(o.elems); }
+        if o.elems != null { pool_free(cast(void*, o.elems), cast(i64, o.ecap) * sizeof(Value)); }
         o.elems = ne;
         o.ecap = ncap;
     }
@@ -847,11 +852,11 @@ void js_array_set(JsObject* o, i32 idx, Value v) {
 // still written one at a time, only without growing the storage as they go.
 void js_array_reserve(JsObject* o, i32 n) {
     if n <= o.ecap { return; }
-    Value* ne = alloc<Value>(n);
+    Value* ne = cast(Value*, pool_alloc(cast(i64, n) * sizeof(Value)));
     for i32 i = 0; i < o.elen; i++ {
         *(ne + i) = *(o.elems + i);
     }
-    if o.elems != null { free(o.elems); }
+    if o.elems != null { pool_free(cast(void*, o.elems), cast(i64, o.ecap) * sizeof(Value)); }
     o.elems = ne;
     o.ecap = n;
 }

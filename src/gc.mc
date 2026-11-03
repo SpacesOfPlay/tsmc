@@ -108,11 +108,51 @@ private i64 gc_class_size(i32 cls) {
 private void gc_cell_release(GcHeap* h, GcCell* c) {
     i32 cls = gc_class_of(c.size);
     if cls < 0 {
+        gc_stat_frees = gc_stat_frees + 1;
         free(c);
         return;
     }
     c.next = h.free_cells[cls];
     h.free_cells[cls] = c;
+}
+
+// --- raw blocks ------------------------------------------------------
+//
+// The arrays behind an object's properties and elements, a map's slots
+// and a closure's upvalues: small, made and freed as constantly as the
+// cells, and the program allocator's free list stands between every pair.
+// They come from free lists by the cells' size classes instead; a block
+// above the largest class is the program allocator's as before. A caller
+// frees with the byte count it asked for, which names the class.
+private threadlocal u8*[GC_CLASS_COUNT] g_pool_free;
+
+void* pool_alloc(i64 bytes) {
+    i32 cls = gc_class_of(bytes);
+    if cls < 0 { return alloc(bytes); }
+    u8* p = g_pool_free[cls];
+    if p != null {
+        g_pool_free[cls] = *(cast(u8**, p));
+        return cast(void*, p);
+    }
+    return alloc(gc_class_size(cls));
+}
+
+void pool_free(void* p, i64 bytes) {
+    if p == null { return; }
+    i32 cls = gc_class_of(bytes);
+    if cls < 0 { free(p); return; }
+    *(cast(u8**, p)) = g_pool_free[cls];
+    g_pool_free[cls] = cast(u8*, p);
+}
+
+// When the next collection comes, from what the last one found live: at
+// twice that for a small heap; later for a large one, whose every full
+// mark and sweep costs more than the memory it would give back sooner.
+private i64 gc_next_threshold(i64 live) {
+    i64 next = live * 2;
+    if live > 134217728 { next = live * 3; }
+    else if live > 33554432 { next = live * 5 / 2; }
+    return next < GC_MIN_THRESHOLD ? GC_MIN_THRESHOLD : next;
 }
 
 void gc_init(GcHeap* h) {
@@ -224,6 +264,9 @@ i64 gc_stat_collections = 0;
 i64 gc_stat_ticks = 0;
 i64 gc_stat_sweep_ticks = 0;     // sweeping left to the start of the next collection
 i64 gc_stat_max_ticks = 0;       // the longest collection
+i64 gc_stat_step_ticks = 0;      // sweeping in the steps between allocations
+i64 gc_stat_mallocs = 0;         // cells the free lists could not supply
+i64 gc_stat_frees = 0;           // cells released to the program allocator
 // allocations by kind, counted only while a profile is being taken, in a
 // profiling build
 bool gc_stat_on = false;
@@ -241,6 +284,8 @@ const i32 GC_SWEEP_STEP = 64;
 // that follow, which used to be the larger part of its pause: with
 // 10,000 connections open, 611 of 1,000 ms over 14 collections.
 void gc_sweep_some(GcHeap* h, i32 n) {
+    if h.sweep_list == null { return; }
+    i64 t0 = qpc();
     while n > 0 && h.sweep_list != null {
         GcCell* c = h.sweep_list;
         h.sweep_list = c.next;
@@ -254,6 +299,7 @@ void gc_sweep_some(GcHeap* h, i32 n) {
         }
         n--;
     }
+    gc_stat_step_ticks = gc_stat_step_ticks + (qpc() - t0);
 }
 
 // Sweeps what is left of the last collection's cells.
@@ -300,8 +346,7 @@ void gc_collect(GcHeap* h) {
         h.all = null;
         h.bytes_live = h.marked_bytes;
         h.n_cells = h.marked_cells;
-        h.next_gc = h.marked_bytes * 2;
-        if h.next_gc < GC_MIN_THRESHOLD { h.next_gc = GC_MIN_THRESHOLD; }
+        h.next_gc = gc_next_threshold(h.marked_bytes);
         h.n_collections++;
         gc_stat_collections = gc_stat_collections + 1;
         gc_stat_ticks = gc_stat_ticks + (gc_t1 - gc_t0);
@@ -337,8 +382,7 @@ void gc_collect(GcHeap* h) {
     gc_report_poison();
     h.bytes_live = live_bytes;
     h.n_cells = live_cells;
-    h.next_gc = live_bytes * 2;
-    if h.next_gc < GC_MIN_THRESHOLD { h.next_gc = GC_MIN_THRESHOLD; }
+    h.next_gc = gc_next_threshold(live_bytes);
     h.n_collections++;
     gc_stat_collections = gc_stat_collections + 1;
     i64 gc_t2 = qpc();
@@ -385,6 +429,7 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
         c = h.free_cells[cls];
         h.free_cells[cls] = c.next;
     } else {
+        gc_stat_mallocs = gc_stat_mallocs + 1;
         c = cast(GcCell*, alloc(block));
     }
     memset(cast(u8*, c), 0, zero < 0 || zero > block ? block : zero);
@@ -427,7 +472,8 @@ struct GcString {
 }
 
 GcString* gc_new_string(GcHeap* h, str s) {
-    GcCell* c = gc_alloc(h, GC_STRING, sizeof(GcString) + s.len);
+    // the bytes are written next: only the header needs clearing
+    GcCell* c = gc_alloc_zeroing(h, GC_STRING, sizeof(GcString) + s.len, sizeof(GcString));
     GcString* gs = cast(GcString*, c);
     gs.len = s.len;
     gs.cur_u = 0;
