@@ -127,6 +127,9 @@ const i32 NF_EXPORTED = 134217728;  // dotted-inner namespace
 const i32 NF_METHOD = 268435456;    // method definition: parameters must be unique
 const i32 NF_PARENED = 536870912;   // was written in parentheses: ends an optional chain
 const i32 NF_NAME_INFERRED = 1073741824; // function/class name came from its binding, not syntax
+// a function whose body the parser passed over, to be compiled on its first
+// call: its body is a stand-in naming what the real one mentions
+const i32 NF_SKIPPED = -2147483648;
 
 struct NodeList {
     Node** items;

@@ -39,6 +39,14 @@ struct Parser {
     // the parameter defaults, which try every '(' inside them again, make
     // nested parentheses exponential (reCAPTCHA's bundle never finished).
     ArrowMemo arrow_fail;
+    // a function compiled on its first call has its body passed over here,
+    // only scanned for the names it mentions (skip_body); off inside a class
+    // and a with statement, whose bodies the lazy compile cannot take
+    bool skip_bodies;
+    bool skipped_any;
+    i32 skip_depth;     // functions nested deeper than this are passed over
+    i32 class_depth;
+    i32 with_depth;
 }
 
 struct PState {
@@ -66,6 +74,11 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.too_deep = false;
     p.module_top = false;
     p.arrow_fail = ArrowMemo{};
+    p.skip_bodies = false;
+    p.skipped_any = false;
+    p.skip_depth = 0;
+    p.class_depth = 0;
+    p.with_depth = 0;
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -90,6 +103,11 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.too_deep = false;
     p.module_top = false;
     p.arrow_fail = ArrowMemo{};
+    p.skip_bodies = false;
+    p.skipped_any = false;
+    p.skip_depth = 0;
+    p.class_depth = 0;
+    p.with_depth = 0;
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -847,6 +865,14 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     if eat(p, TOK_COLON) { ts_return_type(p); }
     if at(p, TOK_LBRACE) {
         bool strict_body = peek(p).kind == TOK_STRING && str_equal(peek(p).text, "use strict");
+        if p.skip_bodies && p.fn_depth > p.skip_depth && p.class_depth == 0 && p.with_depth == 0
+                && (flags & (NF_GENERATOR | NF_ASYNC | NF_GETTER | NF_SETTER | NF_METHOD | NF_ARROW)) == 0
+                && skip_body(p, fun, strict_body) {
+            p.fn_depth--;
+            p.in_async = saved_async;
+            p.in_gen = saved_gen;
+            return fun;
+        }
         if strict_body { p.strict++; }
         i32 saved_floor = p.label_floor;
         p.label_floor = p.labels.len;
@@ -861,6 +887,196 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     p.in_async = saved_async;
     p.in_gen = saved_gen;
     return nfin(p, fun);
+}
+
+// --- bodies passed over -----------------------------------------------
+
+// A program parsed with the bodies of the functions in it passed over
+// when `skip` says so. A body the scan misread leaves the rest of the
+// source unparsable: then the whole of it is parsed again, nothing passed
+// over, so a skip can cost time but never change what the source means.
+Node* parse_program_skipping(Parser* p, bool skip) {
+    Token cur0 = p.cur;
+    i32 pos0 = lexer_tell(&p.lx);
+    i32 prev0 = p.prev_end;
+    i32 errs0 = p.diags.n_errors;
+    i32 list0 = p.diags.list.len;
+    p.skip_bodies = skip;
+    Node* prog = parse_program(p);
+    if p.skipped_any && p.diags.n_errors > errs0 {
+        p.diags.n_errors = errs0;
+        p.diags.list.len = list0;
+        p.skip_bodies = false;
+        p.skipped_any = false;
+        p.fn_depth = 0;
+        p.class_depth = 0;
+        p.with_depth = 0;
+        lexer_seek(&p.lx, pos0);
+        p.cur = cur0;
+        p.prev_end = prev0;
+        prog = parse_program(p);
+    }
+    return prog;
+}
+
+// A function parsed from its source for its first call, the functions
+// nested in it passed over when `skip` says so, with the same fallback.
+Node* parse_function_skipping(Parser* p, bool method, bool skip) {
+    Token cur0 = p.cur;
+    i32 pos0 = lexer_tell(&p.lx);
+    i32 prev0 = p.prev_end;
+    i32 errs0 = p.diags.n_errors;
+    i32 list0 = p.diags.list.len;
+    p.skip_bodies = skip;
+    p.skip_depth = 1;
+    Node* f = parse_function_at(p, method);
+    if p.skipped_any && p.diags.n_errors > errs0 {
+        p.diags.n_errors = errs0;
+        p.diags.list.len = list0;
+        p.skip_bodies = false;
+        p.skipped_any = false;
+        p.fn_depth = 0;
+        p.class_depth = 0;
+        p.with_depth = 0;
+        lexer_seek(&p.lx, pos0);
+        p.cur = cur0;
+        p.prev_end = prev0;
+        f = parse_function_at(p, method);
+    }
+    return f;
+}
+
+// The shortest function worth passing over, from its keyword to its
+// closing brace: a short one costs more to scan and parse again than to
+// parse now. The compiler's lazy_eligible has the same floor.
+const i32 SKIP_MIN_FN = 256;
+
+// The '/' at a token after `prev` begins a regular expression, not a
+// division: after an operator, a keyword other than a value, an opening
+// bracket or a brace.
+private bool skip_regex_after(i32 prev) {
+    if prev == TOK_IDENT || prev == TOK_NUMBER || prev == TOK_STRING || prev == TOK_BIGINT || prev == TOK_REGEX
+        || prev == TOK_TEMPLATE_FULL || prev == TOK_TEMPLATE_TAIL || prev == TOK_RPAREN || prev == TOK_RBRACK
+        || prev == TOK_KW_THIS || prev == TOK_KW_SUPER || prev == TOK_KW_NULL || prev == TOK_KW_TRUE || prev == TOK_KW_FALSE
+        || prev == TOK_PLUSPLUS || prev == TOK_MINUSMINUS {
+        return false;
+    }
+    return true;
+}
+
+// A function body at '{' passed over: its tokens are scanned to the brace
+// that closes it, the names it mentions collected, and a stand-in body
+// made of them, so the compiler sees what it captures as it would in the
+// real one; the lazy compile parses the real one on the first call. Not
+// done, the position restored, for a body that names eval or has a with
+// statement, for one too short to be worth it, and for a function called
+// where it is written.
+private bool skip_body(Parser* p, Node* fun, bool strict_body) {
+    i32 at_pos = lexer_tell(&p.lx);
+    Token open = p.cur;
+    i32 prev_end0 = p.prev_end;
+    i32 mark = p.scratch.len;
+    StrMap<i32> seen;
+    strmap_init<i32>(&seen);
+    defer strmap_free<i32>(&seen);
+    // the brackets open, and for a template's substitution a 't'
+    Vec<u8> stack = vec_new<u8>(16);
+    defer vec_free(&stack);
+    vec_push(&stack, '{');
+    i32 prev = TOK_LBRACE;
+    i32 prev2 = TOK_EOF;
+    bool ok = true;
+    i32 end = -1;
+    i32 n_diags = p.diags.n_errors;
+    while true {
+        Token t = lexer_next(&p.lx);
+        i32 k = t.kind;
+        if k == TOK_EOF || k == TOK_ERROR { ok = false; break; }
+        if (k == TOK_SLASH || k == TOK_SLASH_EQ) && skip_regex_after(prev) {
+            t = lexer_rescan_regex(&p.lx, t);
+            k = t.kind;
+            if k != TOK_REGEX { ok = false; break; }
+        } else if k == TOK_LBRACE || k == TOK_LPAREN || k == TOK_LBRACK {
+            vec_push(&stack, k == TOK_LBRACE ? cast(u8, '{') : k == TOK_LPAREN ? cast(u8, '(') : cast(u8, '['));
+        } else if k == TOK_TEMPLATE_HEAD {
+            vec_push(&stack, 't');
+        } else if k == TOK_RBRACE {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top == 't' {
+                t = lexer_rescan_template(&p.lx, t);
+                k = t.kind;
+                if k == TOK_TEMPLATE_TAIL { stack.len--; }
+                else if k != TOK_TEMPLATE_MIDDLE { ok = false; break; }
+            } else {
+                if top != '{' { ok = false; break; }
+                stack.len--;
+                if stack.len == 0 { end = lexer_tell(&p.lx); break; }
+            }
+        } else if k == TOK_RPAREN || k == TOK_RBRACK {
+            if stack.len == 0 || stack.data[stack.len - 1] != (k == TOK_RPAREN ? cast(u8, '(') : cast(u8, '[')) { ok = false; break; }
+            stack.len--;
+        } else if k == TOK_KW_WITH {
+            // a super or a private name here belongs to a class inside, which the lazy compile parses whole
+            ok = false;
+            break;
+        } else if k == TOK_KW_THIS {
+            strmap_set<i32>(&seen, "this", 1);
+        } else if k == TOK_IDENT || tok_is_keyword(k) {
+            bool member = prev == TOK_DOT || prev == TOK_QUESTION_DOT;
+            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { strmap_set<i32>(&seen, "%newtarget", 1); }
+            else if !member && t.text.len > 0 {
+                if str_equal(t.text, "eval") { ok = false; break; }
+                strmap_set<i32>(&seen, t.text, 1);
+            }
+        }
+        prev2 = prev;
+        prev = k;
+    }
+    // too short, or something here the lazy compile does not take
+    ok = ok && end >= 0 && p.diags.n_errors == n_diags && end - fun.span.start >= SKIP_MIN_FN;
+    // called where it is written: function () {...}() or (function () {...})()
+    if ok {
+        Token n1 = lexer_next(&p.lx);
+        Token n2 = lexer_next(&p.lx);
+        if n1.kind == TOK_LPAREN || n1.kind == TOK_DOT || (n1.kind == TOK_RPAREN && (n2.kind == TOK_LPAREN || n2.kind == TOK_DOT)) { ok = false; }
+        lexer_seek(&p.lx, end);
+    }
+    if !ok {
+        lexer_seek(&p.lx, at_pos);
+        p.cur = open;
+        p.prev_end = prev_end0;
+        return false;
+    }
+    // the stand-in: a directive when the real one has it, then the names
+    Node* body = nnew(p, N_BLOCK);
+    if strict_body {
+        Node* st = nnew(p, N_EXPR_STMT);
+        Node* lit = nnew(p, N_STRING);
+        lit.name = "use strict";
+        st.a = lit;
+        vec_push(&p.scratch, st);
+    }
+    for i32 i = 0; i < seen.cap; i++ {
+        StrSlot<i32>* sl = seen.slots + i;
+        if sl.state != SLOT_USED { continue; }
+        Node* st = nnew(p, N_EXPR_STMT);
+        Node* id;
+        if str_equal(sl.key, "this") { id = nnew(p, N_THIS); }
+        else if str_equal(sl.key, "%newtarget") { id = nnew(p, N_NEW_TARGET); }
+        else { id = nnew(p, N_IDENT); id.name = sl.key; }
+        st.a = id;
+        vec_push(&p.scratch, st);
+    }
+    body.kids = finish_kids(p, mark);
+    fun.a = body;
+    fun.flags |= NF_SKIPPED;
+    p.skipped_any = true;
+    // on past the closing brace
+    p.prev_end = end;
+    fun.span.end = end;
+    p.cur = contextualize(p, lexer_next(&p.lx));
+    return true;
 }
 
 // After the 'function' keyword; `start` is where that keyword was.
@@ -1978,6 +2194,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     // a class definition is strict-mode code throughout: its own name, the
     // expression it extends, and its body
     p.strict++;
+    p.class_depth++;
     if is_binding_ident(p.cur.kind) {
         c.name = p.cur.text;
         advance(p);
@@ -2009,6 +2226,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     }
     expect(p, TOK_RBRACE, "expected '}'");
     p.strict--;
+    p.class_depth--;
     c.kids = finish_kids(p, mark);
     return nfin(p, c);
 }
@@ -2459,7 +2677,9 @@ private Node* parse_statement_in(Parser* p) {
         expect(p, TOK_LPAREN, "expected '('");
         n.a = parse_expression(p);
         expect(p, TOK_RPAREN, "expected ')'");
+        p.with_depth++;
         n.b = parse_body(p, 2);
+        p.with_depth--;
         return nfin(p, n);
     }
     if k == TOK_KW_DO {

@@ -641,7 +641,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     Parser p;
     parser_init(&p, src, &ld.diags, &mod.arena);
     parser_set_module_top(&p, true);   // top-level await belongs to a module
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &mod.arena, &ld.diags);
     lower_program(&lw, prog);
@@ -1064,7 +1064,7 @@ private bool has_module_syntax(str src) {
     parser_init(&p, src, &d, &arena);
     // parse as module code, so a top-level await does not derail the scan
     parser_set_module_top(&p, true);
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     bool found = false;
     for i32 i = 0; i < prog.kids.len; i++ {
         i32 k = (*(prog.kids.items + i)).kind;
@@ -1636,7 +1636,7 @@ private Value run_js_builtin(VM* vm, str name, str src) {
     bump_init(&arena);
     Parser p;
     parser_init(&p, src, &d, &arena);
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
     lower_program(&lw, prog);
@@ -1874,7 +1874,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     src.len = cast(i32, fd.len);
     Parser p;
     parser_init(&p, src, &d, &arena);
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
     lower_program(&lw, prog);

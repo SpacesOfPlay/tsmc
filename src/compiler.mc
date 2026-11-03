@@ -17,6 +17,8 @@ import value;
 import gc;
 import atom;
 import bytecode;
+import parser;
+import lower;
 import regex;
 import bump;
 import object;
@@ -3322,9 +3324,40 @@ private void compile_function(Compiler* co, Node* f, bool self_name) {
     // A method's name is its property key, not a binding: `{ f() { f() } }`
     // calls the outer f. Only a named function expression sees itself.
     if (f.flags & NF_METHOD) != 0 { self_name = false; }
-    FnTemplate* t = lazy_eligible(co, f) ? lazy_template(co, f, self_name) : compile_function_tmpl(co, f, null, 0, self_name);
+    FnTemplate* t = null;
+    if lazy_eligible(co, f) {
+        t = lazy_template(co, f, self_name);
+    } else if (f.flags & NF_SKIPPED) != 0 {
+        t = compile_skipped(co, f, self_name);
+    } else {
+        t = compile_function_tmpl(co, f, null, 0, self_name);
+    }
     vec_push(&co.cur.ch.subs, t);
     ch_op_u16(&co.cur.ch, OP_CLOSURE, co.cur.ch.subs.len - 1);
+}
+
+// A function the parser passed over that is to be compiled now after all
+// (a default value's, a static block's, one called where it is written):
+// its real body parsed from the source, then compiled as any other.
+private FnTemplate* compile_skipped(Compiler* co, Node* f, bool self_name) {
+    Parser p;
+    parser_init_at(&p, co.src, co.diags, co.arena, f.span.start, co.strict);
+    Node* nf = parse_function_skipping(&p, false, true);
+    Lower lw;
+    lower_init(&lw, co.arena, co.diags);
+    if nf != null { lower_function(&lw, &nf); }
+    FnTemplate* t = null;
+    if nf == null || nf.kind != N_FUNCTION || co.diags.n_errors > 0 {
+        cerror(co, f, "a function could not be compiled");
+        t = compile_function_tmpl(co, f, null, 0, self_name);
+    } else {
+        nf.name = f.name;
+        nf.flags |= f.flags & NF_NAME_INFERRED;
+        t = compile_function_tmpl(co, nf, null, 0, self_name);
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    return t;
 }
 
 // --- lazy functions ----------------------------------------------------------------
@@ -3345,12 +3378,12 @@ private void compile_function(Compiler* co, Node* f, bool self_name) {
 // where it is written, (function () { ... })(), runs at once and is
 // compiled at once.
 
-// Off unless the embedder turns it on: a function compiled lazily that
-// runs anyway is parsed twice, and the lazy functions inside it once more
-// per level, so a page that runs most of its bundle pays more than it
-// saves. Measured on the brmc corpus: 8 of 10 script-heavy pages slower,
-// the one that ships most code it never runs (165 modules) 10% faster.
-// A pre-parse that skips nested bodies is what would make it pay.
+// Off unless the embedder turns it on (tsmc --lazy; brmc does). The first
+// parse passes over the bodies of the functions it can (parser.mc,
+// skip_body), so a body is parsed in full once, on its first call, and one
+// never called not at all. A syntax error in a body passed over is reported
+// when the function is first called, not before the source runs. bsky.app's
+// 9.5 MB bundle: its compile 848 to 220 ms, and 406 ms of first calls after.
 bool lazy_functions = false;
 
 const i32 LAZY_MIN_SOURCE = 65536;
@@ -3407,6 +3440,8 @@ private bool lazy_eligible(Compiler* co, Node* f) {
     if !co.lazy_ok || co.cur == null || co.in_params || co.in_static_block || f == co.eager_fn { return false; }
     // inside a with body its names resolve against the object, at run time
     if co.cur.withs.len > 0 { return false; }
+    // one the parser passed over was eligible by everything it could see
+    if (f.flags & NF_SKIPPED) != 0 { return true; }
     if (f.flags & (NF_GENERATOR | NF_ASYNC | NF_SIGNATURE | NF_GETTER | NF_SETTER)) != 0 { return false; }
     bool arrow = (f.flags & NF_ARROW) != 0;
     bool method = (f.flags & NF_METHOD) != 0;

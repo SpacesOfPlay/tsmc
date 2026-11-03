@@ -8596,7 +8596,7 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
     bump_init(&arena);
     Parser p;
     parser_init_at(&p, s.src, &d, &arena, lz.start, lz.strict);
-    Node* f = parse_function_at(&p, lz.method);
+    Node* f = parse_function_skipping(&p, lz.method, true);
     bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
     Lower lw;
     lower_init(&lw, &arena, &d);
@@ -8635,7 +8635,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
     u64 c0 = vm_clock_ns();
     Parser p;
     parser_init(&p, src, &d, &arena);
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
     lower_program(&lw, prog);
