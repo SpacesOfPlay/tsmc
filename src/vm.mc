@@ -4329,6 +4329,18 @@ private i32 rd_u16(u8* code, i32 at) {
     return lo | (hi << 8);
 }
 
+// The interpreter loop keeps its position as a pointer into the code, which
+// spares it an add per byte read; these read at the pointer.
+private i32 rd_u16p(u8* p) {
+    i32 lo = *p;
+    i32 hi = *(p + 1);
+    return lo | (hi << 8);
+}
+
+private i32 rd_targetp(u8* p) {
+    return cast(i32, cast(u32, *p) | (cast(u32, *(p + 1)) << 8) | (cast(u32, *(p + 2)) << 16) | (cast(u32, *(p + 3)) << 24));
+}
+
 // The `process` global, or undefined before the builtins are installed.
 Value vm_process_object(VM* vm) {
     Value* pv = intmap_get<Value>(&vm.globals, atom_intern(&vm.atoms, "process"));
@@ -4519,7 +4531,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
     Frame* fr = vm.frames + (vm.fp - 1);
     FnTemplate* t = fr.tmpl;
     u8* code = t.code;
-    i32 ip = fr.ret_ip;   // 0 for calls; the resume point for generators
+    u8* pc = code + fr.ret_ip;   // the first byte for calls; the resume point for generators
 
     while true {
         // top-of-loop so resuming a generator with a pending throw
@@ -4534,7 +4546,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 fr = vm.frames + (vm.fp - 1);
                 t = fr.tmpl;
                 code = t.code;
-                ip = h.ip;
+                pc = code + h.ip;
                 vpush(vm, vm.pending);
                 vm.pending = value_undefined();
                 vm.has_pending = false;
@@ -4552,15 +4564,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 return 1;
             }
         }
-        i32 op = *(code + ip);
-        ip++;
+        i32 op = *pc;
+        pc++;
         when defined(TSMC_PROF) {
             if vm.prof != null { prof_step(vm.prof, t, op); }
         }
         switch op {
             case OP_CONST: {
-                vpush(vm, *(t.consts + rd_u16(code, ip)));
-                ip += 2;
+                vpush(vm, *(t.consts + rd_u16p(pc)));
+                pc += 2;
             }
             case OP_UNDEF: { vpush(vm, value_undefined()); }
             case OP_HOLE: { vpush(vm, value_hole()); }
@@ -4594,20 +4606,20 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, result);
             }
             case OP_GETLOCAL: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
             }
             case OP_INCLOCAL: {
-                ip += 2;
-                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 1);
+                pc += 2;
+                op_step_local(vm, fr.base + rd_u16p(pc - 2), 1);
             }
             case OP_DECLOCAL: {
-                ip += 2;
-                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 0 - 1);
+                pc += 2;
+                op_step_local(vm, fr.base + rd_u16p(pc - 2), 0 - 1);
             }
             case OP_GETLOCAL_CHK: {
-                Value v = *(vm.stack + fr.base + rd_u16(code, ip));
-                ip += 2;
+                Value v = *(vm.stack + fr.base + rd_u16p(pc));
+                pc += 2;
                 if value_is_hole(v) {
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
@@ -4615,42 +4627,42 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SETLOCAL: {
-                *(vm.stack + fr.base + rd_u16(code, ip)) = vpeek(vm, 0);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = vpeek(vm, 0);
+                pc += 2;
             }
             case OP_PUTLOCAL: {
                 vm.sp--;
-                *(vm.stack + fr.base + rd_u16(code, ip)) = *(vm.stack + vm.sp);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = *(vm.stack + vm.sp);
+                pc += 2;
             }
             case OP_SETHOLE: {
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_hole();
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = value_hole();
+                pc += 2;
             }
             case OP_NEWCELL_UNDEF: {
                 JsBox* b = js_new_box(&vm.heap, value_undefined());
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_cell(&b.head);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
+                pc += 2;
             }
             case OP_NEWCELL_HOLE: {
                 JsBox* b = js_new_box(&vm.heap, value_hole());
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_cell(&b.head);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
+                pc += 2;
             }
             case OP_CELLIFY: {
-                i32 slot = rd_u16(code, ip);
-                ip += 2;
+                i32 slot = rd_u16p(pc);
+                pc += 2;
                 JsBox* b = js_new_box(&vm.heap, *(vm.stack + fr.base + slot));
                 *(vm.stack + fr.base + slot) = value_cell(&b.head);
             }
             case OP_GETCELL: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
                 vpush(vm, b.v);
             }
             case OP_GETCELL_CHK: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
                 if value_is_hole(b.v) {
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
@@ -4658,18 +4670,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SETCELL: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
                 b.v = vpeek(vm, 0);
             }
             case OP_GETUPVAL: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
                 vpush(vm, b.v);
             }
             case OP_GETUPVAL_CHK: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
                 if value_is_hole(b.v) {
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
@@ -4677,56 +4689,56 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SETUPVAL: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
                 b.v = vpeek(vm, 0);
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
-                ip += 2;
-                get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                pc += 2;
+                get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     op == OP_GETGLOBAL_SOFT);
             }
             case OP_SETGLOBAL: {
-                ip += 2;
+                pc += 2;
                 ignore set_global(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     vpeek(vm, 0), !t.sloppy);
             }
             case OP_SETEXPORT: {
-                ip += 2;
-                set_export(vm, t, rd_u16(code, ip - 2));
+                pc += 2;
+                set_export(vm, t, rd_u16p(pc - 2));
             }
             case OP_DEFGLOBAL: {
-                ip += 2;
+                pc += 2;
                 ignore set_global(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     vpeek(vm, 0), false);
             }
             case OP_WITH_OBJ: { op_with_obj(vm); }
             case OP_WITH_HAS: {
-                ip += 2;
+                pc += 2;
                 op_with_has(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
             case OP_WITH_GET: {
-                ip += 2;
+                pc += 2;
                 op_with_get(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
             case OP_WITH_SET: {
-                ip += 2;
+                pc += 2;
                 op_with_set(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
             case OP_WITH_METH: {
-                ip += 2;
+                pc += 2;
                 op_with_meth(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
             case OP_DELGLOBAL: {
-                ip += 2;
+                pc += 2;
                 del_global(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
             case OP_SETCONST_ERR: {
                 // the value was computed first, as the assignment says
@@ -5003,7 +5015,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if r >= 0 { vpush(vm, value_bool(r == 1)); }
             }
             case OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF: {
-                ip += 4;
+                pc += 4;
                 // two ints, which is what a counted loop's condition compares,
                 // are compared here; anything else takes the general path
                 if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
@@ -5015,10 +5027,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     else if op == OP_GT_JF { r = x > y; }
                     else if op == OP_LE_JF { r = x <= y; }
                     else { r = x >= y; }
-                    if !r { ip = rd_target(code, ip - 4); }
+                    if !r { pc = code + rd_targetp(pc - 4); }
                 } else {
                     i32 r = cmp_rel(vm, rel_base(op));
-                    if r == 0 { ip = rd_target(code, ip - 4); }
+                    if r == 0 { pc = code + rd_targetp(pc - 4); }
                 }
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
@@ -5129,8 +5141,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 // #name in obj: an own check for the private element's hidden
                 // atom, never routed through a proxy trap. Non-object right-hand
                 // sides throw, like the ordinary `in` operator.
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value objv = vpeek(vm, 0);
                 if value_props(objv) != null {
                     bool r = has_private(vm, objv, a);
@@ -5141,8 +5153,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JUMP: {
-                i32 target = rd_target(code, ip);
-                if target < ip && vm.deadline_ns != 0 {
+                i32 target = rd_targetp(pc);
+                if code + target < pc && vm.deadline_ns != 0 {
                     vm.deadline_tick++;
                     if (vm.deadline_tick & 4095) == 0 && vm_clock_ns() > vm.deadline_ns {
                         // once: a catch around the loop gets to run
@@ -5150,47 +5162,47 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
                     }
                 }
-                ip = target;
+                pc = code + target;
             }
             case OP_JUMPF: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 // what a comparison leaves is a boolean, which needs no test
                 vm.sp--;
                 if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(false)) { ip = target; }
+                    if value_same_bits(*(vm.stack + vm.sp), value_bool(false)) { pc = code + target; }
                 } else if !js_truthy(*(vm.stack + vm.sp)) {
-                    ip = target;
+                    pc = code + target;
                 }
             }
             case OP_JUMPT: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 vm.sp--;
                 if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { ip = target; }
+                    if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { pc = code + target; }
                 } else if js_truthy(*(vm.stack + vm.sp)) {
-                    ip = target;
+                    pc = code + target;
                 }
             }
             case OP_JF_KEEP: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
-                if !js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if !js_truthy(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
             }
             case OP_JT_KEEP: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
-                if js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if js_truthy(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
             }
             case OP_JNN_KEEP: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
-                if !is_nullish(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if !is_nullish(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
             }
             case OP_CLOSURE: {
-                FnTemplate* sub = *(t.subs + rd_u16(code, ip));
-                ip += 2;
+                FnTemplate* sub = *(t.subs + rd_u16p(pc));
+                pc += 2;
                 JsFunction* f = js_new_function(&vm.heap, sub, sub.n_upvals);
                 for i32 i = 0; i < sub.n_upvals; i++ {
                     TmplUpval u = *(sub.upvals + i);
@@ -5203,9 +5215,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_cell(&f.head));
             }
             case OP_CALL, OP_NEW, OP_SUPERCALL: {
-                i32 argc = rd_u16(code, ip);
-                ip += 2;
-                fr.cur_ip = ip;   // this frame's call site, for stack traces
+                i32 argc = rd_u16p(pc);
+                pc += 2;
+                fr.cur_ip = cast(i32, pc - code);   // this frame's call site, for stack traces
                 // super() forwards the current frame's new.target to the base
                 // constructor; captured now, before fr is reassigned
                 Value inherited_target = fr.new_target;
@@ -5261,7 +5273,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             Frame* nf = vm.frames + vm.fp;
                             nf.fun = f;
                             nf.tmpl = ft;
-                            nf.ret_ip = ip;
+                            nf.ret_ip = cast(i32, pc - code);
                             nf.cur_ip = 0;
                             nf.base = base;
                             nf.this_val = thisv;
@@ -5281,7 +5293,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             fr = nf;
                             t = ft;
                             code = t.code;
-                            ip = 0;
+                            pc = code;
                         }
                     } else if fk == GC_OBJECT
                               && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
@@ -5324,19 +5336,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     fr = vm.frames + (vm.fp - 1);
                     t = fr.tmpl;
                     code = t.code;
-                    ip = popped.ret_ip;
+                    pc = code + popped.ret_ip;
                 }
             }
             case OP_NEWOBJ: {
-                i32 nprops = rd_u16(code, ip);
-                ip += 2;
+                i32 nprops = rd_u16p(pc);
+                pc += 2;
                 JsObject* o = js_new_object(&vm.heap, vm.object_proto);
                 props_reserve(&o.props, nprops);
                 vpush(vm, value_cell(&o.head));
             }
             case OP_NEWARR: {
-                i32 n = rd_u16(code, ip);
-                ip += 2;
+                i32 n = rd_u16p(pc);
+                pc += 2;
                 JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
                 js_array_reserve(arr, n);
                 for i32 i = 0; i < n; i++ {
@@ -5346,8 +5358,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_cell(&arr.head));
             }
             case OP_GETPROP: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value out;
                 if prop_get(vm, vpeek(vm, 0), a, &out) {
                     vm.sp--;
@@ -5355,12 +5367,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_GETIMPORT: {
-                get_import(vm, t, rd_u16(code, ip), rd_u16(code, ip + 2));
-                ip += 4;
+                get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
+                pc += 4;
             }
             case OP_SETPROP: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value v = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
                 if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
@@ -5369,16 +5381,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DEFPROP_FIXED: {
-                ip += 2;
+                pc += 2;
                 def_prop_fixed(vpeek(vm, 1), cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), vpeek(vm, 0));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), vpeek(vm, 0));
                 vm.sp--;
             }
             case OP_DEFMETHOD: {
                 // like SETPROP but installs a non-enumerable property
                 // (class methods, static methods, constructor back-link)
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value v = vpeek(vm, 0);
                 def_method(vpeek(vm, 1), a, v);
                 vm.sp -= 2;
@@ -5472,8 +5484,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_GETMETHOD: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value objv = vpeek(vm, 0);
                 Value out;
                 if prop_get(vm, objv, a, &out) {
@@ -5483,13 +5495,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DEFPRIVATE: {
-                ip += 4;
-                def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 4)))),
-                    cast(i32, rd_u16(code, ip - 2)));
+                pc += 4;
+                def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 4)))),
+                    cast(i32, rd_u16p(pc - 2)));
             }
-            case OP_GETPRIVATE: { private_get(vm, t, rd_u16(code, ip)); ip += 2; }
-            case OP_SETPRIVATE: { private_set(vm, t, rd_u16(code, ip)); ip += 2; }
-            case OP_GETMETHOD_PRIV: { private_method(vm, t, rd_u16(code, ip)); ip += 2; }
+            case OP_GETPRIVATE: { private_get(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_SETPRIVATE: { private_set(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_GETMETHOD_PRIV: { private_method(vm, t, rd_u16p(pc)); pc += 2; }
             case OP_GETMETHOD_DYN: {
                 Value key = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
@@ -5512,15 +5524,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DELPROP: {
-                ip += 2;
-                op_delete_prop(vm, t, rd_u16(code, ip - 2));
+                pc += 2;
+                op_delete_prop(vm, t, rd_u16p(pc - 2));
             }
             case OP_DELINDEX: {
                 op_delete_index(vm, !t.sloppy);
             }
             case OP_TRY_PUSH: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if vm.hp >= VM_HANDLERS_MAX {
                     vm_throw_error(vm, ERR_RANGE, "too many nested try blocks");
                 } else {
@@ -5555,29 +5567,29 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_DEFPROP, OP_DEFPROP_NEW: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 if op == OP_DEFPROP_NEW { def_prop_new(vm, a); } else { def_prop(vm, a); }
             }
             case OP_REQUIRE_OBJ: {
                 require_object(vm);
             }
             case OP_DEFPROP_DYN: {
-                ip += 2;
-                def_prop_dyn(vm, rd_u16(code, ip - 2) != 0);
+                pc += 2;
+                def_prop_dyn(vm, rd_u16p(pc - 2) != 0);
             }
             case OP_DEFGETTER, OP_DEFSETTER: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
-                bool enumer = rd_u16(code, ip) != 0;
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                bool enumer = rd_u16p(pc) != 0;
+                pc += 2;
                 def_accessor(vm, vpeek(vm, 1), a, vpeek(vm, 0), op == OP_DEFGETTER, enumer);
                 vm.sp--;
             }
             case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: {
                 // computed accessor: `get [expr]() {}` / `set [expr](v) {}`
-                bool enumer = rd_u16(code, ip) != 0;
-                ip += 2;
+                bool enumer = rd_u16p(pc) != 0;
+                pc += 2;
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
                 name_by_key(vm, vpeek(vm, 0), a, op == OP_DEFGETTER_DYN ? "get " : "set ");
@@ -5693,12 +5705,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !vm.has_pending { vm.sp--; }
             }
             case OP_OBJ_REST: {
-                ip += 2;
-                op_obj_rest(vm, fr, rd_u16(code, ip - 2));
+                pc += 2;
+                op_obj_rest(vm, fr, rd_u16p(pc - 2));
             }
             case OP_ARR_SLICE_FROM: {
-                i32 start = rd_u16(code, ip);
-                ip += 2;
+                i32 start = rd_u16p(pc);
+                pc += 2;
                 Value src = vpeek(vm, 0);
                 JsObject* out = js_new_array(&vm.heap, vm.array_proto);
                 vpush(vm, value_cell(&out.head));
@@ -5726,7 +5738,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, ov);
             }
             case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: {
-                fr.cur_ip = ip;   // call site, for stack traces
+                fr.cur_ip = cast(i32, pc - code);   // call site, for stack traces
                 // new.target for the frame vm_call_stack is about to build:
                 // the constructor for `new`, the inherited target for super()
                 if op == OP_NEW_ARRAY { vm.pending_new_target = vpeek(vm, 1); }
@@ -5774,19 +5786,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_JUMP_NULLISH: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if is_nullish(vpeek(vm, 0)) {
                     vm.sp--;
-                    ip = target;
+                    pc = code + target;
                 }
             }
             case OP_JUMP_NULLISH_METH: {
-                i32 target = rd_target(code, ip);
-                ip += 4;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if is_nullish(vpeek(vm, 1)) {
                     vm.sp -= 2;
-                    ip = target;
+                    pc = code + target;
                 }
             }
             case OP_CHECK_ITERABLE: {
@@ -5805,7 +5817,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.gen == null {
                     vm_throw_error(vm, ERR_TYPE, "generator body outside a generator");
                 } else {
-                    gen_start_suspend(vm, fr, ip);
+                    gen_start_suspend(vm, fr, cast(i32, pc - code));
                     vm.sp = fr.base - 2;
                     vpush(vm, value_undefined());
                     vm.fp--;
@@ -5813,7 +5825,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     fr = vm.frames + (vm.fp - 1);
                     t = fr.tmpl;
                     code = t.code;
-                    ip = (vm.frames + vm.fp).ret_ip;
+                    pc = code + (vm.frames + vm.fp).ret_ip;
                 }
             }
             case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: {
@@ -5830,7 +5842,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         *(g.saved + i) = *(vm.stack + fr.base + i);
                     }
                     g.saved_len = depth;
-                    g.resume_ip = ip;
+                    g.resume_ip = cast(i32, pc - code);
                     i32 nh = 0;
                     while vm.hp - nh > 0 {
                         Handler* h = vm.handlers + (vm.hp - nh - 1);
@@ -5862,7 +5874,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     fr = vm.frames + (vm.fp - 1);
                     t = fr.tmpl;
                     code = t.code;
-                    ip = popped.ret_ip;
+                    pc = code + popped.ret_ip;
                 }
             }
             case OP_GET_ITER: {
@@ -5896,23 +5908,23 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_ITER_STEP: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_step(vm, fr.base + dslot);
             }
             case OP_ITER_REST: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_rest(vm, fr.base + dslot);
             }
             case OP_ITER_CLOSE: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_close(vm, fr.base + dslot);
             }
             case OP_ITER_CLOSE_ABRUPT: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_close_abrupt(vm, fr.base + dslot);
             }
             case OP_ITER_CHECK: {
@@ -5922,10 +5934,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 freeze_top(vm);
             }
             case OP_REGEX: {
-                Value srcv = *(t.consts + rd_u16(code, ip));
-                ip += 2;
-                Value flgv = *(t.consts + rd_u16(code, ip));
-                ip += 2;
+                Value srcv = *(t.consts + rd_u16p(pc));
+                pc += 2;
+                Value flgv = *(t.consts + rd_u16p(pc));
+                pc += 2;
                 Value re = vm_new_regexp(vm, gc_string_view(value_as_string(srcv)),
                     gc_string_view(value_as_string(flgv)));
                 if !vm.has_pending { vpush(vm, re); }
