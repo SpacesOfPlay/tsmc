@@ -432,7 +432,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         gc_mark_value(h, *(vm.stack + i));
     }
     for i32 i = 0; i < vm.atom_strs.len; i++ { if vm.atom_strs.data[i] != null { gc_mark_cell(h, &vm.atom_strs.data[i].head); } }
-    for i32 i = 0; i < vm.regex_srcs.len; i++ { gc_mark_cell(h, &vm.regex_srcs.data[i].head); gc_mark_cell(h, &vm.regex_flgs.data[i].head); }
+    for i32 i = 0; i < vm.regex_srcs.len; i++ { gc_mark_cell(h, &vm.regex_srcs.data[i].head); }
+    for i32 i = 0; i < vm.regex_flgs.len; i++ { gc_mark_cell(h, &vm.regex_flgs.data[i].head); }
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.fun != null { gc_mark_cell(h, &fr.fun.head); }
@@ -8215,9 +8216,11 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
         str owned = str_buf_to_str(&kb);   // the buffer's bytes become the key
         vec_push(&vm.regex_keys, owned);
         strmap_set(&vm.regex_cache, owned, idx);
-        // an empty pattern reports "(?:)" so String(re) stays a valid literal
+        // an empty pattern reports "(?:)" so String(re) stays a valid literal;
+        // the source string is in its vector, a root, before the flags string's allocation may collect
         vec_push(&vm.regex_srcs, gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)"));
-        vec_push(&vm.regex_flgs, gc_new_string(&vm.heap, flags));
+        GcString* fs = gc_new_string(&vm.heap, flags);
+        vec_push(&vm.regex_flgs, fs);
     }
     RegexProg* prog = vec_get(&vm.regexps, idx);
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
