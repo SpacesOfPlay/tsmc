@@ -186,6 +186,7 @@ struct VM {
     // for one, and the marking pass is looped until it marks nothing new, so a
     // program that has none should not pay for them at all.
     bool any_weak;
+    Vec<JsMap*> weak_maps;     // every WeakMap and WeakSet made, for the ephemeron passes; the dead drop out at the sweep
     // Bindings stored in the globals table that the global object must not
     // report. In node these are module-scoped, so a bare `__dirname` resolves
     // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
@@ -358,26 +359,21 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
     VM* vmw = cast(VM*, ctx);
     if !vmw.any_weak { return false; }
     bool any = false;
-    GcCell* c = h.all;
-    while c != null {
-        if c.mark != 0 && c.kind == GC_MAP {
-            JsMap* m = cast(JsMap*, c);
-            if m.weak {
-                for i32 i = 0; i < m.len; i++ {
-                    if *(m.live + i) {
-                        Value k = *(m.keys + i);
-                        if value_is_cell(k) && value_as_cell(k).mark != 0 {
-                            Value v = *(m.vals + i);
-                            if value_is_cell(v) && value_as_cell(v).mark == 0 {
-                                gc_mark_value(h, v);
-                                any = true;
-                            }
-                        }
+    for i32 wi = 0; wi < vmw.weak_maps.len; wi++ {
+        JsMap* m = vmw.weak_maps.data[wi];
+        if m.head.mark == 0 { continue; }
+        for i32 i = 0; i < m.len; i++ {
+            if *(m.live + i) {
+                Value k = *(m.keys + i);
+                if value_is_cell(k) && value_as_cell(k).mark != 0 {
+                    Value v = *(m.vals + i);
+                    if value_is_cell(v) && value_as_cell(v).mark == 0 {
+                        gc_mark_value(h, v);
+                        any = true;
                     }
                 }
             }
         }
-        c = c.next;
     }
     return any;
 }
@@ -390,24 +386,23 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
         ignore atoms_sweep(&vms.atoms, h.key_marks, h.key_marks_len, h.alloc_total);
     }
     if !vms.any_weak { return; }
-    GcCell* c = h.all;
-    while c != null {
-        if c.mark != 0 && c.kind == GC_MAP {
-            JsMap* m = cast(JsMap*, c);
-            if m.weak {
-                for i32 i = 0; i < m.len; i++ {
-                    if *(m.live + i) {
-                        Value k = *(m.keys + i);
-                        if !value_is_cell(k) || value_as_cell(k).mark == 0 {
-                            *(m.live + i) = false;
-                            m.count--;
-                        }
-                    }
+    i32 kept = 0;
+    for i32 wi = 0; wi < vms.weak_maps.len; wi++ {
+        JsMap* m = vms.weak_maps.data[wi];
+        if m.head.mark == 0 { continue; }      // the sweep frees it
+        vms.weak_maps.data[kept] = m;
+        kept++;
+        for i32 i = 0; i < m.len; i++ {
+            if *(m.live + i) {
+                Value k = *(m.keys + i);
+                if !value_is_cell(k) || value_as_cell(k).mark == 0 {
+                    *(m.live + i) = false;
+                    m.count--;
                 }
             }
         }
-        c = c.next;
     }
+    vms.weak_maps.len = kept;
 }
 
 // The key marks for this collection: a byte per atom, when there are
@@ -4110,6 +4105,7 @@ void vm_init(VM* vm) {
     vm.main_module = null;
     vm.global_obj = null;
     vm.any_weak = false;
+    vec_init<JsMap*>(&vm.weak_maps, 4);
     vm.iter_fast = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vm.pending = value_undefined();
@@ -4266,6 +4262,7 @@ void vm_destroy(VM* vm) {
     vec_free(&vm.jobs);
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
+    vec_free(&vm.weak_maps);
     vec_free(&vm.timer_heap);
     vec_free(&vm.handles);
     vec_free(&vm.symbols);
