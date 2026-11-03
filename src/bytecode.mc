@@ -170,8 +170,10 @@ enum Op {
     OP_REGEX,        // u16 source const, u16 flags const -> RegExp object
     OP_DEFGLOBAL,    // u16 const idx; keeps value: a script's top-level
                      // declaration made a global, never a strict-mode error
-    OP_PUTLOCAL      // u16 slot; pops into the slot: a store whose value the
+    OP_PUTLOCAL,     // u16 slot; pops into the slot: a store whose value the
                      // statement discards
+    OP_GETPROP_L,    // u16 slot, u16 const idx: GETLOCAL then GETPROP
+    OP_GETINDEX_LL   // u16 slot, u16 slot: two GETLOCALs then GETINDEX
 }
 
 struct TmplUpval {
@@ -314,8 +316,10 @@ struct PosEntry {
 struct Chunk {
     Vec<u8> code;
     // Where the last instruction's opcode byte went, so the compiler can
-    // recognise what it just emitted and fold a pair into one instruction.
+    // recognise what it just emitted and fold a pair into one instruction;
+    // and the one before it, for a triple.
     i32 last_op;
+    i32 prev_op;
     // The furthest position any jump has been pointed at. A pair may only be
     // folded when nothing jumps into the second half of it, and a jump patched
     // to the position the second half would occupy is exactly that.
@@ -354,6 +358,7 @@ void ch_record_pos(Chunk* ch, i32 line, i32 col) {
 }
 
 void ch_op(Chunk* ch, i32 op) {
+    ch.prev_op = ch.last_op;
     ch.last_op = ch.code.len;
     vec_push(&ch.code, cast(u8, op));
 }

@@ -128,6 +128,7 @@ type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 struct VM {
     GcHeap heap;
     AtomTable atoms;
+    AtomCacheEntry[ATOM_CACHE] atom_cache;   // vm_atom_dyn's cache, zero at start
     Prof* prof;                // the `--prof` accounting, or null
     i32 lazy_compiles;         // lazy functions compiled on their first call
     i64 lazy_ns;               // and the time that took
@@ -2038,6 +2039,61 @@ bool vm_delete_prop_report(VM* vm, Value objv, u32 a) {
     return delete_key(vm, objv, a, false) == 1;
 }
 
+// obj[key]: an array's element, a view's, a string's unit, else the
+// property by the key's atom. Shared by OP_GETINDEX and OP_GETINDEX_LL,
+// and out of the loop for its frame's sake.
+private void op_getindex(VM* vm) {
+    Value key = vpeek(vm, 0);
+    Value objv = vpeek(vm, 1);
+    i32 ok = value_kind(objv);
+    if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+        i32 idx = val_to_index(key);
+        // an absent element, in range or past the end, is the
+        // prototype chain's to answer
+        if idx >= 0 && js_array_has(value_as_object(objv), idx) {
+            Value r = js_array_get(value_as_object(objv), idx);
+            vm.sp -= 2;
+            vpush(vm, r);
+            return;
+        }
+    }
+    if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
+        i32 idx = val_to_index(key);
+        if idx >= 0 {
+            JsTypedArray* ta = cast(JsTypedArray*, value_as_object(objv));
+            Value r;
+            // a double or float view read in place: the numeric loops' case
+            if (ta.ta_kind == 8 || ta.ta_kind == 7) && idx < ta.ta_len && ta.elen >= 1 {
+                u8* p = gb_data(value_as_bytes(*(ta.elems))) + ta.ta_off;
+                r = ta.ta_kind == 8 ? value_number(*(cast(f64*, p) + idx)) : value_number(cast(f64, *(cast(f32*, p) + idx)));
+            } else {
+                r = vm_ta_get(vm, value_as_object(objv), idx);
+            }
+            vm.sp -= 2;
+            vpush(vm, r);
+            return;
+        }
+    }
+    if ok == GC_STRING {
+        i32 idx = val_to_index(key);
+        if idx >= 0 {
+            Value ch = value_undefined();
+            if idx < value_as_string(objv).u16len {
+                ch = vm_string_char(vm, value_as_string(objv), idx);
+            }
+            vm.sp -= 2;
+            vpush(vm, ch);
+            return;
+        }
+    }
+    u32 a = key_to_atom(vm, key);
+    Value out;
+    if vm_get_prop_value(vm, objv, a, &out) {
+        vm.sp -= 2;
+        vpush(vm, out);
+    }
+}
+
 // `mode` says what a refusal means to the caller: SET_SLOPPY, SET_STRICT or
 // SET_REPORT.
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
@@ -2356,8 +2412,37 @@ private u32 key_to_atom(VM* vm, Value key) {
 }
 
 // The atom for a property name that arrives as data: the collector frees
-// it once nothing uses it (atom.mc).
+// it once nothing uses it (atom.mc). A cache by the name's address and
+// length stands before the table: a script that indexes objects by the
+// same few strings (a key read from an array, a field name in a loop)
+// asks for the same bytes at the same address over and over, and the
+// hash and probe were most of the cost. A hit is confirmed by comparing
+// the bytes with the atom's name, so an address reused for other bytes,
+// or an atom freed and reused, cannot answer wrongly.
+const i32 ATOM_CACHE = 1024;
+
+struct AtomCacheEntry {
+    u8* data;
+    i32 len;
+    u32 atom;
+}
+
 u32 vm_atom_dyn(VM* vm, str name) {
+    if name.len > 0 && name.len < 64 {
+        u64 h = (cast(u64, name.data) >> 3) ^ (cast(u64, cast(u32, name.len)) * 0x9E3779B9);
+        AtomCacheEntry* e = &vm.atom_cache[cast(i32, h & cast(u64, ATOM_CACHE - 1))];
+        if e.data == name.data && e.len == name.len && cast(i32, e.atom) < vm.atoms.names.len
+           && str_equal(atom_name(&vm.atoms, e.atom), name) {
+            // the stamp the table would have refreshed, so the atom stays
+            if vec_get(&vm.atoms.stamp, cast(i32, e.atom)) != ATOM_PINNED { vec_set(&vm.atoms.stamp, cast(i32, e.atom), vm.heap.alloc_total); }
+            return e.atom;
+        }
+        u32 a = atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
+        e.data = name.data;
+        e.len = name.len;
+        e.atom = a;
+        return a;
+    }
     return atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
 }
 
@@ -5366,6 +5451,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, out);
                 }
             }
+            case OP_GETPROP_L: {
+                Value objv = *(vm.stack + fr.base + rd_u16p(pc));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
+                pc += 4;
+                Value out;
+                if prop_get(vm, objv, a, &out) { vpush(vm, out); }
+            }
             case OP_GETIMPORT: {
                 get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
                 pc += 4;
@@ -5404,48 +5496,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 def_method(vpeek(vm, 2), a, vpeek(vm, 0));
                 vm.sp -= 2;
             }
-            case OP_GETINDEX: {
-                Value key = vpeek(vm, 0);
-                Value objv = vpeek(vm, 1);
-                i32 ok = value_kind(objv);
-                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
-                    i32 idx = val_to_index(key);
-                    // an absent element, in range or past the end, is the
-                    // prototype chain's to answer
-                    if idx >= 0 && js_array_has(value_as_object(objv), idx) {
-                        Value r = js_array_get(value_as_object(objv), idx);
-                        vm.sp -= 2;
-                        vpush(vm, r);
-                        break case;
-                    }
-                }
-                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
-                    i32 idx = val_to_index(key);
-                    if idx >= 0 {
-                        Value r = vm_ta_get(vm, value_as_object(objv), idx);
-                        vm.sp -= 2;
-                        vpush(vm, r);
-                        break case;
-                    }
-                }
-                if ok == GC_STRING {
-                    i32 idx = val_to_index(key);
-                    if idx >= 0 {
-                        Value ch = value_undefined();
-                        if idx < value_as_string(objv).u16len {
-                            ch = vm_string_char(vm, value_as_string(objv), idx);
-                        }
-                        vm.sp -= 2;
-                        vpush(vm, ch);
-                        break case;
-                    }
-                }
-                u32 a = key_to_atom(vm, key);
-                Value out;
-                if vm_get_prop_value(vm, objv, a, &out) {
-                    vm.sp -= 2;
-                    vpush(vm, out);
-                }
+            case OP_GETINDEX: { op_getindex(vm); }
+            case OP_GETINDEX_LL: {
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc + 2)));
+                pc += 4;
+                op_getindex(vm);
             }
             case OP_SETINDEX: {
                 Value v = vpeek(vm, 0);

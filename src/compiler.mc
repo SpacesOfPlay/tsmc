@@ -1392,6 +1392,40 @@ private void emit_store_ident_static(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_SETGLOBAL, name_const(co, n.name));
 }
 
+// A property read whose object is a plain local just loaded: the two
+// become one instruction, unless a jump lands on the read. The same for
+// an index read whose object and key are two locals just loaded.
+private void emit_getprop(Chunk* ch, i32 kc) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 3 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL {
+        vec_set(&ch.code, at, cast(u8, OP_GETPROP_L));
+        ch_u16(ch, kc);
+        return;
+    }
+    ch_op_u16(ch, OP_GETPROP, kc);
+}
+
+private void emit_getindex(Chunk* ch) {
+    i32 at = ch.last_op;
+    i32 before = ch.prev_op;
+    if at >= 0 && before >= 0 && at == ch.code.len - 3 && before == at - 3 && ch.max_target <= before
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, before)) == OP_GETLOCAL {
+        vec_set(&ch.code, before, cast(u8, OP_GETINDEX_LL));
+        // the two slots follow the opcode: the first's two bytes stay, the
+        // second's move up over the second opcode byte
+        u8 lo = vec_get(&ch.code, at + 1);
+        u8 hi = vec_get(&ch.code, at + 2);
+        vec_set(&ch.code, at, lo);
+        vec_set(&ch.code, at + 1, hi);
+        ch.code.len = at + 2;
+        ch.last_op = before;
+        ch.prev_op = -1;
+        return;
+    }
+    ch_op(ch, OP_GETINDEX);
+}
+
 // Drops the value an expression left. A store to a local slot just before it
 // becomes the one instruction that stores and drops, unless a jump lands on
 // the drop (`c ? a = 1 : a = 2;` patches one there).
@@ -1744,7 +1778,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                 if pp.b != null {
                     // default via synthetic assign-pattern shape
                     ch_op_u16(ch, OP_GETLOCAL, tmp);
-                    ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                    emit_getprop(ch, prop_key_const(co, keyn));
                     ch_op(ch, OP_DUP);
                     ch_op(ch, OP_UNDEF);
                     ch_op(ch, OP_SEQ);
@@ -1780,10 +1814,10 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             if t_k >= 0 {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
                 ch_op_u16(ch, OP_GETLOCAL, t_k);
-                ch_op(ch, OP_GETINDEX);
+                emit_getindex(ch);
             } else {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
-                ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                emit_getprop(ch, prop_key_const(co, keyn));
                 note_taken_key(co, t_ex, 0 - 1, keyn);
             }
             if by_ref {
@@ -1944,7 +1978,7 @@ private void compile_assign(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_SETLOCAL, t_obj);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
-            ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
+            if priv { ch_op_u16(ch, OP_GETPRIVATE, kc); } else { emit_getprop(ch, kc); }
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             compile_expr(co, n.b);
@@ -1968,7 +2002,7 @@ private void compile_assign(Compiler* co, Node* n) {
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             ch_op_u16(ch, OP_GETLOCAL, t_key);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             ch_op_u16(ch, OP_GETLOCAL, t_key);
@@ -1998,7 +2032,7 @@ private void compile_assign(Compiler* co, Node* n) {
         i32 kc = priv ? private_key_const(co, t, t.name) : name_const(co, t.name);
         compile_expr(co, t.a);
         ch_op(ch, OP_DUP);
-        ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
+        if priv { ch_op_u16(ch, OP_GETPRIVATE, kc); } else { emit_getprop(ch, kc); }
         compile_expr(co, n.b);
         ch_op(ch, op);
         ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
@@ -2008,7 +2042,7 @@ private void compile_assign(Compiler* co, Node* n) {
         compile_expr(co, t.a);
         compile_expr(co, t.b);
         ch_op(ch, OP_DUP2);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         compile_expr(co, n.b);
         ch_op(ch, op);
         ch_op(ch, OP_SETINDEX);
@@ -2039,12 +2073,12 @@ private void compile_update(Compiler* co, Node* n) {
             mkc = mpriv ? private_key_const(co, t, t.name) : name_const(co, t.name);
             compile_expr(co, t.a);
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, mpriv ? OP_GETPRIVATE : OP_GETPROP, mkc);
+            if mpriv { ch_op_u16(ch, OP_GETPRIVATE, mkc); } else { emit_getprop(ch, mkc); }
         } else {
             compile_expr(co, t.a);
             compile_expr(co, t.b);
             ch_op(ch, OP_DUP2);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
         }
         ch_op(ch, OP_TONUM);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
@@ -2099,7 +2133,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
         if (n.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_GETPRIVATE, private_key_const(co, n, n.name));
         } else {
-            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+            emit_getprop(ch, name_const(co, n.name));
         }
         return;
     }
@@ -2109,7 +2143,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
         compile_expr(co, n.b);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         return;
     }
     if k == N_CALL {
@@ -2241,9 +2275,9 @@ private void compile_call(Compiler* co, Node* n) {
         emit_super_home(co, n);
         if callee.kind == N_INDEX {
             compile_expr(co, callee.b);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
         } else {
-            ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
+            emit_getprop(ch, name_const(co, callee.name));
         }
         // the receiver stays `this`, as for super.name(...)
         emit_this(co, n);
@@ -2698,7 +2732,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 return;
             }
             emit_super_home(co, n);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+            emit_getprop(ch, name_const(co, n.name));
             return;
         }
         // a private read outside an optional chain; `o?.#x` takes the
@@ -2713,7 +2747,7 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         compile_expr(co, n.a);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+        emit_getprop(ch, name_const(co, n.name));
         return;
     }
     if k == N_INDEX {
@@ -2726,7 +2760,7 @@ private void compile_expr(Compiler* co, Node* n) {
             }
             emit_super_home(co, n);
             compile_expr(co, n.b);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
             return;
         }
         if chain_has_opt(n) {
@@ -2735,7 +2769,7 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         compile_expr(co, n.a);
         compile_expr(co, n.b);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         return;
     }
     if k == N_CALL { compile_call(co, n); return; }
@@ -2794,7 +2828,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // the next method is read once, as the language's iterator record has it
             i32 t_next = alloc_slot(co.cur);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+            emit_getprop(ch, name_const(co, "next"));
             ch_op_u16(ch, OP_SETLOCAL, t_next);
             ch_op(ch, OP_POP);
             // What resumed this generator: the input, and the completion's
@@ -2837,9 +2871,9 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 lyield = ch_pos(ch);           // [value]
             ch_op(ch, OP_YIELD_DELEGATE);      // resumes with [input, kind]
@@ -2849,7 +2883,7 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op(ch, OP_POP);
             ch_op_target(ch, OP_JUMP, lstart);
             ch_patch(ch, jdone);               // [res]: the delegate is done
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 jend = ch_jump(ch, OP_JUMP);
 
@@ -2857,7 +2891,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // the delegate is closed and the caller gets a TypeError
             ch_patch(ch, jthrow);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "throw"));
+            emit_getprop(ch, name_const(co, "throw"));
             ch_op_u16(ch, OP_SETLOCAL, t_meth);
             // undefined or null means the delegate has no throw; anything
             // else has to be callable, and is an error on its own if not
@@ -2878,13 +2912,13 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jthrowdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jthrowdone);          // [res]
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 jend2 = ch_jump(ch, OP_JUMP);
             ch_patch(ch, jnothrow);
@@ -2901,7 +2935,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // finally blocks run.
             ch_patch(ch, jret);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "return"));
+            emit_getprop(ch, name_const(co, "return"));
             ch_op_u16(ch, OP_SETLOCAL, t_meth);
             i32 jnoret = ch_jump(ch, OP_JUMP_NULLISH);
             ch_op(ch, OP_TYPEOF);
@@ -2920,13 +2954,13 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jretdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jretdone);            // [res]
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             inline_finallys(co, 0);
             ch_op(ch, OP_RETURN);
@@ -3895,7 +3929,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     ch_op_u16(ch, OP_NEWOBJ, 0);
     if derived {
         emit_load_name(co, "%super", c);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+        emit_getprop(ch, name_const(co, "prototype"));
         ch_op(ch, OP_SETPROTO);
     }
     i32 t_proto = alloc_slot(fs);
@@ -4348,7 +4382,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op(ch, OP_POP);
     i32 t_len = alloc_slot(fs);
     ch_op_u16(ch, OP_GETLOCAL, t_obj);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "length"));
+    emit_getprop(ch, name_const(co, "length"));
     ch_op_u16(ch, OP_SETLOCAL, t_len);
     ch_op(ch, OP_POP);
 
@@ -4380,7 +4414,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     }
     ch_op_u16(ch, OP_GETLOCAL, t_obj);
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
-    ch_op(ch, OP_GETINDEX);
+    emit_getindex(ch);
     if pattern != null {
         compile_destructure(co, pattern, !plain_var);
     } else {
@@ -4433,7 +4467,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     // the next method is read once, as the language's iterator record has it
     i32 t_next = alloc_slot(fs);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+    emit_getprop(ch, name_const(co, "next"));
     ch_op_u16(ch, OP_SETLOCAL, t_next);
     ch_op(ch, OP_POP);
     // tracks exhaustion, so a loop left early still releases the iterator
@@ -4472,13 +4506,13 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op(ch, OP_ITER_CHECK);
     // if result.done: break (leaving result on the stack for the pop)
     ch_op(ch, OP_DUP);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+    emit_getprop(ch, name_const(co, "done"));
     ch_op(ch, OP_DUP);
     ch_op_u16(ch, OP_SETLOCAL, t_done);
     ch_op(ch, OP_POP);
     i32 jend = ch_jump(ch, OP_JUMPT);
     // value = result.value, awaited when the iterator is a wrapped sync one
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+    emit_getprop(ch, name_const(co, "value"));
     emit_await_if_wrapped(co, t_wrapped);
 
     for i32 i = bind_start; i < bind_end; i++ {
@@ -5522,7 +5556,7 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
             str exported = sp.a != null ? sp.a.name : sp.name;
             emit_load_name(co, ns_name, null);
             emit_load_name(co, mname, null);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, sp.name));
+            emit_getprop(ch, name_const(co, sp.name));
             ch_op_u16(ch, OP_SETEXPORT, name_const(co, exported));
             ch_op(ch, OP_POP);
         }

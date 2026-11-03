@@ -225,6 +225,8 @@ str op_name(i32 op) {
         case 146: { return "FREEZE"; }
         case 147: { return "REGEX"; }
         case 148: { return "PUTLOCAL"; }
+        case 149: { return "GETPROP_L"; }
+        case 150: { return "GETINDEX_LL"; }
     }
     return "?";
 }
