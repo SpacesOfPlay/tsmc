@@ -105,8 +105,10 @@ private i64 gc_class_size(i32 cls) {
 
 // A dead cell's memory goes back on its class list, or to the program
 // allocator when it has no class.
+// The class of a size, with the common small sizes computed in place: the
+// function has a loop, which keeps the inliner away from it.
 private void gc_cell_release(GcHeap* h, GcCell* c) {
-    i32 cls = gc_class_of(c.size);
+    i32 cls = c.size <= 1024 ? cast(i32, (c.size + 15) / 16) - 1 : gc_class_of(c.size);
     if cls < 0 {
         gc_stat_frees = gc_stat_frees + 1;
         free(c);
@@ -127,19 +129,19 @@ private void gc_cell_release(GcHeap* h, GcCell* c) {
 private threadlocal u8*[GC_CLASS_COUNT] g_pool_free;
 
 void* pool_alloc(i64 bytes) {
-    i32 cls = gc_class_of(bytes);
+    i32 cls = bytes <= 1024 ? cast(i32, (bytes + 15) / 16) - 1 : gc_class_of(bytes);
     if cls < 0 { return alloc(bytes); }
     u8* p = g_pool_free[cls];
     if p != null {
         g_pool_free[cls] = *(cast(u8**, p));
         return cast(void*, p);
     }
-    return alloc(gc_class_size(cls));
+    return alloc(cls < GC_CLASS_SMALL ? cast(i64, cls + 1) * 16 : gc_class_size(cls));
 }
 
 void pool_free(void* p, i64 bytes) {
     if p == null { return; }
-    i32 cls = gc_class_of(bytes);
+    i32 cls = bytes <= 1024 ? cast(i32, (bytes + 15) / 16) - 1 : gc_class_of(bytes);
     if cls < 0 { free(p); return; }
     *(cast(u8**, p)) = g_pool_free[cls];
     g_pool_free[cls] = cast(u8*, p);
@@ -422,8 +424,9 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
         gc_collect(h);
     }
     h.alloc_total += size;
-    i32 cls = gc_class_of(size);
-    i64 block = cls >= 0 ? gc_class_size(cls) : size;
+    i32 cls = size <= 1024 ? cast(i32, (size + 15) / 16) - 1 : gc_class_of(size);
+    i64 block = size;
+    if cls >= 0 { block = cls < GC_CLASS_SMALL ? cast(i64, cls + 1) * 16 : gc_class_size(cls); }
     GcCell* c = null;
     if cls >= 0 && h.free_cells[cls] != null {
         c = h.free_cells[cls];
@@ -432,7 +435,16 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
         gc_stat_mallocs = gc_stat_mallocs + 1;
         c = cast(GcCell*, alloc(block));
     }
-    memset(cast(u8*, c), 0, zero < 0 || zero > block ? block : zero);
+    i64 nz = zero < 0 || zero > block ? block : zero;
+    if nz <= 256 {
+        // a small cell is cleared in place: a word store a time, where the
+        // library call would be most of the cost
+        u64* w = cast(u64*, c);
+        i64 nw = (nz + 7) / 8;
+        for i64 i = 0; i < nw; i++ { *(w + i) = 0; }
+    } else {
+        memset(cast(u8*, c), 0, nz);
+    }
     c.next = h.all;
     h.all = c;
     c.size = block;

@@ -567,8 +567,9 @@ bool js_truthy(Value v) {
     }
     if value_is_bool(v) { return value_is_true(v); }
     if value_is_undefined(v) || value_is_null(v) || value_is_hole(v) { return false; }
-    if value_is_string(v) { return value_as_string(v).len > 0; }
-    if value_is_bigint(v) { return value_as_bigint(v).nlimbs != 0; }
+    i32 k = value_kind(v);
+    if k == GC_STRING { return value_as_string(v).len > 0; }
+    if k == GC_BIGINT { return value_as_bigint(v).nlimbs != 0; }
     return true;
 }
 
@@ -1196,20 +1197,21 @@ void vm_throw_error(VM* vm, i32 kind, str msg) {
 // --- property helpers -----------------------------------------------------------
 
 private Value ensure_prototype(VM* vm, Value fnv) {
+    i32 fk = value_kind(fnv);
     // a proxy has no .prototype of its own; its target's is the answer
-    if value_is_object(fnv) && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
+    if fk == GC_OBJECT && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
         return ensure_prototype(vm, cast(JsProxy*, value_as_object(fnv)).target);
     }
     PropList* props = null;
-    if value_is_function(fnv) { props = &value_as_function(fnv).props; }
-    if value_is_native(fnv) { props = &value_as_native(fnv).props; }
+    if fk == GC_FUNCTION { props = &value_as_function(fnv).props; }
+    if fk == GC_NATIVE { props = &value_as_native(fnv).props; }
     if props == null { return value_undefined(); }
     Value* p = props_get(props, vm.atom_prototype);
     if p != null { return *p; }
     // Only something that can be `new`ed, or a generator whose results need an
     // object to inherit from, has a .prototype at all. An arrow, a shorthand
     // method and a plain async function have none -- not an empty one.
-    if value_is_function(fnv) {
+    if fk == GC_FUNCTION {
         FnTemplate* ft0 = value_as_function(fnv).tmpl;
         if ft0 != null && !ft0.is_gen && (ft0.not_ctor || ft0.is_async) {
             return value_undefined();
@@ -2452,7 +2454,7 @@ private void def_prop(VM* vm, u32 a) {
 private void def_prop_new(VM* vm, u32 a) {
     Value v = vpop(vm);
     Value objv = vpeek(vm, 0);
-    if value_is_object(objv) {
+    if value_kind(objv) == GC_OBJECT {
         props_add_new(&value_as_object(objv).props, a, v);
     }
 }
@@ -4751,7 +4753,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         vpush(vm, value_number(cast(f64, s)));
                     }
                 } else if value_is_number(a) && value_is_number(b) {
-                    f64 r = js_to_number(a) + js_to_number(b);
+                    f64 r = value_number_f64(a) + value_number_f64(b);
                     vm.sp -= 2;
                     vpush(vm, num_norm(r));
                 } else if value_is_string(a) || value_is_string(b) {
@@ -4791,6 +4793,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_number(a) && value_is_number(b) {
+                    f64 r = value_number_f64(a) - value_number_f64(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
                 } else if value_is_bigint(a) || value_is_bigint(b) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, OP_SUB, &r);
@@ -4824,6 +4830,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_number(a) && value_is_number(b) {
+                    f64 r = value_number_f64(a) * value_number_f64(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
                 } else if value_is_bigint(a) || value_is_bigint(b) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, OP_MUL, &r);
@@ -4845,15 +4855,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         a = vpeek(vm, 1);
                     }
                 }
-                if value_is_bigint(a) || value_is_bigint(b) {
+                bool nums = value_is_number(a) && value_is_number(b);
+                if !nums && (value_is_bigint(a) || value_is_bigint(b)) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, op, &r);
                     vm.sp -= 2;
                     if !vm.has_pending { vpush(vm, r); }
                     break case;
                 }
-                f64 x = vm_to_number(vm, a);
-                f64 y = vm_to_number(vm, b);
+                f64 x = nums ? value_number_f64(a) : vm_to_number(vm, a);
+                f64 y = nums ? value_number_f64(b) : vm_to_number(vm, b);
                 f64 r = 0.0;
                 if op == OP_DIV { r = x / y; }
                 if op == OP_POW { r = pow(x, y); }
@@ -4874,18 +4885,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_NEG: {
                 Value v = vpeek(vm, 0);
-                if value_is_bigint(v) {
+                if !value_is_number(v) && value_is_bigint(v) {
                     vm.sp--;
                     vpush(vm, bigint_negate(vm, v));
                     break case;
                 }
-                f64 r = -vm_to_number(vm, v);
+                f64 r = value_is_number(v) ? -value_number_f64(v) : -vm_to_number(vm, v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
             case OP_TONUM: {
                 Value v = vpeek(vm, 0);
-                if value_is_int(v) { break case; }      // already a number
+                if value_is_number(v) { break case; }   // already a number
                 if value_is_bigint(v) { break case; }   // ToNumeric keeps BigInt
                 f64 r = vm_to_number(vm, v);
                 vm.sp--;
@@ -6451,6 +6462,13 @@ private i32 cmp_rel(VM* vm, i32 op) {
     if value_is_int(a) && value_is_int(b) {
         i32 x = value_as_int(a);
         i32 y = value_as_int(b);
+        if op == OP_LT { r = x < y; }
+        if op == OP_GT { r = x > y; }
+        if op == OP_LE { r = x <= y; }
+        if op == OP_GE { r = x >= y; }
+    } else if value_is_number(a) && value_is_number(b) {
+        f64 x = value_number_f64(a);
+        f64 y = value_number_f64(b);
         if op == OP_LT { r = x < y; }
         if op == OP_GT { r = x > y; }
         if op == OP_LE { r = x <= y; }
