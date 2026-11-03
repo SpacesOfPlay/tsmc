@@ -1939,7 +1939,7 @@ const i32 OBJF_NOT_PLAIN = OBJF_PROXY | OBJF_PROXY_REVOKED
 // through to the full path. This is the commonest operation a program performs,
 // and the path it replaces was four nested calls per level.
 private bool prop_get(VM* vm, Value objv, u32 a, Value* out) {
-    JsObject* o = value_is_object(objv) ? value_as_object(objv) : null;
+    JsObject* o = value_kind(objv) == GC_OBJECT ? value_as_object(objv) : null;
     bool plain = o != null;
     while o != null {
         i32 fl = o.obj_flags;
@@ -1951,12 +1951,23 @@ private bool prop_get(VM* vm, Value objv, u32 a, Value* out) {
             plain = false;
             break;
         }
-        Value* p = props_get(&o.props, a);
-        if p == null {
+        // a short table is scanned here: the call to do it would cost more
+        // than its few compares
+        PropList* pl = &o.props;
+        Prop* pr = null;
+        if pl.idx != null {
+            pr = props_entry(pl, a);
+        } else {
+            for i32 i = 0; i < pl.len; i++ {
+                if (pl.items + i).key == a { pr = pl.items + i; break; }
+            }
+        }
+        if pr == null {
             o = o.proto;
             continue;
         }
-        if !value_is_accessor(*p) {
+        Value* p = &pr.val;
+        if value_kind(*p) != GC_ACCESSOR {
             *out = *p;
             return true;
         }
@@ -2028,7 +2039,7 @@ bool vm_delete_prop_report(VM* vm, Value objv, u32 a) {
 // `mode` says what a refusal means to the caller: SET_SLOPPY, SET_STRICT or
 // SET_REPORT.
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
-    if value_is_object(objv) {
+    if value_kind(objv) == GC_OBJECT {
         JsObject* o = value_as_object(objv);
         if (o.obj_flags & OBJF_MODULE_NS) != 0 {
             return write_refused(vm, mode,
@@ -2088,9 +2099,17 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
         // a setter anywhere on the chain intercepts the write
         JsObject* cur = o;
         while cur != null {
-            Prop* pe = props_entry(&cur.props, a);
+            PropList* pl = &cur.props;
+            Prop* pe = null;
+            if pl.idx != null {
+                pe = props_entry(pl, a);
+            } else {
+                for i32 i = 0; i < pl.len; i++ {
+                    if (pl.items + i).key == a { pe = pl.items + i; break; }
+                }
+            }
             if pe != null {
-                if value_is_accessor(pe.val) {
+                if value_kind(pe.val) == GC_ACCESSOR {
                     JsAccessor* ac = value_as_accessor(pe.val);
                     if value_is_callable(ac.set) {
                         Value[1] sa = { v };
@@ -2118,7 +2137,8 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
         if (o.obj_flags & OBJF_NONEXT) != 0 {
             return write_refused(vm, mode, "cannot add property to a non-extensible object");
         }
-        js_set_prop(o, a, v);
+        // the walk began with the object's own table, so the name is new there
+        props_add_new(&o.props, a, v);
         return true;
     }
     if value_is_function(objv) || value_is_native(objv) {
@@ -4596,6 +4616,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 *(vm.stack + fr.base + rd_u16(code, ip)) = vpeek(vm, 0);
                 ip += 2;
             }
+            case OP_PUTLOCAL: {
+                vm.sp--;
+                *(vm.stack + fr.base + rd_u16(code, ip)) = *(vm.stack + vm.sp);
+                ip += 2;
+            }
             case OP_SETHOLE: {
                 *(vm.stack + fr.base + rd_u16(code, ip)) = value_hole();
                 ip += 2;
@@ -4947,7 +4972,17 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_bool(r));
             }
             case OP_SEQ, OP_SNEQ: {
-                bool r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                // the same bits are the same value, NaN apart; two different
+                // ints are different values; the rest is the general compare
+                bool r;
+                if value_same_bits(vpeek(vm, 1), vpeek(vm, 0)) {
+                    r = !value_is_double(vpeek(vm, 0))
+                        || value_as_f64(vpeek(vm, 0)) == value_as_f64(vpeek(vm, 0));
+                } else if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
+                    r = false;
+                } else {
+                    r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                }
                 if op == OP_SNEQ { r = !r; }
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
@@ -4958,8 +4993,22 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF: {
                 ip += 4;
-                i32 r = cmp_rel(vm, rel_base(op));
-                if r == 0 { ip = rd_target(code, ip - 4); }
+                // two ints, which is what a counted loop's condition compares,
+                // are compared here; anything else takes the general path
+                if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
+                    i32 x = value_as_int(vpeek(vm, 1));
+                    i32 y = value_as_int(vpeek(vm, 0));
+                    vm.sp -= 2;
+                    bool r = false;
+                    if op == OP_LT_JF { r = x < y; }
+                    else if op == OP_GT_JF { r = x > y; }
+                    else if op == OP_LE_JF { r = x <= y; }
+                    else { r = x >= y; }
+                    if !r { ip = rd_target(code, ip - 4); }
+                } else {
+                    i32 r = cmp_rel(vm, rel_base(op));
+                    if r == 0 { ip = rd_target(code, ip - 4); }
+                }
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
                 // an object operand becomes a primitive first, which is how
@@ -5158,7 +5207,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !vm.has_pending {
                     fnv = vpeek(vm, argc + 1);
                     thisv = vpeek(vm, argc);
-                    if value_is_native(fnv) {
+                    i32 fk = value_kind(fnv);
+                    if fk == GC_NATIVE {
                         JsNative* na = value_as_native(fnv);
                         when defined(TSMC_PROF) {
                             if vm.prof != null { vm.prof.native_calls++; }
@@ -5168,12 +5218,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         if op == OP_SUPERCALL && !vm.has_pending { super_native_result(vm, res, inherited_target, thisv, derived_ctor_index(vm)); }
                         vm.sp -= argc + 2;
                         vpush(vm, res);
-                    } else if value_is_function(fnv) {
+                    } else if fk == GC_FUNCTION {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
                         if ft.lazy != null && !vm_lazy_compile(vm, ft) {
                             // threw: its body does not compile
-                        } else if (ft.not_ctor || ft.is_class) && call_kind_error(vm, ft, op) {
+                        } else if ((op == OP_NEW && ft.not_ctor) || (op == OP_CALL && ft.is_class))
+                                  && call_kind_error(vm, ft, op) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
@@ -5191,7 +5242,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                                 argobj = vm_build_arguments(vm, vm.stack + vm.sp - argc, argc);
                                 gc_root(&vm.heap, argobj);
                             }
-                            normalize_args(vm, ft, argc);
+                            if argc != ft.n_params || ft.has_rest { normalize_args(vm, ft, argc); }
                             i32 base = vm.sp - ft.n_params;
                             for i32 i = ft.n_params; i < ft.n_slots; i++ {
                                 vpush(vm, value_undefined());
@@ -5221,7 +5272,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             code = t.code;
                             ip = 0;
                         }
-                    } else if value_is_object(fnv)
+                    } else if fk == GC_OBJECT
                               && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
                         // a callable-target proxy: route through apply/construct
                         JsProxy* p = cast(JsProxy*, value_as_object(fnv));
@@ -5333,7 +5384,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GETINDEX: {
                 Value key = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
-                if value_is_array(objv) {
+                i32 ok = value_kind(objv);
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     // an absent element, in range or past the end, is the
                     // prototype chain's to answer
@@ -5344,7 +5396,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         break case;
                     }
                 }
-                if vm_is_typed_array(objv) {
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         Value r = vm_ta_get(vm, value_as_object(objv), idx);
@@ -5353,7 +5405,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         break case;
                     }
                 }
-                if value_is_string(objv) {
+                if ok == GC_STRING {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         Value ch = value_undefined();
@@ -5376,7 +5428,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value v = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 Value objv = vpeek(vm, 2);
-                if value_is_array(objv) {
+                i32 ok = value_kind(objv);
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         if !array_index_writable(vm, value_as_object(objv), idx,
@@ -5392,7 +5445,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         break case;
                     }
                 }
-                if vm_is_typed_array(objv) {
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         vm_ta_set(vm, value_as_object(objv), idx, v);

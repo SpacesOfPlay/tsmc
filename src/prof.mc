@@ -224,6 +224,7 @@ str op_name(i32 op) {
         case 145: { return "ITER_CHECK"; }
         case 146: { return "FREEZE"; }
         case 147: { return "REGEX"; }
+        case 148: { return "PUTLOCAL"; }
     }
     return "?";
 }

@@ -712,6 +712,15 @@ bool value_is_kind(Value v, i32 kind) {
     return k == kind;
 }
 
+// The cell kind of a value, or -1 for a primitive: one load where a path
+// asks after several kinds, each predicate being a call. A cell --gc-stress
+// has poisoned answers -1 as well and so matches no kind, as the predicates
+// have it; this one does not record the hit.
+i32 value_kind(Value v) {
+    if !value_is_cell(v) { return 0 - 1; }
+    return value_as_cell(v).kind;
+}
+
 bool value_is_string(Value v)  { return value_is_kind(v, GC_STRING); }
 bool value_is_object(Value v)  { return value_is_kind(v, GC_OBJECT); }
 bool value_is_function(Value v){ return value_is_kind(v, GC_FUNCTION); }

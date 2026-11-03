@@ -99,6 +99,8 @@ struct FScope {
     bool static_home;       // a static member: `super.x` is the parent class
     i32 loop_floor;         // loops below this index belong to an enclosing
                             // scope a break or continue may not reach
+    i32 switch_depth;       // the depth of the innermost switch's clause scope,
+                            // -1 outside one: its bindings keep their TDZ checks
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
@@ -361,6 +363,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     // an arrow has no home object of its own; it uses the one around it
     fs.static_home = is_arrow && parent != null ? parent.static_home : false;
     fs.loop_floor = 0;
+    fs.switch_depth = 0 - 1;
     vec_init<BrkJump>(&fs.break_jumps, 8);
     vec_init<BrkJump>(&fs.cont_jumps, 8);
     vec_init<LoopCtx>(&fs.loops, 4);
@@ -1389,7 +1392,27 @@ private void emit_store_ident_static(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_SETGLOBAL, name_const(co, n.name));
 }
 
+// Drops the value an expression left. A store to a local slot just before it
+// becomes the one instruction that stores and drops, unless a jump lands on
+// the drop (`c ? a = 1 : a = 2;` patches one there).
+private void emit_discard(Chunk* ch) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 3 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_SETLOCAL {
+        vec_set(&ch.code, at, cast(u8, OP_PUTLOCAL));
+        return;
+    }
+    ch_op(ch, OP_POP);
+}
+
 // Direct store for initialization; bypasses the const check.
+// A binding in its own frame's slot is read only by this function's code, so
+// once its initializer has run every later use in the source is initialized
+// too: the hole is written at the block's entry and the declaration runs
+// before anything textually after it. The reads and writes that follow drop
+// their TDZ check. A captured binding keeps it (a hoisted function may run
+// before the declaration), and so does one declared in a switch's clause
+// scope, which a jump into a later clause skips.
 private void emit_init_binding(Compiler* co, i32 bind_idx) {
     FScope* fs = co.cur;
     CBind b = vec_get(&fs.binds, bind_idx);
@@ -1400,7 +1423,10 @@ private void emit_init_binding(Compiler* co, i32 bind_idx) {
     }
     ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
     if b.exported { emit_export_writes(co, b.name, null); }
-    ch_op(&fs.ch, OP_POP);
+    emit_discard(&fs.ch);
+    if b.tdz && !b.is_cell && b.depth != fs.switch_depth {
+        (fs.binds.data + bind_idx).tdz = false;
+    }
 }
 
 // In a static member, and in an arrow inside one, `super.x` reads the parent
@@ -4587,7 +4613,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_EXPR_STMT {
         if emit_update_discarded(co, n.a) { return; }
         compile_expr(co, n.a);
-        ch_op(ch, OP_POP);
+        emit_discard(ch);
         return;
     }
     if k == N_VAR { compile_var_stmt(co, n); return; }
@@ -4654,7 +4680,7 @@ private void compile_stmt(Compiler* co, Node* n) {
                 compile_var_stmt(co, n.a);
             } else {
                 compile_expr(co, n.a);
-                ch_op(ch, OP_POP);
+                emit_discard(ch);
             }
         }
         i32 bind_end = fs.binds.len;
@@ -4682,7 +4708,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         }
         if n.c != null && !emit_update_discarded(co, n.c) {
             compile_expr(co, n.c);
-            ch_op(ch, OP_POP);
+            emit_discard(ch);
         }
         ch_op_target(ch, OP_JUMP, lcond);
         if jend >= 0 { ch_patch(ch, jend); }
@@ -4844,6 +4870,8 @@ private void compile_stmt(Compiler* co, Node* n) {
         // comparisons, because the jump table branches straight into a body
         // and would otherwise skip the code that puts the bindings in TDZ.
         fs.depth++;
+        i32 saved_switch = fs.switch_depth;
+        fs.switch_depth = fs.depth;
         i32 saved_binds = fs.binds.len;
         i32 saved_slots = fs.cur_slots;
         Vec<str> svars = vec_new<str>(4);
@@ -4906,6 +4934,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         if default_idx < 0 { ch_patch(ch, jdefault); }
         binds_cut(fs, saved_binds);
         fs.cur_slots = saved_slots;
+        fs.switch_depth = saved_switch;
         fs.depth--;
         ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
