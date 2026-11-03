@@ -9880,7 +9880,8 @@ private Value nat_str_search(void* vmp, Value callee, Value thisv, Value* args, 
     if prog != null {
         i32 ncap = 2 * (regex_ngroups(prog) + 1);
         i32* caps = alloc<i32>(ncap);
-        if regex_exec(prog, sview(sv2), 0, caps) { result = *(caps + 0); }
+        // the index in UTF-16 units, as every other match reports it
+        if regex_exec(prog, sview(sv2), 0, caps) { result = u16_byte_to_unit(sview(sv2), *(caps + 0)); }
         free(caps);
     }
     gc_root_reset(&vm.heap, rm);
