@@ -1057,6 +1057,26 @@ private i32 emit_jumpf(Chunk* ch) {
         if was == OP_GT { fused = OP_GT_JF; }
         if was == OP_LE { fused = OP_LE_JF; }
         if was == OP_GE { fused = OP_GE_JF; }
+        if was == OP_SEQ { fused = OP_SEQ_JF; }
+        if was == OP_SNEQ { fused = OP_SNEQ_JF; }
+        // a loop's test of two locals, `i < n`: the loads fold in as well
+        i32 p1 = ch.prev_op;
+        i32 p2 = ch.prev2_op;
+        if was == OP_LT && p2 >= 0 && p1 == at - 3 && p2 == at - 6 && ch.max_target <= p2
+           && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, p2)) == OP_GETLOCAL {
+            u8 lo = vec_get(&ch.code, p1 + 1);
+            u8 hi = vec_get(&ch.code, p1 + 2);
+            vec_set(&ch.code, p2, cast(u8, OP_LT_JF_LL));
+            vec_set(&ch.code, p1, lo);
+            vec_set(&ch.code, p1 + 1, hi);
+            ch.code.len = p1 + 2;
+            ch.last_op = p2;
+            ch.prev_op = -1;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
         if fused >= 0 {
             ch.code.len = at;          // the comparison becomes the fused op
             return ch_jump(ch, fused);
@@ -1400,6 +1420,12 @@ private void emit_getprop(Chunk* ch, i32 kc) {
     if at >= 0 && at == ch.code.len - 3 && ch.max_target < ch.code.len
        && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL {
         vec_set(&ch.code, at, cast(u8, OP_GETPROP_L));
+        ch_u16(ch, kc);
+        return;
+    }
+    if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_THIS {
+        vec_set(&ch.code, at, cast(u8, OP_GETPROP_THIS));
         ch_u16(ch, kc);
         return;
     }

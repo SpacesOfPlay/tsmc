@@ -5451,6 +5451,41 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, out);
                 }
             }
+            case OP_GETPROP_THIS: {
+                Value objv = this_of(vm, fr.this_val, t.sloppy);
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                Value out;
+                if prop_get(vm, objv, a, &out) { vpush(vm, out); }
+            }
+            case OP_LT_JF_LL: {
+                Value a = *(vm.stack + fr.base + rd_u16p(pc));
+                Value b = *(vm.stack + fr.base + rd_u16p(pc + 2));
+                pc += 8;
+                if value_is_int(a) && value_is_int(b) {
+                    if !(value_as_int(a) < value_as_int(b)) { pc = code + rd_targetp(pc - 4); }
+                } else {
+                    vpush(vm, a);
+                    vpush(vm, b);
+                    i32 r = cmp_rel(vm, OP_LT);
+                    if r == 0 { pc = code + rd_targetp(pc - 4); }
+                }
+            }
+            case OP_SEQ_JF, OP_SNEQ_JF: {
+                bool r;
+                if value_same_bits(vpeek(vm, 1), vpeek(vm, 0)) {
+                    r = !value_is_double(vpeek(vm, 0))
+                        || value_as_f64(vpeek(vm, 0)) == value_as_f64(vpeek(vm, 0));
+                } else if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
+                    r = false;
+                } else {
+                    r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                }
+                if op == OP_SNEQ_JF { r = !r; }
+                vm.sp -= 2;
+                pc += 4;
+                if !r { pc = code + rd_targetp(pc - 4); }
+            }
             case OP_GETPROP_L: {
                 Value objv = *(vm.stack + fr.base + rd_u16p(pc));
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));

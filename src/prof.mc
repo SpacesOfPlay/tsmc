@@ -227,6 +227,10 @@ str op_name(i32 op) {
         case 148: { return "PUTLOCAL"; }
         case 149: { return "GETPROP_L"; }
         case 150: { return "GETINDEX_LL"; }
+        case 151: { return "LT_JF_LL"; }
+        case 152: { return "GETPROP_THIS"; }
+        case 153: { return "SEQ_JF"; }
+        case 154: { return "SNEQ_JF"; }
     }
     return "?";
 }
