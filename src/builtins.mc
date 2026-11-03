@@ -7044,30 +7044,50 @@ private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* arg
 // kind: 0 keys, 1 values, 2 entries
 private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
-    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
+    JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, mp.proto == vm.set_proto ? ITER_KIND_SET : ITER_KIND_MAP));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_map_iter_next, "next");
     nx.env0 = value_cell(&mp.head);
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
     nx.env3 = value_number(-1.0);
-    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    props_set_desc(&it.props, vm_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
 }
 
 private Value make_index_iterator(VM* vm, Value src, i32 kind) {
+    return make_index_iterator_of(vm, src, kind, value_is_string(src) ? ITER_KIND_STRING : ITER_KIND_ARRAY);
+}
+
+private Value make_index_iterator_of(VM* vm, Value src, i32 kind, i32 iter_kind) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, src);
-    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
+    JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, iter_kind));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
-    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    props_set_desc(&it.props, vm_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
+}
+
+// The kinds of built-in iterator, each with its prototype between its
+// iterators and Iterator.prototype, as scripts that find Iterator.prototype
+// two steps up from [].values() expect.
+private {
+    const i32 ITER_KIND_ARRAY = 0;
+    const i32 ITER_KIND_MAP = 1;
+    const i32 ITER_KIND_SET = 2;
+    const i32 ITER_KIND_STRING = 3;
+    const i32 ITER_KIND_REGEXP = 4;
+}
+
+private JsObject* iter_kind_proto(VM* vm, i32 k) {
+    JsObject* p = vm.iter_kind_protos[k];
+    return p != null ? p : vm.iterator_proto;
 }
 
 // Build the `arguments` object: an array-like plain object (Object.prototype
@@ -9841,7 +9861,7 @@ private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args
             js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(to_int_arg(liv) + 1));
         }
     }
-    Value it = make_index_iterator(vm, value_cell(&out.head), 0);
+    Value it = make_index_iterator_of(vm, value_cell(&out.head), 0, ITER_KIND_REGEXP);
     gc_root_reset(&vm.heap, rm);
     return it;
 }
@@ -21029,6 +21049,12 @@ void builtins_install(VM* vm) {
     vm_push(vm, value_cell(&it_tg.head));
     def_get_set_pair(vm, vm.iterator_proto, vm_sym_to_string_tag_id(vm), it_tg, &nat_iter_tag_set);
     vm_pop(vm);
+
+    str[5] kind_tags = { "Array Iterator", "Map Iterator", "Set Iterator", "String Iterator", "RegExp String Iterator" };
+    for i32 k = 0; k < 5; k++ {
+        vm.iter_kind_protos[k] = js_new_object(&vm.heap, vm.iterator_proto);
+        def_tag(vm, vm.iter_kind_protos[k], kind_tags[k]);
+    }
 
     // What map/filter/take/drop/flatMap return
     vm.iter_helper_proto = js_new_object(&vm.heap, vm.iterator_proto);

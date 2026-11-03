@@ -4328,9 +4328,16 @@ private void compile_for_in(Compiler* co, Node* n) {
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var { declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2); }
     }
     i32 bind_end = fs.binds.len;
 
@@ -4349,7 +4356,7 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
     ch_op(ch, OP_GETINDEX);
     if pattern != null {
-        compile_destructure(co, pattern, true);
+        compile_destructure(co, pattern, !plain_var);
     } else {
         compile_destructure(co, n.a, false);
     }
@@ -4411,9 +4418,16 @@ private void compile_for_await_of(Compiler* co, Node* n) {
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var { declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2); }
     }
     i32 bind_end = fs.binds.len;
 
@@ -4445,7 +4459,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
         CBind b = vec_get(&fs.binds, i);
         if b.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot); }
     }
-    if pattern != null { compile_destructure(co, pattern, true); }
+    if pattern != null { compile_destructure(co, pattern, !plain_var); }
     else { compile_destructure(co, n.a, false); }
 
     vec_push(&fs.loops, lc);
@@ -4496,9 +4510,16 @@ private void compile_for_of(Compiler* co, Node* n) {
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var { declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2); }
     }
     i32 bind_end = fs.binds.len;
 
@@ -4523,7 +4544,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     }
     // value is on the stack
     if pattern != null {
-        compile_destructure(co, pattern, true);
+        compile_destructure(co, pattern, !plain_var);
     } else {
         compile_destructure(co, n.a, false);
     }

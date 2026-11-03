@@ -218,6 +218,7 @@ struct VM {
     JsObject* async_generator_proto;
     JsObject* iterator_proto;      // shared by every iterator: the helpers live here
     JsObject* iter_helper_proto;   // what map/filter/take/drop/flatMap return
+    JsObject*[5] iter_kind_protos; // %ArrayIteratorPrototype% and its kin, by ITER_KIND_*: each over iterator_proto
     JsObject* promise_proto;
     JsObject* regexp_proto;
     JsObject* map_proto;
@@ -468,6 +469,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.async_generator_proto != null { gc_mark_cell(h, &vm.async_generator_proto.head); }
     if vm.iterator_proto != null { gc_mark_cell(h, &vm.iterator_proto.head); }
     if vm.iter_helper_proto != null { gc_mark_cell(h, &vm.iter_helper_proto.head); }
+    for i32 i = 0; i < 5; i++ { if vm.iter_kind_protos[i] != null { gc_mark_cell(h, &vm.iter_kind_protos[i].head); } }
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
@@ -1372,6 +1374,16 @@ private bool write_refused(VM* vm, i32 mode, str msg) {
     return false;
 }
 
+// A write to an accessor without a setter, the property named as V8 does.
+private bool getter_refused(VM* vm, i32 mode, u32 a) {
+    if mode != SET_STRICT { return write_refused(vm, mode, ""); }
+    string name = vm_atom_display(vm, a);
+    defer free(name);
+    string msg = format("Cannot set property {} which has only a getter", name);
+    defer free(msg);
+    return write_refused(vm, mode, msg);
+}
+
 // A delete the object refuses: 0 for `false`, -1 for a thrown TypeError.
 private i32 delete_refused(VM* vm, bool strict, str msg) {
     if !strict { return 0; }
@@ -1536,6 +1548,20 @@ private void op_bigint_bitop(VM* vm, i32 op) {
 }
 
 // Where the derived constructor a super() belongs to sits, or -1.
+// A native base constructor reached through super(): the object it built
+// (a typed array, an array, an error) is the derived constructor's `this`,
+// under new.target's prototype, as the spec's OrdinaryCreateFromConstructor
+// gives a derived instance. The object made ahead for `this` is dropped.
+// A result that is not a plain object (a map's cell) keeps the old way.
+private void super_native_result(VM* vm, Value res, Value new_target, Value thisv, i32 super_for) {
+    if !value_is_object(res) || value_same_bits(res, thisv) { return; }
+    if value_is_callable(new_target) {
+        Value protov = ensure_prototype(vm, new_target);
+        if value_is_object(protov) { value_as_object(res).proto = value_as_object(protov); }
+    }
+    if super_for >= 0 { (vm.frames + super_for).this_val = res; }
+}
+
 private i32 derived_ctor_index(VM* vm) {
     for i32 i = vm.fp - 1; i >= 0; i-- {
         if (vm.frames + i).tmpl != null && (vm.frames + i).tmpl.derived_ctor { return i; }
@@ -2070,8 +2096,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
                         ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                         return !vm.has_pending;
                     }
-                    return write_refused(vm, mode,
-                        "cannot set property which has only a getter");
+                    return getter_refused(vm, mode, a);
                 }
                 if cur == o {
                     if (pe.flags & PROP_WRITABLE) == 0 {
@@ -2105,7 +2130,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
                 ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                 return !vm.has_pending;
             }
-            return write_refused(vm, mode, "cannot set property which has only a getter");
+            return getter_refused(vm, mode, a);
         }
         PropList* fprops = value_props(objv);
         if fn_synth_bit(vm, a) != 0 && props_get(fprops, a) == null && !vm_fn_synth_hidden(vm, objv, a) {
@@ -4112,6 +4137,7 @@ void vm_init(VM* vm) {
     vm.async_generator_proto = null;
     vm.iterator_proto = null;
     vm.iter_helper_proto = null;
+    for i32 i = 0; i < 5; i++ { vm.iter_kind_protos[i] = null; }
     vm.promise_proto = null;
     vm.regexp_proto = null;
     vm.map_proto = null;
@@ -5130,6 +5156,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         }
                         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
                         if op == OP_NEW && !value_is_reference(res) { res = thisv; }
+                        if op == OP_SUPERCALL && !vm.has_pending { super_native_result(vm, res, inherited_target, thisv, derived_ctor_index(vm)); }
                         vm.sp -= argc + 2;
                         vpush(vm, res);
                     } else if value_is_function(fnv) {
@@ -7987,10 +8014,13 @@ Value vm_call_stack(VM* vm, i32 argc) {
     Value fnv = vpeek(vm, argc + 1);
     Value thisv = vpeek(vm, argc);
     if value_is_native(fnv) {
-        // a native base cannot settle a derived constructor's `this`
+        i32 super_for = vm.pending_super_for;
+        Value new_target = vm.pending_new_target;
         vm.pending_super_for = 0 - 1;
+        vm.pending_new_target = value_undefined();
         JsNative* na = value_as_native(fnv);
         Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        if super_for >= 0 && !vm.has_pending { super_native_result(vm, res, new_target, thisv, super_for); }
         vm.sp = entry_sp;
         return res;
     }
