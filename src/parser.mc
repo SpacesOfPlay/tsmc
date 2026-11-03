@@ -38,7 +38,7 @@ struct Parser {
     // (arrow_ctx): a '(' tried as an arrow head is tried once. Without it
     // the parameter defaults, which try every '(' inside them again, make
     // nested parentheses exponential (reCAPTCHA's bundle never finished).
-    u32* arrow_fail;
+    ArrowMemo arrow_fail;
 }
 
 struct PState {
@@ -65,7 +65,7 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.depth = 0;
     p.too_deep = false;
     p.module_top = false;
-    p.arrow_fail = null;
+    p.arrow_fail = ArrowMemo{};
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -89,7 +89,7 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.depth = 0;
     p.too_deep = false;
     p.module_top = false;
-    p.arrow_fail = null;
+    p.arrow_fail = ArrowMemo{};
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -115,7 +115,7 @@ Node* parse_function_at(Parser* p, bool method) {
 }
 
 void parser_destroy(Parser* p) {
-    if p.arrow_fail != null { free(p.arrow_fail); }
+    if p.arrow_fail.keys != null { free(p.arrow_fail.keys); free(p.arrow_fail.vals); }
     vec_free(&p.scratch);
     vec_free(&p.labels);
     lexer_destroy(&p.lx);
@@ -1459,6 +1459,55 @@ private Node* parse_yield(Parser* p) {
     return nfin(p, y);
 }
 
+// The arrow attempts that failed, by the position they began at: a bit per
+// context. A table of the few positions tried, where a word per byte of the
+// source was allocated and cleared for each parse, and a function compiled
+// on its first call is a parse of its own: bsky.app's 9 MB bundle cleared
+// 38 MB for every one of them.
+struct ArrowMemo {
+    i32* keys;      // -1 for an empty slot
+    u32* vals;
+    i32 cap;        // a power of two, or 0
+    i32 n;
+}
+
+private i32 arrow_slot(ArrowMemo* m, i32 pos) {
+    u32 h = cast(u32, pos) * 2654435761;
+    i32 i = cast(i32, h >> 8) & (m.cap - 1);
+    while *(m.keys + i) != pos && *(m.keys + i) != -1 { i = (i + 1) & (m.cap - 1); }
+    return i;
+}
+
+private u32 arrow_failed(ArrowMemo* m, i32 pos) {
+    if m.cap == 0 { return 0; }
+    i32 i = arrow_slot(m, pos);
+    return *(m.keys + i) == pos ? *(m.vals + i) : 0;
+}
+
+private void arrow_fail_add(ArrowMemo* m, i32 pos, u32 ctx) {
+    if (m.n + 1) * 2 > m.cap {
+        i32 ocap = m.cap;
+        i32* okeys = m.keys;
+        u32* ovals = m.vals;
+        m.cap = ocap == 0 ? 64 : ocap * 2;
+        m.keys = alloc<i32>(m.cap);
+        m.vals = alloc<u32>(m.cap);
+        for i32 i = 0; i < m.cap; i++ { *(m.keys + i) = -1; *(m.vals + i) = 0; }
+        m.n = 0;
+        for i32 i = 0; i < ocap; i++ {
+            if *(okeys + i) == -1 { continue; }
+            i32 j = arrow_slot(m, *(okeys + i));
+            *(m.keys + j) = *(okeys + i);
+            *(m.vals + j) = *(ovals + i);
+            m.n++;
+        }
+        if okeys != null { free(okeys); free(ovals); }
+    }
+    i32 i = arrow_slot(m, pos);
+    if *(m.keys + i) == -1 { *(m.keys + i) = pos; m.n++; }
+    *(m.vals + i) = *(m.vals + i) | ctx;
+}
+
 // The context an arrow attempt's outcome depends on, as one bit of
 // arrow_fail.
 private u32 arrow_ctx(Parser* p, i32 flags) {
@@ -1472,7 +1521,7 @@ private u32 arrow_ctx(Parser* p, i32 flags) {
 private Node* try_arrow(Parser* p, i32 flags) {
     i32 at_pos = p.cur.start;
     u32 ctx = arrow_ctx(p, flags);
-    if p.arrow_fail != null && at_pos >= 0 && at_pos < p.lx.src.len && (p.arrow_fail[at_pos] & ctx) != 0 { return null; }
+    if at_pos >= 0 && (arrow_failed(&p.arrow_fail, at_pos) & ctx) != 0 { return null; }
     PState st = psave(p);
     i32 base = p.diags.n_suppressed;
     diags_mute(p.diags);
@@ -1499,13 +1548,7 @@ private Node* try_arrow(Parser* p, i32 flags) {
         // what this attempt suppressed is forgotten with it: an arrow being
         // tried around this one counts only its own
         p.diags.n_suppressed = base;
-        if at_pos >= 0 && at_pos < p.lx.src.len {
-            if p.arrow_fail == null {
-                p.arrow_fail = alloc<u32>(p.lx.src.len);
-                memset(cast(u8*, p.arrow_fail), 0, cast(i64, p.lx.src.len) * 4);
-            }
-            p.arrow_fail[at_pos] |= ctx;
-        }
+        if at_pos >= 0 && at_pos < p.lx.src.len { arrow_fail_add(&p.arrow_fail, at_pos, ctx); }
         return null;
     }
     Node* fun = nnew(p, N_FUNCTION);
