@@ -18,9 +18,28 @@ enum GcKind {
 
 struct GcCell {
     GcCell* next;
-    i64 size;
+    i32 size;
+    i32 chunk;      // the chunk a small cell lies in, plus one; 0 for a large cell on the heap's list
     i32 kind;
     i32 mark;
+}
+
+// A free small cell, on its class's list: the sweep passes it by.
+const i32 GC_FREE = -2;
+
+// Small cells (1 KB and less) lie in chunks of their size class, one after
+// another, and the sweep walks a chunk in address order: the list of every
+// cell it followed before took a cache miss a cell, live or dead, and that
+// was most of a collection. A large cell is its own allocation, on a list.
+const i64 GC_CHUNK_BYTES = 65536;
+
+struct GcChunk {
+    u8* mem;
+    i32 cls;
+    i32 cell;       // the cell size
+    i32 cap;        // cells it holds
+    i32 used;       // cells handed out so far, from the start
+    bool swept;     // the last collection's sweep has been through it
 }
 
 type CellPtr = GcCell*;
@@ -62,6 +81,14 @@ struct GcHeap {
     void* mark_ctx;
     GcCell*[GC_CLASS_COUNT] free_cells;   // dead cells by size class, reused first
     i64 alloc_total;      // bytes allocated since the heap began: a clock
+    Vec<GcChunk> chunks;
+    i32[GC_CLASS_SMALL] bump;    // per small class, the chunk new cells come from, -1 for none
+    // the lazy sweep of the chunks: the next cell to look at, and the chunks
+    // the collection found (those made since have nothing to sweep)
+    bool chunk_sweep;
+    i32 sw_chunk;
+    i32 sw_cell;
+    i32 sw_end;
     // A byte per property key, set during marking for each key a live
     // property list holds (the embedder sizes it, and reads it after);
     // keys at or past key_marks_len are not recorded.
@@ -104,10 +131,17 @@ private i64 gc_class_size(i32 cls) {
 }
 
 // A dead cell's memory goes back on its class list, or to the program
-// allocator when it has no class.
+// allocator when it has no class. A small cell stays in its chunk, marked free.
 // The class of a size, with the common small sizes computed in place: the
 // function has a loop, which keeps the inliner away from it.
 private void gc_cell_release(GcHeap* h, GcCell* c) {
+    if c.chunk > 0 {
+        c.kind = GC_FREE;
+        i32 sc = c.size / 16 - 1;
+        c.next = h.free_cells[sc];
+        h.free_cells[sc] = c;
+        return;
+    }
     i32 cls = c.size <= 1024 ? cast(i32, (c.size + 15) / 16) - 1 : gc_class_of(c.size);
     if cls < 0 {
         gc_stat_frees = gc_stat_frees + 1;
@@ -179,6 +213,12 @@ void gc_init(GcHeap* h) {
     h.alloc_total = 0;
     h.key_marks = null;
     h.key_marks_len = 0;
+    vec_init<GcChunk>(&h.chunks, 16);
+    for i32 i = 0; i < GC_CLASS_SMALL; i++ { h.bump[i] = -1; }
+    h.chunk_sweep = false;
+    h.sw_chunk = 0;
+    h.sw_cell = 0;
+    h.sw_end = 0;
 }
 
 void gc_destroy(GcHeap* h) {
@@ -192,11 +232,21 @@ void gc_destroy(GcHeap* h) {
         c = n;
     }
     h.all = null;
+    for i32 k = 0; k < h.chunks.len; k++ {
+        GcChunk* ch = &h.chunks.data[k];
+        for i32 i = 0; i < ch.used; i++ {
+            GcCell* sc = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
+            if sc.kind >= 0 && h.finalizer != null { h.finalizer(sc); }
+        }
+        free(ch.mem);
+    }
+    vec_free(&h.chunks);
     h.bytes_live = 0;
     h.n_cells = 0;
     for i32 i = 0; i < GC_CLASS_COUNT; i++ {
         GcCell* f = h.free_cells[i];
-        while f != null {
+        // a small class's free cells are its chunks' memory, freed above
+        while f != null && i >= GC_CLASS_SMALL {
             GcCell* n = f.next;
             free(f);
             f = n;
@@ -286,8 +336,37 @@ const i32 GC_SWEEP_STEP = 64;
 // that follow, which used to be the larger part of its pause: with
 // 10,000 connections open, 611 of 1,000 ms over 14 collections.
 void gc_sweep_some(GcHeap* h, i32 n) {
-    if h.sweep_list == null { return; }
+    if h.sweep_list == null && !h.chunk_sweep { return; }
     i64 t0 = qpc();
+    // the chunks, a cell after another: a survivor's mark is cleared, a dead
+    // cell is finalized and goes on its class's free list
+    while n > 0 && h.chunk_sweep {
+        if h.sw_chunk >= h.sw_end { h.chunk_sweep = false; break; }
+        GcChunk* ch = &h.chunks.data[h.sw_chunk];
+        u8* base = ch.mem;
+        i32 cell = ch.cell;
+        i32 i = h.sw_cell;
+        while i < ch.used && n > 0 {
+            GcCell* c = cast(GcCell*, base + cast(i64, i) * cell);
+            if c.kind >= 0 {
+                if c.mark != 0 {
+                    c.mark = 0;
+                } else {
+                    if h.finalizer != null { h.finalizer(c); }
+                    gc_cell_release(h, c);
+                }
+            }
+            i++;
+            n--;
+        }
+        if i >= ch.used {
+            ch.swept = true;
+            h.sw_chunk++;
+            h.sw_cell = 0;
+        } else {
+            h.sw_cell = i;
+        }
+    }
     while n > 0 && h.sweep_list != null {
         GcCell* c = h.sweep_list;
         h.sweep_list = c.next;
@@ -306,7 +385,7 @@ void gc_sweep_some(GcHeap* h, i32 n) {
 
 // Sweeps what is left of the last collection's cells.
 void gc_sweep_finish(GcHeap* h) {
-    if h.sweep_list == null { return; }
+    if h.sweep_list == null && !h.chunk_sweep { return; }
     i64 t0 = qpc();
     gc_sweep_some(h, 2147483647);
     gc_stat_sweep_ticks = gc_stat_sweep_ticks + (qpc() - t0);
@@ -343,9 +422,15 @@ void gc_collect(GcHeap* h) {
 
     i64 gc_t1 = qpc();
     if !h.stress {
-        // The sweep is left to the allocations that follow.
+        // The sweep is left to the allocations that follow. A cell made in a
+        // chunk the sweep has yet to reach is made marked, so it survives it.
         h.sweep_list = h.all;
         h.all = null;
+        for i32 k = 0; k < h.chunks.len; k++ { h.chunks.data[k].swept = false; }
+        h.chunk_sweep = h.chunks.len > 0;
+        h.sw_chunk = 0;
+        h.sw_cell = 0;
+        h.sw_end = h.chunks.len;
         h.bytes_live = h.marked_bytes;
         h.n_cells = h.marked_cells;
         h.next_gc = gc_next_threshold(h.marked_bytes);
@@ -359,6 +444,28 @@ void gc_collect(GcHeap* h) {
     GcCell** link = &h.all;
     i64 live_bytes = 0;
     i64 live_cells = 0;
+    for i32 k = 0; k < h.chunks.len; k++ {
+        GcChunk* ch = &h.chunks.data[k];
+        for i32 i = 0; i < ch.used; i++ {
+            GcCell* c = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
+            if c.kind < 0 { continue; }
+            if c.mark != 0 {
+                c.mark = 0;
+                live_bytes += c.size;
+                live_cells++;
+            } else {
+                if h.finalizer != null { h.finalizer(c); }
+                // poisoned and kept, as a large cell is: never handed out again
+                i32 keep_chunk = c.chunk;
+                i32 keep_size = c.size;
+                memset(cast(u8*, c), 0xAB, keep_size);
+                c.chunk = keep_chunk;
+                c.size = keep_size;
+                c.kind = -1;
+            }
+        }
+        ch.swept = true;
+    }
     while *link != null {
         GcCell* c = *link;
         if c.mark != 0 {
@@ -419,7 +526,7 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     when defined(TSMC_PROF) {
         if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
     }
-    if h.sweep_list != null { gc_sweep_some(h, GC_SWEEP_STEP); }
+    if h.sweep_list != null || h.chunk_sweep { gc_sweep_some(h, GC_SWEEP_STEP); }
     if h.stress || h.bytes_live >= h.next_gc {
         gc_collect(h);
     }
@@ -428,7 +535,16 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     i64 block = size;
     if cls >= 0 { block = cls < GC_CLASS_SMALL ? cast(i64, cls + 1) * 16 : gc_class_size(cls); }
     GcCell* c = null;
-    if cls >= 0 && h.free_cells[cls] != null {
+    i32 chunk = 0;
+    if cls >= 0 && cls < GC_CLASS_SMALL {
+        c = h.free_cells[cls];
+        if c != null {
+            h.free_cells[cls] = c.next;
+            chunk = c.chunk;
+        } else {
+            c = gc_chunk_cell(h, cls, cast(i32, block), &chunk);
+        }
+    } else if cls >= 0 && h.free_cells[cls] != null {
         c = h.free_cells[cls];
         h.free_cells[cls] = c.next;
     } else {
@@ -445,13 +561,51 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     } else {
         memset(cast(u8*, c), 0, nz);
     }
-    c.next = h.all;
-    h.all = c;
-    c.size = block;
+    c.size = cast(i32, block);
+    c.chunk = chunk;
     c.kind = kind;
-    c.mark = 0;
+    if chunk > 0 {
+        // made marked where the pending sweep has yet to reach, which clears it;
+        // behind the sweep, or in a chunk made since, it starts unmarked
+        c.mark = gc_ahead_of_sweep(h, chunk - 1, c) ? 1 : 0;
+    } else {
+        c.mark = 0;
+        c.next = h.all;
+        h.all = c;
+    }
     h.bytes_live += block;
     h.n_cells++;
+    return c;
+}
+
+private bool gc_ahead_of_sweep(GcHeap* h, i32 k, GcCell* c) {
+    if !h.chunk_sweep || k >= h.sw_end || k < h.sw_chunk { return false; }
+    if k > h.sw_chunk { return true; }
+    GcChunk* ch = &h.chunks.data[k];
+    return (cast(u8*, c) - ch.mem) / ch.cell >= h.sw_cell;
+}
+
+// A fresh cell of a small class from its chunk, a new chunk when that one
+// is full; *chunk takes its index plus one.
+private GcCell* gc_chunk_cell(GcHeap* h, i32 cls, i32 block, i32* chunk) {
+    i32 k = h.bump[cls];
+    if k < 0 || h.chunks.data[k].used >= h.chunks.data[k].cap {
+        GcChunk ch = GcChunk{};
+        ch.cls = cls;
+        ch.cell = block;
+        ch.cap = cast(i32, GC_CHUNK_BYTES / block);
+        ch.mem = alloc<u8>(cast(i64, ch.cap) * block);
+        ch.used = 0;
+        ch.swept = true;    // nothing in it for a pending sweep
+        vec_push(&h.chunks, ch);
+        k = h.chunks.len - 1;
+        h.bump[cls] = k;
+        gc_stat_mallocs = gc_stat_mallocs + 1;
+    }
+    GcChunk* ch = &h.chunks.data[k];
+    GcCell* c = cast(GcCell*, ch.mem + cast(i64, ch.used) * block);
+    ch.used++;
+    *chunk = k + 1;
     return c;
 }
 
