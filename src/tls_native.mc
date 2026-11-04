@@ -54,6 +54,10 @@ when os(wasm) {
                            u8* key_der, u64 key_len) { return -1; }
     void tls_server_ctx_free(i32 id) { }
     TlsSession* tls_server_session_new(i32 ctx_id) { return null; }
+    void tls_select_ctx(TlsSession* s, i32 ctx_id) { }
+    i32 tls_pump_read(TlsSession* s, i64 fd) { return TLS_ERR; }
+    u8* tls_buffered(TlsSession* s, i32* n) { *n = 0; return null; }
+    i32 tls_handshake_step(TlsSession* s) { return TLS_ERR; }
 }
 else {
 // --- native implementation (everything below) --------------------------------
@@ -483,6 +487,7 @@ struct TlsSession {
     u8* ticket;               // the offered ticket's bytes, the session's own
     i32 ticket_len;
     u64 max_early;            // the early data the offered ticket allows, once the ClientHello is out; 0 none
+    bool ctx_chosen;          // a server session whose context the embedder picked before the handshake (tls_select_ctx)
 }
 
 TlsSession* tls_session_new(u8* sni, bool insecure) {
@@ -804,6 +809,48 @@ i32 tls_pump(TlsSession* s, i64 fd) {
     return flags;
 }
 
+// The handshake in two halves, for an embedder that runs the
+// handshake's crypto on another thread: the socket side here, on the
+// thread that owns the socket, and the step on buffered bytes anywhere.
+//
+// tls_pump_read flushes what is queued and reads what the socket has
+// into the session's buffer without stepping picotls. Its result bits
+// are TLS_EOF and TLS_ERR; the bytes wait in tls_buffered.
+i32 tls_pump_read(TlsSession* s, i64 fd) {
+    if s.failed { return TLS_ERR; }
+    if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
+    u8* tmp = tls_pump_buf();
+    if tmp == null { s.failed = true; return TLS_ERR; }
+    i32 budget = TLS_PUMP_BUDGET;
+    while budget > 0 {
+        i32 n = net_try_recv(fd, tmp, budget < TLS_PUMP_READ ? budget : TLS_PUMP_READ);
+        if n == 0 { s.eof = true; return TLS_EOF; }
+        if n == NET_WOULDBLOCK { return 0; }
+        if n < 0 { s.failed = true; s.tls_err = TLS_ERR_READ; return TLS_ERR; }
+        if !tls_keep(s, tmp, n) { s.failed = true; return TLS_ERR; }
+        budget = budget - n;
+    }
+    return 0;
+}
+
+// The bytes a session holds that picotls has not taken.
+u8* tls_buffered(TlsSession* s, i32* n) {
+    *n = s.cipher_in_len;
+    return s.cipher_in;
+}
+
+// Steps picotls over the buffered bytes: the handshake's crypto, with
+// no socket access, so it may run on any thread while the owner does
+// not touch the session. The result bits are those of tls_pump; the
+// output waits for tls_flush_out on the owner's thread.
+i32 tls_handshake_step(TlsSession* s) {
+    if s.failed { return TLS_ERR; }
+    i32 flags = s.cipher_in_len > 0 ? tls_feed(s, null, 0) : 0;
+    if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
+    if tls_wants_write(s) { flags = flags | TLS_WANT_WRITE; }
+    return flags;
+}
+
 // Encrypt+queue plaintext for sending. Returns false on a picotls error.
 bool tls_write(TlsSession* s, i64 fd, u8* data, i32 len) {
     if s.failed { return false; }
@@ -1104,13 +1151,14 @@ fn(u8*, i32): i32 tls_server_sni_hook = null;
 
 private i32 tls_on_client_hello_cb(st_ptls_on_client_hello_t* self, ptls_t* tls,
                                    ptls_on_client_hello_parameters_t* params) {
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s != null && s.ctx_chosen { return 0; }   // the embedder chose on its own thread; this one may be another
     if tls_server_sni_hook == null || params.server_name.base == null || params.server_name.len == cast(u64, 0) { return 0; }
     i32 id = tls_server_sni_hook(params.server_name.base, cast(i32, params.server_name.len));
     if id < 0 || id >= TLS_SERVER_CTX_MAX || g_server_ctxs[id] == null { return 0; }
     TlsServerCtx* sc = g_server_ctxs[id];
     ptls_set_context(tls, &sc.ctx);
     // the session's reference moves to the context it will sign with
-    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
     if s != null && s.server != cast(void*, sc) {
         TlsServerCtx* old = cast(TlsServerCtx*, s.server);
         sc.sessions++;
@@ -1280,10 +1328,28 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     s.checked_connect = false;
     s.started = false;
     s.is_server = true;
+    s.ctx_chosen = false;
     s.established = false;
     s.failed = false;
     s.eof = false;
     return s;
+}
+
+// The context a server session signs with, chosen by the embedder from
+// this thread's contexts before the handshake runs (it has read the
+// client's name off the ClientHello itself); -1 keeps the one the
+// session was made with. The handshake's own name callback then does
+// nothing, so the handshake can run on a thread that has no contexts.
+void tls_select_ctx(TlsSession* s, i32 ctx_id) {
+    s.ctx_chosen = true;
+    if ctx_id < 0 || ctx_id >= TLS_SERVER_CTX_MAX || !s.is_server { return; }
+    TlsServerCtx* sc = g_server_ctxs[ctx_id];
+    if sc == null || s.server == cast(void*, sc) { return; }
+    ptls_set_context(s.tls, &sc.ctx);
+    TlsServerCtx* old = cast(TlsServerCtx*, s.server);
+    sc.sessions++;
+    s.server = cast(void*, sc);
+    if old != null { tls_server_ctx_release(old); }
 }
 
 // A context for QUIC (RFC 9001): picotls gives each epoch's traffic
