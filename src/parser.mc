@@ -47,6 +47,9 @@ struct Parser {
     i32 skip_depth;     // functions nested deeper than this are passed over
     i32 class_depth;
     i32 with_depth;
+    // skip_body's name set and bracket stack, kept from one body to the next
+    StrMap<i32> skip_seen;
+    Vec<u8> skip_stack;
 }
 
 struct PState {
@@ -79,6 +82,8 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.skip_depth = 0;
     p.class_depth = 0;
     p.with_depth = 0;
+    strmap_init<i32>(&p.skip_seen);
+    vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -108,6 +113,8 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.skip_depth = 0;
     p.class_depth = 0;
     p.with_depth = 0;
+    strmap_init<i32>(&p.skip_seen);
+    vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
@@ -136,6 +143,8 @@ void parser_destroy(Parser* p) {
     if p.arrow_fail.keys != null { free(p.arrow_fail.keys); free(p.arrow_fail.vals); }
     vec_free(&p.scratch);
     vec_free(&p.labels);
+    strmap_free<i32>(&p.skip_seen);
+    vec_free(&p.skip_stack);
     lexer_destroy(&p.lx);
 }
 
@@ -971,18 +980,27 @@ private bool skip_regex_after(i32 prev) {
 // done, the position restored, for a body that names eval or has a with
 // statement, for one too short to be worth it, and for a function called
 // where it is written.
+// The set emptied for the next body; one grown large is let go, so a
+// clear stays cheap for the small bodies that are most of them.
+private void skip_seen_clear(StrMap<i32>* m) {
+    if m.cap > 1024 { strmap_free<i32>(m); return; }
+    if m.count == 0 { return; }
+    memset(cast(u8*, m.slots), 0, m.cap * sizeof(StrSlot<i32>));
+    m.count = 0;
+    m.filled = 0;
+}
+
 private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     i32 at_pos = lexer_tell(&p.lx);
     Token open = p.cur;
     i32 prev_end0 = p.prev_end;
     i32 mark = p.scratch.len;
-    StrMap<i32> seen;
-    strmap_init<i32>(&seen);
-    defer strmap_free<i32>(&seen);
+    StrMap<i32>* seen = &p.skip_seen;
+    defer skip_seen_clear(seen);
     // the brackets open, and for a template's substitution a 't'
-    Vec<u8> stack = vec_new<u8>(16);
-    defer vec_free(&stack);
-    vec_push(&stack, '{');
+    Vec<u8>* stack = &p.skip_stack;
+    stack.len = 0;
+    vec_push(stack, '{');
     i32 prev = TOK_LBRACE;
     i32 prev2 = TOK_EOF;
     bool ok = true;
@@ -997,9 +1015,9 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
             k = t.kind;
             if k != TOK_REGEX { ok = false; break; }
         } else if k == TOK_LBRACE || k == TOK_LPAREN || k == TOK_LBRACK {
-            vec_push(&stack, k == TOK_LBRACE ? cast(u8, '{') : k == TOK_LPAREN ? cast(u8, '(') : cast(u8, '['));
+            vec_push(stack, k == TOK_LBRACE ? cast(u8, '{') : k == TOK_LPAREN ? cast(u8, '(') : cast(u8, '['));
         } else if k == TOK_TEMPLATE_HEAD {
-            vec_push(&stack, 't');
+            vec_push(stack, 't');
         } else if k == TOK_RBRACE {
             if stack.len == 0 { ok = false; break; }
             u8 top = stack.data[stack.len - 1];
@@ -1021,13 +1039,13 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
             ok = false;
             break;
         } else if k == TOK_KW_THIS {
-            strmap_set<i32>(&seen, "this", 1);
+            strmap_set<i32>(seen, "this", 1);
         } else if k == TOK_IDENT || tok_is_keyword(k) {
             bool member = prev == TOK_DOT || prev == TOK_QUESTION_DOT;
-            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { strmap_set<i32>(&seen, "%newtarget", 1); }
+            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { strmap_set<i32>(seen, "%newtarget", 1); }
             else if !member && t.text.len > 0 {
                 if str_equal(t.text, "eval") { ok = false; break; }
-                strmap_set<i32>(&seen, t.text, 1);
+                strmap_set<i32>(seen, t.text, 1);
             }
         }
         prev2 = prev;

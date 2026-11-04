@@ -83,7 +83,7 @@ struct Lexer {
     str src;
     i32 pos;
     DiagList* diags;
-    StrMap<i32> keywords;
+    StrMap<i32>* keywords;   // the thread's table, shared by every lexer on it
     Vec<str> owned;        // decoded literal buffers, freed in lexer_destroy
 }
 
@@ -592,7 +592,7 @@ private void scan_ident(Lexer* lx, Token* t) {
     if t.text.len >= 2 && t.text.len <= 10 {
         u8 c0 = *(t.text.data);
         u8 cl = *(t.text.data + t.text.len - 1);
-        if c0 >= 'a' && c0 <= 'z' && cl >= 'a' && cl <= 'z' { k = strmap_get<i32>(&lx.keywords, t.text); }
+        if c0 >= 'a' && c0 <= 'z' && cl >= 'a' && cl <= 'z' { k = strmap_get<i32>(lx.keywords, t.text); }
     }
     if k != null && !esc {
         t.kind = *k;
@@ -1162,8 +1162,13 @@ void lexer_seek(Lexer* lx, i32 pos) {
 
 // --- init / teardown ------------------------------------------------
 
+// Built once a thread: a lazily compiled function is a lexer of its own,
+// and a page has thousands of them.
+private threadlocal StrMap<i32> g_keywords;
+private threadlocal bool g_keywords_ready = false;
+
 private void kw(Lexer* lx, str name, i32 kind) {
-    strmap_set<i32>(&lx.keywords, name, kind);
+    strmap_set<i32>(&g_keywords, name, kind);
 }
 
 private void add_keywords(Lexer* lx) {
@@ -1239,9 +1244,13 @@ void lexer_init(Lexer* lx, str src, DiagList* diags) {
     lx.src = src;
     lx.pos = 0;
     lx.diags = diags;
-    strmap_init<i32>(&lx.keywords);
     vec_init<str>(&lx.owned, 8);
-    add_keywords(lx);
+    if !g_keywords_ready {
+        strmap_init<i32>(&g_keywords);
+        add_keywords(lx);
+        g_keywords_ready = true;
+    }
+    lx.keywords = &g_keywords;
     if src.len >= 3 && *(src.data) == 0xEF && *(src.data + 1) == 0xBB && *(src.data + 2) == 0xBF {
         lx.pos = 3;
     }
@@ -1256,5 +1265,4 @@ void lexer_destroy(Lexer* lx) {
         free(s.data);
     }
     vec_free(&lx.owned);
-    strmap_free<i32>(&lx.keywords);
 }
