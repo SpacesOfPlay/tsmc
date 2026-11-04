@@ -544,6 +544,9 @@ i64 gc_stat_frees = 0;           // cells released to the program allocator
 // profiling build
 bool gc_stat_on = false;
 i64[16] gc_stat_allocs;
+// the same counts for the function running, 16 slots the profiler points
+// here when it enters one: null between profiles
+i64* gc_stat_allocs_at = null;
 
 // Cells swept for each allocation while a collection's sweep is under
 // way. The sweep ends long before the next collection is due: that comes
@@ -899,7 +902,11 @@ GcCell* gc_alloc(GcHeap* h, i32 kind, i64 size) {
 // reads it, such as the bytes of a Buffer a socket read fills.
 GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     when defined(TSMC_PROF) {
-        if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
+        if gc_stat_on {
+            i32 k = kind >= 0 && kind < 16 ? kind : 15;
+            gc_stat_allocs[k]++;
+            if gc_stat_allocs_at != null { *(gc_stat_allocs_at + k) += 1; }
+        }
     }
     if h.sweep_list != null || h.chunk_sweep { gc_sweep_some(h, GC_SWEEP_STEP); }
     if h.stress {
@@ -1110,6 +1117,9 @@ private const i32 STR_SHARE_MIN = 128;
 // Otherwise the result starts a buffer of its own, with room to grow.
 // Both operands must be rooted by the caller.
 GcString* gc_string_concat(GcHeap* h, GcString* a, GcString* b) {
+    // strings are immutable: `s + ""` and `"" + s` are s
+    if b.len == 0 { return a; }
+    if a.len == 0 { return b; }
     i32 total = a.len + b.len;
     if total < STR_SHARE_MIN {
         GcString* g = cast(GcString*, gc_alloc(h, GC_STRING, sizeof(GcString) + total));

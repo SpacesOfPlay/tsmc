@@ -323,6 +323,8 @@ struct VM {
     u32 atom_done;
     u32 atom_next;
     i32 exec_depth;   // nested vm_execute invocations (C-stack guard)
+    GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
+    Value array_values;         // Array.prototype.values, which every arguments object iterates by
 }
 
 const i32 ERR_ERROR = 0;
@@ -468,7 +470,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 c = 0; c < 8; c++ {
         if vm.http_strs[c] != null { gc_mark_cell(h, &vm.http_strs[c].head); }
+        if vm.typeof_strs[c] != null { gc_mark_cell(h, &vm.typeof_strs[c].head); }
     }
+    gc_mark_value(h, vm.array_values);
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
@@ -2050,6 +2054,34 @@ bool vm_delete_prop_report(VM* vm, Value objv, u32 a) {
 // obj[key]: an array's element, a view's, a string's unit, else the
 // property by the key's atom. Shared by OP_GETINDEX and OP_GETINDEX_LL,
 // and out of the loop for its frame's sake.
+// [v] -> [typeof v]: the answer is one of eight strings made once, and
+// this stays out of the interpreter loop, whose code it weighed on
+private void op_typeof(VM* vm) {
+    Value v = vpeek(vm, 0);
+    i32 k = 0;
+    if value_is_undefined(v) || value_is_hole(v) { k = 1; }
+    else if value_is_number(v) { k = 2; }
+    else if value_is_bool(v) { k = 3; }
+    else if value_is_string(v) { k = 4; }
+    else if value_is_symbol(v) { k = 5; }
+    else if value_is_bigint(v) { k = 6; }
+    else if value_is_function(v) || value_is_native(v) { k = 7; }
+    else if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0
+            && value_is_callable(v) { k = 7; }
+    GcString* g = vm.typeof_strs[k];
+    if g == null {
+        str s = "object";
+        if k == 1 { s = "undefined"; } else if k == 2 { s = "number"; }
+        else if k == 3 { s = "boolean"; } else if k == 4 { s = "string"; }
+        else if k == 5 { s = "symbol"; } else if k == 6 { s = "bigint"; }
+        else if k == 7 { s = "function"; }
+        g = gc_new_string(&vm.heap, s);
+        vm.typeof_strs[k] = g;
+    }
+    vm.sp--;
+    vpush(vm, value_cell(&g.head));
+}
+
 private void op_getindex(VM* vm) {
     Value key = vpeek(vm, 0);
     Value objv = vpeek(vm, 1);
@@ -2410,6 +2442,26 @@ private u32 key_to_atom(VM* vm, Value key) {
         if !vm_to_primitive(vm, k, HINT_STRING, &prim) { return atom_intern(&vm.atoms, ""); }
         if value_is_symbol(prim) { return value_as_symbol(prim).id; }
         k = prim;
+    }
+    // an integer key spelled on the stack: `arguments[i]` and an object
+    // indexed by id made a string cell for every access
+    if value_is_number(k) {
+        f64 d = js_to_number(k);
+        if d == floor(d) && d >= 0.0 && d < 1e15 {
+            u8[24] digits;
+            i32 n = 24;
+            u64 u = cast(u64, d);
+            if u == 0 { n--; digits[n] = '0'; }
+            while u > 0 {
+                n--;
+                digits[n] = cast(u8, 48 + cast(i32, u % 10));
+                u = u / 10;
+            }
+            str ds;
+            ds.data = &digits[n];
+            ds.len = 24 - n;
+            return vm_atom_dyn(vm, ds);
+        }
     }
     vpush(vm, k);
     Value s = js_to_string_value(vm, k);
@@ -4336,6 +4388,7 @@ void vm_init(VM* vm) {
     vm.dynimport_hook = null;
     vm.esm_loader = null;
     vm.arguments_builder = null;
+    vm.array_values = value_undefined();
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -4791,6 +4844,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, b.v);
                 }
             }
+            case OP_GETUPVALV: {
+                Value uv = *(fr.fun.upvals + rd_u16p(pc));
+                pc += 2;
+                if value_is_hole(uv) {
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
+                } else {
+                    vpush(vm, uv);
+                }
+            }
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
@@ -5058,22 +5120,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, value_int(r));
             }
-            case OP_TYPEOF: {
-                Value v = vpeek(vm, 0);
-                str s = "object";
-                if value_is_undefined(v) || value_is_hole(v) { s = "undefined"; }
-                else if value_is_number(v) { s = "number"; }
-                else if value_is_bool(v) { s = "boolean"; }
-                else if value_is_string(v) { s = "string"; }
-                else if value_is_symbol(v) { s = "symbol"; }
-                else if value_is_bigint(v) { s = "bigint"; }
-                else if value_is_function(v) || value_is_native(v) { s = "function"; }
-                else if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0
-                        && value_is_callable(v) { s = "function"; }
-                GcString* g = gc_new_string(&vm.heap, s);
-                vm.sp--;
-                vpush(vm, value_cell(&g.head));
-            }
+            case OP_TYPEOF: { op_typeof(vm); }
             case OP_EQ, OP_NEQ: {
                 // object vs a non-nullish primitive: ToPrimitive the object
                 Value a0 = vpeek(vm, 1);
@@ -5391,7 +5438,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.gen = null;
                             vm.fp++;
                             when defined(TSMC_PROF) {
-                                if vm.prof != null { vm.prof.js_calls++; }
+                                if vm.prof != null { vm.prof.js_calls++; ft.prof_calls++; }
                             }
                             gc_root_reset(&vm.heap, arm);
                             fr = nf;
@@ -6161,6 +6208,18 @@ private JsObject* forin_keys(VM* vm, Value objv) {
     if !value_is_object(objv) { return own; }
     JsObject* proto = value_as_object(objv).proto;
     if proto == null { return own; }
+    // the chain under an ordinary object adds nothing to enumerate: its own
+    // keys are the answer, without a list per prototype
+    bool bare = true;
+    JsObject* pc = proto;
+    while bare && pc != null {
+        if (pc.obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 || pc.elen > 0 { bare = false; break; }
+        for i32 i = 0; i < pc.props.len; i++ {
+            if prop_enumerable(vm, pc.props.items + i) { bare = false; break; }
+        }
+        pc = pc.proto;
+    }
+    if bare { return own; }
     vpush(vm, value_cell(&own.head));
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&out.head));

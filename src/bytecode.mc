@@ -177,12 +177,14 @@ enum Op {
     OP_LT_JF_LL,     // u16 slot, u16 slot, i32 target: two GETLOCALs, LT, jump when false
     OP_GETPROP_THIS, // u16 const idx: THIS then GETPROP
     OP_SEQ_JF,       // i32 target: SEQ then JUMPF
-    OP_SNEQ_JF       // i32 target: SNEQ then JUMPF
+    OP_SNEQ_JF,      // i32 target: SNEQ then JUMPF
+    OP_GETUPVALV     // u16 upvalue index: the value itself, captured as such; a hole refused
 }
 
 struct TmplUpval {
     bool from_parent_slot;   // else from parent's upvalues
     i32 index;
+    bool by_value;           // the value itself, not a box: read with OP_GETUPVALV
 }
 
 // A function compiled on its first call (compiler.mc, lazy_template): the
@@ -245,6 +247,7 @@ struct LazyUp {
     bool is_const;
     bool tdz;
     bool exported;
+    bool by_value;
 }
 
 struct LazyFn {
@@ -305,6 +308,8 @@ struct FnTemplate {
     i64 prof_ops;
     i64 prof_ns;
     i32 prof_samples;
+    i64 prof_calls;
+    i64* prof_allocs;    // its allocations by cell kind, 16 slots, once seen
 }
 
 type TmplPtr = FnTemplate*;
@@ -442,6 +447,8 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
     t.prof_ops = 0;
     t.prof_ns = 0;
     t.prof_samples = 0;
+    t.prof_calls = 0;
+    t.prof_allocs = null;
     t.src_text.data = null;
     t.src_text.len = 0;
     t.src_start = 0;
@@ -538,6 +545,7 @@ void template_free(FnTemplate* t) {
     if t.upvals != null { free(t.upvals); }
     if t.subs != null { free(t.subs); }
     if t.pos != null { free(t.pos); }
+    if t.prof_allocs != null { free(t.prof_allocs); }
     LazySource* owner = t.owner;
     free(t);
     if owner != null { owner.refs--; if owner.refs == 0 { lazy_source_free(owner); } }

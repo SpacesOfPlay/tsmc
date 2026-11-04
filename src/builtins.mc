@@ -3155,9 +3155,20 @@ private Value str_case_map(VM* vm, Value thisv, bool upper) {
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     str s = sview(sv2);
+    // a string already in the case asked for is its own answer: a style
+    // key or a tag name is lowercased on every write
+    i32 off = 0;
+    bool same = true;
+    while same && off < s.len {
+        i32 n;
+        i32 cp = utf8_decode(s, off, &n);
+        off += n;
+        if (upper && cp == 0xDF) || (!upper && cp == 0x3A3) || case_map_cp(cp, upper) != cp { same = false; }
+    }
+    if same { gc_root_reset(&vm.heap, rm); return sv2; }
     str_buf sb;
     str_buf_init(&sb);
-    i32 off = 0;
+    off = 0;
     while off < s.len {
         i32 n;
         i32 cp = utf8_decode(s, off, &n);
@@ -3309,6 +3320,7 @@ private Value nat_str_trim(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 a = 0;
     i32 b = s.len;
     trim_bounds(s, &a, &b, true, true);
+    if a == 0 && b == s.len { gc_root_reset(&vm.heap, rm); return sv2; }
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -3557,6 +3569,7 @@ private Value str_trim_side(VM* vm, Value thisv, bool left, bool right) {
     i32 a = 0;
     i32 b = s.len;
     trim_bounds(s, &a, &b, left, right);
+    if a == 0 && b == s.len { gc_root_reset(&vm.heap, rm); return sv2; }
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -7115,8 +7128,8 @@ Value build_arguments_object(VM* vm, Value* argstart, i32 argc) {
     }
     props_set_desc(&o.props, vm.atom_length, value_int(argc),
         PROP_WRITABLE | PROP_CONFIGURABLE);   // length: own, non-enumerable
-    JsNative* si = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
-    props_set_desc(&o.props, vm_sym_iterator_id(vm), value_cell(&si.head), METHOD_ATTRS);
+    // its iterator is Array.prototype.values itself, as the language has it
+    props_set_desc(&o.props, vm_sym_iterator_id(vm), vm.array_values, METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&o.head);
 }
@@ -9648,7 +9661,7 @@ private Value match_span(VM* vm, GcString* sg, bool ascii, i32 gs, i32 ge) {
     return value_cell(&pair.head);
 }
 
-private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
+private Value regexp_exec_impl(VM* vm, Value re, Value subjectv, bool build) {
     RegexProg* prog = vm_regexp_prog(vm, re);
     if prog == null { return value_null(); }
     GcString* sg = value_as_string(subjectv);
@@ -9679,6 +9692,15 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
             js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
         }
         return value_null();
+    }
+    if !build {
+        // test(): the match's extent is all that is wanted
+        if regex_is_global(prog) || regex_is_sticky(prog) {
+            i32 end_u = ascii ? *(caps + 1) : u16_byte_to_unit_cur(s, *(caps + 1), &sg.cur_u, &sg.cur_off);
+            js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(end_u));
+        }
+        free(caps);
+        return value_bool(true);
     }
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
@@ -9761,7 +9783,7 @@ private Value nat_regexp_exec(void* vmp, Value callee, Value thisv, Value* args,
     gc_root(&vm.heap, thisv);
     Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, sv2);
-    Value r = regexp_exec_impl(vm, thisv, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2, true);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -9776,7 +9798,7 @@ private Value nat_regexp_test(void* vmp, Value callee, Value thisv, Value* args,
     gc_root(&vm.heap, thisv);
     Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, sv2);
-    Value r = regexp_exec_impl(vm, thisv, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2, false);
     gc_root_reset(&vm.heap, rm);
     return value_bool(!value_is_null(r));
 }
@@ -9831,7 +9853,7 @@ private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i
         i32 guard = 0;
         while guard < 1000000 {
             guard++;
-            Value mv = regexp_exec_impl(vm, re, sv2);
+            Value mv = regexp_exec_impl(vm, re, sv2, true);
             if value_is_null(mv) { break; }
             gc_root(&vm.heap, mv);
             Value whole = js_array_get(value_as_object(mv), 0);
@@ -9849,7 +9871,7 @@ private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i
         if n == 0 { return value_null(); }
         return value_cell(&out.head);
     }
-    Value r = regexp_exec_impl(vm, re, sv2);
+    Value r = regexp_exec_impl(vm, re, sv2, true);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -9879,7 +9901,7 @@ private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args
     i32 guard = 0;
     while guard < 1000000 {
         guard++;
-        Value m = regexp_exec_impl(vm, re, sv2);
+        Value m = regexp_exec_impl(vm, re, sv2, true);
         if value_is_null(m) { break; }
         gc_root(&vm.heap, m);
         js_array_set(out, n, m);
@@ -21074,6 +21096,7 @@ void builtins_install(VM* vm) {
     // and Array.prototype.values are one and the same function object.
     u32 iter_id = vm_sym_iterator_id(vm);
     JsNative* arr_it = js_new_native(&vm.heap, &nat_arr_symiter, "values");
+    vm.array_values = value_cell(&arr_it.head);
     js_set_prop(vm.array_proto, iter_id, value_cell(&arr_it.head));
     props_set_desc(&vm.array_proto.props, bi_atom(vm, "values"), value_cell(&arr_it.head), METHOD_ATTRS);
     JsNative* str_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");

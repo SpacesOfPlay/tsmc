@@ -49,6 +49,8 @@ struct Parser {
     i32 with_depth;
     // skip_body's name set and bracket stack, kept from one body to the next
     StrMap<i32> skip_seen;
+    StrMap<i32> skip_declared;   // the names its `var`s declare
+    StrMap<i32> skip_written;    // the names it stores to
     Vec<u8> skip_stack;
 }
 
@@ -83,6 +85,8 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.class_depth = 0;
     p.with_depth = 0;
     strmap_init<i32>(&p.skip_seen);
+    strmap_init<i32>(&p.skip_declared);
+    strmap_init<i32>(&p.skip_written);
     vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
@@ -114,6 +118,8 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.class_depth = 0;
     p.with_depth = 0;
     strmap_init<i32>(&p.skip_seen);
+    strmap_init<i32>(&p.skip_declared);
+    strmap_init<i32>(&p.skip_written);
     vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
@@ -144,6 +150,8 @@ void parser_destroy(Parser* p) {
     vec_free(&p.scratch);
     vec_free(&p.labels);
     strmap_free<i32>(&p.skip_seen);
+    strmap_free<i32>(&p.skip_declared);
+    strmap_free<i32>(&p.skip_written);
     vec_free(&p.skip_stack);
     lexer_destroy(&p.lx);
 }
@@ -990,6 +998,10 @@ private void skip_seen_clear(StrMap<i32>* m) {
     m.filled = 0;
 }
 
+private bool skip_assign_tok(i32 k) {
+    return (k >= TOK_EQ && k <= TOK_PIPEPIPE_EQ) || k == TOK_QUESTION_QUESTION_EQ;
+}
+
 private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     i32 at_pos = lexer_tell(&p.lx);
     Token open = p.cur;
@@ -997,6 +1009,10 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     i32 mark = p.scratch.len;
     StrMap<i32>* seen = &p.skip_seen;
     defer skip_seen_clear(seen);
+    StrMap<i32>* declared = &p.skip_declared;
+    defer skip_seen_clear(declared);
+    StrMap<i32>* written = &p.skip_written;
+    defer skip_seen_clear(written);
     // the brackets open, and for a template's substitution a 't'
     Vec<u8>* stack = &p.skip_stack;
     stack.len = 0;
@@ -1006,16 +1022,67 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     bool ok = true;
     i32 end = -1;
     i32 n_diags = p.diags.n_errors;
+    // a name is placed by the token after it: before `:` after `{` or `,`
+    // it is a key, a label or a typed declaration, not a reference, and
+    // before `=>` a parameter; before an assignment operator, `++` or `--`,
+    // after `++` or `--`, or between a for's `(` and its `in` or `of`, it
+    // is written, which the stand-in says with an assignment, so the scope
+    // that owns the binding keeps it in a box. A `]` or `}` closing an
+    // array or object before `=` is a destructuring assignment, which may
+    // write any name in it: then every name is taken as written.
+    str pending;
+    pending.data = null;
+    pending.len = 0;
+    i32 pend_prev = TOK_EOF;
+    bool pend_for = false;
+    bool open_for = false;
+    bool assign_all = false;
+    u8 last_close = 0;
+    // a `var` statement open at this bracket depth, outside any function
+    // nested here: the names it declares are the function's own, however
+    // the body uses them. A brace after a parenthesis that no if, for,
+    // while, switch, catch or with opened, or after an arrow, is a nested
+    // function's body ('F' on the stack, 'c' for a control parenthesis).
+    i32 var_depth = -1;
+    i32 fn_depth = 0;
+    bool last_paren_ctrl = false;
     while true {
         Token t = lexer_next(&p.lx);
         i32 k = t.kind;
         if k == TOK_EOF || k == TOK_ERROR { ok = false; break; }
+        if pending.len > 0 {
+            bool key = (k == TOK_COLON && (pend_prev == TOK_LBRACE || pend_prev == TOK_COMMA))
+                || k == TOK_ARROW || pend_prev == TOK_KW_FUNCTION || pend_prev == TOK_KW_CLASS;
+            bool stored = skip_assign_tok(k) || k == TOK_PLUSPLUS || k == TOK_MINUSMINUS
+                || pend_prev == TOK_PLUSPLUS || pend_prev == TOK_MINUSMINUS
+                || ((k == TOK_KW_IN || k == TOK_KW_OF) && pend_for);
+            if !key {
+                strmap_set<i32>(seen, pending, 1);
+                if stored { strmap_set<i32>(written, pending, 1); }
+            }
+            pending.len = 0;
+        }
+        if k == TOK_EQ && ((prev == TOK_RBRACK && last_close == '[') || (prev == TOK_RBRACE && last_close == '{')) { assign_all = true; }
+        // the declarators end at `;`, at the bracket that closes them, and at
+        // a for-in's `in` or for-of's `of`, after which the commas are the expression's
+        if var_depth >= 0 && (k == TOK_SEMI || k == TOK_KW_IN || k == TOK_KW_OF || stack.len < var_depth) { var_depth = -1; }
         if (k == TOK_SLASH || k == TOK_SLASH_EQ) && skip_regex_after(prev) {
             t = lexer_rescan_regex(&p.lx, t);
             k = t.kind;
             if k != TOK_REGEX { ok = false; break; }
-        } else if k == TOK_LBRACE || k == TOK_LPAREN || k == TOK_LBRACK {
-            vec_push(stack, k == TOK_LBRACE ? cast(u8, '{') : k == TOK_LPAREN ? cast(u8, '(') : cast(u8, '['));
+        } else if k == TOK_LBRACE {
+            bool fn_body = (prev == TOK_RPAREN && !last_paren_ctrl) || prev == TOK_ARROW;
+            if fn_body { fn_depth++; }
+            vec_push(stack, fn_body ? cast(u8, 'F') : cast(u8, '{'));
+        } else if k == TOK_LPAREN {
+            bool ctrl = prev == TOK_KW_IF || prev == TOK_KW_FOR || prev == TOK_KW_WHILE
+                || prev == TOK_KW_SWITCH || prev == TOK_KW_CATCH || prev == TOK_KW_WITH;
+            open_for = prev == TOK_KW_FOR;
+            vec_push(stack, ctrl ? cast(u8, 'c') : cast(u8, '('));
+        } else if k == TOK_LBRACK {
+            // an index into what came before ('i'), else an array, which may be a pattern
+            bool index = prev == TOK_IDENT || prev == TOK_RPAREN || prev == TOK_RBRACK || prev == TOK_KW_THIS || prev == TOK_KW_SUPER;
+            vec_push(stack, index ? cast(u8, 'i') : cast(u8, '['));
         } else if k == TOK_TEMPLATE_HEAD {
             vec_push(stack, 't');
         } else if k == TOK_RBRACE {
@@ -1027,12 +1094,23 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
                 if k == TOK_TEMPLATE_TAIL { stack.len--; }
                 else if k != TOK_TEMPLATE_MIDDLE { ok = false; break; }
             } else {
-                if top != '{' { ok = false; break; }
+                if top != '{' && top != 'F' { ok = false; break; }
+                if top == 'F' { fn_depth--; }
+                last_close = top;
                 stack.len--;
                 if stack.len == 0 { end = lexer_tell(&p.lx); break; }
             }
-        } else if k == TOK_RPAREN || k == TOK_RBRACK {
-            if stack.len == 0 || stack.data[stack.len - 1] != (k == TOK_RPAREN ? cast(u8, '(') : cast(u8, '[')) { ok = false; break; }
+        } else if k == TOK_RPAREN {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top != '(' && top != 'c' { ok = false; break; }
+            last_paren_ctrl = top == 'c';
+            stack.len--;
+        } else if k == TOK_RBRACK {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top != '[' && top != 'i' { ok = false; break; }
+            last_close = top;
             stack.len--;
         } else if k == TOK_KW_WITH {
             // a super or a private name here belongs to a class inside, which the lazy compile parses whole
@@ -1045,12 +1123,19 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
             if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { strmap_set<i32>(seen, "%newtarget", 1); }
             else if !member && t.text.len > 0 {
                 if str_equal(t.text, "eval") { ok = false; break; }
-                strmap_set<i32>(seen, t.text, 1);
+                if k == TOK_KW_VAR { if fn_depth == 0 { var_depth = stack.len; } }
+                else if var_depth == stack.len && (prev == TOK_KW_VAR || prev == TOK_COMMA) { strmap_set<i32>(declared, t.text, 1); }
+                else {
+                    pending = t.text;
+                    pend_prev = prev;
+                    pend_for = prev == TOK_LPAREN && open_for;
+                }
             }
         }
         prev2 = prev;
         prev = k;
     }
+    if pending.len > 0 { strmap_set<i32>(seen, pending, 1); }
     // too short, or something here the lazy compile does not take
     ok = ok && end >= 0 && p.diags.n_errors == n_diags && end - fun.span.start >= SKIP_MIN_FN;
     // called where it is written: function () {...}() or (function () {...})()
@@ -1078,12 +1163,25 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     for i32 i = 0; i < seen.cap; i++ {
         StrSlot<i32>* sl = seen.slots + i;
         if sl.state != SLOT_USED { continue; }
+        if strmap_get<i32>(declared, sl.key) != null { continue; }
         Node* st = nnew(p, N_EXPR_STMT);
         Node* id;
+        bool stored = false;
         if str_equal(sl.key, "this") { id = nnew(p, N_THIS); }
         else if str_equal(sl.key, "%newtarget") { id = nnew(p, N_NEW_TARGET); }
-        else { id = nnew(p, N_IDENT); id.name = sl.key; }
-        st.a = id;
+        else { id = nnew(p, N_IDENT); id.name = sl.key; stored = assign_all || strmap_get<i32>(written, sl.key) != null; }
+        if stored {
+            // `name = name`: the scan sees a store
+            Node* asg = nnew(p, N_ASSIGN);
+            asg.op = TOK_EQ;
+            asg.a = id;
+            Node* rhs = nnew(p, N_IDENT);
+            rhs.name = sl.key;
+            asg.b = rhs;
+            st.a = asg;
+        } else {
+            st.a = id;
+        }
         vec_push(&p.scratch, st);
     }
     body.kids = finish_kids(p, mark);

@@ -106,6 +106,34 @@ void strmap_set<V>(StrMap<V>* m, str key, V val) {
     strmap_insert(m, key, map_hash_str(key), val);
 }
 
+// The value under key, made with `init` when there is none: one probe for
+// a read-modify-write, where a get and a set would hash the key twice.
+V* strmap_slot<V>(StrMap<V>* m, str key, V init) {
+    if (m.filled + 1) * 4 > m.cap * 3 { strmap_grow(m); }
+    u32 h = map_hash_str(key);
+    i32 mask = m.cap - 1;
+    i32 i = cast(i32, h) & mask;
+    i32 first_tomb = -1;
+    while true {
+        StrSlot<V>* sl = m.slots + i;
+        if sl.state == SLOT_EMPTY {
+            StrSlot<V>* dst = sl;
+            if first_tomb >= 0 { dst = m.slots + first_tomb; }
+            if dst.state == SLOT_EMPTY { m.filled++; }
+            dst.key = key;
+            dst.hash = h;
+            dst.val = init;
+            dst.state = SLOT_USED;
+            m.count++;
+            return &dst.val;
+        }
+        if sl.state == SLOT_USED && sl.hash == h && str_equal(sl.key, key) { return &sl.val; }
+        if sl.state == SLOT_TOMB && first_tomb < 0 { first_tomb = i; }
+        i = (i + 1) & mask;
+    }
+    return null;
+}
+
 V* strmap_get<V>(StrMap<V>* m, str key) {
     if m.count == 0 { return null; }
     u32 h = map_hash_str(key);

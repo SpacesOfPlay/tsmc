@@ -62,8 +62,13 @@ void prof_step(Prof* p, FnTemplate* t, i32 op) {
     if t.prof_ops == 0 {
         vec_push(&p.seen, t);
         vec_push(&p.files, format("{}", t.src_name.len > 0 ? t.src_name : "<anonymous>"));
+        if t.prof_allocs == null {
+            t.prof_allocs = alloc<i64>(16);
+            for i32 k = 0; k < 16; k++ { *(t.prof_allocs + k) = 0; }
+        }
     }
     t.prof_ops++;
+    gc_stat_allocs_at = t.prof_allocs;
     p.budget--;
     if p.budget <= 0 {
         p.budget = PROF_STRIDE;
@@ -231,6 +236,7 @@ str op_name(i32 op) {
         case 152: { return "GETPROP_THIS"; }
         case 153: { return "SEQ_JF"; }
         case 154: { return "SNEQ_JF"; }
+        case 155: { return "GETUPVALV"; }
     }
     return "?";
 }
@@ -376,6 +382,81 @@ void prof_report(Prof* p, i64 collections) {
         free(c);
     }
     eprint("\n");
+
+    // the functions by cells allocated while they ran, a native's charged
+    // to the function that called it; the three kinds that lead each one
+    if allocs > 0 && n > 0 {
+        i64* sum = alloc<i64>(n);
+        for i32 i = 0; i < n; i++ {
+            FnTemplate* t = vec_get(&p.seen, i);
+            i64 s = 0;
+            if t.prof_allocs != null { for i32 k = 0; k < 16; k++ { s = s + *(t.prof_allocs + k); } }
+            *(sum + i) = s;
+        }
+        i32* ai = alloc<i32>(n);
+        for i32 i = 0; i < n; i++ { *(ai + i) = i; }
+        for i32 i = 1; i < n; i++ {
+            i32 key = *(ai + i);
+            i64 ks = *(sum + key);
+            i32 j = i - 1;
+            while j >= 0 && *(sum + *(ai + j)) < ks { *(ai + j + 1) = *(ai + j); j--; }
+            *(ai + j + 1) = key;
+        }
+        eprint("  alloc%  cells      per call  function (file:line)  kinds\n");
+        i32 ashown = n < 30 ? n : 30;
+        for i32 i = 0; i < ashown; i++ {
+            i32 at = *(ai + i);
+            FnTemplate* t = vec_get(&p.seen, at);
+            i64 s = *(sum + at);
+            if s * 200 < allocs { break; }   // under half a percent
+            i32 line = t.n_pos > 0 ? (t.pos + 0).line : 0;
+            str_buf sb;
+            str_buf_init(&sb);
+            string a = pct(s, allocs);
+            pad_to(&sb, 7 - a.len); str_buf_add(&sb, a); free(a);
+            string c = with_commas(s);
+            pad_to(&sb, 18 - c.len); str_buf_add(&sb, c); free(c);
+            i64 calls = t.prof_calls > 0 ? t.prof_calls : 1;
+            string pc = format("{}", s / calls);
+            pad_to(&sb, 28 - pc.len); str_buf_add(&sb, pc); free(pc);
+            str_buf_add(&sb, "  ");
+            if t.name.len > 0 { str_buf_add(&sb, t.name); } else { str_buf_add(&sb, "<anonymous>"); }
+            str_buf_add(&sb, " (");
+            string* file = p.files.data + at;
+            i32 cut = 0;
+            for i32 k = 0; k < file.len; k++ {
+                u8 ch = *(file.data + k);
+                if ch == '/' || ch == 92 { cut = k + 1; }
+            }
+            str tail;
+            tail.data = file.data + cut;
+            tail.len = file.len - cut;
+            str_buf_add(&sb, tail);
+            string ls = format(":{})", line);
+            str_buf_add(&sb, ls);
+            free(ls);
+            for i32 r = 0; r < 3; r++ {
+                i32 best = -1;
+                for i32 k = 0; k < 16; k++ {
+                    i64 v = *(t.prof_allocs + k);
+                    if v > 0 && (best < 0 || v > *(t.prof_allocs + best)) { best = k; }
+                }
+                if best < 0 { break; }
+                string kc = with_commas(*(t.prof_allocs + best));
+                str_buf_add(&sb, " ");
+                str_buf_add(&sb, gc_kind_name(best));
+                str_buf_add(&sb, " ");
+                str_buf_add(&sb, kc);
+                free(kc);
+                *(t.prof_allocs + best) = 0 - *(t.prof_allocs + best);   // taken; restored below
+            }
+            for i32 k = 0; k < 16; k++ { if *(t.prof_allocs + k) < 0 { *(t.prof_allocs + k) = 0 - *(t.prof_allocs + k); } }
+            eprint("{}\n", str_buf_to_str(&sb));
+            str_buf_free(&sb);
+        }
+        free(ai);
+        free(sum);
+    }
 }
 
 // Reports, then starts over: the counts, the opcode mix and the charges to
@@ -387,7 +468,10 @@ void prof_report_reset(Prof* p, i64 collections) {
         t.prof_ns = 0;
         t.prof_ops = 0;
         t.prof_samples = 0;
+        t.prof_calls = 0;
+        if t.prof_allocs != null { for i32 k = 0; k < 16; k++ { *(t.prof_allocs + k) = 0; } }
     }
+    gc_stat_allocs_at = null;
     for i32 i = 0; i < p.files.len; i++ { free(*(p.files.data + i)); }
     p.seen.len = 0;
     p.files.len = 0;

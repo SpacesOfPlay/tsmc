@@ -28,11 +28,32 @@ evaluating the object expression once.
 
 Per function, before emitting:
 
-1. **Inner-name scan**: every identifier (and `this`) mentioned
-   anywhere inside nested functions, transitively. A binding whose
-   name is in this set becomes a **cell** — a GC box holding the
-   value — stored in its frame slot. Over-approximation by name is
-   deliberate: shadowing only costs an extra box, never correctness.
+1. **Inner-name scan**: every name free in a nested function,
+   transitively: mentioned in it, or free in a function nested in
+   it, and bound by none of its own scopes (its parameters, vars,
+   lets, catch parameters, class names; `this` and `arguments` in a
+   non-arrow). Name-level at the declaring function: shadowing within
+   it only costs an extra box, never correctness. A binding whose
+   name is in the set is captured, and one of two ways. It is a
+   **cell** — a GC box holding the value — stored in its frame slot,
+   when a closure could see more than one value in it: it is assigned
+   anywhere after its initialization (the scan flags the stores,
+   including those in nested functions), declared more than once, a
+   var initialized inside a loop, or captured by a function
+   declaration, which is made at scope entry before the declaration
+   runs. Otherwise it is **captured by value**: `OP_CLOSURE` copies
+   the value itself into the closure's upvalue and the nested
+   function reads it with `OP_GETUPVALV`, which refuses a hole. A
+   parameter, `this`, `arguments`, `new.target`, a catch parameter
+   and a for-in/of binding are by value even under function
+   declarations, since they are set before those are made; a var, let,
+   const or class only for function expressions written after its
+   declarator. A lazily compiled function's body is scanned at the
+   token level: its parameters, its `var`-declared names outside the
+   functions nested in it and the keys before a colon are left out,
+   a name before an assignment operator, `++` or `--`, or between a
+   for's `(` and `in`/`of` is a store, and a `]` or `}` before `=`
+   makes every name in the body a store.
 2. **Hoisting**: `var` declarators (stopping at nested functions)
    get function-level slots, undefined at entry. Function
    declarations bind and initialize at block entry, so mutual
@@ -44,10 +65,10 @@ Per function, before emitting:
    the cell pointer, not the slot.
 
 Identifier resolution walks: local bindings → enclosing functions
-(adding an upvalue chain entry per level; the inner-name rule
-guarantees the source binding is a cell) → global by atom.
-`OP_CLOSURE` copies cell pointers out of the creating frame's slots
-or its own upvalues, per the template's capture spec. Arrows have no
+(adding an upvalue chain entry per level, which carries whether the
+source binding is a cell or a value) → global by atom.
+`OP_CLOSURE` copies cell pointers, or values, out of the creating
+frame's slots or its own upvalues, per the template's capture spec. Arrows have no
 own `this`; non-arrow functions materialize a `this` binding only
 when some inner arrow mentions it, and arrows resolve it like any
 captured variable.
