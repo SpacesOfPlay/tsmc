@@ -182,6 +182,7 @@ struct VM {
     // Steps an index iterator directly (see IterFastFn), or null before the
     // built-ins are installed.
     IterFastFn iter_fast;
+    MapDirectFn map_direct;     // and a Map or Set stepped as its own iterator
     // Whether a WeakMap or WeakSet has ever been made. The ephemeron pass and
     // the pass that drops dead keys both walk every cell in the heap looking
     // for one, and the marking pass is looped until it marks nothing new, so a
@@ -326,6 +327,8 @@ struct VM {
     GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
     GcString*[128] latin1_chars; // one-character strings for U+0080..U+00FF, as ascii_chars: what atob's output is indexed by
     Value array_values;         // Array.prototype.values, which every arguments object iterates by
+    Value map_entries;          // Map.prototype[Symbol.iterator] and Set.prototype's as made: a
+    Value set_values;           // collection whose prototype still has them is iterated directly
 }
 
 const i32 ERR_ERROR = 0;
@@ -477,6 +480,8 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
         if vm.latin1_chars[c] != null { gc_mark_cell(h, &vm.latin1_chars[c].head); }
     }
     gc_mark_value(h, vm.array_values);
+    gc_mark_value(h, vm.map_entries);
+    gc_mark_value(h, vm.set_values);
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
@@ -4294,6 +4299,7 @@ void vm_init(VM* vm) {
     vec_init<GcString*>(&vm.regex_flgs, 8);
     vec_init<GcString*>(&vm.atom_strs, 64);
     vm.iter_fast = null;
+    vm.map_direct = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vec_init<TmplPtr>(&vm.fresh_tmpls, 16);
     vm.pending = value_undefined();
@@ -4393,6 +4399,8 @@ void vm_init(VM* vm) {
     vm.esm_loader = null;
     vm.arguments_builder = null;
     vm.array_values = value_undefined();
+    vm.map_entries = value_undefined();
+    vm.set_values = value_undefined();
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -6080,8 +6088,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 Value v = vpeek(vm, 0);
-                if iter_array_direct(vm, v) {
-                    *(vm.stack + fr.base + dslot) = value_int(0);
+                if iter_direct(vm, v) {
+                    *(vm.stack + fr.base + dslot) = iter_direct_start(v);
                 } else {
                     *(vm.stack + fr.base + dslot) = value_bool(false);
                     Value it;
@@ -6098,7 +6106,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 Value val;
                 bool done = false;
                 if value_is_int(*(vm.stack + fr.base + dslot)) {
-                    done = !iter_array_next(vm, iter, fr.base + dslot, &val);
+                    done = !iter_direct_next(vm, iter, fr.base + dslot, &val);
                     vm.sp--;
                     vpush(vm, val);
                     vpush(vm, value_bool(done));
@@ -6790,24 +6798,52 @@ private void do_get_aiter_w(VM* vm) {
 // (a callback recursing through a builtin) has only so much room.
 // `di` is the absolute stack index of the "exhausted" flag.
 
-// A plain array is iterated as itself, the done slot holding the index
-// as an int (a bool once it is spent, or when the iterator protocol is in
-// use), so a for-of or a destructuring over one allocates nothing: what
-// Array.prototype.values would do, which the array has not replaced.
-private bool iter_array_direct(VM* vm, Value v) {
-    if !value_is_object(v) { return false; }
-    JsObject* o = value_as_object(v);
-    if (o.obj_flags & (OBJF_ARRAY | OBJF_PROXY)) != OBJF_ARRAY || o.proto != vm.array_proto { return false; }
-    if o.props.len > 0 && props_get(&o.props, vm.sym_iterator_id) != null { return false; }
-    Value* pv = props_get(&vm.array_proto.props, vm.sym_iterator_id);
-    return pv != null && js_strict_eq(*pv, vm.array_values);
+// A plain array, Map or Set is iterated as itself, the done slot holding
+// its place as an int (a bool once it is spent, or when the iterator
+// protocol is in use), so a for-of or a destructuring over one allocates
+// no iterator: what Array.prototype.values, Map.prototype.entries or
+// Set.prototype.values would do, which the prototype still has. For an
+// array the place is the next index; for a collection the sequence number
+// of the entry returned last, -1 before the first, which finds the entry
+// again after a compaction.
+private bool iter_direct(VM* vm, Value v) {
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        if (o.obj_flags & (OBJF_ARRAY | OBJF_PROXY)) != OBJF_ARRAY || o.proto != vm.array_proto { return false; }
+        if o.props.len > 0 && props_get(&o.props, vm.sym_iterator_id) != null { return false; }
+        Value* pv = props_get(&vm.array_proto.props, vm.sym_iterator_id);
+        return pv != null && js_strict_eq(*pv, vm.array_values);
+    }
+    if value_is_map(v) && vm.map_direct != null {
+        JsMap* mp = value_as_map(v);
+        if mp.next_seq > 2147483647 { return false; }
+        JsObject* proto = mp.is_set ? vm.set_proto : vm.map_proto;
+        if mp.proto != proto { return false; }
+        Value* pv = props_get(&proto.props, vm.sym_iterator_id);
+        return pv != null && js_strict_eq(*pv, mp.is_set ? vm.set_values : vm.map_entries);
+    }
+    return false;
+}
+
+private Value iter_direct_start(Value v) {
+    return value_int(value_is_map(v) ? 0 - 1 : 0);
 }
 
 // The next element of the array in the fast mode; false once past the end,
 // the slot then a bool. A hole reads through the prototype chain, as the
 // iterator's Get would.
-private bool iter_array_next(VM* vm, Value arrv, i32 di, Value* out) {
+private bool iter_direct_next(VM* vm, Value arrv, i32 di, Value* out) {
     i32 i = value_as_int(*(vm.stack + di));
+    if value_is_map(arrv) {
+        i32 seq = vm.map_direct(cast(void*, vm), value_as_map(arrv), i, out);
+        if seq < 0 {
+            *(vm.stack + di) = value_bool(true);
+            *out = value_undefined();
+            return false;
+        }
+        *(vm.stack + di) = value_int(seq);
+        return true;
+    }
     JsObject* arr = value_as_object(arrv);
     if i >= arr.elen {
         *(vm.stack + di) = value_bool(true);
@@ -6826,7 +6862,7 @@ private void iter_step(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
     if value_is_int(*(vm.stack + di)) {
         Value val;
-        ignore iter_array_next(vm, iter, di, &val);
+        ignore iter_direct_next(vm, iter, di, &val);
         vm.sp--;
         vpush(vm, val);
         return;
@@ -6855,7 +6891,7 @@ private void iter_rest(VM* vm, i32 di) {
     vpush(vm, value_cell(&arr.head));   // rooted while draining
     if value_is_int(*(vm.stack + di)) {
         Value val;
-        while iter_array_next(vm, iter, di, &val) { js_array_set(arr, arr.elen, val); }
+        while iter_direct_next(vm, iter, di, &val) { js_array_set(arr, arr.elen, val); }
     } else if !js_truthy(*(vm.stack + di)) {
         while true {
             Value val;
@@ -6927,7 +6963,7 @@ private void iter_check_result(VM* vm) {
 private void iter_close_mode(VM* vm, i32 di, bool throwing) {
     Value iter = vpeek(vm, 0);
     if value_is_int(*(vm.stack + di)) {
-        // an array iterated directly: nothing to return
+        // an array or a collection iterated directly: nothing to return
         vm.sp--;
         return;
     }

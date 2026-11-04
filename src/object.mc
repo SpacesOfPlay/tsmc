@@ -350,6 +350,12 @@ type NativeFn = fn(void*, Value, Value, Value*, i32): Value;
 // it on the VM, since the interpreter is built without them.
 type IterFastFn = fn(void*, Value, Value*, bool*): i32;
 
+// Steps a Map or Set iterated directly, as its own iterator (vm.mc,
+// OP_GET_ITER_S): the entry after the one with sequence number `last`
+// (-1 before the first), its key for a Set and a [key, value] pair for a
+// Map in *out. Returns that entry's sequence number, or -1 past the end.
+type MapDirectFn = fn(void*, JsMap*, i32, Value*): i32;
+
 struct JsNative {
     GcCell head;
     NativeFn fun;
@@ -382,6 +388,7 @@ struct JsMap {
     // the number of the entry it returned last.
     i64* seqs;
     i64 next_seq;
+    i32 hint;     // where a direct iteration left off: the slot after the entry it returned last
     i32 pinned;   // native walks over the slots under way: no compaction
     i32 len;      // slots used, including tombstones
     i32 cap;

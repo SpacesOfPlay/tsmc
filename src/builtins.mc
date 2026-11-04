@@ -7156,6 +7156,26 @@ private i32 index_iter_len(VM* vm, Value src, bool* ok) {
 
 // One step of a Map or Set iterator, in the state make_map_iterator left it.
 // `entries` still builds the pair it yields, but no result object around it.
+// The step of a Map or Set iterated as its own iterator (MapDirectFn).
+i32 map_iter_direct(void* vmp, JsMap* mp, i32 last, Value* out) {
+    VM* vm = as_vm(vmp);
+    i32 i = map_iter_pos(mp, mp.hint, cast(f64, last));
+    while i < mp.len && !*(mp.live + i) { i++; }
+    mp.hint = i < mp.len ? i + 1 : i;
+    if i >= mp.len { return 0 - 1; }
+    i32 seq = cast(i32, *(mp.seqs + i));
+    Value key = *(mp.keys + i);
+    if mp.is_set { *out = key; return seq; }
+    JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&pair.head));
+    js_array_reserve(pair, 2);
+    js_array_set(pair, 0, key);
+    js_array_set(pair, 1, *(mp.vals + i));
+    vm_pop(vm);
+    *out = value_cell(&pair.head);
+    return seq;
+}
+
 private i32 map_iter_step(VM* vm, JsNative* nx, Value* val, bool* done) {
     JsMap* mp = value_as_map(nx.env0);
     i32 i = map_iter_pos(mp, value_as_int(nx.env1), js_to_number(nx.env3));
@@ -21196,6 +21216,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.map_proto, "entries", &nat_map_entries);
     def_accessor(vm, vm.map_proto, "size", &nat_map_size);
     JsNative* map_it = js_new_native(&vm.heap, &nat_map_entries, "[Symbol.iterator]");
+    vm.map_entries = value_cell(&map_it.head);
     js_set_prop(vm.map_proto, iter_id, value_cell(&map_it.head));
 
     // Set
@@ -21220,7 +21241,9 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.set_proto, "isSupersetOf", &nat_set_is_superset);
     def_method(vm, vm.set_proto, "isDisjointFrom", &nat_set_is_disjoint);
     JsNative* set_it = js_new_native(&vm.heap, &nat_map_values, "[Symbol.iterator]");
+    vm.set_values = value_cell(&set_it.head);
     js_set_prop(vm.set_proto, iter_id, value_cell(&set_it.head));
+    vm.map_direct = &map_iter_direct;
 
     // WeakMap / WeakSet (keys held weakly; get/has/delete reuse Map's)
     vm.weakmap_proto = js_new_object(&vm.heap, vm.object_proto);

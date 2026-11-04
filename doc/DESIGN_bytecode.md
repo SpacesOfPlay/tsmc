@@ -76,8 +76,13 @@ Array.prototype, no own Symbol.iterator, the prototype's still the
 built-in) the array stays on the stack as its own iterator and the
 done slot holds the index as an int; `OP_ITER_NEXT_S`, `OP_ITER_STEP`
 and `OP_ITER_REST` step it without an iterator object or a result,
-and `OP_ITER_CLOSE` has nothing to return. Any other iterable goes
-through the protocol with the slot a bool, as before. `{}.name`
+and `OP_ITER_CLOSE` has nothing to return. A Map or Set whose
+prototype still has the built-in iterator is stepped the same way, the
+slot holding the sequence number of the entry returned last (-1 before
+the first) and the map a hint of the slot after it, so a compaction
+between steps loses no place; a Map yields a fresh [key, value] pair.
+Any other iterable goes through the protocol with the slot a bool, as
+before. `{}.name`
 compiles to `OP_PROTOGET`, Object.prototype's data property without
 the object; an accessor or a miss makes the object after all. Arrows have no
 own `this`; non-arrow functions materialize a `this` binding only
