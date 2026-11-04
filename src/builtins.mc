@@ -602,6 +602,7 @@ private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
             return false;
         }
         if value_is_object(pv) {
+            gc_barrier(&o.head, pv);
             o.proto = value_as_object(pv);
         } else if value_is_null(pv) {
             o.proto = null;
@@ -610,6 +611,7 @@ private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
         // a function's [[Prototype]] is stored inline; accept a plain object,
         // another callable, or null (undefined means "unchanged").
         if value_is_object(pv) || value_is_function(pv) || value_is_native(pv) {
+            gc_barrier(value_as_cell(ov), pv);
             value_as_function(ov).fproto = pv;
         } else if value_is_null(pv) {
             value_as_function(ov).fproto = value_null();
@@ -873,7 +875,9 @@ private bool define_property_core(void* vmp, Value* args, i32 argc, bool report)
             s = value_is_callable(tmp) ? tmp : value_undefined();
         }
         JsAccessor* ac = js_new_accessor(&vm.heap);
+        gc_barrier(&ac.head, g);
         ac.get = g;
+        gc_barrier(&ac.head, s);
         ac.set = s;
         stored = value_cell(&ac.head);
         flags = flags & cast(u8, ~PROP_WRITABLE);
@@ -2434,6 +2438,7 @@ private Value nat_arr_fill(void* vmp, Value callee, Value thisv, Value* args, i3
     Value v = arg_at(args, argc, 0);
     i32 start = argc > 1 ? rel_index(to_int_sat(*(args + 1)), a.elen) : 0;
     i32 end = argc > 2 ? rel_index(to_int_sat(*(args + 2)), a.elen) : a.elen;
+    gc_barrier(&a.head, v);
     for i32 i = start; i < end; i++ {
         *(a.elems + i) = v;
     }
@@ -2553,7 +2558,7 @@ private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i3
             return value_undefined();
         }
         // a comparator may have shrunk the array under us; write what fits
-        for i32 i = 0; i < count && i < a.elen; i++ { *(a.elems + i) = *(res + i); }
+        for i32 i = 0; i < count && i < a.elen; i++ { gc_barrier(&a.head, *(res + i)); *(a.elems + i) = *(res + i); }
     } else if count == 1 && a.elen > 0 {
         *(a.elems) = *(src.elems);
     }
@@ -5746,8 +5751,11 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
     // the visible name is set as a property below; the internal one stays
     // empty so toString reads "function () { [native code] }" like node's
     JsNative* w = js_new_native(&vm.heap, &nat_bound_entry, "");
+    gc_barrier(&w.head, thisv);
     w.env0 = thisv;
+    gc_barrier(&w.head, arg_at(args, argc, 0));
     w.env1 = arg_at(args, argc, 0);
+    gc_barrier(&w.head, value_cell(&pre.head));
     w.env2 = value_cell(&pre.head);
     vm_push(vm, value_cell(&w.head));
     // a bound function reports "bound <target>" and the target's remaining arity
@@ -6965,9 +6973,11 @@ private Value nat_iterator_from(void* vmp, Value callee, Value thisv, Value* arg
     Value wv = value_cell(&w.head);
     gc_root(&vm.heap, wv);
     JsNative* nx = js_new_native(&vm.heap, &nat_iterwrap_next, "next");
+    gc_barrier(&nx.head, it);
     nx.env0 = it;
     props_set_desc(&w.props, bi_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     JsNative* rt = js_new_native(&vm.heap, &nat_iterwrap_return, "return");
+    gc_barrier(&rt.head, it);
     rt.env0 = it;
     props_set_desc(&w.props, bi_atom(vm, "return"), value_cell(&rt.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
@@ -7047,6 +7057,7 @@ private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
     JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, mp.proto == vm.set_proto ? ITER_KIND_SET : ITER_KIND_MAP));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_map_iter_next, "next");
+    gc_barrier(&nx.head, value_cell(&mp.head));
     nx.env0 = value_cell(&mp.head);
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
@@ -7066,6 +7077,7 @@ private Value make_index_iterator_of(VM* vm, Value src, i32 kind, i32 iter_kind)
     JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, iter_kind));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
+    gc_barrier(&nx.head, src);
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
@@ -7374,9 +7386,11 @@ private Value nat_promise_withresolvers(void* vmp, Value callee, Value thisv, Va
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, p);
     JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    gc_barrier(&res.head, p);
     res.env0 = p;
     gc_root(&vm.heap, value_cell(&res.head));
     JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    gc_barrier(&rej.head, p);
     rej.env0 = p;
     gc_root(&vm.heap, value_cell(&rej.head));
     JsObject* o = js_new_object(&vm.heap, vm.object_proto);
@@ -7399,9 +7413,11 @@ private Value nat_promise_ctor(void* vmp, Value callee, Value thisv, Value* args
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, p);
     JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    gc_barrier(&res.head, p);
     res.env0 = p;
     gc_root(&vm.heap, value_cell(&res.head));
     JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    gc_barrier(&rej.head, p);
     rej.env0 = p;
     gc_root(&vm.heap, value_cell(&rej.head));
     Value[2] ca = { value_cell(&res.head), value_cell(&rej.head) };
@@ -7507,9 +7523,11 @@ private Value nat_promise_finally(void* vmp, Value callee, Value thisv, Value* a
     Value cb = arg_at(args, argc, 0);
     i32 rm = gc_root_mark(&vm.heap);
     JsNative* onf = js_new_native(&vm.heap, &nat_finally_pass, "finally");
+    gc_barrier(&onf.head, cb);
     onf.env0 = cb;
     gc_root(&vm.heap, value_cell(&onf.head));
     JsNative* onr = js_new_native(&vm.heap, &nat_finally_throw, "finally");
+    gc_barrier(&onr.head, cb);
     onr.env0 = cb;
     gc_root(&vm.heap, value_cell(&onr.head));
     Value r = vm_promise_then(vm, thisv, value_cell(&onf.head), value_cell(&onr.head));
@@ -7614,10 +7632,12 @@ private Value nat_promise_all(void* vmp, Value callee, Value thisv, Value* args,
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, &nat_all_elem, "all");
+        gc_barrier(&onf.head, value_cell(&st.head));
         onf.env0 = value_cell(&st.head);
         onf.env1 = value_int(i);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_all_rej, "all");
+        gc_barrier(&onr.head, value_cell(&st.head));
         onr.env0 = value_cell(&st.head);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
         ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
@@ -7662,11 +7682,15 @@ private Value nat_promise_race(void* vmp, Value callee, Value thisv, Value* args
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, &nat_race_settle, "race");
+        gc_barrier(&onf.head, p);
         onf.env0 = p;
+        gc_barrier(&onf.head, value_bool(false));
         onf.env1 = value_bool(false);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_race_settle, "race");
+        gc_barrier(&onr.head, p);
         onr.env0 = p;
+        gc_barrier(&onr.head, value_bool(true));
         onr.env1 = value_bool(true);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
         ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
@@ -7809,10 +7833,12 @@ private Value promise_combine(VM* vm, Value list, NativeFn onful, NativeFn onrej
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, onful, "combine");
+        gc_barrier(&onf.head, value_cell(&st.head));
         onf.env0 = value_cell(&st.head);
         onf.env1 = value_int(i);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, onrej, "combine");
+        gc_barrier(&onr.head, value_cell(&st.head));
         onr.env0 = value_cell(&st.head);
         onr.env1 = value_int(i);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
@@ -8052,10 +8078,12 @@ private void map_put(JsMap* mp, Value key, Value val) {
     // lookup already treats the two as the same (SameValueZero)
     if value_is_double(key) && value_as_f64(key) == 0.0 { key = value_number(0.0); }
     i32 at = map_find(mp, key);
+    gc_barrier(&mp.head, val);
     if at >= 0 {
         *(mp.vals + at) = val;
         return;
     }
+    gc_barrier(&mp.head, key);
     map_reserve(mp);
     *(mp.keys + mp.len) = key;
     *(mp.vals + mp.len) = val;
@@ -8694,7 +8722,9 @@ private Value nat_util_debuglog(void* vmp, Value callee, Value thisv, Value* arg
     gc_root(&vm.heap, prefix);
     str_buf_free(&pre);
     JsNative* logfn = js_new_native(&vm.heap, &nat_debuglog_call, "debuglog");
+    gc_barrier(&logfn.head, value_bool(on));
     logfn.env0 = value_bool(on);
+    gc_barrier(&logfn.head, prefix);
     logfn.env1 = prefix;
     Value fv = value_cell(&logfn.head);
     gc_root(&vm.heap, fv);
@@ -10274,6 +10304,7 @@ private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
     // keep the getter alive across the accessor allocation, which can GC
     vm_push(vm, value_cell(&g.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&g.head));
     ac.get = value_cell(&g.head);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -10566,7 +10597,9 @@ private Value nat_process_emit_warning(void* vmp, Value callee, Value thisv, Val
     // node hands a warning out on the next tick rather than inline, so a
     // listener installed in the same block still hears it
     JsNative* job = js_new_native(&vm.heap, &nat_warning_deliver, "emitWarning");
+    gc_barrier(&job.head, err);
     job.env0 = err;
+    gc_barrier(&job.head, codev);
     job.env1 = codev;
     gc_root(&vm.heap, value_cell(&job.head));
     Value p = vm_promise_new(vm);
@@ -12420,6 +12453,7 @@ private Value make_ta_iterator(VM* vm, Value src, i32 kind) {
     JsObject* it = js_new_object(&vm.heap, vm.object_proto);
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_ta_iter_next, "next");
+    gc_barrier(&nx.head, src);
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
@@ -13392,7 +13426,7 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
             str_buf_add(&sb, v);
             Value j = new_str(vm, str_buf_to_str(&sb));
             str_buf_free(&sb);
-            *props_get(&h.props, key) = j;
+            props_set(&h.props, key, j);
         }
         vm_pop(vm);
     }
@@ -16162,8 +16196,11 @@ private void fs_schedule_cb(VM* vm, Value cb, Value err, Value value) {
     gc_root(&vm.heap, err);
     gc_root(&vm.heap, value);
     JsNative* inv = js_new_native(&vm.heap, &nat_fs_cb_invoke, "");
+    gc_barrier(&inv.head, cb);
     inv.env0 = cb;
+    gc_barrier(&inv.head, err);
     inv.env1 = err;
+    gc_barrier(&inv.head, value);
     inv.env2 = value;
     gc_root(&vm.heap, value_cell(&inv.head));
     Value p = vm_promise_new(vm);
@@ -16813,8 +16850,11 @@ private Value ee_make_once(VM* vm, Value thisv, Value namev, Value cb) {
     vm_push(vm, namev);
     vm_push(vm, cb);
     JsNative* w = js_new_native(&vm.heap, &nat_ee_once_wrap, "");
+    gc_barrier(&w.head, thisv);
     w.env0 = thisv;
+    gc_barrier(&w.head, namev);
     w.env1 = namev;
+    gc_barrier(&w.head, cb);
     w.env2 = cb;
     // rawListeners hands out the wrapper, so it carries the original for
     // callers that need to recognise it
@@ -17107,6 +17147,7 @@ private Value nat_promisified(void* vmp, Value callee, Value thisv, Value* args,
     Value p = vm_promise_new(vm);
     vm_push(vm, p);
     JsNative* cb = js_new_native(&vm.heap, &nat_promisify_cb, "");
+    gc_barrier(&cb.head, p);
     cb.env0 = p;
     Value cbv = value_cell(&cb.head);
     vm_push(vm, cbv);
@@ -17129,6 +17170,7 @@ private Value nat_util_promisify(void* vmp, Value callee, Value thisv, Value* ar
     }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_promisified, "");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -17164,9 +17206,11 @@ private Value nat_callbackified(void* vmp, Value callee, Value thisv, Value* arg
     gc_root(&vm.heap, p);
     if vm_is_promise(vm, p) {
         JsNative* onok = js_new_native(&vm.heap, &nat_callbackify_ok, "");
+        gc_barrier(&onok.head, cbv);
         onok.env0 = cbv;
         gc_root(&vm.heap, value_cell(&onok.head));   // the next allocation would sweep it
         JsNative* onerr = js_new_native(&vm.heap, &nat_callbackify_err, "");
+        gc_barrier(&onerr.head, cbv);
         onerr.env0 = cbv;
         ignore vm_promise_then(vm, p, value_cell(&onok.head), value_cell(&onerr.head));
     }
@@ -17182,6 +17226,7 @@ private Value nat_util_callbackify(void* vmp, Value callee, Value thisv, Value* 
     }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_callbackified, "");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -17332,6 +17377,7 @@ private Value nat_util_deprecate(void* vmp, Value callee, Value thisv, Value* ar
     if !value_is_callable(orig) { return orig; }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_deprecated_call, "deprecated");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -20296,7 +20342,9 @@ private void def_get_set_pair(VM* vm, JsObject* obj, u32 key, JsNative* getter, 
     JsNative* s = js_new_native(&vm.heap, setter, "set");
     vm_push(vm, value_cell(&s.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&getter.head));
     ac.get = value_cell(&getter.head);
+    gc_barrier(&ac.head, value_cell(&s.head));
     ac.set = value_cell(&s.head);
     props_set_desc(&obj.props, key, value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -20308,7 +20356,9 @@ private void def_get_set(VM* vm, JsObject* obj, str name, NativeFn getter, Nativ
     JsNative* s = js_new_native(&vm.heap, setter, name);
     vm_push(vm, value_cell(&s.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&g.head));
     ac.get = value_cell(&g.head);
+    gc_barrier(&ac.head, value_cell(&s.head));
     ac.set = value_cell(&s.head);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -20407,6 +20457,7 @@ private Value nat_proxy_revocable(void* vmp, Value callee, Value thisv, Value* a
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, pv);
     JsNative* revoke = js_new_native(&vm.heap, &nat_proxy_revoke, "revoke");
+    gc_barrier(&revoke.head, pv);
     revoke.env0 = pv;
     gc_root(&vm.heap, value_cell(&revoke.head));
     JsObject* result = js_new_object(&vm.heap, vm.object_proto);
@@ -20688,7 +20739,9 @@ void builtins_install(VM* vm) {
         JsNative* ps = js_new_native(&vm.heap, &nat_proto_set, "__proto__");
         vm_push(vm, value_cell(&ps.head));
         JsAccessor* pac = js_new_accessor(&vm.heap);
+        gc_barrier(&pac.head, value_cell(&pg.head));
         pac.get = value_cell(&pg.head);
+        gc_barrier(&pac.head, value_cell(&ps.head));
         pac.set = value_cell(&ps.head);
         props_set_desc(&vm.object_proto.props, bi_atom(vm, "__proto__"),
             value_cell(&pac.head), PROP_CONFIGURABLE);
@@ -20915,7 +20968,9 @@ void builtins_install(VM* vm) {
     JsNative* lim_set = js_new_native(&vm.heap, &nat_error_limit_set, "stackTraceLimit");
     vm_push(vm, value_cell(&lim_set.head));
     JsAccessor* lim_ac = js_new_accessor(&vm.heap);
+    gc_barrier(&lim_ac.head, value_cell(&lim_get.head));
     lim_ac.get = value_cell(&lim_get.head);
+    gc_barrier(&lim_ac.head, value_cell(&lim_set.head));
     lim_ac.set = value_cell(&lim_set.head);
     props_set_desc(&err_ctor.props, bi_atom(vm, "stackTraceLimit"), value_cell(&lim_ac.head),
         PROP_WRITABLE | PROP_CONFIGURABLE);
@@ -21043,6 +21098,7 @@ void builtins_install(VM* vm) {
     JsNative* it_si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
     props_set_desc(&vm.iterator_proto.props, iter_id, value_cell(&it_si.head), METHOD_ATTRS);
     JsNative* it_cg = js_new_native(&vm.heap, &nat_iter_ctor_get, "constructor");
+    gc_barrier(&it_cg.head, value_cell(&iter_ctor.head));
     it_cg.env0 = value_cell(&iter_ctor.head);
     vm_push(vm, value_cell(&it_cg.head));
     def_get_set_pair(vm, vm.iterator_proto, bi_atom(vm, "constructor"), it_cg, &nat_iter_ctor_set);

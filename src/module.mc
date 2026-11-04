@@ -1476,6 +1476,7 @@ private Value make_require_fn(VM* vm, str module_path) {
     Value pv = new_js_str(vm, module_path);
     vm_push(vm, pv);
     JsNative* n = js_new_native(&vm.heap, &nat_require, "require");
+    gc_barrier(&n.head, pv);
     n.env0 = pv;
     // rooted before anything else is allocated: the properties below each
     // allocate, and an object held only in a local is not reachable from
@@ -1487,6 +1488,7 @@ private Value make_require_fn(VM* vm, str module_path) {
     props_set_desc(&n.props, atom_intern(&vm.atoms, "cache"),
         value_cell(&require_cache(vm).head), PROP_DEFAULT);
     JsNative* rs = js_new_native(&vm.heap, &nat_require_resolve, "resolve");
+    gc_barrier(&rs.head, pv);
     rs.env0 = pv;
     props_set_desc(&n.props, atom_intern(&vm.atoms, "resolve"),
         value_cell(&rs.head), PROP_DEFAULT);
@@ -2042,6 +2044,7 @@ private void attach_accessor(VM* vm, JsObject* obj, u32 key, NativeFn getter) {
     JsNative* g = js_new_native(&vm.heap, getter, "get");
     vm_push(vm, value_cell(&g.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&g.head));
     ac.get = value_cell(&g.head);
     props_set_desc(&obj.props, key, value_cell(&ac.head), PROP_ENUMERABLE | PROP_CONFIGURABLE);
     vm_pop(vm);

@@ -72,8 +72,34 @@ const i32 PROPS_INDEX_MIN = 16;
 struct PropList {
     Prop* items;
     i32 len;
-    i32 cap;
+    i32 cap;            // the room, under PROPS_CAP_MASK; the generation bits above it
     IntMap<i32>* idx;   // null below the threshold
+}
+
+// The table's generation rides in cap's top bits, so the struct stays its
+// size: PROPS_OLD once a collection has traced it (its cell is old), and
+// PROPS_REMEMBERED while it is on the remembered list for holding a young
+// cell (gc.mc, generations).
+const i32 PROPS_CAP_MASK = 0x0FFFFFFF;
+const i32 PROPS_OLD = 0x40000000;
+const i32 PROPS_REMEMBERED = 0x20000000;
+
+private i32 props_cap(PropList* p) { return p.cap & PROPS_CAP_MASK; }
+
+// Before a store of v into an old table (the caller tests PROPS_OLD, so a
+// young table's store, the common one, makes no call).
+void props_barrier(PropList* p, Value v) {
+    if (p.cap & PROPS_REMEMBERED) == 0 && gc_young(v) {
+        p.cap = p.cap | PROPS_REMEMBERED;
+        gc_remember_props(cast(void*, p));
+    }
+}
+
+// The heap's props_trace hook: a remembered table traced, and off the list.
+void js_props_trace(GcHeap* h, void* pp) {
+    PropList* p = cast(PropList*, pp);
+    mark_props(h, p);
+    p.cap = p.cap & ~PROPS_REMEMBERED;
 }
 
 void props_init(PropList* p) {
@@ -87,13 +113,13 @@ void props_init(PropList* p) {
 // coming -- an object literal. Only on an untouched table, so it never shrinks
 // one and never moves entries.
 void props_reserve(PropList* p, i32 n) {
-    if p.cap > 0 || n <= 0 { return; }
+    if props_cap(p) > 0 || n <= 0 { return; }
     p.items = cast(Prop*, pool_alloc(cast(i64, n) * sizeof(Prop)));
-    p.cap = n;
+    p.cap = (p.cap & ~PROPS_CAP_MASK) | n;
 }
 
 void props_free(PropList* p) {
-    if p.items != null { pool_free(cast(void*, p.items), cast(i64, p.cap) * sizeof(Prop)); }
+    if p.items != null { pool_free(cast(void*, p.items), cast(i64, props_cap(p)) * sizeof(Prop)); }
     if p.idx != null {
         intmap_free<i32>(p.idx);
         free(p.idx);
@@ -139,16 +165,18 @@ Prop* props_entry(PropList* p, u32 key) {
 // Appends a fresh entry with the given attribute flags. Caller must
 // have checked the key is absent.
 private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
-    if p.len >= p.cap {
-        i32 ncap = p.cap * 2;
+    if (p.cap & PROPS_OLD) != 0 { props_barrier(p, v); }
+    i32 cap = props_cap(p);
+    if p.len >= cap {
+        i32 ncap = cap * 2;
         if ncap < 4 { ncap = 4; }
         Prop* ni = cast(Prop*, pool_alloc(cast(i64, ncap) * sizeof(Prop)));
         for i32 i = 0; i < p.len; i++ {
             *(ni + i) = *(p.items + i);
         }
-        if p.items != null { pool_free(cast(void*, p.items), cast(i64, p.cap) * sizeof(Prop)); }
+        if p.items != null { pool_free(cast(void*, p.items), cast(i64, cap) * sizeof(Prop)); }
         p.items = ni;
-        p.cap = ncap;
+        p.cap = (p.cap & ~PROPS_CAP_MASK) | ncap;
     }
     i32 pos = p.len;
     Prop* pr = p.items + pos;
@@ -174,6 +202,7 @@ void props_add_new(PropList* p, u32 key, Value v) {
 void props_set(PropList* p, u32 key, Value v) {
     Value* ex = props_get(p, key);
     if ex != null {
+        if (p.cap & PROPS_OLD) != 0 { props_barrier(p, v); }
         *ex = v;
         return;
     }
@@ -184,6 +213,7 @@ void props_set(PropList* p, u32 key, Value v) {
 void props_set_desc(PropList* p, u32 key, Value v, u8 flags) {
     Prop* ex = props_entry(p, key);
     if ex != null {
+        if (p.cap & PROPS_OLD) != 0 { props_barrier(p, v); }
         ex.val = v;
         ex.flags = flags;
         return;
@@ -435,8 +465,11 @@ struct JsGenerator {
 // --- GC hooks ---------------------------------------------------------
 
 private void mark_props(GcHeap* h, PropList* p) {
+    if h.verifying { h.verify_cap = p.cap; }
+    else { p.cap = p.cap | PROPS_OLD; }
     for i32 i = 0; i < p.len; i++ {
         Prop* pr = p.items + i;
+        if h.verifying { h.verify_key = cast(i32, pr.key); }
         gc_mark_value(h, pr.val);
         if pr.key < cast(u32, h.key_marks_len) { *(h.key_marks + pr.key) = cast(u8, 1); }
     }
@@ -445,12 +478,16 @@ private void mark_props(GcHeap* h, PropList* p) {
 void js_trace(GcHeap* h, GcCell* c) {
     if c.kind == GC_OBJECT {
         JsObject* o = cast(JsObject*, c);
+        h.verify_slot = "proto";
         if o.proto != null { gc_mark_cell(h, &o.proto.head); }
+        h.verify_slot = "props";
         mark_props(h, &o.props);
+        h.verify_slot = "elems";
         for i32 i = 0; i < o.elen; i++ {
             gc_mark_value(h, *(o.elems + i));
         }
         if (o.obj_flags & OBJF_PROXY) != 0 {
+            h.verify_slot = "proxy";
             JsProxy* p = cast(JsProxy*, o);
             gc_mark_value(h, p.target);
             gc_mark_value(h, p.handler);
@@ -459,16 +496,21 @@ void js_trace(GcHeap* h, GcCell* c) {
     }
     if c.kind == GC_FUNCTION {
         JsFunction* f = cast(JsFunction*, c);
+        h.verify_slot = "upvals";
         for i32 i = 0; i < f.n_upvals; i++ {
             gc_mark_value(h, *(f.upvals + i));
         }
+        h.verify_slot = "props";
         mark_props(h, &f.props);
+        h.verify_slot = "fproto";
         gc_mark_value(h, f.fproto);
         return;
     }
     if c.kind == GC_NATIVE {
         JsNative* n = cast(JsNative*, c);
+        h.verify_slot = "props";
         mark_props(h, &n.props);
+        h.verify_slot = "env";
         gc_mark_value(h, n.env0);
         gc_mark_value(h, n.env1);
         gc_mark_value(h, n.env2);
@@ -837,6 +879,7 @@ bool js_array_has(JsObject* o, i32 idx) {
 
 void js_array_set(JsObject* o, i32 idx, Value v) {
     if idx < 0 { return; }
+    if o.head.mark == GC_OLD { gc_barrier(&o.head, v); }
     if idx >= o.ecap {
         i32 ncap = o.ecap * 2;
         if ncap < 8 { ncap = 8; }

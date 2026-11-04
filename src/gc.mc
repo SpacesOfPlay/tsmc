@@ -21,7 +21,7 @@ struct GcCell {
     i32 size;
     i32 chunk;      // the chunk a small cell lies in, plus one; 0 for a large cell on the heap's list
     i32 kind;
-    i32 mark;
+    i32 mark;       // 0 young; GC_OLD, GC_REMEMBERED, GC_FRESH below
 }
 
 // A free small cell, on its class's list: the sweep passes it by.
@@ -39,7 +39,18 @@ struct GcChunk {
     i32 cell;       // the cell size
     i32 cap;        // cells it holds
     i32 used;       // cells handed out so far, from the start
-    bool swept;     // the last collection's sweep has been through it
+    bool young;     // a cell was handed out of it since its last sweep: a minor collection sweeps it
+    i32 lo;         // the cells handed out since its last sweep lie in lo..hi: what a minor's sweep walks
+    i32 hi;
+    u32 inv;        // ceil(2^32 / cell): a cell's index is (offset * inv) >> 32, exact for a 64 KB chunk, without the division
+    // its dead cells, handed out again before any other chunk's: new cells
+    // fill one chunk at a time, the emptiest first, so the young lie close
+    // together and a minor's sweep streams through them instead of taking a
+    // cache miss on each (one in five cells, 38 ns a cell against 10)
+    GcCell* free;
+    i32 n_free;
+    i32 next_avail;  // the next chunk of its class with free cells, -1 at the end
+    bool avail;      // on its class's list of chunks with free cells
 }
 
 type CellPtr = GcCell*;
@@ -51,6 +62,9 @@ type GcMarkRootsFn = fn(GcHeap*, void*): void;
 // sweep hook drops entries with dead keys, run while marks are still set.
 type GcWeakMarkFn = fn(GcHeap*, void*): bool;
 type GcWeakSweepFn = fn(GcHeap*, void*): void;
+// A remembered property table traced (object.mc, which knows its layout).
+type GcPropsTraceFn = fn(GcHeap*, void*): void;
+type VoidPtr = void*;
 
 const i64 GC_MIN_THRESHOLD = 262144;
 
@@ -69,6 +83,8 @@ struct GcHeap {
     i64 bytes_live;
     i64 next_gc;
     bool stress;          // collect on every allocation (tests)
+    bool verify;          // the whole graph checked after every collection (gc_verify), without the stress
+    bool trace;           // a line per collection on stderr: its kind, what it marked, what it took
     i64 n_cells;
     i64 n_collections;
     Vec<Value> roots;
@@ -78,11 +94,39 @@ struct GcHeap {
     GcMarkRootsFn mark_roots; // extra roots (VM stack, globals, …)
     GcWeakMarkFn weak_mark;   // ephemeron marking (WeakMap/WeakSet)
     GcWeakSweepFn weak_sweep; // drops dead-keyed weak entries
+    GcPropsTraceFn props_trace;
     void* mark_ctx;
+    // generations: the large cells made since the last collection, apart
+    // from `all`, which holds the old ones; what the old cells amount to;
+    // the young bytes a minor collection waits for; which kind of
+    // collection is under way, and whether its sweep takes every chunk
+    GcCell* young_large;
+    i64 old_bytes;
+    i64 old_cells;
+    i64 minor_threshold;
+    bool minor_pass;
+    bool minor_sweep;     // the sweep counted in sw_ticks was a minor's, for the trace
+    Vec<i32> young_chunks; // the chunks allocated into since the last collection: what a minor sweeps
+    i64 n_minor;
+    i64 sw_ticks;         // the sweep under way: its time, cells visited and chunks entered, for the trace
+    i64 sw_cells;
+    i64 sw_chunks;
+    i32 stress_count;
+    // the verifier (gc_verify, under stress): a walk of the whole graph
+    // with GC_SEEN as its visited set, the cell it is tracing, the cells
+    // it has seen
+    bool verifying;
+    GcCell* verify_parent;
+    str verify_slot;      // which of the parent's slots is being traced, named by the tracer
+    i32 verify_key;       // the property key being traced, and the table's cap word with its generation bits
+    i32 verify_cap;
+    Vec<CellPtr> verify_seen;
     GcCell*[GC_CLASS_COUNT] free_cells;   // dead cells by size class, reused first
     i64 alloc_total;      // bytes allocated since the heap began: a clock
     Vec<GcChunk> chunks;
-    i32[GC_CLASS_SMALL] bump;    // per small class, the chunk new cells come from, -1 for none
+    i32[GC_CLASS_SMALL] bump;    // per small class, the chunk new cells come from (its free cells, then its unused tail), -1 for none
+    i32[GC_CLASS_SMALL] avail;   // per small class, the chunks with free cells, the emptiest first
+    i64 chunk_bytes;             // the chunks' memory: the heap's footprint apart from the large cells
     // the lazy sweep of the chunks: the next cell to look at, and the chunks
     // the collection found (those made since have nothing to sweep)
     bool chunk_sweep;
@@ -137,9 +181,10 @@ private i64 gc_class_size(i32 cls) {
 private void gc_cell_release(GcHeap* h, GcCell* c) {
     if c.chunk > 0 {
         c.kind = GC_FREE;
-        i32 sc = c.size / 16 - 1;
-        c.next = h.free_cells[sc];
-        h.free_cells[sc] = c;
+        GcChunk* ch = &h.chunks.data[c.chunk - 1];
+        c.next = ch.free;
+        ch.free = c;
+        ch.n_free++;
         return;
     }
     i32 cls = c.size <= 1024 ? cast(i32, (c.size + 15) / 16) - 1 : gc_class_of(c.size);
@@ -199,6 +244,8 @@ void gc_init(GcHeap* h) {
     h.bytes_live = 0;
     h.next_gc = GC_MIN_THRESHOLD;
     h.stress = false;
+    h.verify = false;
+    h.trace = false;
     h.n_cells = 0;
     h.n_collections = 0;
     vec_init<Value>(&h.roots, 16);
@@ -214,24 +261,35 @@ void gc_init(GcHeap* h) {
     h.key_marks = null;
     h.key_marks_len = 0;
     vec_init<GcChunk>(&h.chunks, 16);
-    for i32 i = 0; i < GC_CLASS_SMALL; i++ { h.bump[i] = -1; }
+    for i32 i = 0; i < GC_CLASS_SMALL; i++ { h.bump[i] = -1; h.avail[i] = -1; }
+    h.chunk_bytes = 0;
     h.chunk_sweep = false;
     h.sw_chunk = 0;
     h.sw_cell = 0;
     h.sw_end = 0;
+    h.props_trace = null;
+    h.young_large = null;
+    h.old_bytes = 0;
+    h.old_cells = 0;
+    h.minor_threshold = GC_MINOR_THRESHOLD;
+    h.minor_pass = false;
+    h.minor_sweep = false;
+    vec_init<i32>(&h.young_chunks, 64);
+    h.n_minor = 0;
+    h.stress_count = 0;
+    h.verifying = false;
+    h.verify_parent = null;
+    vec_init<CellPtr>(&h.verify_seen, 16);
 }
 
 void gc_destroy(GcHeap* h) {
     gc_sweep_finish(h);
     gc_report_poison();
-    GcCell* c = h.all;
-    while c != null {
-        GcCell* n = c.next;
-        if h.finalizer != null { h.finalizer(c); }
-        free(c);
-        c = n;
-    }
+    gc_forget_remembered(h);
+    gc_free_list(h, h.all);
+    gc_free_list(h, h.young_large);
     h.all = null;
+    h.young_large = null;
     for i32 k = 0; k < h.chunks.len; k++ {
         GcChunk* ch = &h.chunks.data[k];
         for i32 i = 0; i < ch.used; i++ {
@@ -241,6 +299,7 @@ void gc_destroy(GcHeap* h) {
         free(ch.mem);
     }
     vec_free(&h.chunks);
+    vec_free(&h.young_chunks);
     h.bytes_live = 0;
     h.n_cells = 0;
     for i32 i = 0; i < GC_CLASS_COUNT; i++ {
@@ -255,7 +314,156 @@ void gc_destroy(GcHeap* h) {
     }
     vec_free(&h.roots);
     vec_free(&h.mark_stack);
+    vec_free(&h.verify_seen);
     if h.key_marks != null { free(h.key_marks); h.key_marks = null; }
+}
+
+private void gc_free_list(GcHeap* h, GcCell* c) {
+    while c != null {
+        GcCell* n = c.next;
+        if h.finalizer != null { h.finalizer(c); }
+        free(c);
+        c = n;
+    }
+}
+
+// --- generations --------------------------------------------------------
+//
+// A cell keeps its mark once set: one that survived a collection is old.
+// A minor collection marks from the roots and from the old cells written
+// since the last collection, traces only the young cells it reaches, and
+// sweeps only the chunks allocated into since; a major clears every mark
+// first and does the whole heap. A store of a young cell into an old one
+// goes through gc_barrier, or props_barrier for a property table, which
+// puts the holder on a remembered list. The lists are the thread's, shared
+// by the heaps on it, and every collection on the thread drains them: an
+// entry is traced into whichever heap collects first, which marks its
+// young referents old a little early, and never outlives its cell, since a
+// cell dies only in a collection of its own heap.
+const i32 GC_OLD = 1;
+const i32 GC_REMEMBERED = 2;    // old, and on the remembered list
+const i32 GC_FRESH = 4;         // young, made where a pending sweep has yet to reach, which passes it by
+const i32 GC_SEEN = 256;        // the verifier's visited bit, over the others
+// The young bytes a minor collection waits for. Small: the young fill a
+// few chunks that stay in the cache when they are recycled every megabyte,
+// and bsky.app ran slower with each doubling, 8 MB costing a tenth more.
+const i64 GC_MINOR_THRESHOLD = 1048576;
+
+private threadlocal Vec<CellPtr> g_remembered_cells;
+private threadlocal Vec<VoidPtr> g_remembered_props;
+private threadlocal bool g_remembered_ready = false;
+
+private void remembered_ready() {
+    if g_remembered_ready { return; }
+    vec_init<CellPtr>(&g_remembered_cells, 64);
+    vec_init<VoidPtr>(&g_remembered_props, 64);
+    g_remembered_ready = true;
+}
+
+// Whether v is a cell no collection has marked yet.
+bool gc_young(Value v) {
+    if !value_is_cell(v) { return false; }
+    i32 m = value_as_cell(v).mark;
+    return m == 0 || m == GC_FRESH;
+}
+
+// An old cell about to hold a young one: traced by the next collection.
+void gc_remember_cell(GcCell* c) {
+    if c.mark != GC_OLD { return; }
+    remembered_ready();
+    c.mark = GC_REMEMBERED;
+    vec_push(&g_remembered_cells, c);
+}
+
+// Before a store of v into a slot of c.
+void gc_barrier(GcCell* c, Value v) {
+    if c.mark == GC_OLD && gc_young(v) { gc_remember_cell(c); }
+}
+
+// A property table (object.mc) about to hold a young cell; traced through
+// the heap's props_trace hook, which also takes it off its list.
+void gc_remember_props(void* p) {
+    remembered_ready();
+    vec_push(&g_remembered_props, p);
+}
+
+// The remembered cells and tables traced, as a collection's marking does.
+private void gc_drain_remembered(GcHeap* h) {
+    if !g_remembered_ready { return; }
+    for i32 i = 0; i < g_remembered_cells.len; i++ {
+        GcCell* c = g_remembered_cells.data[i];
+        if c.mark == GC_REMEMBERED { c.mark = GC_OLD; }
+        gc_trace(h, c);
+    }
+    g_remembered_cells.len = 0;
+    for i32 i = 0; i < g_remembered_props.len; i++ {
+        if h.props_trace != null { h.props_trace(h, g_remembered_props.data[i]); }
+    }
+    g_remembered_props.len = 0;
+}
+
+// Whether the address lies in one of the heap's cells.
+private bool gc_owns(GcHeap* h, u8* p) {
+    for i32 k = 0; k < h.chunks.len; k++ {
+        GcChunk* ch = &h.chunks.data[k];
+        if p >= ch.mem && p < ch.mem + cast(i64, ch.cap) * ch.cell { return true; }
+    }
+    GcCell* c = h.all;
+    while c != null { if p >= cast(u8*, c) && p < cast(u8*, c) + c.size { return true; } c = c.next; }
+    c = h.young_large;
+    while c != null { if p >= cast(u8*, c) && p < cast(u8*, c) + c.size { return true; } c = c.next; }
+    return false;
+}
+
+// A heap going away takes its entries off the thread's lists.
+private void gc_forget_remembered(GcHeap* h) {
+    if !g_remembered_ready { return; }
+    i32 k = 0;
+    for i32 i = 0; i < g_remembered_cells.len; i++ {
+        GcCell* c = g_remembered_cells.data[i];
+        if !gc_owns(h, cast(u8*, c)) { g_remembered_cells.data[k] = c; k++; }
+    }
+    g_remembered_cells.len = k;
+    k = 0;
+    for i32 i = 0; i < g_remembered_props.len; i++ {
+        void* p = g_remembered_props.data[i];
+        if !gc_owns(h, cast(u8*, p)) { g_remembered_props.data[k] = p; k++; }
+    }
+    g_remembered_props.len = k;
+}
+
+// Every mark cleared, for a major collection.
+private void gc_clear_marks(GcHeap* h) {
+    for i32 k = 0; k < h.chunks.len; k++ {
+        GcChunk* ch = &h.chunks.data[k];
+        for i32 i = 0; i < ch.used; i++ {
+            GcCell* c = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
+            if c.kind >= 0 { c.mark = 0; }
+        }
+    }
+    GcCell* c = h.all;
+    while c != null { c.mark = 0; c = c.next; }
+    c = h.young_large;
+    while c != null { c.mark = 0; c = c.next; }
+}
+
+// Under stress, after a collection's marking: the whole graph walked from
+// the roots again, and a live cell found unmarked is a store that went
+// without its barrier. It names the cell's kind and the holder's.
+private void gc_verify(GcHeap* h, bool minor) {
+    h.verifying = true;
+    if h.mark_roots != null { h.mark_roots(h, h.mark_ctx); }
+    for i32 i = 0; i < h.roots.len; i++ { gc_mark_value(h, vec_get(&h.roots, i)); }
+    while h.mark_stack.len > 0 {
+        CellPtr c = vec_pop(&h.mark_stack);
+        h.verify_parent = c;
+        h.verify_slot = "";
+        gc_trace(h, c);
+    }
+    h.verify_parent = null;
+    h.verifying = false;
+    for i32 i = 0; i < h.verify_seen.len; i++ { h.verify_seen.data[i].mark = h.verify_seen.data[i].mark & ~GC_SEEN; }
+    h.verify_seen.len = 0;
 }
 
 // --- roots ---------------------------------------------------------
@@ -276,8 +484,21 @@ void gc_root_reset(GcHeap* h, i32 mark) {
 
 void gc_mark_cell(GcHeap* h, GcCell* c) {
     if c == null { return; }
+    if h.verifying {
+        if (c.mark & GC_SEEN) != 0 { return; }
+        if (c.mark & 255) == 0 {
+            eprint("gc: a live cell of kind {} is unmarked after a {} collection, held by a cell of kind {} in its {}: a store without its barrier\n",
+                c.kind, h.minor_pass ? "minor" : "major", h.verify_parent != null ? h.verify_parent.kind : -1, h.verify_slot);
+            eprint("gc: the holder's mark {}, the cell's mark {}, its chunk {} (young {}), key {}, table cap {} (old {}, remembered {}), collection {}\n", h.verify_parent != null ? h.verify_parent.mark : -1, c.mark, c.chunk, c.chunk > 0 ? h.chunks.data[c.chunk - 1].young : false, h.verify_key, h.verify_cap & 0x0FFFFFFF, (h.verify_cap & 0x40000000) != 0, (h.verify_cap & 0x20000000) != 0, h.n_collections);
+            exit(70);
+        }
+        c.mark = c.mark | GC_SEEN;
+        vec_push(&h.verify_seen, c);
+        vec_push(&h.mark_stack, c);
+        return;
+    }
     if c.mark != 0 { return; }
-    c.mark = 1;
+    c.mark = GC_OLD;
     h.marked_bytes += c.size;
     h.marked_cells++;
     vec_push(&h.mark_stack, c);
@@ -338,40 +559,31 @@ const i32 GC_SWEEP_STEP = 64;
 void gc_sweep_some(GcHeap* h, i32 n) {
     if h.sweep_list == null && !h.chunk_sweep { return; }
     i64 t0 = qpc();
+    i32 n0 = n;
     // the chunks, a cell after another: a survivor's mark is cleared, a dead
-    // cell is finalized and goes on its class's free list
+    // cell is finalized and goes on its chunk's free list
     while n > 0 && h.chunk_sweep {
         if h.sw_chunk >= h.sw_end { h.chunk_sweep = false; break; }
         GcChunk* ch = &h.chunks.data[h.sw_chunk];
-        u8* base = ch.mem;
-        i32 cell = ch.cell;
-        i32 i = h.sw_cell;
-        while i < ch.used && n > 0 {
-            GcCell* c = cast(GcCell*, base + cast(i64, i) * cell);
-            if c.kind >= 0 {
-                if c.mark != 0 {
-                    c.mark = 0;
-                } else {
-                    if h.finalizer != null { h.finalizer(c); }
-                    gc_cell_release(h, c);
-                }
-            }
-            i++;
-            n--;
-        }
+        // young again if a cell was made in it ahead of the sweep (fresh)
+        // or, by the allocator, behind it
+        if h.sw_cell == 0 { h.sw_chunks++; ch.young = false; ch.lo = ch.cap; ch.hi = -1; }
+        bool was_young = ch.young;
+        i32 i = gc_sweep_every(h, ch, h.sw_cell, &n, false);
+        if ch.young && !was_young { vec_push(&h.young_chunks, h.sw_chunk); }
         if i >= ch.used {
-            ch.swept = true;
+            gc_chunk_avail(h, h.sw_chunk);
             h.sw_chunk++;
             h.sw_cell = 0;
         } else {
             h.sw_cell = i;
         }
     }
+    if !h.chunk_sweep { gc_rank_chunks(h); }
     while n > 0 && h.sweep_list != null {
         GcCell* c = h.sweep_list;
         h.sweep_list = c.next;
         if c.mark != 0 {
-            c.mark = 0;
             c.next = h.all;
             h.all = c;
         } else {
@@ -380,8 +592,104 @@ void gc_sweep_some(GcHeap* h, i32 n) {
         }
         n--;
     }
-    gc_stat_step_ticks = gc_stat_step_ticks + (qpc() - t0);
+    i64 dt = qpc() - t0;
+    gc_stat_step_ticks = gc_stat_step_ticks + dt;
+    h.sw_ticks += dt;
+    h.sw_cells += n0 - n;
 }
+
+// A dead cell's memory given back, or under stress kept and poisoned, so a
+// reference that outlived its root reads an invalid kind and fails at once
+// rather than whenever the memory is reused.
+private void gc_cell_dead(GcHeap* h, GcCell* c, bool poison) {
+    if h.finalizer != null { h.finalizer(c); }
+    if !poison { gc_cell_release(h, c); return; }
+    i32 keep_chunk = c.chunk;
+    i32 keep_size = c.size;
+    memset(cast(u8*, c), 0xAB, keep_size);
+    c.chunk = keep_chunk;
+    c.size = keep_size;
+    c.kind = -1;
+}
+
+// A chunk's young cells swept: the cells of lo..hi, every one looked at,
+// since the young fill a chunk together, and an old one (marked) passed
+// by. A minor's sweep, which has no pending lazy sweep to make a cell
+// fresh. The cells visited.
+private i32 gc_sweep_young(GcHeap* h, GcChunk* ch, bool poison) {
+    i32 end = ch.hi < ch.used ? ch.hi : ch.used - 1;
+    for i32 i = ch.lo; i <= end; i++ {
+        GcCell* c = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
+        if c.kind >= 0 && c.mark == 0 { gc_cell_dead(h, c, poison); }
+    }
+    i32 visited = end - ch.lo + 1;
+    ch.lo = ch.cap;
+    ch.hi = -1;
+    return visited < 0 ? 0 : visited;
+}
+
+// Every cell of a chunk swept, from `start`, up to *n of them; a fresh
+// cell is made young and sets the chunk young, for the next minor. The
+// cell reached.
+private i32 gc_sweep_every(GcHeap* h, GcChunk* ch, i32 start, i32* n, bool poison) {
+    i32 i = start;
+    while i < ch.used && *n > 0 {
+        GcCell* c = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
+        if c.kind >= 0 {
+            if c.mark == 0 { gc_cell_dead(h, c, poison); }
+            else if c.mark == GC_FRESH {
+                c.mark = 0;
+                ch.young = true;
+                if i < ch.lo { ch.lo = i; }
+                if i > ch.hi { ch.hi = i; }
+            }
+        }
+        i++;
+        *n = *n - 1;
+    }
+    return i;
+}
+
+// A chunk the sweep has been through joins its class's list when it has
+// free cells and is not the one being allocated from.
+private void gc_chunk_avail(GcHeap* h, i32 k) {
+    GcChunk* ch = &h.chunks.data[k];
+    if ch.avail || ch.n_free == 0 || h.bump[ch.cls] == k { return; }
+    ch.avail = true;
+    ch.next_avail = h.avail[ch.cls];
+    h.avail[ch.cls] = k;
+}
+
+// When a sweep has ended: each class's chunks with free cells listed again,
+// the emptiest first, in eight bands of how much of the chunk is free. The
+// chunks the young filled last time are mostly free again, and come first:
+// a nursery, without a space set aside for one.
+private void gc_rank_chunks(GcHeap* h) {
+    i32[GC_CLASS_SMALL * 8] head;
+    i32[GC_CLASS_SMALL * 8] tail;
+    for i32 i = 0; i < GC_CLASS_SMALL * 8; i++ { head[i] = -1; tail[i] = -1; }
+    for i32 k = 0; k < h.chunks.len; k++ {
+        GcChunk* ch = &h.chunks.data[k];
+        ch.avail = false;
+        ch.next_avail = -1;
+        if ch.n_free == 0 || h.bump[ch.cls] == k { continue; }
+        i32 b = ch.cls * 8 + cast(i32, cast(i64, ch.n_free) * 8 / (ch.cap + 1));
+        ch.avail = true;
+        if head[b] < 0 { head[b] = k; } else { h.chunks.data[tail[b]].next_avail = k; }
+        tail[b] = k;
+    }
+    for i32 cls = 0; cls < GC_CLASS_SMALL; cls++ {
+        i32 list = -1;
+        for i32 b = 0; b < 8; b++ {
+            i32 i = cls * 8 + b;
+            if head[i] < 0 { continue; }
+            h.chunks.data[tail[i]].next_avail = list;
+            list = head[i];
+        }
+        h.avail[cls] = list;
+    }
+}
+
 
 // Sweeps what is left of the last collection's cells.
 void gc_sweep_finish(GcHeap* h) {
@@ -391,17 +699,37 @@ void gc_sweep_finish(GcHeap* h) {
     gc_stat_sweep_ticks = gc_stat_sweep_ticks + (qpc() - t0);
 }
 
-void gc_collect(GcHeap* h) {
-    // The previous sweep ends first: marking needs every cell unmarked,
+// A major collection: every mark cleared, the whole heap marked and swept.
+void gc_collect(GcHeap* h) { gc_collect_pass(h, false); }
+
+// A minor collection: the young cells reachable from the roots and from
+// the remembered old ones survive, as old; the rest of the young go.
+void gc_collect_minor(GcHeap* h) { gc_collect_pass(h, true); }
+
+private void gc_collect_pass(GcHeap* h, bool minor) {
+    // The previous sweep ends first: marking needs every young cell unmarked,
     // and the weak passes walk `all`.
     gc_sweep_finish(h);
+    if h.trace && h.n_collections > 0 {
+        eprint("gc: the {} sweep before: {} cells in {} chunks, {} ms\n", h.minor_sweep ? "minor" : "major", h.sw_cells, h.sw_chunks, h.sw_ticks * 1000 / qpf());
+    }
+    h.sw_ticks = 0;
+    h.sw_cells = 0;
+    h.sw_chunks = 0;
     i64 gc_t0 = qpc();
+    h.minor_pass = minor;
+    if !minor { gc_clear_marks(h); }
     h.marked_bytes = 0;
     h.marked_cells = 0;
+    i32 n_rem_cells = g_remembered_ready ? g_remembered_cells.len : 0;
+    i32 n_rem_props = g_remembered_ready ? g_remembered_props.len : 0;
     if h.mark_roots != null { h.mark_roots(h, h.mark_ctx); }
     for i32 i = 0; i < h.roots.len; i++ {
         gc_mark_value(h, vec_get(&h.roots, i));
     }
+    i64 gc_tr = qpc();
+    gc_drain_remembered(h);
+    i64 gc_td = qpc();
     while h.mark_stack.len > 0 {
         CellPtr c = vec_pop(&h.mark_stack);
         gc_trace(h, c);
@@ -419,85 +747,132 @@ void gc_collect(GcHeap* h) {
     }
     // Drop weak entries whose key did not survive (marks still valid).
     if h.weak_sweep != null { h.weak_sweep(h, h.mark_ctx); }
+    if h.stress || h.verify { gc_verify(h, minor); }
 
     i64 gc_t1 = qpc();
-    if !h.stress {
-        // The sweep is left to the allocations that follow. A cell made in a
-        // chunk the sweep has yet to reach is made marked, so it survives it.
+    if h.trace {
+        i64 f = qpf();
+        eprint("gc: {} collection {}: marked {} cells {} KB in {} ms (roots {}, remembered {} cells and {} tables {}); young {} KB of {} KB live, {} chunks {} KB\n",
+            minor ? "minor" : "major", h.n_collections + 1, h.marked_cells, h.marked_bytes / 1024, (gc_t1 - gc_t0) * 1000 / f,
+            (gc_tr - gc_t0) * 1000 / f, n_rem_cells, n_rem_props, (gc_td - gc_tr) * 1000 / f, (h.bytes_live - h.old_bytes) / 1024, h.bytes_live / 1024, h.chunks.len, h.chunk_bytes / 1024);
+    }
+    if !h.stress && !minor {
+        // A major's sweep, the whole heap, is left to the allocations that
+        // follow. A cell made in a chunk the sweep has yet to reach is made
+        // GC_FRESH, so it survives it.
         h.sweep_list = h.all;
+        if h.young_large != null {
+            GcCell* tail = h.young_large;
+            while tail.next != null { tail = tail.next; }
+            tail.next = h.sweep_list;
+            h.sweep_list = h.young_large;
+        }
         h.all = null;
-        for i32 k = 0; k < h.chunks.len; k++ { h.chunks.data[k].swept = false; }
+        h.young_large = null;
+        h.young_chunks.len = 0;
         h.chunk_sweep = h.chunks.len > 0;
+        h.minor_sweep = false;
         h.sw_chunk = 0;
         h.sw_cell = 0;
         h.sw_end = h.chunks.len;
-        h.bytes_live = h.marked_bytes;
-        h.n_cells = h.marked_cells;
-        h.next_gc = gc_next_threshold(h.marked_bytes);
-        h.n_collections++;
-        gc_stat_collections = gc_stat_collections + 1;
+        gc_account(h, minor, h.marked_bytes, h.marked_cells);
         gc_stat_ticks = gc_stat_ticks + (gc_t1 - gc_t0);
         if gc_t1 - gc_t0 > gc_stat_max_ticks { gc_stat_max_ticks = gc_t1 - gc_t0; }
         return;
     }
-    // Stress mode sweeps at once: it poisons each dead cell as it goes.
-    GcCell** link = &h.all;
+    // A minor's sweep, the chunks allocated into and the young large cells,
+    // is done at once: a few milliseconds, and the chunks it empties are the
+    // ones the allocations that follow should fill, which the lazy sweep's
+    // order would hand out last; they go to the front of their class's
+    // list, the ranking of the rest untouched, so a minor's cost is its
+    // young chunks' and not the heap's. Stress mode sweeps everything at
+    // once and poisons each dead cell as it goes, so a reference that
+    // outlived its root reads an invalid kind and fails at once rather than
+    // whenever the memory is reused.
+    bool poison = h.stress;
     i64 live_bytes = 0;
     i64 live_cells = 0;
-    for i32 k = 0; k < h.chunks.len; k++ {
+    h.minor_sweep = minor;
+    if !minor { h.young_chunks.len = 0; }
+    i32 n_young = h.young_chunks.len;
+    i32 n_sweep = minor ? n_young : h.chunks.len;
+    for i32 j = 0; j < n_sweep; j++ {
+        i32 k = minor ? h.young_chunks.data[j] : j;
         GcChunk* ch = &h.chunks.data[k];
+        i32 budget = 2147483647;
+        ch.young = false;
+        if minor {
+            h.sw_cells += gc_sweep_young(h, ch, poison);
+        } else {
+            ch.lo = ch.cap;
+            ch.hi = -1;
+            ignore gc_sweep_every(h, ch, 0, &budget, poison);
+            h.sw_cells += 2147483647 - budget;
+        }
+        h.sw_chunks++;
+        if ch.young { vec_push(&h.young_chunks, k); }
+        if minor { gc_chunk_avail(h, k); }
+        if !poison { continue; }
         for i32 i = 0; i < ch.used; i++ {
             GcCell* c = cast(GcCell*, ch.mem + cast(i64, i) * ch.cell);
-            if c.kind < 0 { continue; }
-            if c.mark != 0 {
-                c.mark = 0;
-                live_bytes += c.size;
-                live_cells++;
-            } else {
-                if h.finalizer != null { h.finalizer(c); }
-                // poisoned and kept, as a large cell is: never handed out again
-                i32 keep_chunk = c.chunk;
-                i32 keep_size = c.size;
-                memset(cast(u8*, c), 0xAB, keep_size);
-                c.chunk = keep_chunk;
-                c.size = keep_size;
-                c.kind = -1;
-            }
+            if c.kind >= 0 && c.mark != 0 { live_bytes += c.size; live_cells++; }
         }
-        ch.swept = true;
     }
-    while *link != null {
-        GcCell* c = *link;
+    // the chunks still young were pushed again, after the ones swept
+    i32 kept = h.young_chunks.len - n_young;
+    for i32 j = 0; j < kept; j++ { h.young_chunks.data[j] = h.young_chunks.data[n_young + j]; }
+    h.young_chunks.len = kept;
+    if !minor { gc_rank_chunks(h); }
+    // the young large cells, and for a major the old ones too: the
+    // survivors go on (or stay on) `all`
+    GcCell* list = h.young_large;
+    h.young_large = null;
+    if !minor {
+        GcCell* tail = list;
+        if tail == null { list = h.all; } else { while tail.next != null { tail = tail.next; } tail.next = h.all; }
+        h.all = null;
+    }
+    while list != null {
+        GcCell* c = list;
+        list = c.next;
         if c.mark != 0 {
-            c.mark = 0;
             live_bytes += c.size;
             live_cells++;
-            link = &c.next;
+            c.next = h.all;
+            h.all = c;
         } else {
-            *link = c.next;
-            if h.finalizer != null { h.finalizer(c); }
-            if h.stress {
-                // Stress mode keeps a dead cell's memory and poisons it, so
-                // a reference that outlived its root reads an invalid kind
-                // and fails at once rather than whenever the memory is
-                // reused.
-                memset(cast(u8*, c), 0xAB, c.size);
-                c.kind = -1;
-            } else {
-                gc_cell_release(h, c);
-            }
+            gc_cell_dead(h, c, poison);
         }
     }
-    gc_report_poison();
-    h.bytes_live = live_bytes;
-    h.n_cells = live_cells;
-    h.next_gc = gc_next_threshold(live_bytes);
-    h.n_collections++;
-    gc_stat_collections = gc_stat_collections + 1;
+    if poison {
+        gc_report_poison();
+        gc_account(h, minor, live_bytes, live_cells);
+    } else {
+        gc_account(h, minor, h.marked_bytes, h.marked_cells);
+    }
     i64 gc_t2 = qpc();
-    gc_stat_ticks = gc_stat_ticks + (gc_t2 - gc_t0);
+    h.sw_ticks += gc_t2 - gc_t1;
+    gc_stat_ticks = gc_stat_ticks + (gc_t1 - gc_t0);
     gc_stat_sweep_ticks = gc_stat_sweep_ticks + (gc_t2 - gc_t1);
     if gc_t2 - gc_t0 > gc_stat_max_ticks { gc_stat_max_ticks = gc_t2 - gc_t0; }
+}
+
+// What a collection found: a minor's survivors join the old; a major's are
+// the old, and set when the next major comes.
+private void gc_account(GcHeap* h, bool minor, i64 marked_bytes, i64 marked_cells) {
+    if minor {
+        h.old_bytes += marked_bytes;
+        h.old_cells += marked_cells;
+        h.n_minor++;
+    } else {
+        h.old_bytes = marked_bytes;
+        h.old_cells = marked_cells;
+        h.next_gc = gc_next_threshold(marked_bytes);
+    }
+    h.bytes_live = h.old_bytes;
+    h.n_cells = h.old_cells;
+    h.n_collections++;
+    gc_stat_collections = gc_stat_collections + 1;
 }
 
 // A cell swept in stress mode keeps its memory and reads as kind -1, which
@@ -527,8 +902,16 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
         if gc_stat_on { gc_stat_allocs[kind >= 0 && kind < 16 ? kind : 15]++; }
     }
     if h.sweep_list != null || h.chunk_sweep { gc_sweep_some(h, GC_SWEEP_STEP); }
-    if h.stress || h.bytes_live >= h.next_gc {
-        gc_collect(h);
+    if h.stress {
+        // every allocation collects: mostly minors, so the barriers are
+        // exercised, a major now and then
+        h.stress_count++;
+        if h.stress_count % 64 == 0 { gc_collect(h); } else { gc_collect_minor(h); }
+    } else if h.bytes_live - h.old_bytes >= h.minor_threshold {
+        // a major when the minors' survivors have grown the old past the
+        // threshold the last major set, else a minor: the young garbage is
+        // the minors' business, and never brings a major on its own
+        if h.old_bytes >= h.next_gc { gc_collect(h); } else { gc_collect_minor(h); }
     }
     h.alloc_total += size;
     i32 cls = size <= 1024 ? cast(i32, (size + 15) / 16) - 1 : gc_class_of(size);
@@ -537,13 +920,15 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     GcCell* c = null;
     i32 chunk = 0;
     if cls >= 0 && cls < GC_CLASS_SMALL {
-        c = h.free_cells[cls];
-        if c != null {
-            h.free_cells[cls] = c.next;
-            chunk = c.chunk;
-        } else {
-            c = gc_chunk_cell(h, cls, cast(i32, block), &chunk);
+        // a free cell of the chunk the class is filling, in place: the
+        // common case, and the rest is a call
+        chunk = h.bump[cls] + 1;
+        if chunk > 0 {
+            GcChunk* ch = &h.chunks.data[chunk - 1];
+            c = ch.free;
+            if c != null { ch.free = c.next; ch.n_free--; }
         }
+        if c == null { c = gc_chunk_cell(h, cls, cast(i32, block), &chunk); }
     } else if cls >= 0 && h.free_cells[cls] != null {
         c = h.free_cells[cls];
         h.free_cells[cls] = c.next;
@@ -565,13 +950,18 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     c.chunk = chunk;
     c.kind = kind;
     if chunk > 0 {
-        // made marked where the pending sweep has yet to reach, which clears it;
-        // behind the sweep, or in a chunk made since, it starts unmarked
-        c.mark = gc_ahead_of_sweep(h, chunk - 1, c) ? 1 : 0;
+        // young; made where the pending sweep has yet to reach, it is fresh,
+        // which the sweep passes by and makes young
+        c.mark = gc_ahead_of_sweep(h, chunk - 1, c) ? GC_FRESH : 0;
+        GcChunk* ch = &h.chunks.data[chunk - 1];
+        i32 idx = cast(i32, (cast(u64, cast(u8*, c) - ch.mem) * ch.inv) >> 32);
+        if idx < ch.lo { ch.lo = idx; }
+        if idx > ch.hi { ch.hi = idx; }
+        if !ch.young { ch.young = true; vec_push(&h.young_chunks, chunk - 1); }
     } else {
         c.mark = 0;
-        c.next = h.all;
-        h.all = c;
+        c.next = h.young_large;
+        h.young_large = c;
     }
     h.bytes_live += block;
     h.n_cells++;
@@ -585,20 +975,50 @@ private bool gc_ahead_of_sweep(GcHeap* h, i32 k, GcCell* c) {
     return (cast(u8*, c) - ch.mem) / ch.cell >= h.sw_cell;
 }
 
-// A fresh cell of a small class from its chunk, a new chunk when that one
-// is full; *chunk takes its index plus one.
+// A cell of a small class from the chunk its class is filling: a free cell
+// of it, else its unused tail; when it has neither, the emptiest chunk
+// with free cells if that is at least half free, else a new chunk. The
+// sparse chunks' holes are left until the heap's footprint reaches the
+// next major's threshold: the young filling them would lie a cell here and
+// a cell there, and cost a cache miss each to sweep and to mark. *chunk
+// takes the chunk's index plus one.
 private GcCell* gc_chunk_cell(GcHeap* h, i32 cls, i32 block, i32* chunk) {
     i32 k = h.bump[cls];
-    if k < 0 || h.chunks.data[k].used >= h.chunks.data[k].cap {
+    while k >= 0 {
+        GcChunk* ch = &h.chunks.data[k];
+        if ch.free != null {
+            GcCell* c = ch.free;
+            ch.free = c.next;
+            ch.n_free--;
+            *chunk = k + 1;
+            return c;
+        }
+        if ch.used < ch.cap { break; }
+        k = h.avail[cls];
+        if k >= 0 {
+            GcChunk* next = &h.chunks.data[k];
+            if next.n_free * 2 < next.cap && h.chunk_bytes + GC_CHUNK_BYTES <= h.next_gc { k = -1; }
+            else { h.avail[cls] = next.next_avail; next.avail = false; }
+        }
+        h.bump[cls] = k;
+    }
+    if k < 0 {
+        h.chunk_bytes += GC_CHUNK_BYTES;
         GcChunk ch = GcChunk{};
+        ch.next_avail = -1;
         ch.cls = cls;
         ch.cell = block;
+        i64 two32 = cast(i64, 1) << 32;
+        ch.inv = cast(u32, (two32 + block - 1) / block);
+        ch.lo = cast(i32, GC_CHUNK_BYTES / block);
+        ch.hi = -1;
         ch.cap = cast(i32, GC_CHUNK_BYTES / block);
         ch.mem = alloc<u8>(cast(i64, ch.cap) * block);
         ch.used = 0;
-        ch.swept = true;    // nothing in it for a pending sweep
+        ch.young = true;
         vec_push(&h.chunks, ch);
         k = h.chunks.len - 1;
+        vec_push(&h.young_chunks, k);
         h.bump[cls] = k;
         gc_stat_mallocs = gc_stat_mallocs + 1;
     }

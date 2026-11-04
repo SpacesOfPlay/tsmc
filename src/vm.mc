@@ -195,6 +195,7 @@ struct VM {
     u32[4] hidden_globals;
     i32 n_hidden_globals;
     Vec<TmplPtr> troots;   // owned root templates; consts are GC roots
+    Vec<TmplPtr> fresh_tmpls;  // the templates compiled since the last collection: what a minor collection marks
     Value pending;
     bool has_pending;
     bool unwind_return;   // the pending value is a return completion, not a throw
@@ -386,7 +387,8 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
 // collection. Runs before the sweep, while marks are still valid.
 private void vm_weak_sweep(GcHeap* h, void* ctx) {
     VM* vms = cast(VM*, ctx);
-    if h.key_marks_len > 0 {
+    // a minor collection's marks cover its young cells only: the atoms wait for a major
+    if h.key_marks_len > 0 && !h.minor_pass {
         ignore atoms_sweep(&vms.atoms, h.key_marks, h.key_marks_len, h.alloc_total);
     }
     if !vms.any_weak { return; }
@@ -413,7 +415,7 @@ private void vm_weak_sweep(GcHeap* h, void* ctx) {
 // dynamic atoms for atoms_sweep to consider.
 private void vm_key_marks_reset(GcHeap* h, VM* vm) {
     h.key_marks_len = 0;
-    if vm.atoms.n_dynamic == 0 { return; }
+    if vm.atoms.n_dynamic == 0 || h.minor_pass || h.verifying { return; }
     i32 n = atom_count(&vm.atoms);
     if n > vm.key_marks_cap {
         if h.key_marks != null { free(h.key_marks); }
@@ -449,9 +451,15 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
             if sl.key < cast(u32, h.key_marks_len) { *(h.key_marks + sl.key) = cast(u8, 1); }
         }
     }
-    for i32 i = 0; i < vm.troots.len; i++ {
-        mark_template(h, vec_get(&vm.troots, i));
+    // a template's constants are made when it is compiled and never after:
+    // a minor collection marks those of the templates compiled since the
+    // last collection, a major every template's
+    if h.minor_pass && !h.verifying {
+        for i32 i = 0; i < vm.fresh_tmpls.len; i++ { mark_template(h, vec_get(&vm.fresh_tmpls, i)); }
+    } else {
+        for i32 i = 0; i < vm.troots.len; i++ { mark_template(h, vec_get(&vm.troots, i)); }
     }
+    if !h.verifying { vm.fresh_tmpls.len = 0; }
     if vm.object_proto != null { gc_mark_cell(h, &vm.object_proto.head); }
     if vm.array_proto != null { gc_mark_cell(h, &vm.array_proto.head); }
     if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
@@ -1561,7 +1569,7 @@ private void super_native_result(VM* vm, Value res, Value new_target, Value this
     if !value_is_object(res) || value_same_bits(res, thisv) { return; }
     if value_is_callable(new_target) {
         Value protov = ensure_prototype(vm, new_target);
-        if value_is_object(protov) { value_as_object(res).proto = value_as_object(protov); }
+        if value_is_object(protov) { gc_barrier(value_as_cell(res), protov); value_as_object(res).proto = value_as_object(protov); }
     }
     if super_for >= 0 { (vm.frames + super_for).this_val = res; }
 }
@@ -2180,6 +2188,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
                     if (pe.flags & PROP_WRITABLE) == 0 {
                         return write_refused(vm, mode, "cannot assign to read-only property");
                     }
+                    if (pl.cap & PROPS_OLD) != 0 { props_barrier(pl, v); }
                     pe.val = v;
                     return true;
                 }
@@ -2752,6 +2761,7 @@ private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, 
         if enumer { attrs = PROP_CONFIGURABLE | PROP_ENUMERABLE; }
         props_set_desc(props, a, value_cell(&ac.head), attrs);
     }
+    gc_barrier(&ac.head, fnv);
     if is_getter { ac.get = fnv; } else { ac.set = fnv; }
 }
 
@@ -2792,6 +2802,7 @@ private void def_private(VM* vm, u32 a, i32 kind) {
         ac = js_new_accessor(&vm.heap);
         props_set_desc(value_props(vpeek(vm, 1)), a, value_cell(&ac.head), 0);
     }
+    gc_barrier(&ac.head, vpeek(vm, 0));
     if kind == 1 { ac.get = vpeek(vm, 0); } else { ac.set = vpeek(vm, 0); }
     vm.sp--;
 }
@@ -3157,7 +3168,10 @@ void vm_set_lazy_global(VM* vm, str name, NativeFn getter) {
     JsAccessor* ac = js_new_accessor(&vm.heap);
     Value acv = value_cell(&ac.head);
     gc_root(&vm.heap, acv);
-    ac.get = vm_make_native(vm, getter, name);
+    Value getv = vm_make_native(vm, getter, name);
+    gc_barrier(&ac.head, getv);
+    gc_barrier(&ac.head, getv);
+    ac.get = getv;
     vm_set_global(vm, name, acv);
     gc_root_reset(&vm.heap, rm);
 }
@@ -4202,6 +4216,7 @@ void vm_init(VM* vm) {
     vm.heap.mark_roots = &vm_mark_roots;
     vm.heap.weak_mark = &vm_weak_mark;
     vm.heap.weak_sweep = &vm_weak_sweep;
+    vm.heap.props_trace = &js_props_trace;
     vm.heap.mark_ctx = cast(void*, vm);
     atoms_init(&vm.atoms);
     vm.key_marks_cap = 0;
@@ -4224,6 +4239,7 @@ void vm_init(VM* vm) {
     vec_init<GcString*>(&vm.atom_strs, 64);
     vm.iter_fast = null;
     vec_init<TmplPtr>(&vm.troots, 4);
+    vec_init<TmplPtr>(&vm.fresh_tmpls, 16);
     vm.pending = value_undefined();
     vm.has_pending = false;
     vm.unwind_return = false;
@@ -4375,6 +4391,7 @@ void vm_destroy(VM* vm) {
         template_free(vec_get(&vm.troots, i));
     }
     vec_free(&vm.troots);
+    vec_free(&vm.fresh_tmpls);
     vec_free(&vm.jobs);
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
@@ -4757,6 +4774,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_SETCELL: {
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
                 pc += 2;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
             }
             case OP_GETUPVAL: {
@@ -4776,6 +4794,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
@@ -5648,12 +5667,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     // only an object or null is a prototype; `{__proto__: 5}`
                     // leaves the object's prototype alone
                     if value_is_object(protov) {
+                        gc_barrier(value_as_cell(objv), protov);
                         value_as_object(objv).proto = value_as_object(protov);
                     } else if value_is_null(protov) {
                         value_as_object(objv).proto = null;
                     }
                 } else if value_is_function(objv) {
                     // static inheritance: a derived ctor's [[Prototype]]
+                    gc_barrier(value_as_cell(objv), protov);
                     value_as_function(objv).fproto = protov;
                 }
             }
@@ -5928,6 +5949,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     g.delegating = op == OP_YIELD_DELEGATE;
                     i32 depth = vm.sp - fr.base - 1;
                     if g.saved != null { free(g.saved); }
+                    gc_remember_cell(&g.head);   // the saved stack may hold young cells
                     g.saved = alloc<Value>(depth > 0 ? depth : 1);
                     for i32 i = 0; i < depth; i++ {
                         *(g.saved + i) = *(vm.stack + fr.base + i);
@@ -6893,6 +6915,7 @@ private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
     normalize_args(vm, ft, argc);
     Value thisv = vpeek(vm, ft.n_params);
     JsGenerator* g = js_new_generator(&vm.heap, f, thisv);
+    gc_barrier(&g.head, argobj);
     g.arguments_obj = argobj;
     i32 n = ft.n_slots;
     g.saved = alloc<Value>(n > 0 ? n : 1);
@@ -6931,6 +6954,7 @@ private void gen_start_suspend(VM* vm, Frame* fr, i32 ip) {
     JsGenerator* g = fr.gen;
     i32 depth = vm.sp - fr.base;
     if g.saved != null { free(g.saved); }
+    gc_remember_cell(&g.head);
     g.saved = alloc<Value>(depth > 0 ? depth : 1);
     for i32 i = 0; i < depth; i++ {
         *(g.saved + i) = *(vm.stack + fr.base + i);
@@ -7179,9 +7203,11 @@ private void run_thenable_job(VM* vm, Value thenv, Value pv, Value thenf) {
     vpush(vm, thenf);
     if value_is_callable(thenf) {
         JsNative* onf = js_new_native(&vm.heap, &nat_adopt_ful, "resolve");
+        gc_barrier(&onf.head, pv);
         onf.env0 = pv;
         vpush(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_adopt_rej, "reject");
+        gc_barrier(&onr.head, pv);
         onr.env0 = pv;
         vpush(vm, value_cell(&onr.head));
         Value[2] a = { vpeek(vm, 1), vpeek(vm, 0) };
@@ -7287,11 +7313,15 @@ void vm_async_step(VM* vm, Value genv, Value rpv, Value input, bool is_throw) {
     }
     if vm_is_promise(vm, target) {
         JsNative* onf = js_new_native(&vm.heap, &nat_async_ful, "step");
+        gc_barrier(&onf.head, genv);
         onf.env0 = genv;
+        gc_barrier(&onf.head, rpv);
         onf.env1 = rpv;
         vpush(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_async_rej, "step");
+        gc_barrier(&onr.head, genv);
         onr.env0 = genv;
+        gc_barrier(&onr.head, rpv);
         onr.env1 = rpv;
         Value onfv = vpop(vm);
         ignore vm_promise_then(vm, target, onfv, value_cell(&onr.head));
@@ -7348,6 +7378,8 @@ private Value agen_head(JsGenerator* g, i32 k) {
 private void agen_push(VM* vm, JsGenerator* g, Value p, Value input, i32 kind) {
     if !value_is_object(g.queue) {
         JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+        gc_barrier(&g.head, value_cell(&a.head));
+        gc_barrier(&g.head, value_cell(&a.head));
         g.queue = value_cell(&a.head);
     }
     JsObject* q = value_as_object(g.queue);
@@ -7474,9 +7506,11 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
         gc_root(&vm.heap, dt);
         vm_promise_settle(vm, dt, res, false);
         JsNative* df = js_new_native(&vm.heap, &nat_agen_done_ful, "step");
+        gc_barrier(&df.head, genv);
         df.env0 = genv;
         gc_root(&vm.heap, value_cell(&df.head));
         JsNative* dr = js_new_native(&vm.heap, &nat_agen_done_rej, "step");
+        gc_barrier(&dr.head, genv);
         dr.env0 = genv;
         gc_root(&vm.heap, value_cell(&dr.head));
         ignore vm_promise_then(vm, dt, value_cell(&df.head), value_cell(&dr.head));
@@ -7500,9 +7534,11 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
     gc_root(&vm.heap, target);
     vm_promise_settle(vm, target, res, false);
     JsNative* onf = js_new_native(&vm.heap, g.awaiting ? &nat_agen_await_ful : &nat_agen_yield_ful, "step");
+    gc_barrier(&onf.head, genv);
     onf.env0 = genv;
     gc_root(&vm.heap, value_cell(&onf.head));
     JsNative* onr = js_new_native(&vm.heap, &nat_agen_throw_in, "step");
+    gc_barrier(&onr.head, genv);
     onr.env0 = genv;
     gc_root(&vm.heap, value_cell(&onr.head));
     ignore vm_promise_then(vm, target, value_cell(&onf.head), value_cell(&onr.head));
@@ -8454,6 +8490,7 @@ AtomTable* vm_atoms(VM* vm) { return &vm.atoms; }
 // Registers a compiled template so its constants stay GC roots.
 void vm_add_template_root(VM* vm, FnTemplate* t) {
     vec_push(&vm.troots, t);
+    vec_push(&vm.fresh_tmpls, t);
 }
 
 // Sorts a namespace's exported names into code unit order, symbols last.
@@ -8608,6 +8645,7 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
         compiler_set_lazy_source(&co, s);
         co.script_globals = vm.script_globals;
         ok = compile_lazy(&co, f, t);
+        if ok { vec_push(&vm.fresh_tmpls, t); }
         gc_root_reset(&vm.heap, rmark);
     }
     if !ok {
@@ -8649,6 +8687,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         co.script_globals = vm.script_globals;
         FnTemplate* t = compile_program(&co, prog);
         vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
         gc_root_reset(&vm.heap, rmark);
         vm.compiles++;
         vm.compile_ns += cast(i64, vm_clock_ns() - c0);
