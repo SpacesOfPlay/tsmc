@@ -48,6 +48,10 @@ when os(wasm) {
     i32 tls_error_code(TlsSession* s) { return 0; }
     bool tls_resumed(TlsSession* s) { return false; }
     bool tls_offered_ticket(TlsSession* s) { return false; }
+    bool tls_client_resumes = true;
+    void tls_tickets_forget() { }
+    i64 tls_tickets_issued = 0;
+    i64 tls_tickets_resumed = 0;
     str tls_alert_str(i32 alert) { return ""; }
     const i32 TLS_SERVER_CHAIN_MAX = 4;
     i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
@@ -295,7 +299,22 @@ private i32 tls_save_ticket_cb(st_ptls_save_ticket_t* self, ptls_t* tls, ptls_io
 
 // The newest ticket for the host still in its lifetime, taken out of the
 // store (a ticket is for one handshake); the caller owns the bytes.
+// Whether a client offers the tickets it saved. A test that reads the
+// certificate a name is served turns it off: a resumed handshake
+// carries none.
+bool tls_client_resumes = true;
+
+// Drops every ticket the client saved, so the next handshakes are full.
+void tls_tickets_forget() {
+    tls_tickets_init();
+    mutex_lock(&g_tickets_mu);
+    for i32 i = 0; i < g_tickets.len; i++ { free(g_tickets.data[i].host); free(g_tickets.data[i].data); }
+    g_tickets.len = 0;
+    mutex_unlock(&g_tickets_mu);
+}
+
 private bool tls_take_ticket(str host, u8** data, i32* len) {
+    if !tls_client_resumes { return false; }
     tls_tickets_init();
     u64 now = tls_wall_time_cb(&g_tls_time);
     bool got = false;
@@ -1117,6 +1136,96 @@ private bool tls_parse_rsa_key(u8* der, u64 der_len, TlsRsaKey* k) {
 // server's lifetime (all its connections share it). Referenced from JS by a
 // small registry id. Holds both sign-context shapes; whichever matches the
 // key is wired into ctx.sign_certificate.
+// --- session tickets a server issues ---------------------------------------------
+//
+// picotls hands the session's identifier to encrypt_ticket and gets the
+// ticket back; a returning client presents the ticket and the callback
+// gives the identifier back. The ticket is AES-128-GCM under a key the
+// server draws at first use and rotates daily, the previous key kept so
+// a ticket outlives one rotation: a key index byte, a 12-byte nonce,
+// the ciphertext and the tag. The state is shared by every thread
+// under a lock, since a ticket from one loop's context comes back on
+// another's; the AEAD here is the global algorithm, not a thread's
+// copy, since the callback runs where the handshake does.
+const i32 TLS_TICKET_KEYS = 2;
+private u8[32] g_ticket_keys;              // two 16-byte keys
+private i32 g_ticket_cur = 0;              // the index of the key tickets are made under
+private u64 g_ticket_made_ms = 0;          // when the current key was drawn
+private bool[2] g_ticket_valid;
+private Mutex g_ticket_mu;
+private bool g_ticket_up = false;
+private ptls_aead_algorithm_t g_ticket_aead;
+private ptls_encrypt_ticket_t g_ticket_cb;
+i64 tls_tickets_issued = 0;                // for a report
+i64 tls_tickets_resumed = 0;               // tickets that decrypted on a later handshake
+
+private void tls_tickets_rotate_locked(u64 now_ms) {
+    i32 next = g_ticket_valid[0] && !g_ticket_valid[1] ? 1 : (g_ticket_cur + 1) % TLS_TICKET_KEYS;
+    mc_csprng_bytes(cast(void*, &g_ticket_keys[next * 16]), cast(u64, 16));
+    g_ticket_valid[next] = true;
+    g_ticket_cur = next;
+    g_ticket_made_ms = now_ms;
+}
+
+private void tls_tickets_server_init() {
+    if g_ticket_up { return; }
+    mutex_init(&g_ticket_mu);
+    g_ticket_aead = ptls_aead_algorithm_t{
+        .name = "AES128-GCM",
+        .confidentiality_limit = cast(u64, 16777216),
+        .integrity_limit = cast(u64, 68719476736),
+        .ctr_cipher = null,
+        .ecb_cipher = null,
+        .key_size = cast(u64, 16),
+        .iv_size = cast(u64, 12),
+        .tag_size = cast(u64, 16),
+        .tls12 = { .fixed_iv_size = cast(u64, 4), .record_iv_size = cast(u64, 8) },
+        .non_temporal = cast(u32, 0),
+        .align_bits = cast(u8, 0),
+        .context_size = sizeof(aesgcm_picotls_ctx_t),
+        .setup_crypto = aesgcm_pl_setup_crypto_128,
+    };
+    g_ticket_cb = ptls_encrypt_ticket_t{ .cb = tls_ticket_cb };
+    tls_tickets_rotate_locked(tls_wall_time_cb(&g_tls_time));
+    g_ticket_up = true;
+}
+
+private i32 tls_ticket_cb(st_ptls_encrypt_ticket_t* self, ptls_t* tls, i32 is_encrypt, ptls_buffer_t* dst, ptls_iovec_t src) {
+    mutex_lock(&g_ticket_mu);
+    defer mutex_unlock(&g_ticket_mu);
+    u64 now = tls_wall_time_cb(&g_tls_time);
+    if is_encrypt != 0 {
+        if now > g_ticket_made_ms + 86400000 { tls_tickets_rotate_locked(now); }
+        u8[12] iv;
+        mc_csprng_bytes(cast(void*, &iv[0]), cast(u64, 12));
+        ptls_aead_context_t* a = ptls_aead_new_direct(&g_ticket_aead, 1, cast(void*, &g_ticket_keys[g_ticket_cur * 16]), cast(void*, &iv[0]));
+        if a == null { return 0x201; }
+        defer ptls_aead_free(a);
+        u64 need = 13 + src.len + 16;
+        if ptls_buffer_reserve(dst, need) != 0 { return 0x201; }
+        u8* out = dst.base + dst.off;
+        *out = cast(u8, g_ticket_cur);
+        memcpy(out + 1, &iv[0], 12);
+        u64 n = ptls_aead_encrypt(a, cast(void*, out + 13), cast(void*, src.base), src.len, cast(u64, 0), cast(void*, out), cast(u64, 13));
+        dst.off = dst.off + 13 + n;
+        tls_tickets_issued++;
+        return 0;
+    }
+    if src.len < cast(u64, 13 + 16) { return 0x201; }
+    i32 k = cast(i32, *src.base);
+    if k < 0 || k >= TLS_TICKET_KEYS || !g_ticket_valid[k] { return 0x201; }
+    ptls_aead_context_t* a = ptls_aead_new_direct(&g_ticket_aead, 0, cast(void*, &g_ticket_keys[k * 16]), cast(void*, src.base + 1));
+    if a == null { return 0x201; }
+    defer ptls_aead_free(a);
+    u64 plain = src.len - 13;
+    if ptls_buffer_reserve(dst, plain) != 0 { return 0x201; }
+    u64 n = ptls_aead_decrypt(a, cast(void*, dst.base + dst.off), cast(void*, src.base + 13), plain, cast(u64, 0), cast(void*, src.base), cast(u64, 13));
+    if n == cast(u64, 0 - 1) { return 0x201; }
+    dst.off = dst.off + n;
+    tls_tickets_resumed++;
+    return 0;
+}
+
 struct TlsServerCtx {
     ptls_context_t ctx;
     ecdsa_sign_cert_ctx_t ec_sign;
@@ -1230,6 +1339,13 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     sc.ctx.certificates.list = &sc.certs[0];
     sc.ctx.certificates.count = cast(u64, n_certs);
     sc.ctx.on_client_hello = &g_on_client_hello;
+    // Session tickets: a returning client resumes with a PSK, the key
+    // exchange kept and early data off (tls_ticket_cb).
+    tls_tickets_server_init();
+    sc.ctx.ticket_lifetime = cast(u32, 86400);
+    sc.ctx.encrypt_ticket = &g_ticket_cb;
+    sc.ctx.require_dhe_on_psk = cast(u32, 1);
+    sc.ctx.max_early_data_size = cast(u32, 0);
 
     if is_ec {
         sc.ec_sign = ecdsa_sign_cert_ctx_t{
