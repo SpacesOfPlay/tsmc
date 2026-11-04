@@ -237,6 +237,9 @@ str op_name(i32 op) {
         case 153: { return "SEQ_JF"; }
         case 154: { return "SNEQ_JF"; }
         case 155: { return "GETUPVALV"; }
+        case 156: { return "GET_ITER_S"; }
+        case 157: { return "ITER_NEXT_S"; }
+        case 158: { return "PROTOGET"; }
     }
     return "?";
 }

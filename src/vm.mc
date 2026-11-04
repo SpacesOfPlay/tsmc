@@ -324,6 +324,7 @@ struct VM {
     u32 atom_next;
     i32 exec_depth;   // nested vm_execute invocations (C-stack guard)
     GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
+    GcString*[128] latin1_chars; // one-character strings for U+0080..U+00FF, as ascii_chars: what atob's output is indexed by
     Value array_values;         // Array.prototype.values, which every arguments object iterates by
 }
 
@@ -471,6 +472,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     for i32 c = 0; c < 8; c++ {
         if vm.http_strs[c] != null { gc_mark_cell(h, &vm.http_strs[c].head); }
         if vm.typeof_strs[c] != null { gc_mark_cell(h, &vm.typeof_strs[c].head); }
+    }
+    for i32 c = 0; c < 128; c++ {
+        if vm.latin1_chars[c] != null { gc_mark_cell(h, &vm.latin1_chars[c].head); }
     }
     gc_mark_value(h, vm.array_values);
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
@@ -6072,6 +6076,56 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 pc += 2;
                 iter_step(vm, fr.base + dslot);
             }
+            case OP_GET_ITER_S: {
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
+                Value v = vpeek(vm, 0);
+                if iter_array_direct(vm, v) {
+                    *(vm.stack + fr.base + dslot) = value_int(0);
+                } else {
+                    *(vm.stack + fr.base + dslot) = value_bool(false);
+                    Value it;
+                    if vm_get_iterator(vm, v, &it) {
+                        vm.sp--;
+                        vpush(vm, it);
+                    }
+                }
+            }
+            case OP_ITER_NEXT_S: {
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
+                Value iter = vpeek(vm, 0);
+                Value val;
+                bool done = false;
+                if value_is_int(*(vm.stack + fr.base + dslot)) {
+                    done = !iter_array_next(vm, iter, fr.base + dslot, &val);
+                    vm.sp--;
+                    vpush(vm, val);
+                    vpush(vm, value_bool(done));
+                } else if vm_iter_next(vm, iter, &val, &done) {
+                    *(vm.stack + fr.base + dslot) = value_bool(done);
+                    vm.sp--;
+                    vpush(vm, val);
+                    vpush(vm, value_bool(done));
+                }
+            }
+            case OP_PROTOGET: {
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                Value* pv = props_get(&vm.object_proto.props, a);
+                if pv != null && !value_is_accessor(*pv) {
+                    vpush(vm, *pv);
+                } else {
+                    // an accessor wants its receiver, a miss the chain's answer: the object after all
+                    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+                    vpush(vm, value_cell(&o.head));
+                    Value out;
+                    if prop_get(vm, vpeek(vm, 0), a, &out) {
+                        vm.sp--;
+                        vpush(vm, out);
+                    }
+                }
+            }
             case OP_ITER_REST: {
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
@@ -6126,7 +6180,15 @@ Value vm_string_char(VM* vm, GcString* s, i32 idx) {
     str_buf sb;
     str_buf_init(&sb);
     u16_slice_into_cur(&sb, view, idx, idx + 1, &s.cur_u, &s.cur_off);
-    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str one = str_buf_to_str(&sb);
+    if one.len == 2 && (*(one.data) == 0xC2 || *(one.data) == 0xC3) {
+        // U+0080..U+00FF, shared: a decoder walks atob's bytes one by one
+        i32 c = ((*(one.data) & 0x1F) << 6 | (*(one.data + 1) & 0x3F)) - 128;
+        if vm.latin1_chars[c] == null { vm.latin1_chars[c] = gc_new_string(&vm.heap, one); }
+        str_buf_free(&sb);
+        return value_cell(&vm.latin1_chars[c].head);
+    }
+    GcString* g = gc_new_string(&vm.heap, one);
     str_buf_free(&sb);
     return value_cell(&g.head);
 }
@@ -6728,8 +6790,47 @@ private void do_get_aiter_w(VM* vm) {
 // (a callback recursing through a builtin) has only so much room.
 // `di` is the absolute stack index of the "exhausted" flag.
 
+// A plain array is iterated as itself, the done slot holding the index
+// as an int (a bool once it is spent, or when the iterator protocol is in
+// use), so a for-of or a destructuring over one allocates nothing: what
+// Array.prototype.values would do, which the array has not replaced.
+private bool iter_array_direct(VM* vm, Value v) {
+    if !value_is_object(v) { return false; }
+    JsObject* o = value_as_object(v);
+    if (o.obj_flags & (OBJF_ARRAY | OBJF_PROXY)) != OBJF_ARRAY || o.proto != vm.array_proto { return false; }
+    if o.props.len > 0 && props_get(&o.props, vm.sym_iterator_id) != null { return false; }
+    Value* pv = props_get(&vm.array_proto.props, vm.sym_iterator_id);
+    return pv != null && js_strict_eq(*pv, vm.array_values);
+}
+
+// The next element of the array in the fast mode; false once past the end,
+// the slot then a bool. A hole reads through the prototype chain, as the
+// iterator's Get would.
+private bool iter_array_next(VM* vm, Value arrv, i32 di, Value* out) {
+    i32 i = value_as_int(*(vm.stack + di));
+    JsObject* arr = value_as_object(arrv);
+    if i >= arr.elen {
+        *(vm.stack + di) = value_bool(true);
+        *out = value_undefined();
+        return false;
+    }
+    *(vm.stack + di) = value_int(i + 1);
+    if js_array_has(arr, i) { *out = js_array_get(arr, i); return true; }
+    Value got;
+    if !vm_get_prop_value(vm, arrv, key_to_atom(vm, value_int(i)), &got) { got = value_undefined(); }
+    *out = got;
+    return true;
+}
+
 private void iter_step(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
+    if value_is_int(*(vm.stack + di)) {
+        Value val;
+        ignore iter_array_next(vm, iter, di, &val);
+        vm.sp--;
+        vpush(vm, val);
+        return;
+    }
     if js_truthy(*(vm.stack + di)) {
         // spent: the element sees undefined and the iterator is left alone
         vm.sp--;
@@ -6752,7 +6853,10 @@ private void iter_rest(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&arr.head));   // rooted while draining
-    if !js_truthy(*(vm.stack + di)) {
+    if value_is_int(*(vm.stack + di)) {
+        Value val;
+        while iter_array_next(vm, iter, di, &val) { js_array_set(arr, arr.elen, val); }
+    } else if !js_truthy(*(vm.stack + di)) {
         while true {
             Value val;
             bool done = false;
@@ -6822,6 +6926,11 @@ private void iter_check_result(VM* vm) {
 // wins, so the method's error and result are dropped.
 private void iter_close_mode(VM* vm, i32 di, bool throwing) {
     Value iter = vpeek(vm, 0);
+    if value_is_int(*(vm.stack + di)) {
+        // an array iterated directly: nothing to return
+        vm.sp--;
+        return;
+    }
     if !js_truthy(*(vm.stack + di)) {
         Value m;
         if vm_get_prop_value(vm, iter, atom_intern(&vm.atoms, "return"), &m) {

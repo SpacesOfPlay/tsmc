@@ -68,7 +68,18 @@ Identifier resolution walks: local bindings → enclosing functions
 (adding an upvalue chain entry per level, which carries whether the
 source binding is a cell or a value) → global by atom.
 `OP_CLOSURE` copies cell pointers, or values, out of the creating
-frame's slots or its own upvalues, per the template's capture spec. Arrows have no
+frame's slots or its own upvalues, per the template's capture spec.
+
+A for-of and an array destructuring open their iterator with
+`OP_GET_ITER_S done`: over a plain array (its own prototype
+Array.prototype, no own Symbol.iterator, the prototype's still the
+built-in) the array stays on the stack as its own iterator and the
+done slot holds the index as an int; `OP_ITER_NEXT_S`, `OP_ITER_STEP`
+and `OP_ITER_REST` step it without an iterator object or a result,
+and `OP_ITER_CLOSE` has nothing to return. Any other iterable goes
+through the protocol with the slot a bool, as before. `{}.name`
+compiles to `OP_PROTOGET`, Object.prototype's data property without
+the object; an accessor or a miss makes the object after all. Arrows have no
 own `this`; non-arrow functions materialize a `this` binding only
 when some inner arrow mentions it, and arrows resolve it like any
 captured variable.

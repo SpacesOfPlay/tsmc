@@ -178,7 +178,10 @@ enum Op {
     OP_GETPROP_THIS, // u16 const idx: THIS then GETPROP
     OP_SEQ_JF,       // i32 target: SEQ then JUMPF
     OP_SNEQ_JF,      // i32 target: SNEQ then JUMPF
-    OP_GETUPVALV     // u16 upvalue index: the value itself, captured as such; a hole refused
+    OP_GETUPVALV,    // u16 upvalue index: the value itself, captured as such; a hole refused
+    OP_GET_ITER_S,   // u16 done slot; [v] -> [iterator]: a plain array stays itself, the slot its index
+    OP_ITER_NEXT_S,  // u16 done slot; [iter] -> [value, done], the slot kept
+    OP_PROTOGET      // u16 const idx (name): `{}.name`, Object.prototype's without the object
 }
 
 struct TmplUpval {

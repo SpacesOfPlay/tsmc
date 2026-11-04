@@ -2109,11 +2109,8 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         // whether the iterator still has to be closed at the end.
         i32 t_iter = alloc_slot(co.cur);
         i32 t_done = alloc_slot(co.cur);
-        ch_op(ch, OP_GET_ITER);
+        ch_op_u16(ch, OP_GET_ITER_S, t_done);
         ch_op_u16(ch, OP_SETLOCAL, t_iter);
-        ch_op(ch, OP_POP);
-        ch_op(ch, OP_FALSE);
-        ch_op_u16(ch, OP_SETLOCAL, t_done);
         ch_op(ch, OP_POP);
         // an element that throws, or a resume that returns into a pattern
         // suspended on a yield, still releases the iterator
@@ -3193,6 +3190,12 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         if chain_has_opt(n) {
             compile_opt_chain(co, n);
+            return;
+        }
+        // `{}.hasOwnProperty`, `{}.toString`: a babel helper's way to
+        // Object.prototype, read there without making the object
+        if n.a.kind == N_OBJECT && n.a.kids.len == 0 {
+            ch_op_u16(ch, OP_PROTOGET, name_const(co, n.name));
             return;
         }
         compile_expr(co, n.a);
@@ -5072,14 +5075,12 @@ private void compile_for_of(Compiler* co, Node* n) {
     i32 saved_slots = fs.cur_slots;
 
     compile_expr(co, n.b);
-    ch_op(ch, OP_GET_ITER);
+    // tracks exhaustion, so a loop left early still releases the iterator;
+    // over a plain array it is the index instead, and the array is its own iterator
     i32 t_iter = alloc_slot(fs);
-    ch_op_u16(ch, OP_SETLOCAL, t_iter);
-    ch_op(ch, OP_POP);
-    // tracks exhaustion, so a loop left early still releases the iterator
     i32 t_done = alloc_slot(fs);
-    ch_op(ch, OP_FALSE);
-    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op_u16(ch, OP_GET_ITER_S, t_done);
+    ch_op_u16(ch, OP_SETLOCAL, t_iter);
     ch_op(ch, OP_POP);
 
     i32 bind_start = fs.binds.len;
@@ -5110,10 +5111,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     LoopCtx lc = make_loop_ctx(co, true);
     i32 lcond = ch_pos(ch);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op(ch, OP_ITER_NEXT);       // [value, done]
-    ch_op(ch, OP_DUP);
-    ch_op_u16(ch, OP_SETLOCAL, t_done);
-    ch_op(ch, OP_POP);
+    ch_op_u16(ch, OP_ITER_NEXT_S, t_done);   // [value, done], the slot written
     i32 jend = ch_jump(ch, OP_JUMPT);
 
     for i32 i = bind_start; i < bind_end; i++ {
