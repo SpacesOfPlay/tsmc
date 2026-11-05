@@ -801,15 +801,22 @@ private str hidden_name(Compiler* co, str prefix, i32 n) {
 // parameters and locals are its own, and the enclosing function's binding
 // of the same name (every function of a minified bundle has an `e` and a
 // `t`) is not what it captures.
+// The memo on a node, made the first time anything is kept there.
+private NodeMemo* node_memo(Compiler* co, Node* n) {
+    if n.memo == null { n.memo = cast(NodeMemo*, bump_alloc(co.arena, cast(i32, sizeof(NodeMemo)))); }
+    return n.memo;
+}
+
 private StrMap<i32>* fn_names(Compiler* co, Node* f) {
-    if f.names != null { return f.names; }
+    NodeMemo* m = node_memo(co, f);
+    if m.names != null { return m.names; }
     StrMap<i32>* set = cast(StrMap<i32>*, bump_alloc(co.arena, cast(i32, sizeof(StrMap<i32>))));
     strmap_init<i32>(set);
     FreeScan fsn;
     free_scan_init(&fsn, co, set);
     free_scan_fn(&fsn, f);
     free_scan_free(&fsn);
-    f.names = set;
+    m.names = set;
     vec_push(&co.name_sets, set);
     return set;
 }
@@ -1057,7 +1064,27 @@ private void free_scan_body(FreeScan* s, NodeList* params, Node* body, bool arro
 // polyfill's `function t()`) writes, and an expression's is one more
 // name the enclosing scope looks up and does not find.
 private void free_scan_fn(FreeScan* s, Node* f) {
-    free_scan_body(s, &f.kids, f.a, (f.flags & NF_ARROW) != 0);
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    i32 mark = s.bound.len;
+    for i32 i = 0; i < f.kids.len; i++ { free_scan_bind_pattern(s, (*(f.kids.items + i)).a); }
+    for i32 i = 0; i < f.kids.len; i++ { free_scan_walk(s, *(f.kids.items + i)); }
+    free_scan_bind_vars(s, f.a);
+    if !arrow {
+        free_scan_push(s, "this");
+        free_scan_push(s, "arguments");
+        free_scan_push(s, "%newtarget");
+    }
+    free_scan_walk(s, f.a);
+    // a body passed over: the names its scan found, on the node
+    if (f.flags & NF_SKIPPED) != 0 && f.memo != null {
+        for i32 i = 0; i < f.memo.n_refs; i++ {
+            NameRef* r = f.memo.refs + i;
+            if (r.flags & 2) != 0 { free_scan_mention(s, "this", 1); }
+            else if (r.flags & 4) != 0 { free_scan_mention(s, "%newtarget", 1); }
+            else { free_scan_mention(s, r.name, (r.flags & 1) != 0 ? 3 : 1); }
+        }
+    }
+    free_scan_unwind(s, mark);
 }
 
 private void names_free(Compiler* co) {
@@ -1072,6 +1099,14 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
     if n == null { return; }
     if n.kind == N_IDENT && n.name.len > 0 {
         strmap_set<i32>(set, n.name, 1);
+    }
+    if n.kind == N_FUNCTION && (n.flags & NF_SKIPPED) != 0 && n.memo != null {
+        for i32 i = 0; i < n.memo.n_refs; i++ {
+            NameRef* r = n.memo.refs + i;
+            if (r.flags & 2) != 0 { strmap_set<i32>(set, "this", 1); }
+            else if (r.flags & 4) != 0 { strmap_set<i32>(set, "%newtarget", 1); }
+            else { strmap_set<i32>(set, r.name, 1); }
+        }
     }
     if n.kind == N_THIS {
         strmap_set<i32>(set, "this", 1);
@@ -1405,8 +1440,8 @@ private Node* g_no_vars_slot;
 
 private void collect_var_decls(Compiler* co, Node* n, Vec<NodePtr>* out) {
     if n == null { return; }
-    if n.vars != null {
-        for i32 i = 0; i < n.n_vars; i++ { vec_push(out, *(n.vars + i)); }
+    if n.memo != null && n.memo.vars != null {
+        for i32 i = 0; i < n.memo.n_vars; i++ { vec_push(out, *(n.memo.vars + i)); }
         return;
     }
     if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
@@ -1429,7 +1464,8 @@ private void collect_var_decls(Compiler* co, Node* n, Vec<NodePtr>* out) {
 
 private Node** var_decls(Compiler* co, Node* n, i32* count) {
     if n == null { *count = 0; return null; }
-    if n.vars == null {
+    NodeMemo* m = node_memo(co, n);
+    if m.vars == null {
         Vec<NodePtr> v;
         vec_lazy<NodePtr>(&v);
         if n.kind == N_BLOCK {
@@ -1438,16 +1474,16 @@ private Node** var_decls(Compiler* co, Node* n, i32* count) {
             collect_var_decls(co, n, &v);
         }
         if v.len == 0 {
-            n.vars = cast(Node**, &g_no_vars_slot);
+            m.vars = cast(Node**, &g_no_vars_slot);
         } else {
-            n.vars = cast(Node**, bump_alloc(co.arena, v.len * 8));
-            memcpy(cast(u8*, n.vars), cast(u8*, v.data), cast(i64, v.len) * 8);
+            m.vars = cast(Node**, bump_alloc(co.arena, v.len * 8));
+            memcpy(cast(u8*, m.vars), cast(u8*, v.data), cast(i64, v.len) * 8);
         }
-        n.n_vars = v.len;
+        m.n_vars = v.len;
         vec_free(&v);
     }
-    *count = n.n_vars;
-    return n.vars;
+    *count = m.n_vars;
+    return m.vars;
 }
 
 // the names those declarators bind
@@ -2835,15 +2871,16 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_REGEX {
         // an invalid literal is a syntax error of the program, not of the
         // statement that first evaluates it
-        if !regex_flags_valid(n.aux) {
+        str rflags = n.a.name;
+        if !regex_flags_valid(rflags) {
             cerror(co, n, "invalid regular expression flags");
         } else {
-            RegexProg* probe = regex_compile(n.name, n.aux);
+            RegexProg* probe = regex_compile(n.name, rflags);
             if probe == null { cerror(co, n, "invalid regular expression"); }
             else { regex_free(probe); }
         }
         i32 src = str_const(co, n.name);
-        i32 flags = str_const(co, n.aux);
+        i32 flags = str_const(co, rflags);
         ch_op(ch, OP_REGEX);
         ch_u16(ch, src);
         ch_u16(ch, flags);
@@ -3072,7 +3109,7 @@ private void compile_expr(Compiler* co, Node* n) {
         for i32 i = 0; i < tmpl.kids.len; i++ {
             Node* e = *(tmpl.kids.items + i);
             if e.kind == N_TEMPLATE_ELEM {
-                ch_op_u16(ch, OP_CONST, str_const(co, e.aux));
+                ch_op_u16(ch, OP_CONST, str_const(co, e.a.name));
             }
         }
         ch_op_u16(ch, OP_NEWARR, nq);

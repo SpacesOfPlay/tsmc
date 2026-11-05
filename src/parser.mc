@@ -51,10 +51,90 @@ struct Parser {
     // do. Plain JavaScript skips it (lower.mc changes nothing in it).
     bool ts_seen;
     // skip_body's name set and bracket stack, kept from one body to the next
-    StrMap<i32> skip_seen;
-    StrMap<i32> skip_declared;   // the names its `var`s declare
-    StrMap<i32> skip_written;    // the names it stores to
+    SkipSet skip_names;
     Vec<u8> skip_stack;
+}
+
+// The names a passed-over body mentions, with what the scan learned of
+// each: 1 mentioned, 2 declared by one of its vars, 4 stored to. Emptied
+// by a stamp: a table cleared by bytes, at the size the largest body
+// needed, cost more than the scan of the small bodies that are most.
+struct SkipSet {
+    str* keys;
+    i32* flags;
+    u32* stamps;
+    i32 cap;
+    i32 count;
+    u32 gen;
+    Vec<i32> order;   // the slots in use, in the order made: the table is read by them
+}
+
+private void skip_set_init(SkipSet* d) {
+    d.cap = 64;
+    d.keys = alloc<str>(d.cap);
+    d.flags = alloc<i32>(d.cap);
+    d.stamps = alloc<u32>(d.cap);
+    memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+    d.count = 0;
+    d.gen = 1;
+    vec_init<i32>(&d.order, 64);
+}
+
+private void skip_set_free(SkipSet* d) {
+    free(d.keys);
+    free(d.flags);
+    free(d.stamps);
+    vec_free(&d.order);
+}
+
+private void skip_set_clear(SkipSet* d) {
+    d.gen++;
+    d.count = 0;
+    d.order.len = 0;
+    if d.gen == 0 {
+        memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+        d.gen = 1;
+    }
+}
+
+// The flags of `name`, a slot made for it if the set has none.
+private i32* skip_set_slot(SkipSet* d, str name) {
+    if (d.count + 1) * 2 > d.cap {
+        // twice the room, the live names rehashed
+        i32 ocap = d.cap;
+        str* okeys = d.keys;
+        i32* oflags = d.flags;
+        u32* ostamps = d.stamps;
+        d.cap = ocap * 2;
+        d.keys = alloc<str>(d.cap);
+        d.flags = alloc<i32>(d.cap);
+        d.stamps = alloc<u32>(d.cap);
+        memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+        for i32 k = 0; k < d.order.len; k++ {
+            i32 i = vec_get(&d.order, k);
+            i32 j = cast(i32, map_hash_str(*(okeys + i))) & (d.cap - 1);
+            while *(d.stamps + j) == d.gen { j = (j + 1) & (d.cap - 1); }
+            *(d.keys + j) = *(okeys + i);
+            *(d.flags + j) = *(oflags + i);
+            *(d.stamps + j) = d.gen;
+            vec_set(&d.order, k, j);
+        }
+        free(okeys);
+        free(oflags);
+        free(ostamps);
+    }
+    i32 mask = d.cap - 1;
+    i32 i = cast(i32, map_hash_str(name)) & mask;
+    while *(d.stamps + i) == d.gen {
+        if str_equal(*(d.keys + i), name) { return d.flags + i; }
+        i = (i + 1) & mask;
+    }
+    *(d.keys + i) = name;
+    *(d.flags + i) = 0;
+    *(d.stamps + i) = d.gen;
+    d.count++;
+    vec_push(&d.order, i);
+    return d.flags + i;
 }
 
 struct PState {
@@ -89,9 +169,7 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.class_depth = 0;
     p.with_depth = 0;
     p.ts_seen = false;
-    strmap_init<i32>(&p.skip_seen);
-    strmap_init<i32>(&p.skip_declared);
-    strmap_init<i32>(&p.skip_written);
+    skip_set_init(&p.skip_names);
     vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
@@ -123,9 +201,7 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.class_depth = 0;
     p.with_depth = 0;
     p.ts_seen = false;
-    strmap_init<i32>(&p.skip_seen);
-    strmap_init<i32>(&p.skip_declared);
-    strmap_init<i32>(&p.skip_written);
+    skip_set_init(&p.skip_names);
     vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
@@ -155,9 +231,7 @@ void parser_destroy(Parser* p) {
     if p.arrow_fail.keys != null { free(p.arrow_fail.keys); free(p.arrow_fail.vals); }
     vec_free(&p.scratch);
     vec_free(&p.labels);
-    strmap_free<i32>(&p.skip_seen);
-    strmap_free<i32>(&p.skip_declared);
-    strmap_free<i32>(&p.skip_written);
+    skip_set_free(&p.skip_names);
     vec_free(&p.skip_stack);
     lexer_destroy(&p.lx);
 }
@@ -1007,16 +1081,6 @@ private bool skip_regex_after(i32 prev) {
 // done, the position restored, for a body that names eval or has a with
 // statement, for one too short to be worth it, and for a function called
 // where it is written.
-// The set emptied for the next body; one grown large is let go, so a
-// clear stays cheap for the small bodies that are most of them.
-private void skip_seen_clear(StrMap<i32>* m) {
-    if m.cap > 1024 { strmap_free<i32>(m); return; }
-    if m.count == 0 { return; }
-    memset(cast(u8*, m.slots), 0, m.cap * sizeof(StrSlot<i32>));
-    m.count = 0;
-    m.filled = 0;
-}
-
 private bool skip_assign_tok(i32 k) {
     return (k >= TOK_EQ && k <= TOK_PIPEPIPE_EQ) || k == TOK_QUESTION_QUESTION_EQ;
 }
@@ -1026,12 +1090,8 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     Token open = p.cur;
     i32 prev_end0 = p.prev_end;
     i32 mark = p.scratch.len;
-    StrMap<i32>* seen = &p.skip_seen;
-    defer skip_seen_clear(seen);
-    StrMap<i32>* declared = &p.skip_declared;
-    defer skip_seen_clear(declared);
-    StrMap<i32>* written = &p.skip_written;
-    defer skip_seen_clear(written);
+    SkipSet* names = &p.skip_names;
+    skip_set_clear(names);
     // the brackets open, and for a template's substitution a 't'
     Vec<u8>* stack = &p.skip_stack;
     stack.len = 0;
@@ -1076,10 +1136,7 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
             bool stored = skip_assign_tok(k) || k == TOK_PLUSPLUS || k == TOK_MINUSMINUS
                 || pend_prev == TOK_PLUSPLUS || pend_prev == TOK_MINUSMINUS
                 || ((k == TOK_KW_IN || k == TOK_KW_OF) && pend_for);
-            if !key {
-                strmap_set<i32>(seen, pending, 1);
-                if stored { strmap_set<i32>(written, pending, 1); }
-            }
+            if !key { *skip_set_slot(names, pending) |= stored ? 5 : 1; }
             pending.len = 0;
         }
         if k == TOK_EQ && ((prev == TOK_RBRACK && last_close == '[') || (prev == TOK_RBRACE && last_close == '{')) { assign_all = true; }
@@ -1137,14 +1194,14 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
             ok = false;
             break;
         } else if k == TOK_KW_THIS {
-            strmap_set<i32>(seen, "this", 1);
+            *skip_set_slot(names, "this") |= 1;
         } else if k == TOK_IDENT || tok_is_keyword(k) {
             bool member = prev == TOK_DOT || prev == TOK_QUESTION_DOT;
-            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { strmap_set<i32>(seen, "%newtarget", 1); }
+            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { *skip_set_slot(names, "%newtarget") |= 1; }
             else if !member && t.text.len > 0 {
                 if str_equal(t.text, "eval") { ok = false; break; }
                 if k == TOK_KW_VAR { if fn_depth == 0 { var_depth = stack.len; } }
-                else if var_depth == stack.len && (prev == TOK_KW_VAR || prev == TOK_COMMA) { strmap_set<i32>(declared, t.text, 1); }
+                else if var_depth == stack.len && (prev == TOK_KW_VAR || prev == TOK_COMMA) { *skip_set_slot(names, t.text) |= 2; }
                 else {
                     pending = t.text;
                     pend_prev = prev;
@@ -1155,7 +1212,7 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
         prev2 = prev;
         prev = k;
     }
-    if pending.len > 0 { strmap_set<i32>(seen, pending, 1); }
+    if pending.len > 0 { *skip_set_slot(names, pending) |= 1; }
     // too short, or something here the lazy compile does not take
     ok = ok && end >= 0 && p.diags.n_errors == n_diags && end - fun.span.start >= SKIP_MIN_FN;
     // called where it is written: function () {...}() or (function () {...})()
@@ -1171,7 +1228,9 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
         p.prev_end = prev_end0;
         return false;
     }
-    // the stand-in: a directive when the real one has it, then the names
+    // the stand-in: a body with the directive when the real one has it,
+    // and the names on the node, which the compiler's scans read as the
+    // body's mentions (a store as an assignment to the name)
     Node* body = nnew(p, N_BLOCK);
     if strict_body {
         Node* st = nnew(p, N_EXPR_STMT);
@@ -1180,30 +1239,27 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
         st.a = lit;
         vec_push(&p.scratch, st);
     }
-    for i32 i = 0; i < seen.cap; i++ {
-        StrSlot<i32>* sl = seen.slots + i;
-        if sl.state != SLOT_USED { continue; }
-        if strmap_get<i32>(declared, sl.key) != null { continue; }
-        Node* st = nnew(p, N_EXPR_STMT);
-        Node* id;
-        bool stored = false;
-        if str_equal(sl.key, "this") { id = nnew(p, N_THIS); }
-        else if str_equal(sl.key, "%newtarget") { id = nnew(p, N_NEW_TARGET); }
-        else { id = nnew(p, N_IDENT); id.name = sl.key; stored = assign_all || strmap_get<i32>(written, sl.key) != null; }
-        if stored {
-            // `name = name`: the scan sees a store
-            Node* asg = nnew(p, N_ASSIGN);
-            asg.op = TOK_EQ;
-            asg.a = id;
-            Node* rhs = nnew(p, N_IDENT);
-            rhs.name = sl.key;
-            asg.b = rhs;
-            st.a = asg;
-        } else {
-            st.a = id;
-        }
-        vec_push(&p.scratch, st);
+    i32 n_refs = 0;
+    for i32 k = 0; k < names.order.len; k++ {
+        if (*(names.flags + vec_get(&names.order, k)) & 2) == 0 { n_refs++; }
     }
+    NodeMemo* memo = cast(NodeMemo*, bump_alloc(p.arena, cast(i32, sizeof(NodeMemo))));
+    memo.refs = cast(NameRef*, bump_alloc(p.arena, cast(i32, (n_refs > 0 ? n_refs : 1) * sizeof(NameRef))));
+    memo.n_refs = n_refs;
+    i32 w = 0;
+    for i32 k = 0; k < names.order.len; k++ {
+        i32 i = vec_get(&names.order, k);
+        i32 f = *(names.flags + i);
+        if (f & 2) != 0 { continue; }
+        str key = *(names.keys + i);
+        NameRef* r = memo.refs + w;
+        w++;
+        r.name = key;
+        if str_equal(key, "this") { r.flags = 2; }
+        else if str_equal(key, "%newtarget") { r.flags = 4; }
+        else { r.flags = assign_all || (f & 4) != 0 ? 1 : 0; }
+    }
+    fun.memo = memo;
     body.kids = finish_kids(p, mark);
     fun.a = body;
     fun.flags |= NF_SKIPPED;
@@ -1255,7 +1311,9 @@ private Node* parse_template(Parser* p) {
     i32 mark = p.scratch.len;
     Node* q = nnew(p, N_TEMPLATE_ELEM);
     q.name = p.cur.text;
-    q.aux = p.cur.aux;   // raw quasi
+    Node* qraw = nnew(p, N_STRING);
+    qraw.name = p.cur.aux;   // raw quasi
+    q.a = qraw;
     vec_push(&p.scratch, q);
     if at(p, TOK_TEMPLATE_FULL) {
         advance(p);
@@ -1274,7 +1332,9 @@ private Node* parse_template(Parser* p) {
         if tk.kind == TOK_ERROR { break; }
         Node* e = nnew(p, N_TEMPLATE_ELEM);
         e.name = tk.text;
-        e.aux = tk.aux;   // raw quasi
+        Node* eraw = nnew(p, N_STRING);
+        eraw.name = tk.aux;   // raw quasi
+        e.a = eraw;
         vec_push(&p.scratch, e);
         advance(p);
         if tk.kind == TOK_TEMPLATE_TAIL { break; }
@@ -1479,7 +1539,9 @@ private Node* parse_primary(Parser* p) {
         p.cur = r;
         Node* n = nnew(p, N_REGEX);
         n.name = r.text;
-        n.aux = r.aux;
+        Node* fl = nnew(p, N_STRING);
+        fl.name = r.aux;
+        n.a = fl;
         advance(p);
         return n;
     }
