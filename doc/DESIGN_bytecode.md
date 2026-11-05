@@ -115,6 +115,29 @@ switch's case). On bsky.app's load the ops fell 17% for about 3% of
 the running time: the dispatch is a small part of an op's cost, the
 work in it the rest.
 
+## Property caches
+
+A property instruction (`GETPROP`, `GETPROP_L`, `GETPROP_THIS`,
+`GETMETHOD`, `SETPROP`, `SETPROP_POP`) carries a u16 after its name,
+empty when compiled, which the interpreter fills with the slot the name
+was found in: on the object itself, or (bit 15 set) on its prototype, in
+which case the own table has to lack the name. The next execution tries
+that slot first: an ordinary object (no proxy, array, typed array or
+other special shape), the slot in range, its key the name, its value not
+an accessor, is the whole read, and for a write a writable own slot is
+the whole write, with the collector's barrier when the object is old. A
+miss takes the full lookup and fills the cache once; a site that misses
+again sees more than one shape, or a name the cache cannot say, and
+stays on the full lookup (`IC_MANY`). There are no hidden classes: the
+guard is the key compare at the slot, which is sound because keys are
+unique in a table, and the cost of a miss is the lookup plus one scan
+to learn. The cache lives in the template's code, shared by every
+closure of the function, and holds an index, never a pointer
+(vm.mc, `prop_get_ic`, `set_prop_ic`). Measured on a read of the tenth
+key of an object: 15.8 ns over the loop to 12.3; the scan it saves was
+3 ns of the read, the rest is the dependent loads from the value to
+the object to its table to the slot to the value's cell.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

@@ -89,16 +89,16 @@ enum Op {
     // once instead of growing as the properties are defined.
     OP_NEWOBJ,
     OP_NEWARR,       // u16 element count popped
-    OP_GETPROP,      // u16 const idx (name)
+    OP_GETPROP,      // u16 const idx (name), u16 cache: the slot the name was found in last (vm.mc, prop_get_ic)
     OP_GETIMPORT,    // u16 const idx (name), u16 const idx (message); a
                      // module import read: the name must be present
-    OP_SETPROP,      // u16 const idx; pops obj, keeps value
+    OP_SETPROP,      // u16 const idx, u16 cache; pops obj, keeps value
     OP_DEFMETHOD,    // u16 const idx; like SETPROP but non-enumerable
     OP_DEFPROP_FIXED,// u16 const idx; neither writable, enumerable nor
                      // configurable — a class's `prototype`
     OP_DEFMETHOD_DYN,// [obj, key, fn] pops key+fn, keeps obj
     OP_GETINDEX, OP_SETINDEX,
-    OP_GETMETHOD,    // u16 const idx; pops obj, pushes fn then obj
+    OP_GETMETHOD,    // u16 const idx, u16 cache; pops obj, pushes fn then obj
     OP_GETMETHOD_DYN,// pops key, obj; pushes fn then obj
     OP_DELPROP,      // u16 const idx
     OP_DELINDEX,
@@ -173,10 +173,10 @@ enum Op {
                      // declaration made a global, never a strict-mode error
     OP_PUTLOCAL,     // u16 slot; pops into the slot: a store whose value the
                      // statement discards
-    OP_GETPROP_L,    // u16 slot, u16 const idx: GETLOCAL then GETPROP
+    OP_GETPROP_L,    // u16 slot, u16 const idx, u16 cache: GETLOCAL then GETPROP
     OP_GETINDEX_LL,  // u16 slot, u16 slot: two GETLOCALs then GETINDEX
     OP_LT_JF_LL,     // u16 slot, u16 slot, i32 target: two GETLOCALs, LT, jump when false
-    OP_GETPROP_THIS, // u16 const idx: THIS then GETPROP
+    OP_GETPROP_THIS, // u16 const idx, u16 cache: THIS then GETPROP
     OP_SEQ_JF,       // i32 target: SEQ then JUMPF
     OP_SNEQ_JF,      // i32 target: SNEQ then JUMPF
     OP_GETUPVALV,    // u16 upvalue index: the value itself, captured as such; a hole refused
@@ -186,7 +186,7 @@ enum Op {
     // Pairs the emitter folds as it goes (ch_op, ch_op_u16; the compiler's
     // emit_jumpf and emit_jumpt), chosen from the bytecode profile of
     // bsky.app's load: a dispatch each and the stack traffic between.
-    OP_SETPROP_POP,  // u16 const idx: SETPROP then POP
+    OP_SETPROP_POP,  // u16 const idx, u16 cache: SETPROP then POP
     OP_SETUPVAL_POP, // u16 upvalue index: SETUPVAL then POP
     OP_SETCELL_POP,  // u16 slot: SETCELL then POP
     OP_GETLOCAL_UNDEF,  // u16 slot: GETLOCAL then UNDEF (a call's callee and this)
@@ -406,7 +406,7 @@ void ch_op(Chunk* ch, i32 op) {
     // a pair the profile shows often becomes one instruction: the first
     // rewritten in place, the second never written
     if op == OP_POP {
-        if ch_fuse_last(ch, OP_SETLOCAL, 3, OP_PUTLOCAL) || ch_fuse_last(ch, OP_SETPROP, 3, OP_SETPROP_POP)
+        if ch_fuse_last(ch, OP_SETLOCAL, 3, OP_PUTLOCAL) || ch_fuse_last(ch, OP_SETPROP, 5, OP_SETPROP_POP)
            || ch_fuse_last(ch, OP_SETUPVAL, 3, OP_SETUPVAL_POP) || ch_fuse_last(ch, OP_SETCELL, 3, OP_SETCELL_POP) { return; }
     } else if op == OP_UNDEF {
         if ch_fuse_last(ch, OP_GETLOCAL, 3, OP_GETLOCAL_UNDEF) || ch_fuse_last(ch, OP_GETUPVAL, 3, OP_GETUPVAL_UNDEF)
@@ -439,6 +439,14 @@ void ch_op_u16(Chunk* ch, i32 op, i32 v) {
     }
     ch_op(ch, op);
     ch_u16(ch, v);
+}
+
+// The property cache is empty when written; the interpreter fills it.
+const i32 IC_EMPTY = 0xFFFF;
+// A property instruction with its name and an empty cache after it.
+void ch_op_ic(Chunk* ch, i32 op, i32 name) {
+    ch_op_u16(ch, op, name);
+    ch_u16(ch, IC_EMPTY);
 }
 
 i32 ch_add_const(Chunk* ch, Value v) {

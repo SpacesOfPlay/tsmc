@@ -1960,6 +1960,7 @@ private void emit_getprop(Chunk* ch, i32 kc) {
        && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL {
         vec_set(&ch.code, at, cast(u8, OP_GETPROP_L));
         ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
         return;
     }
     // two locals loaded as one: the first stays a load, the second's read
@@ -1976,15 +1977,17 @@ private void emit_getprop(Chunk* ch, i32 kc) {
         vec_push(&ch.code, lo);
         vec_push(&ch.code, hi);
         ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
         return;
     }
     if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len
        && cast(i32, vec_get(&ch.code, at)) == OP_THIS {
         vec_set(&ch.code, at, cast(u8, OP_GETPROP_THIS));
         ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
         return;
     }
-    ch_op_u16(ch, OP_GETPROP, kc);
+    ch_op_ic(ch, OP_GETPROP, kc);
 }
 
 private void emit_getindex(Chunk* ch) {
@@ -2061,7 +2064,7 @@ private bool super_home_is_static(Compiler* co) {
 private void emit_super_home(Compiler* co, Node* at) {
     emit_load_name(co, "%super", at);
     if !super_home_is_static(co) {
-        ch_op_u16(&co.cur.ch, OP_GETPROP, name_const(co, "prototype"));
+        ch_op_ic(&co.cur.ch, OP_GETPROP, name_const(co, "prototype"));
     }
 }
 
@@ -2137,7 +2140,7 @@ private void emit_ref_store(Compiler* co, Node* t, i32 t_obj, i32 t_key) {
         if (t.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
         } else {
-            ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+            ch_op_ic(ch, OP_SETPROP, name_const(co, t.name));
         }
     }
     ch_op(ch, OP_POP);
@@ -2216,7 +2219,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             if (pat.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, pat, pat.name));
             } else {
-                ch_op_u16(ch, OP_SETPROP, name_const(co, pat.name));
+                ch_op_ic(ch, OP_SETPROP, name_const(co, pat.name));
             }
         } else {
             compile_expr(co, pat.b);
@@ -2518,7 +2521,7 @@ private void compile_assign(Compiler* co, Node* n) {
             if (t.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
             } else {
-                ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+                ch_op_ic(ch, OP_SETPROP, name_const(co, t.name));
             }
             return;
         }
@@ -2571,7 +2574,7 @@ private void compile_assign(Compiler* co, Node* n) {
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             compile_expr(co, n.b);
-            ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
+            if priv { ch_op_u16(ch, OP_SETPRIVATE, kc); } else { ch_op_ic(ch, OP_SETPROP, kc); }
             ch_patch(ch, j);
             co.cur.cur_slots--;
             return;
@@ -2624,7 +2627,7 @@ private void compile_assign(Compiler* co, Node* n) {
         if priv { ch_op_u16(ch, OP_GETPRIVATE, kc); } else { emit_getprop(ch, kc); }
         compile_expr(co, n.b);
         ch_op(ch, op);
-        ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
+        if priv { ch_op_u16(ch, OP_SETPRIVATE, kc); } else { ch_op_ic(ch, OP_SETPROP, kc); }
         return;
     }
     if t.kind == N_INDEX {
@@ -2673,7 +2676,7 @@ private void compile_update(Compiler* co, Node* n) {
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, step);
         if t.kind == N_MEMBER {
-            ch_op_u16(ch, mpriv ? OP_SETPRIVATE : OP_SETPROP, mkc);
+            if mpriv { ch_op_u16(ch, OP_SETPRIVATE, mkc); } else { ch_op_ic(ch, OP_SETPROP, mkc); }
         } else {
             ch_op(ch, OP_SETINDEX);
         }
@@ -2745,7 +2748,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
             if (callee.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
             } else {
-                ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+                ch_op_ic(ch, OP_GETMETHOD, name_const(co, callee.name));
             }
         } else if callee.kind == N_INDEX {
             emit_chain_base(co, callee.a, nils);
@@ -2883,7 +2886,7 @@ private void compile_call(Compiler* co, Node* n) {
         if (callee.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
         } else {
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+            ch_op_ic(ch, OP_GETMETHOD, name_const(co, callee.name));
         }
     } else if callee.kind == N_INDEX {
         compile_expr(co, callee.a);
@@ -2970,15 +2973,15 @@ private void compile_expr(Compiler* co, Node* n) {
         ch_op_u16(ch, OP_NEWOBJ, 3);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_url_const(co));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "url"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "url"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_path_const(co, false));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "filename"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "filename"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_path_const(co, true));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "dirname"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "dirname"));
         ch_op(ch, OP_POP);
         return;
     }
@@ -3162,7 +3165,7 @@ private void compile_expr(Compiler* co, Node* n) {
         // callee + `this`, mirroring N_CALL: a member tag keeps its receiver
         if tag.kind == N_MEMBER && (tag.flags & NF_PRIVATE) == 0 && tag.a.kind != N_SUPER {
             compile_expr(co, tag.a);
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, tag.name));
+            ch_op_ic(ch, OP_GETMETHOD, name_const(co, tag.name));
         } else if tag.kind == N_INDEX {
             compile_expr(co, tag.a);
             compile_expr(co, tag.b);
@@ -3191,7 +3194,7 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         ch_op_u16(ch, OP_NEWARR, nq);
         ch_op(ch, OP_FREEZE);
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "raw"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "raw"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_FREEZE);
         // substitution expressions as the remaining arguments

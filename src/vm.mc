@@ -4504,6 +4504,112 @@ private i32 rd_u16p(u8* p) {
     return lo | (hi << 8);
 }
 
+private void wr_u16p(u8* p, i32 v) {
+    *p = cast(u8, v);
+    *(p + 1) = cast(u8, v >> 8);
+}
+
+// A property read through the instruction's cache: the slot the name was
+// found in the last time, on the object itself or on its prototype (the
+// own table then has to lack the name), tried first on an ordinary
+// object; a hit on a data property is the whole read. A miss takes the
+// full read and fills the cache, once: a site that then misses again
+// sees objects of more than one shape, and is left to the full read
+// (IC_MANY), as is one whose name is found nowhere the cache can say.
+const i32 IC_MANY = 0xFFFE;
+const i32 IC_PROTO = 0x8000;    // the slot is the prototype's
+const i32 IC_SLOT = 0x7FFF;
+private bool ic_plain(Value objv) {
+    return value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
+}
+
+private bool ic_plain_obj(JsObject* o) {
+    return (o.obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
+}
+
+// the own slot of `a` in o's table, or -1
+private i32 ic_index_of(JsObject* o, u32 a) {
+    PropList* pl = &o.props;
+    if pl.idx != null {
+        i32* pos = intmap_get<i32>(pl.idx, a);
+        return pos != null ? *pos : -1;
+    }
+    for i32 i = 0; i < pl.len; i++ { if (pl.items + i).key == a { return i; } }
+    return -1;
+}
+
+// the slot of a data property `a` on o or its prototype, as the cache
+// spells it, or IC_MANY
+private i32 ic_learn(JsObject* o, u32 a) {
+    i32 at = ic_index_of(o, a);
+    if at >= 0 {
+        return at < IC_PROTO && value_kind((o.props.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
+    }
+    JsObject* p = o.proto;
+    if p == null || !ic_plain_obj(p) { return IC_MANY; }
+    i32 pa = ic_index_of(p, a);
+    if pa < 0 || pa >= IC_PROTO || value_kind((p.props.items + pa).val) == GC_ACCESSOR { return IC_MANY; }
+    return pa | IC_PROTO;
+}
+
+private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
+    i32 ic = rd_u16p(icp);
+    bool plain = ic_plain(objv);
+    if plain && ic < IC_MANY {
+        JsObject* o = value_as_object(objv);
+        if (ic & IC_PROTO) == 0 {
+            if ic < o.props.len {
+                Prop* pr = o.props.items + ic;
+                if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                    *out = pr.val;
+                    return true;
+                }
+            }
+        } else {
+            i32 at = ic & IC_SLOT;
+            JsObject* p = o.proto;
+            if p != null && at < p.props.len && ic_plain_obj(p) && ic_index_of(o, a) < 0 {
+                Prop* pr = p.props.items + at;
+                if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                    *out = pr.val;
+                    return true;
+                }
+            }
+        }
+    }
+    bool ok = prop_get(vm, objv, a, out);
+    if ok && plain && ic != IC_MANY {
+        i32 code = ic_learn(value_as_object(objv), a);
+        wr_u16p(icp, ic == IC_EMPTY || code == ic ? code : IC_MANY);
+    }
+    return ok;
+}
+
+// The write the same way: a hit on an own writable data property stores
+// in place, with the collector's barrier when the object is old.
+private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) {
+    i32 ic = rd_u16p(icp);
+    bool plain = ic_plain(objv);
+    if plain && ic < IC_PROTO {
+        JsObject* o = value_as_object(objv);
+        if ic < o.props.len {
+            Prop* pr = o.props.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR && (pr.flags & PROP_WRITABLE) != 0 {
+                if (o.props.cap & PROPS_OLD) != 0 { props_barrier(&o.props, v); }
+                pr.val = v;
+                return true;
+            }
+        }
+    }
+    bool ok = set_prop_atom(vm, objv, a, v, mode);
+    if ok && plain && ic != IC_MANY {
+        i32 at = ic_index_of(value_as_object(objv), a);
+        i32 code = at >= 0 && at < IC_PROTO ? at : IC_MANY;
+        wr_u16p(icp, ic == IC_EMPTY || code == ic ? code : IC_MANY);
+    }
+    return ok;
+}
+
 private i32 rd_targetp(u8* p) {
     return cast(i32, cast(u32, *p) | (cast(u32, *(p + 1)) << 8) | (cast(u32, *(p + 2)) << 16) | (cast(u32, *(p + 3)) << 24));
 }
@@ -5598,9 +5704,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_GETPROP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
-                pc += 2;
+                pc += 4;
                 Value out;
-                if prop_get(vm, vpeek(vm, 0), a, &out) {
+                if prop_get_ic(vm, vpeek(vm, 0), a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                 }
@@ -5608,9 +5714,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GETPROP_THIS: {
                 Value objv = this_of(vm, fr.this_val, t.sloppy);
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
-                pc += 2;
+                pc += 4;
                 Value out;
-                if prop_get(vm, objv, a, &out) { vpush(vm, out); }
+                if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
             case OP_LT_JF_LL: {
                 Value a = *(vm.stack + fr.base + rd_u16p(pc));
@@ -5643,9 +5749,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GETPROP_L: {
                 Value objv = *(vm.stack + fr.base + rd_u16p(pc));
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
-                pc += 4;
+                pc += 6;
                 Value out;
-                if prop_get(vm, objv, a, &out) { vpush(vm, out); }
+                if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
             case OP_GETIMPORT: {
                 get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
@@ -5653,18 +5759,18 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_SETPROP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
-                pc += 2;
+                pc += 4;
                 Value v = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
-                if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
+                if set_prop_ic(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2) {
                     vm.sp -= 2;
                     vpush(vm, v);
                 }
             }
             case OP_SETPROP_POP: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
-                pc += 2;
-                if set_prop_atom(vm, vpeek(vm, 1), a, vpeek(vm, 0), t.sloppy ? SET_SLOPPY : SET_STRICT) {
+                pc += 4;
+                if set_prop_ic(vm, vpeek(vm, 1), a, vpeek(vm, 0), t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2) {
                     vm.sp -= 2;
                 }
             }
@@ -5737,10 +5843,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_GETMETHOD: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
-                pc += 2;
+                pc += 4;
                 Value objv = vpeek(vm, 0);
                 Value out;
-                if prop_get(vm, objv, a, &out) {
+                if prop_get_ic(vm, objv, a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
