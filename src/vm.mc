@@ -5904,7 +5904,75 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vpush(vm, value_cell(&f.head));
             }
-            case OP_CALL, OP_NEW, OP_SUPERCALL: { vm.sp = sp;
+            case OP_CALL: {
+                // The call most of a page's are: a compiled function with
+                // no rest parameter or arguments object, not a class,
+                // generator or async body. Its frame is built on the
+                // loop's registers; nothing is allocated, so nothing is
+                // rooted. A native is called in place. The rest falls
+                // through to the general case.
+                i32 argc = rd_u16p(pc);
+                Value fnv = *(stack + sp - 2 - argc);
+                if value_is_function(fnv) {
+                    JsFunction* f = value_as_function(fnv);
+                    FnTemplate* ft = f.tmpl;
+                    u8 shape = ft.call_shape;
+                    if shape == 0 && ft.lazy == null {
+                        shape = !ft.is_gen && !ft.is_async && !ft.is_class && !ft.derived_ctor
+                            && !ft.needs_arguments && !ft.has_rest ? CALL_PLAIN : CALL_SLOW;
+                        ft.call_shape = shape;
+                    }
+                    if shape == CALL_PLAIN && vm.fp < VM_FRAMES_MAX
+                        && sp + ft.n_slots + 8 < VM_STACK_MAX {
+                        pc += 2;
+                        i32 ip = cast(i32, pc - code);
+                        fr.cur_ip = ip;
+                        i32 base = sp - argc;
+                        i32 np = ft.n_params;
+                        i32 have = argc;
+                        if have > np { sp = base + np; have = np; }   // surplus arguments dropped
+                        i32 n = ft.n_slots;
+                        for i32 i = have; i < n; i++ { *(stack + sp) = value_undefined(); sp++; }
+                        Frame* nf = vm.frames + vm.fp;
+                        nf.fun = f;
+                        nf.tmpl = ft;
+                        nf.ret_ip = ip;
+                        nf.cur_ip = 0;
+                        nf.base = base;
+                        nf.this_val = *(stack + base - 1);
+                        nf.arguments_obj = value_undefined();
+                        nf.is_ctor = false;
+                        nf.super_pending = false;
+                        nf.super_for = 0 - 1;
+                        nf.new_target = value_undefined();
+                        nf.gen = null;
+                        vm.fp++;
+                        when defined(TSMC_PROF) {
+                            if vm.prof != null { vm.prof.js_calls++; ft.prof_calls++; }
+                        }
+                        fr = nf;
+                        t = ft;
+                        code = t.code;
+                        pc = code;
+                        continue;
+                    }
+                } else if value_is_native(fnv) {
+                    JsNative* na = value_as_native(fnv);
+                    pc += 2;
+                    fr.cur_ip = cast(i32, pc - code);
+                    vm.sp = sp;
+                    when defined(TSMC_PROF) {
+                        if vm.prof != null { vm.prof.native_calls++; }
+                    }
+                    Value res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                    sp -= argc + 2;
+                    *(stack + sp) = res;
+                    sp++;
+                    continue;
+                }
+                fallthrough;
+            }
+            case OP_NEW, OP_SUPERCALL: { vm.sp = sp;
                 i32 argc = rd_u16p(pc);
                 pc += 2;
                 fr.cur_ip = cast(i32, pc - code);   // this frame's call site, for stack traces

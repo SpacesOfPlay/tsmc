@@ -303,6 +303,11 @@ struct IcAux {
     u32 epoch;
 }
 
+// A plain call builds its frame in the interpreter loop: no rest
+// parameter or arguments object, not a class, generator or async body.
+const u8 CALL_PLAIN = 1;
+const u8 CALL_SLOW = 2;
+
 struct FnTemplate {
     str name;            // owned copy
     i32 n_params;
@@ -318,6 +323,8 @@ struct FnTemplate {
     bool needs_arguments; // references `arguments`; build it at call time
     bool sloppy;         // not strict-mode code: a plain call's `this` is
                          // the global object
+    u8 call_shape;       // 0 until the first call of the compiled body,
+                         // then CALL_PLAIN or CALL_SLOW (vm.mc, OP_CALL)
     u8* code;
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook

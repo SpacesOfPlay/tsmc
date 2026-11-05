@@ -24,6 +24,17 @@ flag, and keeps the instance unless the body returned an object.
 Method calls use `OP_GETMETHOD`, which pushes `fn` then the receiver,
 evaluating the object expression once.
 
+`OP_CALL` has a case of its own ahead of the general one it shares with
+`OP_NEW` and `OP_SUPERCALL`: a compiled function with no rest parameter
+or `arguments` object, not a class, generator or async body
+(`FnTemplate.call_shape`, decided at its first call once the body is
+compiled) is called with its frame built on the loop's own stack
+pointer and base, a surplus argument dropped and a missing one filled
+along with the slots, nothing rooted since nothing is allocated; a
+native is called in place with the stack pointer written back first.
+Everything else falls through to the general case. On the benches a
+call 734 to 678 ms, a method call 706 to 611, fib 457 to 373.
+
 ## Scope analysis (fused with compilation)
 
 Per function, before emitting:
