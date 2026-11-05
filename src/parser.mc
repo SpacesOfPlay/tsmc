@@ -47,6 +47,9 @@ struct Parser {
     i32 skip_depth;     // functions nested deeper than this are passed over
     i32 class_depth;
     i32 with_depth;
+    // a TypeScript form was parsed: the lowering pass has something to
+    // do. Plain JavaScript skips it (lower.mc changes nothing in it).
+    bool ts_seen;
     // skip_body's name set and bracket stack, kept from one body to the next
     StrMap<i32> skip_seen;
     StrMap<i32> skip_declared;   // the names its `var`s declare
@@ -59,6 +62,7 @@ struct PState {
     Token cur;
     i32 prev_end;
     i32 scratch_len;
+    bool ts_seen;     // an attempt that fails leaves no TypeScript behind
 }
 
 void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
@@ -84,6 +88,7 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.skip_depth = 0;
     p.class_depth = 0;
     p.with_depth = 0;
+    p.ts_seen = false;
     strmap_init<i32>(&p.skip_seen);
     strmap_init<i32>(&p.skip_declared);
     strmap_init<i32>(&p.skip_written);
@@ -117,6 +122,7 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.skip_depth = 0;
     p.class_depth = 0;
     p.with_depth = 0;
+    p.ts_seen = false;
     strmap_init<i32>(&p.skip_seen);
     strmap_init<i32>(&p.skip_declared);
     strmap_init<i32>(&p.skip_written);
@@ -187,7 +193,8 @@ private Node* too_deep(Parser* p) {
 
 private void advance(Parser* p) {
     p.prev_end = p.cur.end;
-    p.cur = contextualize(p, lexer_next(&p.lx));
+    lexer_next_into(&p.lx, &p.cur);
+    contextualize_in(p, &p.cur);
 }
 
 // `await` and `yield` are keywords only where the grammar says so: inside
@@ -202,7 +209,7 @@ private bool await_is_keyword(Parser* p) {
     return p.in_async > 0 || (p.fn_depth == 0 && p.module_top);
 }
 
-private Token contextualize(Parser* p, Token t) {
+private void contextualize_in(Parser* p, Token* t) {
     if t.kind == TOK_KW_AWAIT {
         if !await_is_keyword(p) { t.kind = TOK_IDENT; }
     } else if t.kind == TOK_KW_YIELD {
@@ -211,6 +218,10 @@ private Token contextualize(Parser* p, Token t) {
         if await_is_keyword(p) && str_equal(t.text, "await") { t.kind = TOK_KW_AWAIT; }
         else if p.in_gen > 0 && str_equal(t.text, "yield") { t.kind = TOK_KW_YIELD; }
     }
+}
+
+private Token contextualize(Parser* p, Token t) {
+    contextualize_in(p, &t);
     return t;
 }
 
@@ -239,6 +250,7 @@ private PState psave(Parser* p) {
     s.cur = p.cur;
     s.prev_end = p.prev_end;
     s.scratch_len = p.scratch.len;
+    s.ts_seen = p.ts_seen;
     return s;
 }
 
@@ -247,6 +259,7 @@ private void prestore(Parser* p, PState s) {
     p.cur = s.cur;
     p.prev_end = s.prev_end;
     p.scratch.len = s.scratch_len;
+    p.ts_seen = s.ts_seen;
 }
 
 private bool at(Parser* p, i32 k) {
@@ -504,6 +517,7 @@ private void ts_entity(Parser* p) {
 }
 
 private void ts_type_args(Parser* p) {
+    p.ts_seen = true;
     split_lt(p);
     while true {
         ts_type(p);
@@ -514,6 +528,7 @@ private void ts_type_args(Parser* p) {
 }
 
 private void ts_type_params(Parser* p) {
+    p.ts_seen = true;
     split_lt(p);
     while true {
         while (p.cur.kind == TOK_KW_CONST || p.cur.kind == TOK_KW_IN
@@ -647,6 +662,7 @@ private void ts_union(Parser* p) {
 }
 
 private void ts_type(Parser* p) {
+    p.ts_seen = true;
     ts_union(p);
     while p.cur.kind == TOK_KW_EXTENDS {
         advance(p);
@@ -660,6 +676,7 @@ private void ts_type(Parser* p) {
 
 // After ':' in a return-type position: allows type predicates.
 private void ts_return_type(Parser* p) {
+    p.ts_seen = true;
     if p.cur.kind == TOK_KW_ASSERTS
         && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_KW_THIS) {
         advance(p);
@@ -837,6 +854,7 @@ private void parse_params_into(Parser* p) {
                     || p.cur.kind == TOK_KW_PROTECTED || p.cur.kind == TOK_KW_READONLY
                     || p.cur.kind == TOK_KW_OVERRIDE) && starts_binding(peek(p)) {
                 prm.flags |= NF_PARAM_PROP;
+                p.ts_seen = true;
                 advance(p);
             }
             if eat(p, TOK_DOTDOTDOT) { prm.flags |= NF_REST; }
@@ -898,6 +916,7 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
         if strict_body { p.strict--; }
     } else {
         fun.flags |= NF_SIGNATURE;
+        p.ts_seen = true;
         expect_semi(p);
     }
     p.fn_depth--;
@@ -1047,7 +1066,8 @@ private bool skip_body(Parser* p, Node* fun, bool strict_body) {
     i32 fn_depth = 0;
     bool last_paren_ctrl = false;
     while true {
-        Token t = lexer_next(&p.lx);
+        noinit Token t;
+        lexer_next_into(&p.lx, &t);
         i32 k = t.kind;
         if k == TOK_EOF || k == TOK_ERROR { ok = false; break; }
         if pending.len > 0 {
@@ -1578,7 +1598,13 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
     } else {
         e = parse_primary(p);
     }
+    // every link deepens the tree under the first operand, which the
+    // compiler recurses through, so a chain counts as nesting too
+    i32 chain = 0;
     while true {
+        p.depth++;
+        chain++;
+        if p.depth >= PARSE_DEPTH_MAX { p.depth -= chain; return too_deep(p); }
         i32 k = p.cur.kind;
         if k == TOK_DOT {
             advance(p);
@@ -1639,6 +1665,7 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
         }
         if k == TOK_BANG && !p.cur.newline_before {
             Node* nn = nnew(p, N_NONNULL);
+            p.ts_seen = true;
             nn.span.start = e.span.start;
             nn.a = e;
             advance(p);
@@ -1651,6 +1678,7 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
         }
         break;
     }
+    p.depth -= chain;
     return e;
 }
 
@@ -1708,12 +1736,17 @@ private Node* parse_unary_in(Parser* p) {
 
 private Node* parse_bin(Parser* p, i32 min_prec) {
     Node* left = parse_unary(p);
+    i32 chain = 0;
     while true {
+        p.depth++;
+        chain++;
+        if p.depth >= PARSE_DEPTH_MAX { p.depth -= chain; return too_deep(p); }
         i32 k = p.cur.kind;
         if k == TOK_KW_AS || k == TOK_KW_SATISFIES {
             if min_prec > 7 { break; }
             advance(p);
             Node* w = nnew(p, N_AS);
+            p.ts_seen = true;
             w.span.start = left.span.start;
             w.a = left;
             if k == TOK_KW_SATISFIES {
@@ -1756,6 +1789,7 @@ private Node* parse_bin(Parser* p, i32 min_prec) {
         b.b = right;
         left = nfin(p, b);
     }
+    p.depth -= chain;
     return left;
 }
 
@@ -2241,8 +2275,8 @@ private Node* parse_class_member(Parser* p) {
         else if k == TOK_KW_ASYNC { add = NF_ASYNC; }
         else if k == TOK_KW_GET { add = NF_GETTER; }
         else if k == TOK_KW_SET { add = NF_SETTER; }
-        else if k == TOK_KW_ABSTRACT { add = NF_ABSTRACT; }
-        else if k == TOK_KW_DECLARE { add = NF_DECLARE; }
+        else if k == TOK_KW_ABSTRACT { add = NF_ABSTRACT; p.ts_seen = true; }
+        else if k == TOK_KW_DECLARE { add = NF_DECLARE; p.ts_seen = true; }
         else if k == TOK_KW_READONLY || k == TOK_KW_PUBLIC || k == TOK_KW_PRIVATE
             || k == TOK_KW_PROTECTED || k == TOK_KW_OVERRIDE { add = 0; }
         if add < 0 { break; }
@@ -2351,6 +2385,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
 
 private Node* parse_enum(Parser* p, i32 flags) {
     Node* e = nnew(p, N_ENUM);
+    p.ts_seen = true;
     e.flags = flags;
     advance(p);
     if is_binding_ident(p.cur.kind) {
@@ -2388,6 +2423,7 @@ private Node* parse_enum(Parser* p, i32 flags) {
 
 private Node* parse_namespace_rest(Parser* p, i32 flags) {
     Node* n = nnew(p, N_NAMESPACE);
+    p.ts_seen = true;
     n.flags = flags;
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -2419,6 +2455,7 @@ private Node* parse_namespace_rest(Parser* p, i32 flags) {
 
 private Node* parse_interface(Parser* p) {
     Node* n = nnew(p, N_INTERFACE);
+    p.ts_seen = true;
     advance(p);
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -2444,6 +2481,7 @@ private Node* parse_interface(Parser* p) {
 
 private Node* parse_type_alias(Parser* p) {
     Node* n = nnew(p, N_TYPE_ALIAS);
+    p.ts_seen = true;
     advance(p);
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -2463,6 +2501,7 @@ private Node* parse_declare(Parser* p) {
     if at(p, TOK_KW_GLOBAL) && peek(p).kind == TOK_LBRACE {
         Node* n = nnew(p, N_EMPTY);
         n.flags = NF_DECLARE;
+        p.ts_seen = true;
         advance(p);
         ts_balanced(p, TOK_LBRACE, TOK_RBRACE);
         return nfin(p, n);
@@ -2470,13 +2509,14 @@ private Node* parse_declare(Parser* p) {
     if at(p, TOK_KW_MODULE) && peek(p).kind == TOK_STRING {
         Node* n = nnew(p, N_EMPTY);
         n.flags = NF_DECLARE;
+        p.ts_seen = true;
         advance(p);
         advance(p);
         if at(p, TOK_LBRACE) { ts_balanced(p, TOK_LBRACE, TOK_RBRACE); }
         return nfin(p, n);
     }
     Node* s = parse_statement(p);
-    if s != null { s.flags |= NF_DECLARE; }
+    if s != null { s.flags |= NF_DECLARE; p.ts_seen = true; }
     return s;
 }
 
@@ -2496,6 +2536,7 @@ private Node* parse_import_decl(Parser* p) {
         if pk.kind == TOK_LBRACE || pk.kind == TOK_STAR
             || (is_binding_ident(pk.kind) && pk.kind != TOK_KW_FROM) {
             n.flags |= NF_TYPE_ONLY;
+            p.ts_seen = true;
             advance(p);
         }
     }
@@ -2524,6 +2565,7 @@ private Node* parse_import_decl(Parser* p) {
             Node* sp = nnew(p, N_IMPORT_SPEC);
             if at(p, TOK_KW_TYPE) && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_STRING) {
                 sp.flags |= NF_TYPE_ONLY;
+                p.ts_seen = true;
                 advance(p);
             }
             if is_ident_like(p.cur.kind) || at(p, TOK_STRING) {
@@ -2614,6 +2656,7 @@ private Node* parse_export_decl(Parser* p) {
             n.a = parse_class(p, 0, false);
         } else if at(p, TOK_KW_ABSTRACT) && peek(p).kind == TOK_KW_CLASS {
             advance(p);
+            p.ts_seen = true;
             n.a = parse_class(p, NF_ABSTRACT, false);
         } else {
             n.a = parse_assign(p);
@@ -2625,6 +2668,7 @@ private Node* parse_export_decl(Parser* p) {
     if at(p, TOK_KW_TYPE) && peek(p).kind == TOK_LBRACE {
         type_only = true;
         n.flags |= NF_TYPE_ONLY;
+        p.ts_seen = true;
         advance(p);
     }
     if at(p, TOK_LBRACE) {
@@ -2635,6 +2679,7 @@ private Node* parse_export_decl(Parser* p) {
             if at(p, TOK_KW_TYPE) && !type_only && is_ident_like(peek(p).kind)
                 && peek(p).kind != TOK_KW_AS {
                 sp.flags |= NF_TYPE_ONLY;
+                p.ts_seen = true;
                 advance(p);
             }
             if is_ident_like(p.cur.kind) || at(p, TOK_STRING) {
@@ -2770,6 +2815,7 @@ private Node* parse_statement_in(Parser* p) {
     }
     if k == TOK_KW_ABSTRACT && peek(p).kind == TOK_KW_CLASS {
         advance(p);
+        p.ts_seen = true;
         return parse_class(p, NF_ABSTRACT, true);
     }
     if k == TOK_KW_IF { return parse_if(p); }

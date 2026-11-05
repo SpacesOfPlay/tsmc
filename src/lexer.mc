@@ -83,7 +83,6 @@ struct Lexer {
     str src;
     i32 pos;
     DiagList* diags;
-    StrMap<i32>* keywords;   // the thread's table, shared by every lexer on it
     Vec<str> owned;        // decoded literal buffers, freed in lexer_destroy
 }
 
@@ -123,12 +122,36 @@ private i32 hex_val(u8 c) {
     return c - 'A' + 10;
 }
 
+// A byte's classes, for the scans that run per byte: a name's letters, a
+// digit, a blank, a line end. Bytes past ASCII have none; the Unicode
+// tables decide those. Filled by the first lexer made, the same from
+// every thread.
+const u8 LXC_ID_START = 1;
+const u8 LXC_DIGIT = 2;
+const u8 LXC_SPACE = 4;
+const u8 LXC_NL = 8;
+const u8 LXC_ID_PART = 3;
+private u8[256] g_lxc;
+private bool g_lxc_ready = false;
+
+private void lxc_init() {
+    for i32 c = 0; c < 256; c++ {
+        u8 f = 0;
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' { f |= LXC_ID_START; }
+        if c >= '0' && c <= '9' { f |= LXC_DIGIT; }
+        if c == ' ' || c == '\t' || c == 11 || c == 12 { f |= LXC_SPACE; }
+        if c == '\n' || c == '\r' { f |= LXC_NL; }
+        g_lxc[c] = f;
+    }
+    g_lxc_ready = true;
+}
+
 private bool is_id_start(u8 c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+    return (g_lxc[c] & LXC_ID_START) != 0;
 }
 
 private bool is_id_part(u8 c) {
-    return is_id_start(c) || is_digit(c);
+    return (g_lxc[c] & LXC_ID_PART) != 0;
 }
 
 // --- Unicode identifiers ---------------------------------------------
@@ -245,10 +268,10 @@ private bool skip_trivia(Lexer* lx) {
         // the blanks and line ends, the common run, with the position in a local
         i32 pos = lx.pos;
         while pos < n {
-            u8 b = *(d + pos);
-            if b == ' ' || b == '\t' || b == 11 || b == 12 { pos++; continue; }   // \v \f
-            if b == '\n' || b == '\r' { nl = true; pos++; continue; }
-            break;
+            u8 f = g_lxc[*(d + pos)];
+            if (f & (LXC_SPACE | LXC_NL)) == 0 { break; }
+            if (f & LXC_NL) != 0 { nl = true; }
+            pos++;
         }
         lx.pos = pos;
         if pos >= n { break; }
@@ -535,6 +558,245 @@ private str decode_ident(Lexer* lx, i32 a, i32 b) {
 // IdentifierName, allowing \uXXXX / \u{...} escapes (ES 12.6). The common
 // escape-free case keeps a borrowed source view; an escaped name decodes
 // into an owned buffer. Keyword classification runs on the decoded name.
+// The keyword a word is, or 0. Every keyword is two to ten lowercase
+// letters: its first eight packed into one word compare at once, and
+// the length and the first letter leave one or two to try.
+private i32 keyword_kind(str w) {
+    i32 n = w.len;
+    if n < 2 || n > 10 { return 0; }
+    u8* d = w.data;
+    u8 c0 = *d;
+    if c0 < 'a' || c0 > 'z' { return 0; }
+    u64 a = 0;
+    i32 m = n < 8 ? n : 8;
+    for i32 i = 0; i < m; i++ { a |= cast(u64, *(d + i)) << cast(u64, 8 * i); }
+    switch n {
+        case 2: {
+            switch c0 {
+                case 'a': {
+                    if a == 0x7361 { return TOK_KW_AS; }
+                }
+                case 'd': {
+                    if a == 0x6F64 { return TOK_KW_DO; }
+                }
+                case 'i': {
+                    if a == 0x6669 { return TOK_KW_IF; }
+                    if a == 0x6E69 { return TOK_KW_IN; }
+                    if a == 0x7369 { return TOK_KW_IS; }
+                }
+                case 'o': {
+                    if a == 0x666F { return TOK_KW_OF; }
+                }
+                default: { }
+            }
+        }
+        case 3: {
+            switch c0 {
+                case 'f': {
+                    if a == 0x726F66 { return TOK_KW_FOR; }
+                }
+                case 'g': {
+                    if a == 0x746567 { return TOK_KW_GET; }
+                }
+                case 'l': {
+                    if a == 0x74656C { return TOK_KW_LET; }
+                }
+                case 'n': {
+                    if a == 0x77656E { return TOK_KW_NEW; }
+                }
+                case 'o': {
+                    if a == 0x74756F { return TOK_KW_OUT; }
+                }
+                case 's': {
+                    if a == 0x746573 { return TOK_KW_SET; }
+                }
+                case 't': {
+                    if a == 0x797274 { return TOK_KW_TRY; }
+                }
+                case 'v': {
+                    if a == 0x726176 { return TOK_KW_VAR; }
+                }
+                default: { }
+            }
+        }
+        case 4: {
+            switch c0 {
+                case 'c': {
+                    if a == 0x65736163 { return TOK_KW_CASE; }
+                }
+                case 'e': {
+                    if a == 0x65736C65 { return TOK_KW_ELSE; }
+                    if a == 0x6D756E65 { return TOK_KW_ENUM; }
+                }
+                case 'f': {
+                    if a == 0x6D6F7266 { return TOK_KW_FROM; }
+                }
+                case 'n': {
+                    if a == 0x6C6C756E { return TOK_KW_NULL; }
+                }
+                case 't': {
+                    if a == 0x73696874 { return TOK_KW_THIS; }
+                    if a == 0x65757274 { return TOK_KW_TRUE; }
+                    if a == 0x65707974 { return TOK_KW_TYPE; }
+                }
+                case 'v': {
+                    if a == 0x64696F76 { return TOK_KW_VOID; }
+                }
+                case 'w': {
+                    if a == 0x68746977 { return TOK_KW_WITH; }
+                }
+                default: { }
+            }
+        }
+        case 5: {
+            switch c0 {
+                case 'a': {
+                    if a == 0x636E797361 { return TOK_KW_ASYNC; }
+                    if a == 0x7469617761 { return TOK_KW_AWAIT; }
+                }
+                case 'b': {
+                    if a == 0x6B61657262 { return TOK_KW_BREAK; }
+                }
+                case 'c': {
+                    if a == 0x6863746163 { return TOK_KW_CATCH; }
+                    if a == 0x7373616C63 { return TOK_KW_CLASS; }
+                    if a == 0x74736E6F63 { return TOK_KW_CONST; }
+                }
+                case 'f': {
+                    if a == 0x65736C6166 { return TOK_KW_FALSE; }
+                }
+                case 'i': {
+                    if a == 0x7265666E69 { return TOK_KW_INFER; }
+                }
+                case 'k': {
+                    if a == 0x666F79656B { return TOK_KW_KEYOF; }
+                }
+                case 's': {
+                    if a == 0x7265707573 { return TOK_KW_SUPER; }
+                }
+                case 't': {
+                    if a == 0x776F726874 { return TOK_KW_THROW; }
+                }
+                case 'w': {
+                    if a == 0x656C696877 { return TOK_KW_WHILE; }
+                }
+                case 'y': {
+                    if a == 0x646C656979 { return TOK_KW_YIELD; }
+                }
+                default: { }
+            }
+        }
+        case 6: {
+            switch c0 {
+                case 'd': {
+                    if a == 0x6574656C6564 { return TOK_KW_DELETE; }
+                }
+                case 'e': {
+                    if a == 0x74726F707865 { return TOK_KW_EXPORT; }
+                }
+                case 'g': {
+                    if a == 0x6C61626F6C67 { return TOK_KW_GLOBAL; }
+                }
+                case 'i': {
+                    if a == 0x74726F706D69 { return TOK_KW_IMPORT; }
+                }
+                case 'm': {
+                    if a == 0x656C75646F6D { return TOK_KW_MODULE; }
+                }
+                case 'p': {
+                    if a == 0x63696C627570 { return TOK_KW_PUBLIC; }
+                }
+                case 'r': {
+                    if a == 0x6E7275746572 { return TOK_KW_RETURN; }
+                }
+                case 's': {
+                    if a == 0x636974617473 { return TOK_KW_STATIC; }
+                    if a == 0x686374697773 { return TOK_KW_SWITCH; }
+                }
+                case 't': {
+                    if a == 0x666F65707974 { return TOK_KW_TYPEOF; }
+                }
+                case 'u': {
+                    if a == 0x657571696E75 { return TOK_KW_UNIQUE; }
+                }
+                default: { }
+            }
+        }
+        case 7: {
+            switch c0 {
+                case 'a': {
+                    if a == 0x73747265737361 { return TOK_KW_ASSERTS; }
+                }
+                case 'd': {
+                    if a == 0x6572616C636564 { return TOK_KW_DECLARE; }
+                    if a == 0x746C7561666564 { return TOK_KW_DEFAULT; }
+                }
+                case 'e': {
+                    if a == 0x73646E65747865 { return TOK_KW_EXTENDS; }
+                }
+                case 'f': {
+                    if a == 0x796C6C616E6966 { return TOK_KW_FINALLY; }
+                }
+                case 'p': {
+                    if a == 0x65746176697270 { return TOK_KW_PRIVATE; }
+                }
+                default: { }
+            }
+        }
+        case 8: {
+            switch c0 {
+                case 'a': {
+                    if a == 0x7463617274736261 { return TOK_KW_ABSTRACT; }
+                }
+                case 'c': {
+                    if a == 0x65756E69746E6F63 { return TOK_KW_CONTINUE; }
+                }
+                case 'd': {
+                    if a == 0x7265676775626564 { return TOK_KW_DEBUGGER; }
+                }
+                case 'f': {
+                    if a == 0x6E6F6974636E7566 { return TOK_KW_FUNCTION; }
+                }
+                case 'o': {
+                    if a == 0x656469727265766F { return TOK_KW_OVERRIDE; }
+                }
+                case 'r': {
+                    if a == 0x796C6E6F64616572 { return TOK_KW_READONLY; }
+                }
+                default: { }
+            }
+        }
+        case 9: {
+            switch c0 {
+                case 'i': {
+                    if a == 0x6361667265746E69 && *(d + 8) == 'e' { return TOK_KW_INTERFACE; }
+                }
+                case 'n': {
+                    if a == 0x63617073656D616E && *(d + 8) == 'e' { return TOK_KW_NAMESPACE; }
+                }
+                case 'p': {
+                    if a == 0x65746365746F7270 && *(d + 8) == 'd' { return TOK_KW_PROTECTED; }
+                }
+                case 's': {
+                    if a == 0x6569667369746173 && *(d + 8) == 's' { return TOK_KW_SATISFIES; }
+                }
+                default: { }
+            }
+        }
+        case 10: {
+            switch c0 {
+                case 'i': {
+                    if a == 0x6E656D656C706D69 && *(d + 8) == 't' && *(d + 9) == 's' { return TOK_KW_IMPLEMENTS; }
+                    if a == 0x65636E6174736E69 && *(d + 8) == 'o' && *(d + 9) == 'f' { return TOK_KW_INSTANCEOF; }
+                }
+                default: { }
+            }
+        }
+        default: { }
+    }
+    return 0;
+}
+
 private void scan_ident(Lexer* lx, Token* t) {
     i32 a = lx.pos;
     bool esc = false;
@@ -558,11 +820,7 @@ private void scan_ident(Lexer* lx, Token* t) {
     u8* d = lx.src.data;
     i32 n = lx.src.len;
     i32 pos = lx.pos;
-    while pos < n {
-        u8 c = *(d + pos);
-        if c >= 0x80 || !is_id_part(c) { break; }
-        pos++;
-    }
+    while pos < n && (g_lxc[*(d + pos)] & LXC_ID_PART) != 0 { pos++; }
     lx.pos = pos;
     while lx.pos < lx.src.len {
         u8 c = lx_cur(lx);
@@ -588,14 +846,9 @@ private void scan_ident(Lexer* lx, Token* t) {
     // a keyword spelled with an escape is an identifier, which the parser
     // refuses wherever the word could not have been one. Every keyword is
     // two to ten lowercase letters: a word shaped otherwise is not looked up.
-    i32* k = null;
-    if t.text.len >= 2 && t.text.len <= 10 {
-        u8 c0 = *(t.text.data);
-        u8 cl = *(t.text.data + t.text.len - 1);
-        if c0 >= 'a' && c0 <= 'z' && cl >= 'a' && cl <= 'z' { k = strmap_get<i32>(lx.keywords, t.text); }
-    }
-    if k != null && !esc {
-        t.kind = *k;
+    i32 k = keyword_kind(t.text);
+    if k != 0 && !esc {
+        t.kind = k;
     } else {
         t.kind = TOK_IDENT;
         t.escaped = esc;
@@ -1049,36 +1302,43 @@ private void scan_punct(Lexer* lx, Token* t) {
 
 // --- main entry points ----------------------------------------------
 
-Token lexer_next(Lexer* lx) {
+void lexer_next_into(Lexer* lx, Token* t) {
     bool nl = skip_trivia(lx);
-    Token t;
     t.newline_before = nl;
     t.escaped = false;
     t.start = lx.pos;
     if lx.pos >= lx.src.len {
         t.kind = TOK_EOF;
         t.end = lx.pos;
-        return t;
+        return;
     }
-    u8 c = lx_cur(lx);
+    u8 c = *(lx.src.data + lx.pos);
+    u8 f = g_lxc[c];
     i32 idlen;
-    if id_start_at(lx, lx.pos, &idlen) || (c == '\\' && lx_at(lx, lx.pos + 1) == 'u') {
-        scan_ident(lx, &t);
-    } else if is_digit(c) {
-        scan_number(lx, &t);
+    if (f & LXC_ID_START) != 0 || (c >= 0x80 && id_start_at(lx, lx.pos, &idlen))
+       || (c == '\\' && lx_at(lx, lx.pos + 1) == 'u') {
+        scan_ident(lx, t);
+    } else if (f & LXC_DIGIT) != 0 {
+        scan_number(lx, t);
     } else if c == '.' && is_digit(lx_at(lx, lx.pos + 1)) {
-        scan_number(lx, &t);
+        scan_number(lx, t);
     } else if c == '"' || c == '\'' {
-        scan_string(lx, &t);
+        scan_string(lx, t);
     } else if c == '`' {
         lx.pos++;
-        scan_template(lx, &t, false);
+        scan_template(lx, t, false);
     } else if c == '#' {
-        scan_private_name(lx, &t);
+        scan_private_name(lx, t);
     } else {
-        scan_punct(lx, &t);
+        scan_punct(lx, t);
     }
     t.end = lx.pos;
+    return;
+}
+
+Token lexer_next(Lexer* lx) {
+    noinit Token t;
+    lexer_next_into(lx, &t);
     return t;
 }
 
@@ -1162,95 +1422,12 @@ void lexer_seek(Lexer* lx, i32 pos) {
 
 // --- init / teardown ------------------------------------------------
 
-// Built once a thread: a lazily compiled function is a lexer of its own,
-// and a page has thousands of them.
-private threadlocal StrMap<i32> g_keywords;
-private threadlocal bool g_keywords_ready = false;
-
-private void kw(Lexer* lx, str name, i32 kind) {
-    strmap_set<i32>(&g_keywords, name, kind);
-}
-
-private void add_keywords(Lexer* lx) {
-    kw(lx, "abstract", TOK_KW_ABSTRACT);
-    kw(lx, "as", TOK_KW_AS);
-    kw(lx, "asserts", TOK_KW_ASSERTS);
-    kw(lx, "async", TOK_KW_ASYNC);
-    kw(lx, "await", TOK_KW_AWAIT);
-    kw(lx, "break", TOK_KW_BREAK);
-    kw(lx, "case", TOK_KW_CASE);
-    kw(lx, "catch", TOK_KW_CATCH);
-    kw(lx, "class", TOK_KW_CLASS);
-    kw(lx, "const", TOK_KW_CONST);
-    kw(lx, "continue", TOK_KW_CONTINUE);
-    kw(lx, "debugger", TOK_KW_DEBUGGER);
-    kw(lx, "declare", TOK_KW_DECLARE);
-    kw(lx, "default", TOK_KW_DEFAULT);
-    kw(lx, "delete", TOK_KW_DELETE);
-    kw(lx, "do", TOK_KW_DO);
-    kw(lx, "else", TOK_KW_ELSE);
-    kw(lx, "enum", TOK_KW_ENUM);
-    kw(lx, "export", TOK_KW_EXPORT);
-    kw(lx, "extends", TOK_KW_EXTENDS);
-    kw(lx, "false", TOK_KW_FALSE);
-    kw(lx, "finally", TOK_KW_FINALLY);
-    kw(lx, "for", TOK_KW_FOR);
-    kw(lx, "from", TOK_KW_FROM);
-    kw(lx, "function", TOK_KW_FUNCTION);
-    kw(lx, "get", TOK_KW_GET);
-    kw(lx, "global", TOK_KW_GLOBAL);
-    kw(lx, "if", TOK_KW_IF);
-    kw(lx, "implements", TOK_KW_IMPLEMENTS);
-    kw(lx, "import", TOK_KW_IMPORT);
-    kw(lx, "in", TOK_KW_IN);
-    kw(lx, "infer", TOK_KW_INFER);
-    kw(lx, "instanceof", TOK_KW_INSTANCEOF);
-    kw(lx, "interface", TOK_KW_INTERFACE);
-    kw(lx, "is", TOK_KW_IS);
-    kw(lx, "keyof", TOK_KW_KEYOF);
-    kw(lx, "let", TOK_KW_LET);
-    kw(lx, "module", TOK_KW_MODULE);
-    kw(lx, "namespace", TOK_KW_NAMESPACE);
-    kw(lx, "new", TOK_KW_NEW);
-    kw(lx, "null", TOK_KW_NULL);
-    kw(lx, "of", TOK_KW_OF);
-    kw(lx, "out", TOK_KW_OUT);
-    kw(lx, "override", TOK_KW_OVERRIDE);
-    kw(lx, "private", TOK_KW_PRIVATE);
-    kw(lx, "protected", TOK_KW_PROTECTED);
-    kw(lx, "public", TOK_KW_PUBLIC);
-    kw(lx, "readonly", TOK_KW_READONLY);
-    kw(lx, "return", TOK_KW_RETURN);
-    kw(lx, "satisfies", TOK_KW_SATISFIES);
-    kw(lx, "set", TOK_KW_SET);
-    kw(lx, "static", TOK_KW_STATIC);
-    kw(lx, "super", TOK_KW_SUPER);
-    kw(lx, "switch", TOK_KW_SWITCH);
-    kw(lx, "this", TOK_KW_THIS);
-    kw(lx, "throw", TOK_KW_THROW);
-    kw(lx, "true", TOK_KW_TRUE);
-    kw(lx, "try", TOK_KW_TRY);
-    kw(lx, "type", TOK_KW_TYPE);
-    kw(lx, "typeof", TOK_KW_TYPEOF);
-    kw(lx, "unique", TOK_KW_UNIQUE);
-    kw(lx, "var", TOK_KW_VAR);
-    kw(lx, "void", TOK_KW_VOID);
-    kw(lx, "while", TOK_KW_WHILE);
-    kw(lx, "with", TOK_KW_WITH);
-    kw(lx, "yield", TOK_KW_YIELD);
-}
-
 void lexer_init(Lexer* lx, str src, DiagList* diags) {
     lx.src = src;
     lx.pos = 0;
     lx.diags = diags;
     vec_init<str>(&lx.owned, 8);
-    if !g_keywords_ready {
-        strmap_init<i32>(&g_keywords);
-        add_keywords(lx);
-        g_keywords_ready = true;
-    }
-    lx.keywords = &g_keywords;
+    if !g_lxc_ready { lxc_init(); }
     if src.len >= 3 && *(src.data) == 0xEF && *(src.data + 1) == 0xBB && *(src.data + 2) == 0xBF {
         lx.pos = 3;
     }

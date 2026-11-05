@@ -644,7 +644,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &mod.arena, &ld.diags);
-    lower_program(&lw, prog);
+    if p.ts_seen { lower_program(&lw, prog); }
     if ld.diags.n_errors > 0 {
         // report against this module's own source, while it is in scope
         diags_print_from(&ld.diags, mod.path, src, ld.printed);
@@ -1641,7 +1641,7 @@ private Value run_js_builtin(VM* vm, str name, str src) {
     Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
-    lower_program(&lw, prog);
+    if p.ts_seen { lower_program(&lw, prog); }
     if d.n_errors == 0 {
         i32 cm = gc_root_mark(&vm.heap);
         Compiler co;
@@ -1879,7 +1879,7 @@ Value module_require(VM* vm, str importer_path, str spec) {
     Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
-    lower_program(&lw, prog);
+    if p.ts_seen { lower_program(&lw, prog); }
 
     if d.n_errors == 0 {
         i32 cm = gc_root_mark(&vm.heap);

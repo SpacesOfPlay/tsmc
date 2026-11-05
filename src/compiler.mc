@@ -3784,7 +3784,7 @@ private FnTemplate* compile_skipped(Compiler* co, Node* f, bool self_name) {
     Node* nf = parse_function_skipping(&p, false, true);
     Lower lw;
     lower_init(&lw, co.arena, co.diags);
-    if nf != null { lower_function(&lw, &nf); }
+    if nf != null && p.ts_seen { lower_function(&lw, &nf); }
     FnTemplate* t = null;
     if nf == null || nf.kind != N_FUNCTION || co.diags.n_errors > 0 {
         cerror(co, f, "a function could not be compiled");

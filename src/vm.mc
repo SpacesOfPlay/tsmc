@@ -8841,7 +8841,7 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
     bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
     Lower lw;
     lower_init(&lw, &arena, &d);
-    if ok { lower_function(&lw, &f); ok = d.n_errors == 0; }
+    if ok && p.ts_seen { lower_function(&lw, &f); ok = d.n_errors == 0; }
     if ok {
         i32 rmark = gc_root_mark(&vm.heap);
         Compiler co;
@@ -8880,7 +8880,7 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
     Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
-    lower_program(&lw, prog);
+    if p.ts_seen { lower_program(&lw, prog); }
 
     i32 status = 2;
     if d.n_errors == 0 {
