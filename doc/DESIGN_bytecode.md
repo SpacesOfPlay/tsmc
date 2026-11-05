@@ -89,6 +89,32 @@ own `this`; non-arrow functions materialize a `this` binding only
 when some inner arrow mentions it, and arrows resolve it like any
 captured variable.
 
+## Fused instructions
+
+The emitter folds the pairs the bytecode profile of a real page shows
+most, so that a dispatch and the stack traffic between them go. The
+fold happens as the second instruction is about to be written: when
+the one before it is whole, nothing jumps to the boundary between them
+(`max_target` says what has been patched so far) and its opcode is the
+expected one, the first is rewritten in place and the second never
+written (`ch_op`, `ch_op_u16` in bytecode.mc; `emit_jumpf`,
+`emit_jumpt`, `emit_getprop`, `emit_getindex` in compiler.mc). The
+pairs: a store and the pop after it (`PUTLOCAL`, `SETPROP_POP`,
+`SETUPVAL_POP`, `SETCELL_POP`); a load and the `undefined` a plain call
+pushes as `this` (`GETLOCAL_UNDEF`, `GETUPVAL_UNDEF`,
+`GETUPVALV_UNDEF`); a function's `undefined; return` (`RETURN_UNDEF`);
+a comparison against `null` or `undefined` (`SEQ_NULL`, `SNEQ_NULL`,
+`SEQ_UNDEF`, `SNEQ_UNDEF`, `EQ_NULLISH`, `NEQ_NULLISH`; the compiler
+puts the literal second when the source has it first, `null === x`, and
+`void 0` is `UNDEF` alone); a local and a constant or two locals loaded
+together (`GETLOCAL_CONST`, `GETLOCAL2`, which `GETPROP_L`,
+`GETINDEX_LL` and `LT_JF_LL` then fold further); a comparison and the
+jump on it (`SEQ_JF`, `SNEQ_JF`, `SEQ_JT`, `SNEQ_JT`, `SEQ_NULL_JF`,
+`SNEQ_NULL_JF`, and with the loads `SEQ_LC_JF` and `SEQ_LC_JT`, a
+switch's case). On bsky.app's load the ops fell 17% for about 3% of
+the running time: the dispatch is a small part of an op's cost, the
+work in it the rest.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

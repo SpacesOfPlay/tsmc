@@ -4776,6 +4776,48 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
                 pc += 2;
             }
+            case OP_GETLOCAL_UNDEF: {
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                vpush(vm, value_undefined());
+                pc += 2;
+            }
+            case OP_GETLOCAL_CONST: {
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                vpush(vm, *(t.consts + rd_u16p(pc + 2)));
+                pc += 4;
+            }
+            case OP_GETLOCAL2: {
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc + 2)));
+                pc += 4;
+            }
+            case OP_SEQ_NULL: { *(vm.stack + vm.sp - 1) = value_bool(value_is_null(vpeek(vm, 0))); }
+            case OP_SNEQ_NULL: { *(vm.stack + vm.sp - 1) = value_bool(!value_is_null(vpeek(vm, 0))); }
+            case OP_SEQ_UNDEF: { *(vm.stack + vm.sp - 1) = value_bool(value_is_undefined(vpeek(vm, 0))); }
+            case OP_SNEQ_UNDEF: { *(vm.stack + vm.sp - 1) = value_bool(!value_is_undefined(vpeek(vm, 0))); }
+            case OP_EQ_NULLISH: { *(vm.stack + vm.sp - 1) = value_bool(is_nullish(vpeek(vm, 0))); }
+            case OP_NEQ_NULLISH: { *(vm.stack + vm.sp - 1) = value_bool(!is_nullish(vpeek(vm, 0))); }
+            case OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF: {
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                vm.sp--;
+                bool isnull = value_is_null(*(vm.stack + vm.sp));
+                if (op == OP_SEQ_NULL_JF) != isnull { pc = code + target; }
+            }
+            case OP_SEQ_JT, OP_SNEQ_JT: {
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                bool eq = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                vm.sp -= 2;
+                if (op == OP_SEQ_JT) == eq { pc = code + target; }
+            }
+            case OP_SEQ_LC_JF, OP_SEQ_LC_JT: {
+                Value a = *(vm.stack + fr.base + rd_u16p(pc));
+                Value b = *(t.consts + rd_u16p(pc + 2));
+                i32 target = rd_targetp(pc + 4);
+                pc += 8;
+                if (op == OP_SEQ_LC_JT) == js_strict_eq(a, b) { pc = code + target; }
+            }
             case OP_INCLOCAL: {
                 pc += 2;
                 op_step_local(vm, fr.base + rd_u16p(pc - 2), 1);
@@ -4842,6 +4884,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
             }
+            case OP_SETCELL_POP: {
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
+                vm.sp--;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(vm.stack + vm.sp)); }
+                b.v = *(vm.stack + vm.sp);
+            }
             case OP_GETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
@@ -4870,6 +4919,29 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 pc += 2;
                 if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
+            }
+            case OP_SETUPVAL_POP: {
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                vm.sp--;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(vm.stack + vm.sp)); }
+                b.v = *(vm.stack + vm.sp);
+            }
+            case OP_GETUPVAL_UNDEF: {
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                vpush(vm, b.v);
+                vpush(vm, value_undefined());
+            }
+            case OP_GETUPVALV_UNDEF: {
+                Value uv = *(fr.fun.upvals + rd_u16p(pc));
+                pc += 2;
+                if value_is_hole(uv) {
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
+                } else {
+                    vpush(vm, uv);
+                    vpush(vm, value_undefined());
+                }
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
                 pc += 2;
@@ -5475,6 +5547,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
+            case OP_RETURN_UNDEF: {
+                vpush(vm, value_undefined());
+                fallthrough;
+            }
             case OP_RETURN: {
                 Value res = vpop(vm);
                 // A derived constructor that never called super() has no
@@ -5583,6 +5659,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
                     vm.sp -= 2;
                     vpush(vm, v);
+                }
+            }
+            case OP_SETPROP_POP: {
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                if set_prop_atom(vm, vpeek(vm, 1), a, vpeek(vm, 0), t.sloppy ? SET_SLOPPY : SET_STRICT) {
+                    vm.sp -= 2;
                 }
             }
             case OP_DEFPROP_FIXED: {

@@ -1543,9 +1543,33 @@ private i32 emit_jumpf(Chunk* ch) {
         if was == OP_GE { fused = OP_GE_JF; }
         if was == OP_SEQ { fused = OP_SEQ_JF; }
         if was == OP_SNEQ { fused = OP_SNEQ_JF; }
-        // a loop's test of two locals, `i < n`: the loads fold in as well
+        if was == OP_SEQ_NULL { fused = OP_SEQ_NULL_JF; }
+        if was == OP_SNEQ_NULL { fused = OP_SNEQ_NULL_JF; }
         i32 p1 = ch.prev_op;
         i32 p2 = ch.prev2_op;
+        // a local against a constant, `x === "y"`: the loads fold in
+        if was == OP_SEQ && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL_CONST {
+            vec_set(&ch.code, p1, cast(u8, OP_SEQ_LC_JF));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = p2;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
+        // a loop's test of two locals, `i < n`: the loads fold in as well,
+        // whether they were loaded as two or as one
+        if was == OP_LT && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL2 {
+            vec_set(&ch.code, p1, cast(u8, OP_LT_JF_LL));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = p2;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
         if was == OP_LT && p2 >= 0 && p1 == at - 3 && p2 == at - 6 && ch.max_target <= p2
            && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, p2)) == OP_GETLOCAL {
             u8 lo = vec_get(&ch.code, p1 + 1);
@@ -1567,6 +1591,32 @@ private i32 emit_jumpf(Chunk* ch) {
         }
     }
     return ch_jump(ch, OP_JUMPF);
+}
+
+// The jump when true, the same way: a strict comparison just compiled
+// becomes the one instruction that compares and jumps, a local against a
+// constant with its loads (a switch's case).
+private i32 emit_jumpt(Chunk* ch) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len {
+        i32 was = cast(i32, vec_get(&ch.code, at));
+        i32 p1 = ch.prev_op;
+        if was == OP_SEQ && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL_CONST {
+            vec_set(&ch.code, p1, cast(u8, OP_SEQ_LC_JT));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = ch.prev2_op;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
+        if was == OP_SEQ || was == OP_SNEQ {
+            ch.code.len = at;
+            return ch_jump(ch, was == OP_SEQ ? OP_SEQ_JT : OP_SNEQ_JT);
+        }
+    }
+    return ch_jump(ch, OP_JUMPT);
 }
 
 // --- with scopes ---------------------------------------------------------------
@@ -1912,6 +1962,22 @@ private void emit_getprop(Chunk* ch, i32 kc) {
         ch_u16(ch, kc);
         return;
     }
+    // two locals loaded as one: the first stays a load, the second's read
+    // becomes the property read
+    if at >= 0 && at == ch.code.len - 5 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL2 {
+        u8 lo = vec_get(&ch.code, at + 3);
+        u8 hi = vec_get(&ch.code, at + 4);
+        vec_set(&ch.code, at, cast(u8, OP_GETLOCAL));
+        ch.code.len = at + 3;
+        ch.prev_op = at;
+        ch.last_op = at + 3;
+        vec_push(&ch.code, cast(u8, OP_GETPROP_L));
+        vec_push(&ch.code, lo);
+        vec_push(&ch.code, hi);
+        ch_u16(ch, kc);
+        return;
+    }
     if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len
        && cast(i32, vec_get(&ch.code, at)) == OP_THIS {
         vec_set(&ch.code, at, cast(u8, OP_GETPROP_THIS));
@@ -1924,6 +1990,12 @@ private void emit_getprop(Chunk* ch, i32 kc) {
 private void emit_getindex(Chunk* ch) {
     i32 at = ch.last_op;
     i32 before = ch.prev_op;
+    // two locals loaded as one, the same operands in the same places
+    if at >= 0 && at == ch.code.len - 5 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL2 {
+        vec_set(&ch.code, at, cast(u8, OP_GETINDEX_LL));
+        return;
+    }
     if at >= 0 && before >= 0 && at == ch.code.len - 3 && before == at - 3 && ch.max_target <= before
        && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, before)) == OP_GETLOCAL {
         vec_set(&ch.code, before, cast(u8, OP_GETINDEX_LL));
@@ -2349,6 +2421,11 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
 }
 
 // --- expressions ------------------------------------------------------------------
+
+// A literal whose evaluation nothing can observe.
+private bool is_pure_literal(Node* n) {
+    return n != null && (n.kind == N_NUMBER || n.kind == N_STRING || n.kind == N_NULL || n.kind == N_BOOL);
+}
 
 private i32 bin_op_code(i32 tok) {
     if tok == TOK_PLUS { return OP_ADD; }
@@ -3146,12 +3223,22 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_HASPRIVATE, private_key_const(co, n.a, n.a.name));
             return;
         }
-        compile_expr(co, n.a);
-        compile_expr(co, n.b);
         i32 op = bin_op_code(n.op);
         if op < 0 {
             cerror(co, n, "unsupported binary operator");
             return;
+        }
+        // `null === x`, as a minifier writes it: the literal after the
+        // operand, where the emitter folds it into the compare (a literal
+        // evaluates to itself, in either order)
+        bool swap = (op == OP_SEQ || op == OP_SNEQ || op == OP_EQ || op == OP_NEQ)
+            && (n.a.kind == N_NULL || (n.a.kind == N_UNARY && n.a.op == TOK_KW_VOID && is_pure_literal(n.a.a)));
+        if swap {
+            compile_expr(co, n.b);
+            compile_expr(co, n.a);
+        } else {
+            compile_expr(co, n.a);
+            compile_expr(co, n.b);
         }
         ch_op(ch, op);
         return;
@@ -3222,8 +3309,11 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         if n.op == TOK_KW_VOID {
-            compile_expr(co, n.a);
-            ch_op(ch, OP_POP);
+            // `void 0` is undefined itself; an operand with an effect runs first
+            if !is_pure_literal(n.a) {
+                compile_expr(co, n.a);
+                ch_op(ch, OP_POP);
+            }
             ch_op(ch, OP_UNDEF);
             return;
         }
@@ -5539,7 +5629,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETLOCAL, tmp);
             compile_expr(co, c.a);
             ch_op(ch, OP_SEQ);
-            vec_push(&case_jumps, ch_jump(ch, OP_JUMPT));
+            vec_push(&case_jumps, emit_jumpt(ch));
         }
         i32 jdefault = ch_jump(ch, OP_JUMP);
         vec_push(&fs.loops, lc);

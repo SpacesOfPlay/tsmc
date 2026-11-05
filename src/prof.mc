@@ -229,17 +229,39 @@ str op_name(i32 op) {
         case 145: { return "ITER_CHECK"; }
         case 146: { return "FREEZE"; }
         case 147: { return "REGEX"; }
-        case 148: { return "PUTLOCAL"; }
-        case 149: { return "GETPROP_L"; }
-        case 150: { return "GETINDEX_LL"; }
-        case 151: { return "LT_JF_LL"; }
-        case 152: { return "GETPROP_THIS"; }
-        case 153: { return "SEQ_JF"; }
-        case 154: { return "SNEQ_JF"; }
-        case 155: { return "GETUPVALV"; }
-        case 156: { return "GET_ITER_S"; }
-        case 157: { return "ITER_NEXT_S"; }
-        case 158: { return "PROTOGET"; }
+        case 148: { return "DEFGLOBAL"; }
+        case 149: { return "PUTLOCAL"; }
+        case 150: { return "GETPROP_L"; }
+        case 151: { return "GETINDEX_LL"; }
+        case 152: { return "LT_JF_LL"; }
+        case 153: { return "GETPROP_THIS"; }
+        case 154: { return "SEQ_JF"; }
+        case 155: { return "SNEQ_JF"; }
+        case 156: { return "GETUPVALV"; }
+        case 157: { return "GET_ITER_S"; }
+        case 158: { return "ITER_NEXT_S"; }
+        case 159: { return "PROTOGET"; }
+        case 160: { return "SETPROP_POP"; }
+        case 161: { return "SETUPVAL_POP"; }
+        case 162: { return "SETCELL_POP"; }
+        case 163: { return "GETLOCAL_UNDEF"; }
+        case 164: { return "GETUPVAL_UNDEF"; }
+        case 165: { return "GETUPVALV_UNDEF"; }
+        case 166: { return "RETURN_UNDEF"; }
+        case 167: { return "SEQ_NULL"; }
+        case 168: { return "SNEQ_NULL"; }
+        case 169: { return "SEQ_UNDEF"; }
+        case 170: { return "SNEQ_UNDEF"; }
+        case 171: { return "EQ_NULLISH"; }
+        case 172: { return "NEQ_NULLISH"; }
+        case 173: { return "GETLOCAL_CONST"; }
+        case 174: { return "GETLOCAL2"; }
+        case 175: { return "SEQ_JT"; }
+        case 176: { return "SNEQ_JT"; }
+        case 177: { return "SEQ_LC_JF"; }
+        case 178: { return "SEQ_LC_JT"; }
+        case 179: { return "SEQ_NULL_JF"; }
+        case 180: { return "SNEQ_NULL_JF"; }
     }
     return "?";
 }

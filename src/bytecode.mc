@@ -182,7 +182,26 @@ enum Op {
     OP_GETUPVALV,    // u16 upvalue index: the value itself, captured as such; a hole refused
     OP_GET_ITER_S,   // u16 done slot; [v] -> [iterator]: a plain array stays itself, the slot its index
     OP_ITER_NEXT_S,  // u16 done slot; [iter] -> [value, done], the slot kept
-    OP_PROTOGET      // u16 const idx (name): `{}.name`, Object.prototype's without the object
+    OP_PROTOGET,     // u16 const idx (name): `{}.name`, Object.prototype's without the object
+    // Pairs the emitter folds as it goes (ch_op, ch_op_u16; the compiler's
+    // emit_jumpf and emit_jumpt), chosen from the bytecode profile of
+    // bsky.app's load: a dispatch each and the stack traffic between.
+    OP_SETPROP_POP,  // u16 const idx: SETPROP then POP
+    OP_SETUPVAL_POP, // u16 upvalue index: SETUPVAL then POP
+    OP_SETCELL_POP,  // u16 slot: SETCELL then POP
+    OP_GETLOCAL_UNDEF,  // u16 slot: GETLOCAL then UNDEF (a call's callee and this)
+    OP_GETUPVAL_UNDEF,  // u16 upvalue index: GETUPVAL then UNDEF
+    OP_GETUPVALV_UNDEF, // u16 upvalue index: GETUPVALV then UNDEF
+    OP_RETURN_UNDEF, // UNDEF then RETURN
+    OP_SEQ_NULL, OP_SNEQ_NULL,   // [v] -> [v === null], [v !== null]
+    OP_SEQ_UNDEF, OP_SNEQ_UNDEF, // [v] -> [v === undefined], [v !== undefined]
+    OP_EQ_NULLISH, OP_NEQ_NULLISH, // [v] -> [v == null], [v != null]
+    OP_GETLOCAL_CONST, // u16 slot, u16 const idx: GETLOCAL then CONST
+    OP_GETLOCAL2,    // u16 slot, u16 slot: two GETLOCALs
+    OP_SEQ_JT, OP_SNEQ_JT,       // i32 target: SEQ then JUMPT, SNEQ then JUMPT
+    OP_SEQ_LC_JF,    // u16 slot, u16 const idx, i32 target: GETLOCAL, CONST, SEQ, jump when false
+    OP_SEQ_LC_JT,    // u16 slot, u16 const idx, i32 target: the same, jump when true (a switch's case)
+    OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF // i32 target: SEQ_NULL then JUMPF, SNEQ_NULL then JUMPF
 }
 
 struct TmplUpval {
@@ -372,7 +391,35 @@ void ch_record_pos(Chunk* ch, i32 line, i32 col) {
     vec_push(&ch.pos, e);
 }
 
+// The instruction before the one about to be written, when it is whole,
+// nothing jumps to the boundary and its opcode is `want`, rewritten in
+// place as `fused`, which stands for both: true when it was.
+private bool ch_fuse_last(Chunk* ch, i32 want, i32 len, i32 fused) {
+    i32 at = ch.last_op;
+    if at < 0 || at != ch.code.len - len || ch.max_target >= ch.code.len { return false; }
+    if cast(i32, vec_get(&ch.code, at)) != want { return false; }
+    vec_set(&ch.code, at, cast(u8, fused));
+    return true;
+}
+
 void ch_op(Chunk* ch, i32 op) {
+    // a pair the profile shows often becomes one instruction: the first
+    // rewritten in place, the second never written
+    if op == OP_POP {
+        if ch_fuse_last(ch, OP_SETLOCAL, 3, OP_PUTLOCAL) || ch_fuse_last(ch, OP_SETPROP, 3, OP_SETPROP_POP)
+           || ch_fuse_last(ch, OP_SETUPVAL, 3, OP_SETUPVAL_POP) || ch_fuse_last(ch, OP_SETCELL, 3, OP_SETCELL_POP) { return; }
+    } else if op == OP_UNDEF {
+        if ch_fuse_last(ch, OP_GETLOCAL, 3, OP_GETLOCAL_UNDEF) || ch_fuse_last(ch, OP_GETUPVAL, 3, OP_GETUPVAL_UNDEF)
+           || ch_fuse_last(ch, OP_GETUPVALV, 3, OP_GETUPVALV_UNDEF) { return; }
+    } else if op == OP_RETURN {
+        if ch_fuse_last(ch, OP_UNDEF, 1, OP_RETURN_UNDEF) { return; }
+    } else if op == OP_SEQ || op == OP_SNEQ {
+        if ch_fuse_last(ch, OP_NULL, 1, op == OP_SEQ ? OP_SEQ_NULL : OP_SNEQ_NULL)
+           || ch_fuse_last(ch, OP_UNDEF, 1, op == OP_SEQ ? OP_SEQ_UNDEF : OP_SNEQ_UNDEF) { return; }
+    } else if op == OP_EQ || op == OP_NEQ {
+        if ch_fuse_last(ch, OP_NULL, 1, op == OP_EQ ? OP_EQ_NULLISH : OP_NEQ_NULLISH)
+           || ch_fuse_last(ch, OP_UNDEF, 1, op == OP_EQ ? OP_EQ_NULLISH : OP_NEQ_NULLISH) { return; }
+    }
     ch.prev2_op = ch.prev_op;
     ch.prev_op = ch.last_op;
     ch.last_op = ch.code.len;
@@ -385,6 +432,11 @@ void ch_u16(Chunk* ch, i32 v) {
 }
 
 void ch_op_u16(Chunk* ch, i32 op, i32 v) {
+    // a local and a constant, or two locals, loaded as one instruction
+    if (op == OP_CONST || op == OP_GETLOCAL) && ch_fuse_last(ch, OP_GETLOCAL, 3, op == OP_CONST ? OP_GETLOCAL_CONST : OP_GETLOCAL2) {
+        ch_u16(ch, v);
+        return;
+    }
     ch_op(ch, op);
     ch_u16(ch, v);
 }

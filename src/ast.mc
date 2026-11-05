@@ -57,7 +57,7 @@ enum NodeKind {
     N_NUMBER,         // num
     N_STRING,         // name: value
     N_BIGINT,         // name: raw text
-    N_REGEX,          // name: pattern, aux: flags
+    N_REGEX,          // name: pattern, a: the flags as a string node
     N_BOOL,           // name: true/false
     N_NULL,
     N_THIS,
