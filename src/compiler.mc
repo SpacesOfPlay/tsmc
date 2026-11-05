@@ -495,6 +495,12 @@ private void binds_cut(FScope* fs, i32 to) {
     fs.binds.len = to;
 }
 
+// Two names the same: the length and the first byte decide most pairs in
+// a minified bundle, whose names are a letter or two, before the compare.
+private bool name_eq(str a, str b) {
+    return a.len == b.len && *(a.data) == *(b.data) && (a.len == 1 || str_equal(a, b));
+}
+
 // A declaration of this scope by name, global ones included: what the
 // statement that declares it initializes.
 private i32 find_decl(FScope* fs, str name) {
@@ -514,7 +520,7 @@ private i32 resolve_upval(FScope* fs, str name) {
     // a lazy function's scope has its upvalues from the start and no parent
     for i32 i = 0; i < fs.ups.len; i++ {
         CUp u = vec_get(&fs.ups, i);
-        if str_equal(u.name, name) { return i; }
+        if name_eq(u.name, name) { return i; }
     }
     if fs.parent == null { return -1; }
     i32 li = find_local(fs.parent, name);
@@ -842,7 +848,7 @@ private void free_scan_free(FreeScan* s) {
 private bool free_scan_bound(FreeScan* s, str name) {
     if !s.counted {
         for i32 i = s.bound.len - 1; i >= 0; i-- {
-            if str_equal(vec_get(&s.bound, i), name) { return true; }
+            if name_eq(vec_get(&s.bound, i), name) { return true; }
         }
         return false;
     }
@@ -915,17 +921,9 @@ private void free_scan_bind_pattern(FreeScan* s, Node* pat) {
 
 // the var-declared names of n, outside the functions and classes in it
 private void free_scan_bind_vars(FreeScan* s, Node* n) {
-    if n == null { return; }
-    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
-    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
-        for i32 i = 0; i < n.kids.len; i++ { free_scan_bind_pattern(s, (*(n.kids.items + i)).a); }
-        return;
-    }
-    free_scan_bind_vars(s, n.a);
-    free_scan_bind_vars(s, n.b);
-    free_scan_bind_vars(s, n.c);
-    free_scan_bind_vars(s, n.d);
-    for i32 i = 0; i < n.kids.len; i++ { free_scan_bind_vars(s, *(n.kids.items + i)); }
+    i32 nv;
+    Node** vs = var_decls(s.co, n, &nv);
+    for i32 i = 0; i < nv; i++ { free_scan_bind_pattern(s, (*(vs + i)).a); }
 }
 
 // The lexical declarations at the top of a statement list: let, const, a
@@ -1398,27 +1396,70 @@ private void hoist_declare_var(Compiler* co, Node* id) {
 // The var-declared names of a statement list, used to reject a lexical name
 // that collides with a `var` in the same scope. `var` hoists out of nested
 // blocks but not out of functions, so the walk mirrors hoist_vars.
-private void collect_var_names(Node* n, Vec<str>* out) {
+// The var declarators under n, outside the functions and classes in it,
+// in source order. Kept on the node once found: hoisting, a block's
+// lexical checks, a lazy template's own names and the free-name scan each
+// ask, and a block inside a block asks for part of what the outer walk
+// passed, which it kept on the way.
+private Node* g_no_vars_slot;
+
+private void collect_var_decls(Compiler* co, Node* n, Vec<NodePtr>* out) {
     if n == null { return; }
-    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
-    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
-        for i32 i = 0; i < n.kids.len; i++ {
-            collect_pattern_names((*(n.kids.items + i)).a, out);
-        }
+    if n.vars != null {
+        for i32 i = 0; i < n.n_vars; i++ { vec_push(out, *(n.vars + i)); }
         return;
     }
-    collect_var_names(n.a, out);
-    collect_var_names(n.b, out);
-    collect_var_names(n.c, out);
-    collect_var_names(n.d, out);
-    for i32 i = 0; i < n.kids.len; i++ {
-        collect_var_names(*(n.kids.items + i), out);
+    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
+    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
+        for i32 i = 0; i < n.kids.len; i++ { vec_push(out, *(n.kids.items + i)); }
+        return;
     }
+    if n.kind == N_BLOCK {
+        i32 nv;
+        Node** vs = var_decls(co, n, &nv);
+        for i32 i = 0; i < nv; i++ { vec_push(out, *(vs + i)); }
+        return;
+    }
+    collect_var_decls(co, n.a, out);
+    collect_var_decls(co, n.b, out);
+    collect_var_decls(co, n.c, out);
+    collect_var_decls(co, n.d, out);
+    for i32 i = 0; i < n.kids.len; i++ { collect_var_decls(co, *(n.kids.items + i), out); }
+}
+
+private Node** var_decls(Compiler* co, Node* n, i32* count) {
+    if n == null { *count = 0; return null; }
+    if n.vars == null {
+        Vec<NodePtr> v;
+        vec_lazy<NodePtr>(&v);
+        if n.kind == N_BLOCK {
+            for i32 i = 0; i < n.kids.len; i++ { collect_var_decls(co, *(n.kids.items + i), &v); }
+        } else {
+            collect_var_decls(co, n, &v);
+        }
+        if v.len == 0 {
+            n.vars = cast(Node**, &g_no_vars_slot);
+        } else {
+            n.vars = cast(Node**, bump_alloc(co.arena, v.len * 8));
+            memcpy(cast(u8*, n.vars), cast(u8*, v.data), cast(i64, v.len) * 8);
+        }
+        n.n_vars = v.len;
+        vec_free(&v);
+    }
+    *count = n.n_vars;
+    return n.vars;
+}
+
+// the names those declarators bind
+private void collect_var_names(Compiler* co, Node* n, Vec<str>* out) {
+    i32 nv;
+    Node** vs = var_decls(co, n, &nv);
+    for i32 i = 0; i < nv; i++ { collect_pattern_names((*(vs + i)).a, out); }
 }
 
 private bool names_has(Vec<str>* names, str name) {
     for i32 i = 0; i < names.len; i++ {
-        if str_equal(vec_get(names, i), name) { return true; }
+        if name_eq(vec_get(names, i), name) { return true; }
     }
     return false;
 }
@@ -1436,24 +1477,14 @@ private void check_lexical_vs_var(Compiler* co, Node* pat, Vec<str>* vnames) {
 }
 
 private void hoist_vars(Compiler* co, Node* n) {
-    if n == null { return; }
-    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
-    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
-        for i32 i = 0; i < n.kids.len; i++ {
-            Node* d = *(n.kids.items + i);
-            co.decl_kind = 2;
-            co.decl_end = d.span.end;
-            declare_pattern(co, d.a, 3);
-            co.decl_kind = 0;
-        }
-        return;
-    }
-    hoist_vars(co, n.a);
-    hoist_vars(co, n.b);
-    hoist_vars(co, n.c);
-    hoist_vars(co, n.d);
-    for i32 i = 0; i < n.kids.len; i++ {
-        hoist_vars(co, *(n.kids.items + i));
+    i32 nv;
+    Node** vs = var_decls(co, n, &nv);
+    for i32 i = 0; i < nv; i++ {
+        Node* d = *(vs + i);
+        co.decl_kind = 2;
+        co.decl_end = d.span.end;
+        declare_pattern(co, d.a, 3);
+        co.decl_kind = 0;
     }
 }
 
@@ -3718,7 +3749,7 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             collect_pattern_names((*(f.kids.items + i)).a, &co.outer_names);
         }
         co.outer_is_body = true;
-        compile_block_stmts_ex(co, &f.a.kids, fields, n_fields);
+        compile_block_stmts_ex(co, f.a, fields, n_fields);
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_RETURN);
     } else if f.a != null {
@@ -3957,7 +3988,7 @@ private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
     // parameters can see past them to the names outside
     bool simple = true;
     for i32 i = 0; i < f.kids.len; i++ { Node* prm = *(f.kids.items + i); if prm.b != null || prm.a == null || prm.a.kind != N_IDENT { simple = false; } }
-    if simple && f.a.kind == N_BLOCK { for i32 i = 0; i < f.a.kids.len; i++ { collect_var_names(*(f.a.kids.items + i), &own); } }
+    if simple && f.a.kind == N_BLOCK { collect_var_names(co, f.a, &own); }
     StrMap<i32> mine;
     strmap_init<i32>(&mine);
     for i32 i = 0; i < own.len; i++ { strmap_set<i32>(&mine, vec_get(&own, i), 1); }
@@ -4741,7 +4772,8 @@ private void hoist_function_decls(Compiler* co, NodeList* list, Vec<str>* vnames
 
 // Block statement list with optional class-field injection after a
 // leading super() call (constructors only).
-private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields, i32 n_fields) {
+private void compile_block_stmts_ex(Compiler* co, Node* blk, Node** fields, i32 n_fields) {
+    NodeList* list = &blk.kids;
     FScope* fs = co.cur;
     fs.depth++;
     i32 saved_binds = fs.binds.len;
@@ -4763,11 +4795,7 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
         Node* s = *(list.items + i);
         if (s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0) || (s.kind == N_CLASS && s.name.len > 0) || function_decl_of(s) != null { lexical_here = true; }
     }
-    if lexical_here {
-        for i32 i = 0; i < list.len; i++ {
-            collect_var_names(*(list.items + i), &vnames);
-        }
-    }
+    if lexical_here { collect_var_names(co, blk, &vnames); }
     hoist_lexical_decls(co, list, &vnames);
     Vec<NodePtr> seen;
     vec_lazy<NodePtr>(&seen);
@@ -4817,8 +4845,8 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     fs.depth--;
 }
 
-private void compile_block_stmts(Compiler* co, NodeList* list) {
-    compile_block_stmts_ex(co, list, null, 0);
+private void compile_block_stmts(Compiler* co, Node* blk) {
+    compile_block_stmts_ex(co, blk, null, 0);
 }
 
 private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
@@ -5175,7 +5203,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         return;
     }
     if k == N_VAR { compile_var_stmt(co, n); return; }
-    if k == N_BLOCK { compile_block_stmts(co, &n.kids); return; }
+    if k == N_BLOCK { compile_block_stmts(co, n); return; }
     if k == N_EMPTY { return; }
     if k == N_IF {
         compile_expr(co, n.a);
@@ -5437,11 +5465,9 @@ private void compile_stmt(Compiler* co, Node* n) {
         fs.switch_depth = fs.depth;
         i32 saved_binds = fs.binds.len;
         i32 saved_slots = fs.cur_slots;
-        Vec<str> svars = vec_new<str>(4);
-        for i32 i = 0; i < n.kids.len; i++ {
-            NodeList* cl = &(*(n.kids.items + i)).kids;
-            for i32 s = 0; s < cl.len; s++ { collect_var_names(*(cl.items + s), &svars); }
-        }
+        Vec<str> svars;
+        vec_lazy<str>(&svars);
+        for i32 i = 0; i < n.kids.len; i++ { collect_var_names(co, *(n.kids.items + i), &svars); }
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_lexical_decls(co, &(*(n.kids.items + i)).kids, &svars);
         }
@@ -5580,7 +5606,7 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     // a script's top level binds function declarations the way a function
     // body does, so one may repeat a `var` or another function
     co.outer_is_body = true;
-    compile_block_stmts(co, &prog.kids);
+    compile_block_stmts(co, prog);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
     str empty;
@@ -5618,7 +5644,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     co.outer_is_body = true;   // as in a script, not a block
-    compile_block_stmts(co, &prog.kids);
+    compile_block_stmts(co, prog);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
     str empty;
@@ -5943,11 +5969,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     if links != null { collect_links(co, prog, links); }
 
     // 4. hoist vars (unwrapping exports)
-    for i32 i = 0; i < prog.kids.len; i++ {
-        Node* s = *(prog.kids.items + i);
-        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
-        hoist_vars(co, d);
-    }
+    hoist_vars(co, prog);
 
     // 5. lexical/class TDZ holes at top level (before functions, whose
     //    bodies may reference them)
@@ -5974,10 +5996,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     //    A module's top level is lexical, unlike a script's: a function
     //    declared there may not repeat another declaration, nor a `var`.
     Vec<str> mod_vars = vec_new<str>(4);
-    for i32 i = 0; i < prog.kids.len; i++ {
-        Node* s = *(prog.kids.items + i);
-        collect_var_names(s.kind == N_EXPORT && s.a != null ? s.a : s, &mod_vars);
-    }
+    collect_var_names(co, prog, &mod_vars);
     Vec<NodePtr> mod_fns = vec_new<NodePtr>(4);
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);

@@ -133,6 +133,10 @@ const u8 LXC_NL = 8;
 const u8 LXC_ID_PART = 3;
 private u8[256] g_lxc;
 private bool g_lxc_ready = false;
+// By a word's first and last letter, the lengths of the keywords spelled
+// so, a bit per length: most names are turned away by one lookup before
+// the keyword compare.
+private u16[676] g_kw_lens;
 
 private void lxc_init() {
     for i32 c = 0; c < 256; c++ {
@@ -143,6 +147,72 @@ private void lxc_init() {
         if c == '\n' || c == '\r' { f |= LXC_NL; }
         g_lxc[c] = f;
     }
+    g_kw_lens[19] |= 256;
+    g_kw_lens[18] |= 4;
+    g_kw_lens[18] |= 128;
+    g_kw_lens[2] |= 32;
+    g_kw_lens[19] |= 32;
+    g_kw_lens[36] |= 32;
+    g_kw_lens[56] |= 16;
+    g_kw_lens[59] |= 32;
+    g_kw_lens[70] |= 32;
+    g_kw_lens[71] |= 32;
+    g_kw_lens[56] |= 256;
+    g_kw_lens[95] |= 256;
+    g_kw_lens[82] |= 128;
+    g_kw_lens[97] |= 128;
+    g_kw_lens[82] |= 64;
+    g_kw_lens[92] |= 4;
+    g_kw_lens[108] |= 16;
+    g_kw_lens[116] |= 16;
+    g_kw_lens[123] |= 64;
+    g_kw_lens[122] |= 128;
+    g_kw_lens[134] |= 32;
+    g_kw_lens[154] |= 128;
+    g_kw_lens[147] |= 8;
+    g_kw_lens[142] |= 16;
+    g_kw_lens[143] |= 256;
+    g_kw_lens[175] |= 8;
+    g_kw_lens[167] |= 64;
+    g_kw_lens[213] |= 4;
+    g_kw_lens[226] |= 1024;
+    g_kw_lens[227] |= 64;
+    g_kw_lens[221] |= 4;
+    g_kw_lens[225] |= 32;
+    g_kw_lens[213] |= 1024;
+    g_kw_lens[212] |= 512;
+    g_kw_lens[226] |= 4;
+    g_kw_lens[265] |= 32;
+    g_kw_lens[305] |= 8;
+    g_kw_lens[316] |= 64;
+    g_kw_lens[342] |= 512;
+    g_kw_lens[360] |= 8;
+    g_kw_lens[349] |= 16;
+    g_kw_lens[369] |= 4;
+    g_kw_lens[383] |= 8;
+    g_kw_lens[368] |= 256;
+    g_kw_lens[394] |= 128;
+    g_kw_lens[393] |= 512;
+    g_kw_lens[392] |= 64;
+    g_kw_lens[466] |= 256;
+    g_kw_lens[455] |= 64;
+    g_kw_lens[486] |= 512;
+    g_kw_lens[487] |= 8;
+    g_kw_lens[470] |= 64;
+    g_kw_lens[485] |= 32;
+    g_kw_lens[475] |= 64;
+    g_kw_lens[512] |= 16;
+    g_kw_lens[516] |= 32;
+    g_kw_lens[498] |= 16;
+    g_kw_lens[518] |= 8;
+    g_kw_lens[498] |= 16;
+    g_kw_lens[499] |= 64;
+    g_kw_lens[524] |= 64;
+    g_kw_lens[563] |= 8;
+    g_kw_lens[549] |= 16;
+    g_kw_lens[576] |= 32;
+    g_kw_lens[579] |= 16;
+    g_kw_lens[627] |= 32;
     g_lxc_ready = true;
 }
 
@@ -276,6 +346,7 @@ private bool skip_trivia(Lexer* lx) {
         lx.pos = pos;
         if pos >= n { break; }
         u8 c = *(d + pos);
+        if c < 0x80 && c != '/' { break; }
         // U+2028 / U+2029 are line terminators; U+00A0 and a stray
         // BOM are whitespace.
         if c == 0xE2 && lx_at(lx, lx.pos + 1) == 0x80 {
@@ -566,7 +637,9 @@ private i32 keyword_kind(str w) {
     if n < 2 || n > 10 { return 0; }
     u8* d = w.data;
     u8 c0 = *d;
-    if c0 < 'a' || c0 > 'z' { return 0; }
+    u8 cl = *(d + n - 1);
+    if c0 < 'a' || c0 > 'z' || cl < 'a' || cl > 'z' { return 0; }
+    if (g_kw_lens[(c0 - 'a') * 26 + (cl - 'a')] & (1 << n)) == 0 { return 0; }
     u64 a = 0;
     i32 m = n < 8 ? n : 8;
     for i32 i = 0; i < m; i++ { a |= cast(u64, *(d + i)) << cast(u64, 8 * i); }
@@ -822,6 +895,9 @@ private void scan_ident(Lexer* lx, Token* t) {
     i32 pos = lx.pos;
     while pos < n && (g_lxc[*(d + pos)] & LXC_ID_PART) != 0 { pos++; }
     lx.pos = pos;
+    // a name ends at an ASCII byte that is not one of its letters nor an
+    // escape; past ASCII or at a backslash the slow walk decides
+    if lx.pos < lx.src.len && (lx_cur(lx) >= 0x80 || lx_cur(lx) == '\\') {
     while lx.pos < lx.src.len {
         u8 c = lx_cur(lx);
         if c < 0x80 && c != '\\' {
@@ -840,6 +916,7 @@ private void scan_ident(Lexer* lx, Token* t) {
             if !id_part_at(lx, lx.pos, &n) { break; }
             lx.pos += n;
         }
+    }
     }
     if esc { t.text = decode_ident(lx, a, lx.pos); }
     else { t.text = lx_view(lx, a, lx.pos); }
@@ -1161,10 +1238,6 @@ private void pk(Lexer* lx, Token* t, i32 kind, i32 n) {
 
 private void scan_punct(Lexer* lx, Token* t) {
     u8 c = lx_cur(lx);
-    u8 c1 = lx_at(lx, lx.pos + 1);
-    u8 c2 = lx_at(lx, lx.pos + 2);
-    u8 c3 = lx_at(lx, lx.pos + 3);
-
     switch c {
         case '{': { pk(lx, t, TOK_LBRACE, 1); return; }
         case '}': { pk(lx, t, TOK_RBRACE, 1); return; }
@@ -1179,11 +1252,14 @@ private void scan_punct(Lexer* lx, Token* t) {
         case '~': { pk(lx, t, TOK_TILDE, 1); return; }
         default: { }
     }
+    u8 c1 = lx_at(lx, lx.pos + 1);
     if c == '.' {
-        if c1 == '.' && c2 == '.' { pk(lx, t, TOK_DOTDOTDOT, 3); return; }
+        if c1 == '.' && lx_at(lx, lx.pos + 2) == '.' { pk(lx, t, TOK_DOTDOTDOT, 3); return; }
         pk(lx, t, TOK_DOT, 1);
         return;
     }
+    u8 c2 = lx_at(lx, lx.pos + 2);
+    u8 c3 = c2 == 0 ? 0 : lx_at(lx, lx.pos + 3);
     if c == '?' {
         if c1 == '?' {
             if c2 == '=' { pk(lx, t, TOK_QUESTION_QUESTION_EQ, 3); return; }

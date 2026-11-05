@@ -146,6 +146,7 @@ struct Node {
     i32 kind;
     i32 flags;
     i32 op;         // operator token kind
+    i32 n_vars;
     Span span;
     str name;
     str aux;        // regex flags
@@ -156,6 +157,7 @@ struct Node {
     Node* d;
     NodeList kids;
     StrMap<i32>* names;   // a function: the compiler's memo of every name its subtree mentions
+    Node** vars;          // the compiler's memo of the var declarators in the subtree, outside its functions
 }
 
 str node_kind_name(i32 kind) {
