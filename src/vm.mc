@@ -4499,9 +4499,7 @@ private i32 rd_u16(u8* code, i32 at) {
 // The interpreter loop keeps its position as a pointer into the code, which
 // spares it an add per byte read; these read at the pointer.
 private i32 rd_u16p(u8* p) {
-    i32 lo = *p;
-    i32 hi = *(p + 1);
-    return lo | (hi << 8);
+    return *cast(u16*, p);
 }
 
 private void wr_u16p(u8* p, i32 v) {
@@ -4519,15 +4517,18 @@ private void wr_u16p(u8* p, i32 v) {
 const i32 IC_MANY = 0xFFFE;
 const i32 IC_PROTO = 0x8000;    // the slot is the prototype's
 const i32 IC_SLOT = 0x7FFF;
+@inline
 private bool ic_plain(Value objv) {
     return value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
 }
 
+@inline
 private bool ic_plain_obj(JsObject* o) {
     return (o.obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
 }
 
 // the own slot of `a` in o's table, or -1
+@inline
 private i32 ic_index_of(JsObject* o, u32 a) {
     PropList* pl = &o.props;
     if pl.idx != null {
@@ -4552,6 +4553,7 @@ private i32 ic_learn(JsObject* o, u32 a) {
     return pa | IC_PROTO;
 }
 
+@inline
 private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
     i32 ic = rd_u16p(icp);
     bool plain = ic_plain(objv);
@@ -4587,6 +4589,7 @@ private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
 
 // The write the same way: a hit on an own writable data property stores
 // in place, with the collector's barrier when the object is old.
+@inline
 private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) {
     i32 ic = rd_u16p(icp);
     bool plain = ic_plain(objv);
@@ -4611,7 +4614,7 @@ private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) 
 }
 
 private i32 rd_targetp(u8* p) {
-    return cast(i32, cast(u32, *p) | (cast(u32, *(p + 1)) << 8) | (cast(u32, *(p + 2)) << 16) | (cast(u32, *(p + 3)) << 24));
+    return *cast(i32*, p);
 }
 
 // The `process` global, or undefined before the builtins are installed.
