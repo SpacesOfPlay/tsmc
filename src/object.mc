@@ -770,9 +770,13 @@ i32 value_kind(Value v) {
     return value_as_cell(v).kind;
 }
 
+@inline
 bool value_is_string(Value v)  { return value_is_kind(v, GC_STRING); }
+@inline
 bool value_is_object(Value v)  { return value_is_kind(v, GC_OBJECT); }
+@inline
 bool value_is_function(Value v){ return value_is_kind(v, GC_FUNCTION); }
+@inline
 bool value_is_native(Value v)  { return value_is_kind(v, GC_NATIVE); }
 bool value_is_callable(Value v){
     while true {
@@ -784,10 +788,15 @@ bool value_is_callable(Value v){
     }
 }
 
+@inline
 bool value_is_accessor(Value v) { return value_is_kind(v, GC_ACCESSOR); }
+@inline
 bool value_is_symbol(Value v)   { return value_is_kind(v, GC_SYMBOL); }
+@inline
 bool value_is_generator(Value v){ return value_is_kind(v, GC_GENERATOR); }
+@inline
 bool value_is_map(Value v)      { return value_is_kind(v, GC_MAP); }
+@inline
 bool value_is_bigint(Value v)   { return value_is_kind(v, GC_BIGINT); }
 GcBigInt* value_as_bigint(Value v) { return cast(GcBigInt*, value_as_cell(v)); }
 

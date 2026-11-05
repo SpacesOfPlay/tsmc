@@ -31,6 +31,8 @@ struct AtomTable {
     Vec<i64> stamp;      // atom → ATOM_PINNED, ATOM_FREE or a clock
     Vec<u32> free_ids;   // freed atoms, reused first
     i32 n_dynamic;       // dynamic atoms in use
+    u32 gen;             // moves when a dynamic atom is freed: an atom a
+                         // string cell remembers is good while it stands
 }
 
 void atoms_init(AtomTable* t) {
@@ -39,6 +41,7 @@ void atoms_init(AtomTable* t) {
     vec_init<i64>(&t.stamp, 64);
     vec_init<u32>(&t.free_ids, 16);
     t.n_dynamic = 0;
+    t.gen = 1;
 }
 
 void atoms_free(AtomTable* t) {
@@ -126,5 +129,6 @@ i32 atoms_sweep(AtomTable* t, u8* marks, i32 n, i64 now) {
         t.n_dynamic--;
         freed++;
     }
+    if freed > 0 { t.gen++; }
     return freed;
 }

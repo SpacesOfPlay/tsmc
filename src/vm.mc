@@ -2476,7 +2476,7 @@ private u32 key_to_atom(VM* vm, Value key) {
     Value s = js_to_string_value(vm, k);
     vm.sp--;
     vpush(vm, s);
-    u32 a = vm_atom_dyn(vm, gc_string_view(value_as_string(s)));
+    u32 a = vm_atom_of_string(vm, value_as_string(s));
     vm.sp--;
     return a;
 }
@@ -2514,6 +2514,23 @@ u32 vm_atom_dyn(VM* vm, str name) {
         return a;
     }
     return atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
+}
+
+// The atom of a string cell, kept on the cell: a key read from an array
+// or from an object's own keys is the same cell each time it is used, and
+// the by-address cache above still hashed, probed and compared the bytes.
+// The table's generation moves when a dynamic atom is freed, which is the
+// only time a remembered atom can name something else.
+u32 vm_atom_of_string(VM* vm, GcString* g) {
+    if g.atom_gen == vm.atoms.gen {
+        i32 id = cast(i32, g.atom);
+        if vec_get(&vm.atoms.stamp, id) != ATOM_PINNED { vec_set(&vm.atoms.stamp, id, vm.heap.alloc_total); }
+        return g.atom;
+    }
+    u32 a = vm_atom_dyn(vm, gc_string_view(g));
+    g.atom = a;
+    g.atom_gen = vm.atoms.gen;
+    return a;
 }
 
 // a + b for two string values. When a high surrogate at the end of a
@@ -3259,6 +3276,7 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
 }
 
 // A primitive value is anything that is not an object-like reference.
+@inline
 bool value_is_primitive(Value v) {
     if !value_is_cell(v) { return true; }
     // one read of the kind rather than three predicates, each of which reads it

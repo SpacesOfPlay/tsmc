@@ -1062,6 +1062,8 @@ struct GcString {
     i32 cur_off;   // ... and the byte offset of the code point there
     u8* data;
     StrBuffer* buf;   // null when the bytes are inline
+    u32 atom;         // the atom this string was interned as, while atom_gen
+    u32 atom_gen;     // is the atom table's generation (vm_atom_of_string)
 }
 
 GcString* gc_new_string(GcHeap* h, str s) {
@@ -1127,6 +1129,7 @@ GcString* gc_string_concat(GcHeap* h, GcString* a, GcString* b) {
         g.u16len = a.u16len + b.u16len;
         g.data = cast(u8*, g) + sizeof(GcString);
         g.buf = null;
+        g.atom_gen = 0;
         if a.len > 0 { memcpy(g.data, a.data, a.len); }
         if b.len > 0 { memcpy(g.data + a.len, b.data, b.len); }
         return g;
@@ -1148,6 +1151,7 @@ GcString* gc_string_concat(GcHeap* h, GcString* a, GcString* b) {
     g.len = total;
     g.u16len = a.u16len + b.u16len;
     g.data = buf.data;
+    g.atom_gen = 0;
     g.buf = buf;
     buf.refs++;
     return g;
