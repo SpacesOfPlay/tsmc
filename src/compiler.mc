@@ -578,8 +578,7 @@ private i32 str_const(Compiler* co, str s) {
 }
 
 private i32 name_const(Compiler* co, str name) {
-    u32 a = atom_intern(co.atoms, name);
-    return ch_add_const(&co.cur.ch, value_int(cast(i32, a)));
+    return ch_add_const_atom(&co.cur.ch, atom_intern(co.atoms, name));
 }
 
 // Whether the name starts with a URL scheme: letters, digits, + - or .,
@@ -4228,6 +4227,7 @@ bool compile_lazy(Compiler* co, Node* f, FnTemplate* t) {
     t.code_len = nt.code_len;
     t.consts = nt.consts;
     t.n_consts = nt.n_consts;
+    t.catom = nt.catom;
     t.subs = nt.subs;
     t.n_subs = nt.n_subs;
     t.pos = nt.pos;
@@ -5745,6 +5745,9 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false, false, false);
     t.src_name = co.src_name;
     t.sloppy = !co.strict;
+    // the root holds the lazy functions' source too, so an embedder can
+    // see on it what has been compiled since (the code cache)
+    if co.lazy_src != null { t.owner = co.lazy_src; t.owner.refs++; }
     co.strict = false;
     co.cur = null;
     fscope_free(&fs);

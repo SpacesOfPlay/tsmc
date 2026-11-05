@@ -25,6 +25,7 @@ import bump;
 import parser;
 import lower;
 import compiler;
+import codecache;
 import math;
 import format_f64;
 import regex;
@@ -134,6 +135,17 @@ struct VM {
     i64 lazy_ns;               // and the time that took
     i32 compiles;              // scripts and modules compiled
     i64 compile_ns;            // their parse, lower and compile time
+    // The code cache (codecache.mc): bytes offered for the next
+    // vm_run_source, taken whether or not they match; the first root
+    // compiled or loaded, the entry's, for the CLI to write out; how many
+    // loads and their time; and --code-cache-verify's round trip of every
+    // compile.
+    u8* cc_data;
+    i32 cc_len;
+    FnTemplate* first_root;
+    i32 cache_loads;
+    i64 cache_ns;
+    bool cc_verify;
     Value* stack;
     i32 sp;
     Frame* frames;
@@ -4320,6 +4332,12 @@ void vm_init(VM* vm) {
     vm.map_direct = null;
     vec_init<TmplPtr>(&vm.troots, 4);
     vec_init<TmplPtr>(&vm.fresh_tmpls, 16);
+    vm.cc_data = null;
+    vm.cc_len = 0;
+    vm.first_root = null;
+    vm.cache_loads = 0;
+    vm.cache_ns = 0;
+    vm.cc_verify = false;
     vm.pending = value_undefined();
     vm.has_pending = false;
     vm.unwind_return = false;
@@ -9488,7 +9506,7 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
         compiler_set_lazy_source(&co, s);
         co.script_globals = vm.script_globals;
         ok = compile_lazy(&co, f, t);
-        if ok { vec_push(&vm.fresh_tmpls, t); }
+        if ok { vec_push(&vm.fresh_tmpls, t); t.owner.compiled++; }
         gc_root_reset(&vm.heap, rmark);
     }
     if !ok {
@@ -9508,7 +9526,82 @@ private void vm_lazy_account(VM* vm, u64 t0) {
     vm.lazy_ns += cast(i64, vm_clock_ns() - t0);
 }
 
+// The run of a script's root template: the body, then the jobs it queued.
+private i32 vm_run_root(VM* vm, FnTemplate* t) {
+    i32 status = vm_run_template(vm, t);
+    if status == 0 { status = vm_run_event_loop(vm); }
+    if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
+    return status;
+}
+
+// A script's templates as the code cache writes them; the caller frees
+// the buffer.
+CcOut vm_save_templates(VM* vm, FnTemplate* root, str src) {
+    return codecache_write(&vm.atoms, root, src, lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals);
+}
+
+// The tree a cache holds for `src`, owned by the VM, or null when the
+// bytes are not a cache of it.
+FnTemplate* vm_load_templates(VM* vm, u8* data, i32 len, str src, str src_name) {
+    u64 c0 = vm_clock_ns();
+    i32 rmark = gc_root_mark(&vm.heap);
+    i32 n = 0;
+    FnTemplate* t = codecache_read(&vm.heap, &vm.atoms, data, len, src, src_name,
+        lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals, &n);
+    if t != null {
+        vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
+        vm.cache_loads++;
+        vm.cache_ns += cast(i64, vm_clock_ns() - c0);
+    }
+    gc_root_reset(&vm.heap, rmark);
+    return t;
+}
+
+// --code-cache-verify: the compiled tree written, read back and written
+// again, the two writings compared; the tree read back is what runs.
+private FnTemplate* vm_verify_cache(VM* vm, FnTemplate* t, str src, str src_name) {
+    CcOut a = vm_save_templates(vm, t, src);
+    i32 n = 0;
+    FnTemplate* t2 = codecache_read(&vm.heap, &vm.atoms, a.data, a.len, src, src_name,
+        lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals, &n);
+    if t2 == null {
+        eprint("code cache: {} does not read back\n", src_name);
+        free(a.data);
+        return null;
+    }
+    CcOut b = vm_save_templates(vm, t2, src);
+    bool same = a.len == b.len;
+    for i32 i = 0; same && i < a.len; i++ { same = *(a.data + i) == *(b.data + i); }
+    free(a.data);
+    free(b.data);
+    if !same {
+        eprint("code cache: {} differs on the second writing\n", src_name);
+        template_free(t2);
+        return null;
+    }
+    return t2;
+}
+
 i32 vm_run_source(VM* vm, str src, str src_name) {
+    return vm_run_source_root(vm, src, src_name, null);
+}
+
+// A script run, its root template left in *root_out when that is given:
+// the embedder's handle for writing the code cache once the page is done.
+i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {
+    if vm.cc_data != null {
+        u8* data = vm.cc_data;
+        i32 len = vm.cc_len;
+        vm.cc_data = null;
+        vm.cc_len = 0;
+        FnTemplate* ct = vm_load_templates(vm, data, len, src, src_name);
+        if ct != null {
+            if vm.first_root == null { vm.first_root = ct; }
+            if root_out != null { *root_out = ct; }
+            return vm_run_root(vm, ct);
+        }
+    }
     DiagList d;
     diags_init(&d);
     Bump arena;
@@ -9529,17 +9622,20 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         compiler_set_source(&co, src, src_name);
         co.script_globals = vm.script_globals;
         FnTemplate* t = compile_program(&co, prog);
+        if d.n_errors == 0 && vm.cc_verify {
+            FnTemplate* t2 = vm_verify_cache(vm, t, src, src_name);
+            if t2 != null { template_free(t); t = t2; }
+            else { status = 3; }
+        }
         vec_push(&vm.troots, t);
         vec_push(&vm.fresh_tmpls, t);
         gc_root_reset(&vm.heap, rmark);
         vm.compiles++;
         vm.compile_ns += cast(i64, vm_clock_ns() - c0);
-        if d.n_errors == 0 {
-            status = vm_run_template(vm, t);
-            if status == 0 {
-                status = vm_run_event_loop(vm);
-            }
-            if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
+        if vm.first_root == null { vm.first_root = t; }
+        if root_out != null { *root_out = t; }
+        if d.n_errors == 0 && status == 2 {
+            status = vm_run_root(vm, t);
         }
     }
     if d.n_errors > 0 {

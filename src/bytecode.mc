@@ -234,6 +234,7 @@ struct LazySource {
     i32* line_starts;    // owned
     i32 n_lines;
     i32 refs;
+    i32 compiled;        // the lazy functions of it compiled so far: what the code cache would add
     bool module;
     str ns_name;         // owned; the module's namespace binding
     LazyImport* imports;
@@ -250,7 +251,25 @@ str lazy_str(str s) {
     return o;
 }
 
-private void lazy_source_free(LazySource* s) {
+// The source a cache's lazy functions are reparsed from, with nothing of
+// a module: the code cache holds scripts.
+LazySource* lazy_source_new(str src, str src_name) {
+    LazySource* s = new(LazySource);
+    s.src = lazy_str(src);
+    s.src_name = lazy_str(src_name);
+    i32 n = 1;
+    for i32 i = 0; i < src.len; i++ { if *(src.data + i) == '\n' { n++; } }
+    s.line_starts = alloc<i32>(n);
+    *(s.line_starts) = 0;
+    i32 k = 1;
+    for i32 i = 0; i < src.len; i++ {
+        if *(src.data + i) == '\n' { *(s.line_starts + k) = i + 1; k++; }
+    }
+    s.n_lines = n;
+    return s;
+}
+
+void lazy_source_free(LazySource* s) {
     free(s.src.data);
     free(s.src_name.data);
     free(s.line_starts);
@@ -329,6 +348,7 @@ struct FnTemplate {
     i32 code_len;
     Value* consts;       // GC-rooted via the VM mark hook
     i32 n_consts;
+    u8* catom;           // bit i set: constant i is a name (the code cache re-interns it)
     TmplUpval* upvals;
     i32 n_upvals;
     FnTemplate** subs;
@@ -381,6 +401,7 @@ struct Chunk {
     // to the position the second half would occupy is exactly that.
     i32 max_target;
     Vec<Value> consts;
+    Vec<i32> atom_ix;    // the constants that are names, for the code cache
     Vec<TmplUpval> upvals;
     Vec<TmplPtr> subs;
     Vec<PosEntry> pos;
@@ -391,6 +412,7 @@ void chunk_init(Chunk* ch) {
     ch.last_op = 0 - 1;
     ch.max_target = 0 - 1;
     vec_lazy<Value>(&ch.consts);
+    vec_lazy<i32>(&ch.atom_ix);
     vec_lazy<TmplUpval>(&ch.upvals);
     vec_lazy<TmplPtr>(&ch.subs);
     vec_init<PosEntry>(&ch.pos, 16);
@@ -474,6 +496,13 @@ void ch_op_ic(Chunk* ch, i32 op, i32 name) {
 i32 ch_add_const(Chunk* ch, Value v) {
     vec_push(&ch.consts, v);
     return ch.consts.len - 1;
+}
+
+// A name as a constant: the atom's number, which the code cache writes
+// as the name since the numbers are per run.
+i32 ch_add_const_atom(Chunk* ch, u32 a) {
+    vec_push(&ch.atom_ix, ch.consts.len);
+    return ch_add_const(ch, value_int(cast(i32, a)));
 }
 
 // A code position, as every jump carries it: four bytes, so a function's
@@ -569,6 +598,15 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
             *(t.consts + i) = vec_get(&ch.consts, i);
         }
     }
+    if ch.atom_ix.len > 0 {
+        i32 nb = (t.n_consts + 7) / 8;
+        t.catom = alloc<u8>(nb);
+        for i32 i = 0; i < nb; i++ { *(t.catom + i) = 0; }
+        for i32 i = 0; i < ch.atom_ix.len; i++ {
+            i32 ix = vec_get(&ch.atom_ix, i);
+            *(t.catom + (ix >> 3)) |= cast(u8, 1 << (ix & 7));
+        }
+    }
     t.n_upvals = ch.upvals.len;
     if t.n_upvals > 0 {
         t.upvals = alloc<TmplUpval>(t.n_upvals);
@@ -592,6 +630,7 @@ FnTemplate* chunk_finish(Chunk* ch, str name, i32 n_params, i32 n_slots, bool ha
     }
     vec_free(&ch.code);
     vec_free(&ch.consts);
+    vec_free(&ch.atom_ix);
     vec_free(&ch.upvals);
     vec_free(&ch.subs);
     vec_free(&ch.pos);
@@ -621,6 +660,22 @@ void tmpl_pos(FnTemplate* t, i32 code_off, i32* line, i32* col) {
     }
 }
 
+// An empty template with its name, the shape the code cache fills.
+FnTemplate* template_new(str name, i32 n_params, i32 n_slots) {
+    FnTemplate* t = new(FnTemplate);
+    if name.len > 0 {
+        u8* nb = alloc<u8>(name.len);
+        memcpy(nb, name.data, name.len);
+        t.name.data = nb;
+        t.name.len = name.len;
+    }
+    t.n_params = n_params;
+    t.arity = n_params;
+    t.n_slots = n_slots;
+    t.code = alloc<u8>(1);
+    return t;
+}
+
 void template_free(FnTemplate* t) {
     if t.lazy != null { lazy_free(t.lazy); t.lazy = null; }
     for i32 i = 0; i < t.n_subs; i++ {
@@ -629,6 +684,7 @@ void template_free(FnTemplate* t) {
     if t.name.data != null { free(t.name.data); }
     free(t.code);
     if t.consts != null { free(t.consts); }
+    if t.catom != null { free(t.catom); }
     if t.ic_aux != null { free(t.ic_aux); }
     if t.upvals != null { free(t.upvals); }
     if t.subs != null { free(t.subs); }

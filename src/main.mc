@@ -6,6 +6,7 @@
 import str;
 import file;
 import vm;
+import codecache;
 import builtins;
 import module;
 import prof;
@@ -27,6 +28,8 @@ private void print_usage() {
 i32 tsmc_main() {
     // Optional flags precede the script path.
     bool gc_stress = false;
+    str code_cache;
+    bool cc_verify = false;
     bool profile = false;
     i32 i = 1;
     while i < get_argc() {
@@ -46,6 +49,11 @@ i32 tsmc_main() {
         if str_equal(a, "--prof") { profile = true; i++; continue; }
         // functions in a large source compiled on their first call
         if str_equal(a, "--lazy") { lazy_functions = true; i++; continue; }
+        // the script's templates read from the file when it holds them,
+        // and written to it after the run
+        if str_equal(a, "--code-cache") && i + 1 < get_argc() { code_cache = str_from_cstr(get_arg(i + 1)); i += 2; continue; }
+        // every compile written out, read back and run from the reading
+        if str_equal(a, "--code-cache-verify") { cc_verify = true; i++; continue; }
         break;
     }
     // the first non-flag argument is the script; anything after it is
@@ -80,7 +88,23 @@ i32 tsmc_main() {
         m.prof = prof_new();
     }
     builtins_install(&m);
+    m.cc_verify = cc_verify;
+    FileData cached = FileData{};
+    if code_cache.len > 0 {
+        cached = file_read(code_cache);
+        if cached.data != null {
+            m.cc_data = cached.data;
+            m.cc_len = cast(i32, cached.len);
+        }
+    }
     i32 status = module_run_entry(&m, source, arg);
+    if code_cache.len > 0 && m.first_root != null {
+        CcOut o = vm_save_templates(&m, m.first_root, source);
+        FileData fd = FileData{ .data = o.data, .len = o.len };
+        if !file_write(code_cache, fd) { eprint("tsmc: cannot write '{}'\n", code_cache); }
+        free(o.data);
+    }
+    if cached.data != null { free(cached.data); }
     if m.prof != null { prof_report(m.prof, m.heap.n_collections); }
     vm_destroy(&m);
     return status;

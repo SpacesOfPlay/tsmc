@@ -181,6 +181,36 @@ over the loop's own cost: an array's length 10 to 2 ns, a string's 10
 to 2.5, an absent name 15 to 7, an array method 22 to 14, a Map method
 28 to 16, a native's own property 27 to 15.
 
+## The code cache
+
+A script's templates can be written out after a run and read back before
+the next one (codecache.mc; `--code-cache <file>` on the CLI, and the
+embedder's `vm_save_templates` and `vm_run_source_root`), so that a page
+a browser returns to is not parsed and compiled again. The file is the
+tree as it stood when written: a compiled template's code, constants,
+positions, upvalue spec and the state of its property caches, a
+still-lazy template's span and captured names; so a function compiled
+lazily on one visit is compiled on the next. A constant that is a name
+is written as the name and interned again on load, since atom numbers
+are per run (the template keeps a bit per constant, `catom`, saying
+which are names); a string is its bytes, a bigint its digits, any other
+value its bits. The property caches are kept warm rather than cleared:
+an own or prototype slot is guarded by the key at the slot, and an
+absent entry is written without its prototype and epoch, so it misses
+once and re-learns in place. The file names the source it was made from
+by length and hash and the options that shape the code (lazy functions,
+script globals), with the format's version and the size of the opcode
+set folded in; a mismatch is a miss and the source is compiled. A lazy
+template read back reparses from a copy of the source the loader makes
+(`lazy_source_new`), the same as one the compiler made; the root holds
+that source too, and the count of its lazy functions compiled since
+tells an embedder whether the cache has grown. `--code-cache-verify`
+runs every compile through a writing, a reading and a second writing,
+compares the two writings and runs the reading; the golden tests run
+under it. On brmc's saved bsky.app the second visit's first run went
+511 to 180 ms, its lazy compiles 346 to 1 ms and its compiles 156 to 12,
+the three loads 50 ms; the 9.5 MB bundle's cache is 10 MB.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

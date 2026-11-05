@@ -804,6 +804,21 @@ void run_golden_tests(str exe, DirList* scripts) {
         if str_starts_with(name, "lazy_") { c.args[1] = "--lazy"; c.args[2] = str_from(src.data, src.len); }
         golden_check(path_stem(name), str_from(src.data, src.len), &c);
     }
+    // the same scripts run from their code cache: every compile written
+    // out, read back and compared, and the reading is what runs
+    step("run tests from the code cache");
+    for i32 i = 0; i < scripts.count; i++ {
+        str name = scripts.items[i];
+        string src = path_join("test/run", name);
+        defer free(src);
+        ProcCmd c = {
+            .args = { exe, "--code-cache-verify", str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        if str_starts_with(name, "lazy_") { c.args[2] = "--lazy"; c.args[3] = str_from(src.data, src.len); }
+        golden_check(path_stem(name), str_from(src.data, src.len), &c);
+    }
     return;
 }
 
