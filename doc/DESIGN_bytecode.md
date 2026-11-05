@@ -138,6 +138,38 @@ key of an object: 15.8 ns over the loop to 12.3; the scan it saves was
 3 ns of the read, the rest is the dependent loads from the value to
 the object to its table to the slot to the value's cell.
 
+The u16 was then taken further, from what a real page's misses were
+made of (brmc's bsky.app: 29% of reads missed, on arrays' `length` and
+methods, strings' and Maps' methods, natives' own properties, names
+absent from an object and its chain, and sites seeing two layouts).
+Its ranges now: below `IC_KPROTO` (0x4000) an own slot, which a
+function or a native's own table may answer too; from `IC_KPROTO` a
+slot in the prototype of the receiver's kind (`ic_kind_proto`: the
+string, number, boolean, symbol or bigint prototype, a Map's, a
+native's `Function.prototype`, a function's `fproto` when that is a
+plain object or unset), the own table of a function or native checked
+to lack the name; from `IC_AUX` (0x7000) an entry of the template's
+`ic_aux` table; from `IC_PROTO` (0x8000) a slot in the object's own
+prototype as before, an array allowed for a name that is not its
+length or an element; and at the top `IC_ARRLEN` and `IC_STRLEN`, which
+answer `length` from the array or string itself, with `IC_MANY` and
+`IC_EMPTY`. An aux entry is either the two codes of a site that has
+seen two layouts (a third makes it `IC_MANY`), or an absent name: the
+prototype the receiver had when the name was found nowhere on it or
+its chain, and the value of `g_proto_epoch` then. The epoch (object.mc)
+moves when a name is added to or removed from the table of any object
+that is some object's prototype (such objects carry `OBJF_IS_PROTO`
+and their table `PROPS_IS_PROTO`, set when they first become one),
+when an object first becomes a prototype, and when a prototype's own
+prototype changes; so an absent entry is good while the receiver's own
+table lacks the name, its prototype is the one the entry saw, and the
+epoch stands. The entry holds the prototype's address for the compare
+only and never follows it. The receiver's own slot stays inline in the
+interpreter; the other ranges are a call (`ic_try`). On the micro-loops
+over the loop's own cost: an array's length 10 to 2 ns, a string's 10
+to 2.5, an absent name 15 to 7, an array method 22 to 14, a Map method
+28 to 16, a native's own property 27 to 15.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

@@ -603,9 +603,9 @@ private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
         }
         if value_is_object(pv) {
             gc_barrier(&o.head, pv);
-            o.proto = value_as_object(pv);
+            js_set_proto(o, value_as_object(pv));
         } else if value_is_null(pv) {
-            o.proto = null;
+            js_set_proto(o, null);
         }
     } else if value_is_function(ov) {
         // a function's [[Prototype]] is stored inline; accept a plain object,

@@ -1582,7 +1582,7 @@ private void super_native_result(VM* vm, Value res, Value new_target, Value this
     if !value_is_object(res) || value_same_bits(res, thisv) { return; }
     if value_is_callable(new_target) {
         Value protov = ensure_prototype(vm, new_target);
-        if value_is_object(protov) { gc_barrier(value_as_cell(res), protov); value_as_object(res).proto = value_as_object(protov); }
+        if value_is_object(protov) { gc_barrier(value_as_cell(res), protov); js_set_proto(value_as_object(res), value_as_object(protov)); }
     }
     if super_for >= 0 { (vm.frames + super_for).this_val = res; }
 }
@@ -4533,22 +4533,36 @@ private void wr_u16p(u8* p, i32 v) {
 // sees objects of more than one shape, and is left to the full read
 // (IC_MANY), as is one whose name is found nowhere the cache can say.
 const i32 IC_MANY = 0xFFFE;
-const i32 IC_PROTO = 0x8000;    // the slot is the prototype's
+const i32 IC_ARRLEN = 0xFFFD;   // an array's length
+const i32 IC_STRLEN = 0xFFFC;   // a string's length
+const i32 IC_ABSENT_NEW = 0xFFFB;   // ic_learn's answer alone: absent, the chain start in its out-param
+const i32 IC_PROTO = 0x8000;    // from here: the slot is the receiver's prototype's
 const i32 IC_SLOT = 0x7FFF;
+const i32 IC_AUX = 0x7000;      // from here to IC_PROTO: an entry of the template's aux table
+const i32 IC_KPROTO = 0x4000;   // from here to IC_AUX: a slot in the receiver kind's prototype
+const i32 IC_OWN_MAX = 0x4000;  // below: the receiver's own slot
+const i32 IC_KSLOT_MAX = 0x3000;
+const i32 IC_AUX_MAX = 0x1000;
+const i32 IC_PSLOT_MAX = 0x7FF0;
+const i32 AUX_ABSENT = 1;
+const i32 AUX_POLY = 2;
+
 @inline
 private bool ic_plain(Value objv) {
     return value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
 }
 
+// an object the cache may speak for: not a proxy, a view, the global or a
+// module namespace; an array is one, for a name that is not its length or
+// an index, which ic_learn keeps out
 @inline
-private bool ic_plain_obj(JsObject* o) {
-    return (o.obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
+private bool ic_obj_ok(JsObject* o) {
+    return (o.obj_flags & OBJF_NOT_PLAIN) == 0;
 }
 
-// the own slot of `a` in o's table, or -1
+// the own slot of `a` in a table, or -1
 @inline
-private i32 ic_index_of(JsObject* o, u32 a) {
-    PropList* pl = &o.props;
+private i32 ic_index_in(PropList* pl, u32 a) {
     if pl.idx != null {
         i32* pos = intmap_get<i32>(pl.idx, a);
         return pos != null ? *pos : -1;
@@ -4557,59 +4571,259 @@ private i32 ic_index_of(JsObject* o, u32 a) {
     return -1;
 }
 
-// the slot of a data property `a` on o or its prototype, as the cache
-// spells it, or IC_MANY
-private i32 ic_learn(JsObject* o, u32 a) {
-    i32 at = ic_index_of(o, a);
-    if at >= 0 {
-        return at < IC_PROTO && value_kind((o.props.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
-    }
-    JsObject* p = o.proto;
-    if p == null || !ic_plain_obj(p) { return IC_MANY; }
-    i32 pa = ic_index_of(p, a);
-    if pa < 0 || pa >= IC_PROTO || value_kind((p.props.items + pa).val) == GC_ACCESSOR { return IC_MANY; }
-    return pa | IC_PROTO;
+@inline
+private i32 ic_index_of(JsObject* o, u32 a) {
+    return ic_index_in(&o.props, a);
 }
 
-// The cache's hit alone, which needs nothing of the VM: the interpreter
-// takes it with its stack pointer still in a register.
+// the table of the receiver's own names, for the kinds that keep one
 @inline
-private bool prop_get_ic_fast(Value objv, u32 a, Value* out, u8* icp) {
-    i32 ic = rd_u16p(icp);
-    if ic_plain(objv) && ic < IC_MANY {
-        JsObject* o = value_as_object(objv);
-        if (ic & IC_PROTO) == 0 {
-            if ic < o.props.len {
-                Prop* pr = o.props.items + ic;
-                if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
-                    *out = pr.val;
-                    return true;
-                }
-            }
-        } else {
-            i32 at = ic & IC_SLOT;
-            JsObject* p = o.proto;
-            if p != null && at < p.props.len && ic_plain_obj(p) && ic_index_of(o, a) < 0 {
-                Prop* pr = p.props.items + at;
-                if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
-                    *out = pr.val;
-                    return true;
-                }
-            }
+private PropList* ic_own_table(Value v, i32 k) {
+    if k == GC_OBJECT {
+        JsObject* o = value_as_object(v);
+        return ic_obj_ok(o) ? &o.props : null;
+    }
+    if k == GC_FUNCTION { return &value_as_function(v).props; }
+    if k == GC_NATIVE { return &value_as_native(v).props; }
+    return null;
+}
+
+// the prototype a kind-slot names: where a name not the receiver's own is
+// read from, for a receiver that is not an object (an object's is its own
+// prototype, IC_PROTO). Null where the cache does not go: a function whose
+// [[Prototype]] is another function, a null one.
+private JsObject* ic_kind_proto(VM* vm, Value v, i32 k) {
+    if k == GC_STRING { return vm.string_proto; }
+    if k == GC_MAP { return value_as_map(v).proto; }
+    if k == GC_NATIVE { return vm.function_proto; }
+    if k == GC_FUNCTION {
+        Value fp = value_as_function(v).fproto;
+        if value_is_object(fp) { return value_as_object(fp); }
+        if value_is_cell(fp) || value_is_null(fp) { return null; }
+        return vm.function_proto;
+    }
+    if k == GC_SYMBOL { return vm.symbol_proto; }
+    if k == GC_BIGINT { return vm.bigint_proto; }
+    if k < 0 {
+        if value_is_number(v) { return vm.number_proto; }
+        if value_is_bool(v) { return vm.boolean_proto; }
+    }
+    return null;
+}
+
+// a code that is not an aux entry tried on a receiver
+private bool ic_hit(VM* vm, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    if ic < IC_KPROTO {
+        PropList* pl = ic_own_table(v, k);
+        if pl != null && ic < pl.len {
+            Prop* pr = pl.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
         }
+        return false;
+    }
+    if ic >= IC_PROTO {
+        if ic >= IC_STRLEN {
+            if ic == IC_ARRLEN {
+                if k == GC_OBJECT && (value_as_object(v).obj_flags & OBJF_ARRAY) != 0 {
+                    *out = value_int(value_as_object(v).elen);
+                    return true;
+                }
+            } else if ic == IC_STRLEN {
+                if k == GC_STRING { *out = value_int(value_as_string(v).u16len); return true; }
+            }
+            return false;
+        }
+        if k != GC_OBJECT { return false; }
+        JsObject* o = value_as_object(v);
+        if !ic_obj_ok(o) { return false; }
+        i32 at = ic & IC_SLOT;
+        JsObject* p = o.proto;
+        if p != null && at < p.props.len && ic_index_of(o, a) < 0 {
+            Prop* pr = p.props.items + at;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+        }
+        return false;
+    }
+    if ic < IC_AUX {
+        i32 at = ic - IC_KPROTO;
+        JsObject* p = ic_kind_proto(vm, v, k);
+        if p == null || at >= p.props.len { return false; }
+        if k == GC_FUNCTION || k == GC_NATIVE {
+            if ic_index_in(ic_own_table(v, k), a) >= 0 { return false; }
+        }
+        Prop* pr = p.props.items + at;
+        if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+        return false;
     }
     return false;
 }
 
+private bool ic_try(VM* vm, FnTemplate* t, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    if ic >= IC_AUX && ic < IC_PROTO { return ic_hit_aux(vm, t, v, k, a, ic, out); }
+    return ic_hit(vm, v, k, a, ic, out);
+}
+
+// an aux entry tried: the two codes of a polymorphic site, or an absent
+// name, good for a plain object with the prototype the entry saw, whose
+// own table lacks the name, while no prototype has changed since
+private bool ic_hit_aux(VM* vm, FnTemplate* t, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    IcAux* e = t.ic_aux + (ic - IC_AUX);
+    if e.kind == AUX_POLY {
+        if ic_try(vm, t, v, k, a, e.code_a, out) { return true; }
+        return ic_try(vm, t, v, k, a, e.code_b, out);
+    }
+    if k != GC_OBJECT { return false; }
+    JsObject* o = value_as_object(v);
+    if !ic_obj_ok(o) || cast(u64, o.proto) != e.proto || e.epoch != g_proto_epoch || ic_index_of(o, a) >= 0 { return false; }
+    *out = value_undefined();
+    return true;
+}
+
+// The cache's hit alone, which needs nothing of the stack: the interpreter
+// takes it with its stack pointer still in a register. The receiver's own
+// slot, the common case, is inline; the rest is a call.
 @inline
-private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
-    if prop_get_ic_fast(objv, a, out, icp) { return true; }
+private bool prop_get_ic_fast(VM* vm, FnTemplate* t, Value objv, u32 a, Value* out, u8* icp) {
     i32 ic = rd_u16p(icp);
-    bool plain = ic_plain(objv);
+    i32 k = value_kind(objv);
+    if ic < IC_KPROTO {
+        PropList* pl = ic_own_table(objv, k);
+        if pl != null && ic < pl.len {
+            Prop* pr = pl.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+        }
+        return false;
+    }
+    if ic >= IC_MANY { return false; }
+    return ic_try(vm, t, objv, k, a, ic, out);
+}
+
+// the slot of a data property `a` on the kind's prototype, as the cache
+// spells it, or IC_MANY
+private i32 ic_kind_code(JsObject* p, u32 a) {
+    if p == null || !ic_obj_ok(p) { return IC_MANY; }
+    i32 at = ic_index_of(p, a);
+    if at < 0 || at >= IC_KSLOT_MAX || value_kind((p.props.items + at).val) == GC_ACCESSOR { return IC_MANY; }
+    return IC_KPROTO + at;
+}
+
+// whether a name on an array is its length or an element, which the
+// cache leaves to the full read
+private bool ic_array_special(VM* vm, JsObject* o, u32 a) {
+    return (o.obj_flags & OBJF_ARRAY) != 0 && (a == vm.atom_length || ta_atom_index(vm, a) >= 0);
+}
+
+// the code for the way `a` was just found on this receiver: an own slot,
+// a prototype's, a kind prototype's, a length; IC_ABSENT_NEW with the
+// chain start in *chain when the receiver and its chain lack it; or
+// IC_MANY where the cache does not go
+private i32 ic_learn(VM* vm, Value v, u32 a, JsObject** chain) {
+    i32 k = value_kind(v);
+    if k == GC_OBJECT {
+        JsObject* o = value_as_object(v);
+        if !ic_obj_ok(o) { return IC_MANY; }
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { return IC_ARRLEN; }
+            if ta_atom_index(vm, a) >= 0 { return IC_MANY; }
+        }
+        i32 at = ic_index_of(o, a);
+        if at >= 0 {
+            return at < IC_OWN_MAX && value_kind((o.props.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
+        }
+        JsObject* p = o.proto;
+        if p == null { *chain = null; return IC_ABSENT_NEW; }
+        if !ic_obj_ok(p) || ic_array_special(vm, p, a) { return IC_MANY; }
+        i32 pa = ic_index_of(p, a);
+        if pa >= 0 {
+            return pa < IC_PSLOT_MAX && value_kind((p.props.items + pa).val) != GC_ACCESSOR ? (pa | IC_PROTO) : IC_MANY;
+        }
+        JsObject* w = p.proto;
+        while w != null {
+            if !ic_obj_ok(w) || ic_array_special(vm, w, a) || ic_index_of(w, a) >= 0 { return IC_MANY; }
+            w = w.proto;
+        }
+        *chain = p;
+        return IC_ABSENT_NEW;
+    }
+    if k == GC_STRING {
+        if a == vm.atom_length { return IC_STRLEN; }
+        u32 si = 0;
+        if vm_key_array_index(vm, a, &si) { return IC_MANY; }
+        return ic_kind_code(vm.string_proto, a);
+    }
+    if k == GC_FUNCTION || k == GC_NATIVE {
+        if a == vm.atom_prototype { return IC_MANY; }
+        PropList* pl = ic_own_table(v, k);
+        i32 at = ic_index_in(pl, a);
+        if at >= 0 {
+            return at < IC_OWN_MAX && value_kind((pl.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
+        }
+        // name and length are made up unless set
+        if a == vm.atom_name || a == vm.atom_length { return IC_MANY; }
+        return ic_kind_code(ic_kind_proto(vm, v, k), a);
+    }
+    if k == GC_MAP || k == GC_SYMBOL || k == GC_BIGINT || k < 0 {
+        return ic_kind_code(ic_kind_proto(vm, v, k), a);
+    }
+    return IC_MANY;
+}
+
+private i32 ic_aux_new(FnTemplate* t) {
+    if t.n_ic_aux >= IC_AUX_MAX { return -1; }
+    if t.n_ic_aux >= t.ic_aux_cap {
+        i32 ncap = t.ic_aux_cap == 0 ? 8 : t.ic_aux_cap * 2;
+        IcAux* n = alloc<IcAux>(ncap);
+        for i32 i = 0; i < t.n_ic_aux; i++ { *(n + i) = *(t.ic_aux + i); }
+        if t.ic_aux != null { free(t.ic_aux); }
+        t.ic_aux = n;
+        t.ic_aux_cap = ncap;
+    }
+    i32 i = t.n_ic_aux;
+    t.n_ic_aux++;
+    return i;
+}
+
+// the code a site keeps after a miss: the one learned; an absent entry
+// refreshed in place; a second code beside the first for a site that
+// sees two layouts; IC_MANY for a third
+private i32 ic_site_update(FnTemplate* t, i32 ic, i32 code, JsObject* chain) {
+    if code == IC_MANY { return IC_MANY; }
+    bool was_aux = ic >= IC_AUX && ic < IC_PROTO;
+    if code == IC_ABSENT_NEW {
+        if was_aux && (t.ic_aux + (ic - IC_AUX)).kind == AUX_ABSENT {
+            IcAux* e = t.ic_aux + (ic - IC_AUX);
+            e.proto = cast(u64, chain);
+            e.epoch = g_proto_epoch;
+            return ic;
+        }
+        i32 i = ic_aux_new(t);
+        if i < 0 { return IC_MANY; }
+        IcAux* e = t.ic_aux + i;
+        e.kind = AUX_ABSENT;
+        e.proto = cast(u64, chain);
+        e.epoch = g_proto_epoch;
+        code = IC_AUX + i;
+    }
+    if ic == IC_EMPTY || code == ic { return code; }
+    if was_aux && (t.ic_aux + (ic - IC_AUX)).kind == AUX_POLY { return IC_MANY; }
+    i32 i = ic_aux_new(t);
+    if i < 0 { return IC_MANY; }
+    IcAux* e = t.ic_aux + i;
+    e.kind = AUX_POLY;
+    e.code_a = ic;
+    e.code_b = code;
+    return IC_AUX + i;
+}
+
+@inline
+private bool prop_get_ic(VM* vm, FnTemplate* t, Value objv, u32 a, Value* out, u8* icp) {
+    if prop_get_ic_fast(vm, t, objv, a, out, icp) { return true; }
+    i32 ic = rd_u16p(icp);
     bool ok = prop_get(vm, objv, a, out);
-    if ok && plain && ic != IC_MANY {
-        i32 code = ic_learn(value_as_object(objv), a);
-        wr_u16p(icp, ic == IC_EMPTY || code == ic ? code : IC_MANY);
+    if ok && ic != IC_MANY {
+        JsObject* chain = null;
+        i32 code = ic_learn(vm, objv, a, &chain);
+        wr_u16p(icp, ic_site_update(t, ic, code, chain));
     }
     return ok;
 }
@@ -4620,7 +4834,7 @@ private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
 private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) {
     i32 ic = rd_u16p(icp);
     bool plain = ic_plain(objv);
-    if plain && ic < IC_PROTO {
+    if plain && ic < IC_OWN_MAX {
         JsObject* o = value_as_object(objv);
         if ic < o.props.len {
             Prop* pr = o.props.items + ic;
@@ -4634,7 +4848,7 @@ private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) 
     bool ok = set_prop_atom(vm, objv, a, v, mode);
     if ok && plain && ic != IC_MANY {
         i32 at = ic_index_of(value_as_object(objv), a);
-        i32 code = at >= 0 && at < IC_PROTO ? at : IC_MANY;
+        i32 code = at >= 0 && at < IC_OWN_MAX ? at : IC_MANY;
         wr_u16p(icp, ic == IC_EMPTY || code == ic ? code : IC_MANY);
     }
     return ok;
@@ -5850,12 +6064,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
                 Value out;
-                if prop_get_ic_fast(*(stack + sp - 1), a, &out, pc - 2) {
+                if prop_get_ic_fast(vm, t, *(stack + sp - 1), a, &out, pc - 2) {
                     *(stack + sp - 1) = out;
                     continue;
                 }
                 vm.sp = sp;
-                if prop_get_ic(vm, vpeek(vm, 0), a, &out, pc - 2) {
+                if prop_get_ic(vm, t, vpeek(vm, 0), a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                 }
@@ -5865,7 +6079,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
                 Value out;
-                if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
             case OP_LT_JF_LL: {
                 Value a = *(stack + fr.base + rd_u16p(pc));
@@ -5904,13 +6118,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
                 pc += 6;
                 Value out;
-                if prop_get_ic_fast(objv, a, &out, pc - 2) {
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
                     *(stack + sp) = out;
                     sp++;
                     continue;
                 }
                 vm.sp = sp;
-                if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
             case OP_GETIMPORT: { vm.sp = sp;
                 get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
@@ -6007,14 +6221,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 pc += 4;
                 Value objv = *(stack + sp - 1);
                 Value out;
-                if prop_get_ic_fast(objv, a, &out, pc - 2) {
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
                     *(stack + sp - 1) = out;
                     *(stack + sp) = objv;
                     sp++;
                     continue;
                 }
                 vm.sp = sp;
-                if prop_get_ic(vm, objv, a, &out, pc - 2) {
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
@@ -6084,9 +6298,9 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     // leaves the object's prototype alone
                     if value_is_object(protov) {
                         gc_barrier(value_as_cell(objv), protov);
-                        value_as_object(objv).proto = value_as_object(protov);
+                        js_set_proto(value_as_object(objv), value_as_object(protov));
                     } else if value_is_null(protov) {
-                        value_as_object(objv).proto = null;
+                        js_set_proto(value_as_object(objv), null);
                     }
                 } else if value_is_function(objv) {
                     // static inheritance: a derived ctor's [[Prototype]]

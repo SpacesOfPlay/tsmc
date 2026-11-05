@@ -47,6 +47,7 @@ const i32 OBJF_GLOBAL = 128;
 // set is fixed, they cannot be written from outside, and they read in code
 // unit order whatever order the module declared them in.
 const i32 OBJF_MODULE_NS = 256;
+const i32 OBJF_IS_PROTO = 512;   // some object\'s prototype (js_mark_proto)
 
 // Property attribute bits. Ordinary assignment creates PROP_DEFAULT;
 // Object.defineProperty can clear any of them.
@@ -83,6 +84,13 @@ struct PropList {
 const i32 PROPS_CAP_MASK = 0x0FFFFFFF;
 const i32 PROPS_OLD = 0x40000000;
 const i32 PROPS_REMEMBERED = 0x20000000;
+const i32 PROPS_IS_PROTO = 0x10000000;   // the table of some object's prototype
+
+// Moves when a name is added to or removed from a prototype's table, when
+// an object becomes a prototype, or when a prototype's own prototype
+// changes: the property cache's absent entries are good under one value
+// of it (vm.mc).
+u32 g_proto_epoch = 1;
 
 private i32 props_cap(PropList* p) { return p.cap & PROPS_CAP_MASK; }
 
@@ -165,6 +173,7 @@ Prop* props_entry(PropList* p, u32 key) {
 // Appends a fresh entry with the given attribute flags. Caller must
 // have checked the key is absent.
 private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
+    if (p.cap & PROPS_IS_PROTO) != 0 { g_proto_epoch++; }
     if (p.cap & PROPS_OLD) != 0 { props_barrier(p, v); }
     i32 cap = props_cap(p);
     if p.len >= cap {
@@ -232,6 +241,7 @@ void props_reindex(PropList* p) {
 }
 
 bool props_remove(PropList* p, u32 key) {
+    if (p.cap & PROPS_IS_PROTO) != 0 { g_proto_epoch++; }
     for i32 i = 0; i < p.len; i++ {
         if (p.items + i).key == key {
             for i32 j = i; j + 1 < p.len; j++ {
@@ -610,9 +620,28 @@ void js_finalize(GcCell* c) {
 
 // --- constructors -----------------------------------------------------
 
+// An object about to serve as a prototype is marked, with its table, so a
+// change to it moves g_proto_epoch.
+void js_mark_proto(JsObject* p) {
+    if p != null && (p.obj_flags & OBJF_IS_PROTO) == 0 {
+        p.obj_flags |= OBJF_IS_PROTO;
+        p.props.cap = p.props.cap | PROPS_IS_PROTO;
+        g_proto_epoch++;
+    }
+}
+
+// A prototype set after construction: a change to a prototype's own chain
+// moves the epoch too.
+void js_set_proto(JsObject* o, JsObject* p) {
+    if (o.obj_flags & OBJF_IS_PROTO) != 0 { g_proto_epoch++; }
+    o.proto = p;
+    js_mark_proto(p);
+}
+
 JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     JsObject* o = cast(JsObject*, gc_alloc(h, GC_OBJECT, sizeof(JsObject)));
     o.proto = proto;
+    js_mark_proto(proto);
     props_init(&o.props);
     return o;
 }
@@ -623,6 +652,7 @@ JsTypedArray* js_new_typed_array(GcHeap* h, JsObject* proto) {
     JsTypedArray* t = cast(JsTypedArray*, gc_alloc(h, GC_OBJECT, sizeof(JsTypedArray)));
     t.obj_flags = OBJF_TYPEDARRAY;
     t.proto = proto;
+    js_mark_proto(proto);
     props_init(&t.props);
     return t;
 }
@@ -631,6 +661,7 @@ JsProxy* js_new_proxy(GcHeap* h, JsObject* proto, Value target, Value handler) {
     JsProxy* p = cast(JsProxy*, gc_alloc(h, GC_OBJECT, sizeof(JsProxy)));
     p.obj_flags = OBJF_PROXY;
     p.proto = proto;
+    js_mark_proto(proto);
     props_init(&p.props);
     p.target = target;
     p.handler = handler;
@@ -710,6 +741,7 @@ JsGenerator* js_new_generator(GcHeap* h, JsFunction* fun, Value this_val) {
 JsMap* js_new_map(GcHeap* h, JsObject* proto, bool is_set) {
     JsMap* mp = cast(JsMap*, gc_alloc(h, GC_MAP, sizeof(JsMap)));
     mp.proto = proto;
+    js_mark_proto(proto);
     mp.is_set = is_set;
     mp.weak = false;
     return mp;

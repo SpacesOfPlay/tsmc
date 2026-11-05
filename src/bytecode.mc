@@ -291,6 +291,18 @@ void lazy_free(LazyFn* lz) {
     free(lz);
 }
 
+// An entry of a template's property-cache aux table, named by a code in
+// IC_AUX..IC_PROTO: an absent name (the chain start it was absent under
+// and the prototype epoch then), or two codes for a site that sees two
+// layouts (vm.mc, "prop_get_ic").
+struct IcAux {
+    i32 kind;
+    i32 code_a;
+    i32 code_b;
+    u64 proto;
+    u32 epoch;
+}
+
 struct FnTemplate {
     str name;            // owned copy
     i32 n_params;
@@ -334,6 +346,9 @@ struct FnTemplate {
     i32 prof_samples;
     i64 prof_calls;
     i64* prof_allocs;    // its allocations by cell kind, 16 slots, once seen
+    IcAux* ic_aux;       // the property cache's entries that need more than a slot
+    i32 n_ic_aux;
+    i32 ic_aux_cap;
 }
 
 type TmplPtr = FnTemplate*;
@@ -607,6 +622,7 @@ void template_free(FnTemplate* t) {
     if t.name.data != null { free(t.name.data); }
     free(t.code);
     if t.consts != null { free(t.consts); }
+    if t.ic_aux != null { free(t.ic_aux); }
     if t.upvals != null { free(t.upvals); }
     if t.subs != null { free(t.subs); }
     if t.pos != null { free(t.pos); }
