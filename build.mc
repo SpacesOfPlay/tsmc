@@ -819,6 +819,21 @@ void run_golden_tests(str exe, DirList* scripts) {
         if str_starts_with(name, "lazy_") { c.args[2] = "--lazy"; c.args[3] = str_from(src.data, src.len); }
         golden_check(path_stem(name), str_from(src.data, src.len), &c);
     }
+    // and compiled apart from the VM, as an embedder's thread compiles a
+    // script it is fetching, the VM reading the bytes
+    step("run tests compiled ahead");
+    for i32 i = 0; i < scripts.count; i++ {
+        str name = scripts.items[i];
+        string src = path_join("test/run", name);
+        defer free(src);
+        ProcCmd c = {
+            .args = { exe, "--code-cache-ahead", str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        if str_starts_with(name, "lazy_") { c.args[2] = "--lazy"; c.args[3] = str_from(src.data, src.len); }
+        golden_check(path_stem(name), str_from(src.data, src.len), &c);
+    }
     return;
 }
 

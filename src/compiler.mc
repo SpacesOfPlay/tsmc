@@ -4447,8 +4447,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // The class's private names, visible to the body and anything nested in
     // it. The heritage above was compiled outside them, as the language says.
     PrivScope ps;
-    ps.id = g_class_seq;
-    g_class_seq++;
+    // the counter is shared with a compile running on another thread
+    ps.id = atomic_add(&g_class_seq, 1);
     // the syntactic name; a name taken from the binding does not count
     ps.class_name = c.name.len > 0 && (c.flags & NF_NAME_INFERRED) == 0 ? c.name : "anonymous";
     vec_init<PrivName>(&ps.names, 4);

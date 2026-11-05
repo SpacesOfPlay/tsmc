@@ -9587,6 +9587,52 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
     return vm_run_source_root(vm, src, src_name, null);
 }
 
+// A script compiled on its own heap and atom table into the code cache's
+// form, for a thread that is not the VM's: the VM reads the bytes as it
+// would a cache of the script (vm.cc_data). The heap never collects, so
+// it needs no roots; what the compile made goes with it. Empty when the
+// script does not compile, which the VM then reports.
+CcOut vm_compile_ahead(str src, str src_name, bool script_globals) {
+    CcOut out = CcOut{};
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    GcHeap heap;
+    gc_init(&heap);
+    heap.tracer = &js_trace;
+    heap.finalizer = &js_finalize;
+    heap.props_trace = &js_props_trace;
+    heap.minor_threshold = 0x7fffffffffffffff;
+    heap.next_gc = 0x7fffffffffffffff;
+    AtomTable atoms;
+    atoms_init(&atoms);
+    Parser p;
+    parser_init(&p, src, &d, &arena);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if p.ts_seen { lower_program(&lw, prog); }
+    if d.n_errors == 0 {
+        Compiler co;
+        compiler_init(&co, &d, &heap, &atoms, &arena);
+        compiler_set_source(&co, src, src_name);
+        co.script_globals = script_globals;
+        FnTemplate* t = compile_program(&co, prog);
+        if d.n_errors == 0 {
+            out = codecache_write(&atoms, t, src, lazy_functions && src.len >= LAZY_MIN_SOURCE, script_globals);
+        }
+        template_free(t);
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    atoms_free(&atoms);
+    gc_destroy(&heap);
+    return out;
+}
+
 // A script run, its root template left in *root_out when that is given:
 // the embedder's handle for writing the code cache once the page is done.
 i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {

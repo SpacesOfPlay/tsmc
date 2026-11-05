@@ -216,6 +216,10 @@ private void lxc_init() {
     g_lxc_ready = true;
 }
 
+// The tables made before a second thread lexes: a lexer makes them on
+// its first use, which two threads must not do at once.
+void lexer_tables_init() { if !g_lxc_ready { lxc_init(); } }
+
 private bool is_id_start(u8 c) {
     return (g_lxc[c] & LXC_ID_START) != 0;
 }

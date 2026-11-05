@@ -211,6 +211,19 @@ under it. On brmc's saved bsky.app the second visit's first run went
 511 to 180 ms, its lazy compiles 346 to 1 ms and its compiles 156 to 12,
 the three loads 50 ms; the 9.5 MB bundle's cache is 10 MB.
 
+The same form carries a compile from another thread. `vm_compile_ahead`
+takes a source and no VM: it parses and compiles on a heap and an atom
+table of its own and writes the templates out, and the VM reads the
+bytes as it would a cache of the script. The heap never collects (its
+thresholds are set past reach), so the compile needs no roots, and
+everything it made goes with the heap. The one counter the compiler
+shares across threads, the class sequence behind private names, is
+bumped atomically; the lexer's byte tables are made before a second
+thread lexes (`lexer_tables_init`). On the bundle the compile ahead
+takes 149 ms where the VM's own compile takes 137 and the writing 9, and
+the reading 18. `--code-cache-ahead` runs a script that way; the golden
+tests run under it too.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

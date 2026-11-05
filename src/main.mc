@@ -30,6 +30,7 @@ i32 tsmc_main() {
     bool gc_stress = false;
     str code_cache;
     bool cc_verify = false;
+    bool cc_ahead = false;
     bool profile = false;
     i32 i = 1;
     while i < get_argc() {
@@ -54,6 +55,9 @@ i32 tsmc_main() {
         if str_equal(a, "--code-cache") && i + 1 < get_argc() { code_cache = str_from_cstr(get_arg(i + 1)); i += 2; continue; }
         // every compile written out, read back and run from the reading
         if str_equal(a, "--code-cache-verify") { cc_verify = true; i++; continue; }
+        // the script compiled apart from the VM, the way an embedder's
+        // thread would, and run from the bytes
+        if str_equal(a, "--code-cache-ahead") { cc_ahead = true; i++; continue; }
         break;
     }
     // the first non-flag argument is the script; anything after it is
@@ -97,7 +101,17 @@ i32 tsmc_main() {
             m.cc_len = cast(i32, cached.len);
         }
     }
+    CcOut ahead = CcOut{};
+    if cc_ahead && cached.data == null {
+        ahead = vm_compile_ahead(source, arg, m.script_globals);
+        if ahead.data != null { m.cc_data = ahead.data; m.cc_len = ahead.len; }
+    }
     i32 status = module_run_entry(&m, source, arg);
+    if ahead.data != null {
+        if m.cache_loads == 0 { eprint("tsmc: the compile ahead was not taken
+"); }
+        free(ahead.data);
+    }
     if code_cache.len > 0 && m.first_root != null {
         CcOut o = vm_save_templates(&m, m.first_root, source);
         FileData fd = FileData{ .data = o.data, .len = o.len };
