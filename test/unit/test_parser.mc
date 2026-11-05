@@ -96,7 +96,7 @@ i32 main() {
         "(program (expr-stmt (new (ident Foo) (number 1.0))))",
         "new with args");
     check_ast("/ab/g.test(s);",
-        "(program (expr-stmt (call (member-expr test (regex ab)) (ident s))))",
+        "(program (expr-stmt (call (member-expr test (regex ab (string g))) (ident s))))",
         "regex primary");
 
     // arrows
@@ -120,7 +120,7 @@ i32 main() {
 
     // templates
     check_ast("`a${x}b`;",
-        "(program (expr-stmt (template (quasi a) (ident x) (quasi b))))",
+        "(program (expr-stmt (template (quasi a (string a)) (ident x) (quasi b (string b)))))",
         "template");
 
     // statements
