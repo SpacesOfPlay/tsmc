@@ -4553,11 +4553,12 @@ private i32 ic_learn(JsObject* o, u32 a) {
     return pa | IC_PROTO;
 }
 
+// The cache's hit alone, which needs nothing of the VM: the interpreter
+// takes it with its stack pointer still in a register.
 @inline
-private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
+private bool prop_get_ic_fast(Value objv, u32 a, Value* out, u8* icp) {
     i32 ic = rd_u16p(icp);
-    bool plain = ic_plain(objv);
-    if plain && ic < IC_MANY {
+    if ic_plain(objv) && ic < IC_MANY {
         JsObject* o = value_as_object(objv);
         if (ic & IC_PROTO) == 0 {
             if ic < o.props.len {
@@ -4579,6 +4580,14 @@ private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
             }
         }
     }
+    return false;
+}
+
+@inline
+private bool prop_get_ic(VM* vm, Value objv, u32 a, Value* out, u8* icp) {
+    if prop_get_ic_fast(objv, a, out, icp) { return true; }
+    i32 ic = rd_u16p(icp);
+    bool plain = ic_plain(objv);
     bool ok = prop_get(vm, objv, a, out);
     if ok && plain && ic != IC_MANY {
         i32 code = ic_learn(value_as_object(objv), a);
@@ -4808,6 +4817,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
     FnTemplate* t = fr.tmpl;
     u8* code = t.code;
     u8* pc = code + fr.ret_ip;   // the first byte for calls; the resume point for generators
+    // The stack pointer lives here between ops; a case that calls out
+    // writes it back first, and the loop reads it again after the switch.
+    // A case that ends in `continue` keeps it in the register.
+    Value* stack = vm.stack;
+    i32 sp = vm.sp;
 
     while true {
         // top-of-loop so resuming a generator with a pending throw
@@ -4826,6 +4840,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, vm.pending);
                 vm.pending = value_undefined();
                 vm.has_pending = false;
+                sp = vm.sp;
             } else {
                 while vm.hp > 0 {
                     Handler* hh = vm.handlers + (vm.hp - 1);
@@ -4847,28 +4862,32 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
         }
         switch op {
             case OP_CONST: {
-                vpush(vm, *(t.consts + rd_u16p(pc)));
+                *(stack + sp) = *(t.consts + rd_u16p(pc));
+                sp++;
                 pc += 2;
+                continue;
             }
-            case OP_UNDEF: { vpush(vm, value_undefined()); }
-            case OP_HOLE: { vpush(vm, value_hole()); }
-            case OP_NULL: { vpush(vm, value_null()); }
-            case OP_TRUE: { vpush(vm, value_bool(true)); }
-            case OP_FALSE: { vpush(vm, value_bool(false)); }
-            case OP_POP: { vm.sp--; }
-            case OP_DUP: { vpush(vm, vpeek(vm, 0)); }
+            case OP_UNDEF: { *(stack + sp) = value_undefined(); sp++; continue; }
+            case OP_HOLE: { *(stack + sp) = value_hole(); sp++; continue; }
+            case OP_NULL: { *(stack + sp) = value_null(); sp++; continue; }
+            case OP_TRUE: { *(stack + sp) = value_bool(true); sp++; continue; }
+            case OP_FALSE: { *(stack + sp) = value_bool(false); sp++; continue; }
+            case OP_POP: { sp--; continue; }
+            case OP_DUP: { *(stack + sp) = *(stack + sp - 1); sp++; continue; }
             case OP_DUP2: {
-                vpush(vm, vpeek(vm, 1));
-                vpush(vm, vpeek(vm, 1));
+                *(stack + sp) = *(stack + sp - 2);
+                *(stack + sp + 1) = *(stack + sp - 1);
+                sp += 2;
+                continue;
             }
-            case OP_THIS: { vpush(vm, this_of(vm, fr.this_val, t.sloppy)); }
-            case OP_ARGUMENTS: { vpush(vm, fr.arguments_obj); }
-            case OP_CURFUNC: {
+            case OP_THIS: { vm.sp = sp; vpush(vm, this_of(vm, fr.this_val, t.sloppy)); }
+            case OP_ARGUMENTS: { *(stack + sp) = fr.arguments_obj; sp++; continue; }
+            case OP_CURFUNC: { vm.sp = sp;
                 if fr.fun != null { vpush(vm, value_cell(&fr.fun.head)); }
                 else { vpush(vm, value_undefined()); }
             }
-            case OP_NEWTARGET: { vpush(vm, fr.new_target); }
-            case OP_DYNIMPORT: {
+            case OP_NEWTARGET: { *(stack + sp) = fr.new_target; sp++; continue; }
+            case OP_DYNIMPORT: { vm.sp = sp;
                 // spec and referrer stay on the stack (rooted) across the hook,
                 // which allocates the promise and may load/evaluate a module.
                 Value spec = vpeek(vm, 1);
@@ -4882,118 +4901,154 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, result);
             }
             case OP_GETLOCAL: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                sp++;
                 pc += 2;
+                continue;
             }
             case OP_GETLOCAL_UNDEF: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
-                vpush(vm, value_undefined());
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
                 pc += 2;
+                continue;
             }
             case OP_GETLOCAL_CONST: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
-                vpush(vm, *(t.consts + rd_u16p(pc + 2)));
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(t.consts + rd_u16p(pc + 2));
+                sp += 2;
                 pc += 4;
+                continue;
             }
             case OP_GETLOCAL2: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc + 2)));
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(stack + fr.base + rd_u16p(pc + 2));
+                sp += 2;
                 pc += 4;
+                continue;
             }
-            case OP_SEQ_NULL: { *(vm.stack + vm.sp - 1) = value_bool(value_is_null(vpeek(vm, 0))); }
-            case OP_SNEQ_NULL: { *(vm.stack + vm.sp - 1) = value_bool(!value_is_null(vpeek(vm, 0))); }
-            case OP_SEQ_UNDEF: { *(vm.stack + vm.sp - 1) = value_bool(value_is_undefined(vpeek(vm, 0))); }
-            case OP_SNEQ_UNDEF: { *(vm.stack + vm.sp - 1) = value_bool(!value_is_undefined(vpeek(vm, 0))); }
-            case OP_EQ_NULLISH: { *(vm.stack + vm.sp - 1) = value_bool(is_nullish(vpeek(vm, 0))); }
-            case OP_NEQ_NULLISH: { *(vm.stack + vm.sp - 1) = value_bool(!is_nullish(vpeek(vm, 0))); }
+            case OP_SEQ_NULL: { *(stack + sp - 1) = value_bool(value_is_null(*(stack + sp - 1))); continue; }
+            case OP_SNEQ_NULL: { *(stack + sp - 1) = value_bool(!value_is_null(*(stack + sp - 1))); continue; }
+            case OP_SEQ_UNDEF: { *(stack + sp - 1) = value_bool(value_is_undefined(*(stack + sp - 1))); continue; }
+            case OP_SNEQ_UNDEF: { *(stack + sp - 1) = value_bool(!value_is_undefined(*(stack + sp - 1))); continue; }
+            case OP_EQ_NULLISH: { *(stack + sp - 1) = value_bool(is_nullish(*(stack + sp - 1))); continue; }
+            case OP_NEQ_NULLISH: { *(stack + sp - 1) = value_bool(!is_nullish(*(stack + sp - 1))); continue; }
             case OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                vm.sp--;
-                bool isnull = value_is_null(*(vm.stack + vm.sp));
+                sp--;
+                bool isnull = value_is_null(*(stack + sp));
                 if (op == OP_SEQ_NULL_JF) != isnull { pc = code + target; }
+                continue;
             }
             case OP_SEQ_JT, OP_SNEQ_JT: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                bool eq = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
-                vm.sp -= 2;
+                bool eq = js_strict_eq(*(stack + sp - 2), *(stack + sp - 1));
+                sp -= 2;
                 if (op == OP_SEQ_JT) == eq { pc = code + target; }
+                continue;
             }
             case OP_SEQ_LC_JF, OP_SEQ_LC_JT: {
-                Value a = *(vm.stack + fr.base + rd_u16p(pc));
+                Value a = *(stack + fr.base + rd_u16p(pc));
                 Value b = *(t.consts + rd_u16p(pc + 2));
                 i32 target = rd_targetp(pc + 4);
                 pc += 8;
                 if (op == OP_SEQ_LC_JT) == js_strict_eq(a, b) { pc = code + target; }
+                continue;
             }
             case OP_INCLOCAL: {
                 pc += 2;
-                op_step_local(vm, fr.base + rd_u16p(pc - 2), 1);
+                i32 at = fr.base + rd_u16p(pc - 2);
+                Value v = *(stack + at);
+                if value_is_int(v) && value_as_int(v) != 2147483647 {
+                    *(stack + at) = value_int(value_as_int(v) + 1);
+                    continue;
+                }
+                vm.sp = sp;
+                op_step_local(vm, at, 1);
             }
             case OP_DECLOCAL: {
                 pc += 2;
-                op_step_local(vm, fr.base + rd_u16p(pc - 2), 0 - 1);
+                i32 at = fr.base + rd_u16p(pc - 2);
+                Value v = *(stack + at);
+                if value_is_int(v) && value_as_int(v) != -2147483648 {
+                    *(stack + at) = value_int(value_as_int(v) - 1);
+                    continue;
+                }
+                vm.sp = sp;
+                op_step_local(vm, at, 0 - 1);
             }
             case OP_GETLOCAL_CHK: {
-                Value v = *(vm.stack + fr.base + rd_u16p(pc));
+                Value v = *(stack + fr.base + rd_u16p(pc));
                 pc += 2;
                 if value_is_hole(v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
-                    vpush(vm, v);
+                    *(stack + sp) = v;
+                    sp++;
                 }
+                continue;
             }
             case OP_SETLOCAL: {
-                *(vm.stack + fr.base + rd_u16p(pc)) = vpeek(vm, 0);
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + sp - 1);
                 pc += 2;
+                continue;
             }
             case OP_PUTLOCAL: {
-                vm.sp--;
-                *(vm.stack + fr.base + rd_u16p(pc)) = *(vm.stack + vm.sp);
+                sp--;
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + sp);
                 pc += 2;
+                continue;
             }
             case OP_SETHOLE: {
-                *(vm.stack + fr.base + rd_u16p(pc)) = value_hole();
+                *(stack + fr.base + rd_u16p(pc)) = value_hole();
                 pc += 2;
+                continue;
             }
-            case OP_NEWCELL_UNDEF: {
+            case OP_NEWCELL_UNDEF: { vm.sp = sp;
                 JsBox* b = js_new_box(&vm.heap, value_undefined());
                 *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
                 pc += 2;
             }
-            case OP_NEWCELL_HOLE: {
+            case OP_NEWCELL_HOLE: { vm.sp = sp;
                 JsBox* b = js_new_box(&vm.heap, value_hole());
                 *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
                 pc += 2;
             }
-            case OP_CELLIFY: {
+            case OP_CELLIFY: { vm.sp = sp;
                 i32 slot = rd_u16p(pc);
                 pc += 2;
                 JsBox* b = js_new_box(&vm.heap, *(vm.stack + fr.base + slot));
                 *(vm.stack + fr.base + slot) = value_cell(&b.head);
             }
             case OP_GETCELL: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                JsBox* b = value_as_box(*(stack + fr.base + rd_u16p(pc)));
                 pc += 2;
-                vpush(vm, b.v);
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETCELL_CHK: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                JsBox* b = value_as_box(*(stack + fr.base + rd_u16p(pc)));
                 pc += 2;
                 if value_is_hole(b.v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
-                    vpush(vm, b.v);
+                    *(stack + sp) = b.v;
+                    sp++;
                 }
+                continue;
             }
-            case OP_SETCELL: {
+            case OP_SETCELL: { vm.sp = sp;
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
                 pc += 2;
                 if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
             }
-            case OP_SETCELL_POP: {
+            case OP_SETCELL_POP: { vm.sp = sp;
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
                 pc += 2;
                 vm.sp--;
@@ -5003,107 +5058,140 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
-                vpush(vm, b.v);
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETUPVAL_CHK: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
                 if value_is_hole(b.v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
-                    vpush(vm, b.v);
+                    *(stack + sp) = b.v;
+                    sp++;
                 }
+                continue;
             }
             case OP_GETUPVALV: {
                 Value uv = *(fr.fun.upvals + rd_u16p(pc));
                 pc += 2;
                 if value_is_hole(uv) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
-                    vpush(vm, uv);
+                    *(stack + sp) = uv;
+                    sp++;
                 }
+                continue;
             }
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
-                if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
-                b.v = vpeek(vm, 0);
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(stack + sp - 1)); }
+                b.v = *(stack + sp - 1);
+                continue;
             }
             case OP_SETUPVAL_POP: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
-                vm.sp--;
-                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(vm.stack + vm.sp)); }
-                b.v = *(vm.stack + vm.sp);
+                sp--;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(stack + sp)); }
+                b.v = *(stack + sp);
+                continue;
             }
             case OP_GETUPVAL_UNDEF: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
                 pc += 2;
-                vpush(vm, b.v);
-                vpush(vm, value_undefined());
+                *(stack + sp) = b.v;
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                continue;
             }
             case OP_GETUPVALV_UNDEF: {
                 Value uv = *(fr.fun.upvals + rd_u16p(pc));
                 pc += 2;
                 if value_is_hole(uv) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
                 } else {
-                    vpush(vm, uv);
-                    vpush(vm, value_undefined());
+                    *(stack + sp) = uv;
+                    *(stack + sp + 1) = value_undefined();
+                    sp += 2;
                 }
+                continue;
             }
-            case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
+            case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: { vm.sp = sp;
                 pc += 2;
                 get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     op == OP_GETGLOBAL_SOFT);
             }
-            case OP_SETGLOBAL: {
+            case OP_SETGLOBAL: { vm.sp = sp;
                 pc += 2;
                 ignore set_global(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     vpeek(vm, 0), !t.sloppy);
             }
-            case OP_SETEXPORT: {
+            case OP_SETEXPORT: { vm.sp = sp;
                 pc += 2;
                 set_export(vm, t, rd_u16p(pc - 2));
             }
-            case OP_DEFGLOBAL: {
+            case OP_DEFGLOBAL: { vm.sp = sp;
                 pc += 2;
                 ignore set_global(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     vpeek(vm, 0), false);
             }
-            case OP_WITH_OBJ: { op_with_obj(vm); }
-            case OP_WITH_HAS: {
+            case OP_WITH_OBJ: { vm.sp = sp; op_with_obj(vm); }
+            case OP_WITH_HAS: { vm.sp = sp;
                 pc += 2;
                 op_with_has(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
-            case OP_WITH_GET: {
+            case OP_WITH_GET: { vm.sp = sp;
                 pc += 2;
                 op_with_get(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_WITH_SET: {
+            case OP_WITH_SET: { vm.sp = sp;
                 pc += 2;
                 op_with_set(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_WITH_METH: {
+            case OP_WITH_METH: { vm.sp = sp;
                 pc += 2;
                 op_with_meth(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_DELGLOBAL: {
+            case OP_DELGLOBAL: { vm.sp = sp;
                 pc += 2;
                 del_global(vm, cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
-            case OP_SETCONST_ERR: {
+            case OP_SETCONST_ERR: { vm.sp = sp;
                 // the value was computed first, as the assignment says
                 vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
             }
             case OP_ADD: {
+                {
+                    Value fb = *(stack + sp - 1);
+                    Value fa = *(stack + sp - 2);
+                    if value_is_int(fa) && value_is_int(fb) {
+                        i64 s = cast(i64, value_as_int(fa)) + value_as_int(fb);
+                        sp--;
+                        if s >= -2147483648 && s <= 2147483647 { *(stack + sp - 1) = value_int(cast(i32, s)); }
+                        else { *(stack + sp - 1) = value_number(cast(f64, s)); }
+                        continue;
+                    }
+                    if value_is_number(fa) && value_is_number(fb) {
+                        f64 r = value_number_f64(fa) + value_number_f64(fb);
+                        sp--;
+                        *(stack + sp - 1) = num_norm(r);
+                        continue;
+                    }
+                    vm.sp = sp;
+                }
                 // two numbers is the common case, and needs none of the
                 // ToPrimitive machinery below
                 Value b = vpeek(vm, 0);
@@ -5147,6 +5235,24 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SUB: {
+                {
+                    Value fb = *(stack + sp - 1);
+                    Value fa = *(stack + sp - 2);
+                    if value_is_int(fa) && value_is_int(fb) {
+                        i64 s = cast(i64, value_as_int(fa)) - value_as_int(fb);
+                        sp--;
+                        if s >= -2147483648 && s <= 2147483647 { *(stack + sp - 1) = value_int(cast(i32, s)); }
+                        else { *(stack + sp - 1) = value_number(cast(f64, s)); }
+                        continue;
+                    }
+                    if value_is_number(fa) && value_is_number(fb) {
+                        f64 r = value_number_f64(fa) - value_number_f64(fb);
+                        sp--;
+                        *(stack + sp - 1) = num_norm(r);
+                        continue;
+                    }
+                    vm.sp = sp;
+                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -5179,7 +5285,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_MUL: {
+            case OP_MUL: { vm.sp = sp;
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -5216,7 +5322,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_DIV, OP_MOD, OP_POW: {
+            case OP_DIV, OP_MOD, OP_POW: { vm.sp = sp;
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -5254,7 +5360,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, num_norm(r));
             }
-            case OP_NEG: {
+            case OP_NEG: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 if !value_is_number(v) && value_is_bigint(v) {
                     vm.sp--;
@@ -5265,7 +5371,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
-            case OP_TONUM: {
+            case OP_TONUM: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 if value_is_number(v) { break case; }   // already a number
                 if value_is_bigint(v) { break case; }   // ToNumeric keeps BigInt
@@ -5273,11 +5379,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
-            case OP_TONUMBER: { op_to_number(vm); }
-            case OP_TOPROPKEY: {
+            case OP_TONUMBER: { vm.sp = sp; op_to_number(vm); }
+            case OP_TOPROPKEY: { vm.sp = sp;
                 op_to_prop_key(vm);
             }
-            case OP_TOSTR: {
+            case OP_TOSTR: { vm.sp = sp;
                 // ToString with the string hint (template substitutions)
                 Value s = js_to_string_value(vm, vpeek(vm, 0));
                 if !vm.has_pending {
@@ -5285,7 +5391,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, s);
                 }
             }
-            case OP_INC, OP_DEC: {
+            case OP_INC, OP_DEC: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 vm.sp--;
                 if value_is_bigint(v) {
@@ -5299,12 +5405,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_NOT: {
+            case OP_NOT: { vm.sp = sp;
                 bool r = !js_truthy(vpeek(vm, 0));
                 vm.sp--;
                 vpush(vm, value_bool(r));
             }
-            case OP_BITNOT: {
+            case OP_BITNOT: { vm.sp = sp;
                 if value_is_bigint(vpeek(vm, 0)) {
                     op_bitnot_bigint(vm);
                     break case;
@@ -5313,8 +5419,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, value_int(r));
             }
-            case OP_TYPEOF: { op_typeof(vm); }
-            case OP_EQ, OP_NEQ: {
+            case OP_TYPEOF: { vm.sp = sp; op_typeof(vm); }
+            case OP_EQ, OP_NEQ: { vm.sp = sp;
                 // object vs a non-nullish primitive: ToPrimitive the object
                 Value a0 = vpeek(vm, 1);
                 Value b0 = vpeek(vm, 0);
@@ -5338,7 +5444,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
             }
-            case OP_SEQ, OP_SNEQ: {
+            case OP_SEQ, OP_SNEQ: { vm.sp = sp;
                 // the same bits are the same value, NaN apart; two different
                 // ints are different values; the rest is the general compare
                 bool r;
@@ -5354,7 +5460,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
             }
-            case OP_LT, OP_GT, OP_LE, OP_GE: {
+            case OP_LT, OP_GT, OP_LE, OP_GE: { vm.sp = sp;
                 i32 r = cmp_rel(vm, op);
                 if r >= 0 { vpush(vm, value_bool(r == 1)); }
             }
@@ -5362,22 +5468,23 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 pc += 4;
                 // two ints, which is what a counted loop's condition compares,
                 // are compared here; anything else takes the general path
-                if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
-                    i32 x = value_as_int(vpeek(vm, 1));
-                    i32 y = value_as_int(vpeek(vm, 0));
-                    vm.sp -= 2;
+                if value_is_int(*(stack + sp - 2)) && value_is_int(*(stack + sp - 1)) {
+                    i32 x = value_as_int(*(stack + sp - 2));
+                    i32 y = value_as_int(*(stack + sp - 1));
+                    sp -= 2;
                     bool r = false;
                     if op == OP_LT_JF { r = x < y; }
                     else if op == OP_GT_JF { r = x > y; }
                     else if op == OP_LE_JF { r = x <= y; }
                     else { r = x >= y; }
                     if !r { pc = code + rd_targetp(pc - 4); }
-                } else {
-                    i32 r = cmp_rel(vm, rel_base(op));
-                    if r == 0 { pc = code + rd_targetp(pc - 4); }
+                    continue;
                 }
+                vm.sp = sp;
+                i32 r = cmp_rel(vm, rel_base(op));
+                if r == 0 { pc = code + rd_targetp(pc - 4); }
             }
-            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: { vm.sp = sp;
                 // an object operand becomes a primitive first, which is how
                 // a wrapped BigInt reaches the BigInt path
                 if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
@@ -5400,7 +5507,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, value_int(r));
             }
-            case OP_USHR: {
+            case OP_USHR: { vm.sp = sp;
                 if value_is_bigint(vpeek(vm, 0)) || value_is_bigint(vpeek(vm, 1)) {
                     vm_throw_error(vm, ERR_TYPE, "BigInts have no unsigned right shift, use >> instead");
                     break case;
@@ -5416,7 +5523,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_number(d));
                 }
             }
-            case OP_INSTANCEOF: {
+            case OP_INSTANCEOF: { vm.sp = sp;
                 if instanceof_hook(vm) { break case; }
                 Value ctor = vpeek(vm, 0);
                 Value v = vpeek(vm, 1);
@@ -5440,7 +5547,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(r));
                 }
             }
-            case OP_IN: {
+            case OP_IN: { vm.sp = sp;
                 Value objv = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 if value_is_function(objv) || value_is_native(objv) {
@@ -5481,7 +5588,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(r));
                 }
             }
-            case OP_HASPRIVATE: {
+            case OP_HASPRIVATE: { vm.sp = sp;
                 // #name in obj: an own check for the private element's hidden
                 // atom, never routed through a proxy trap. Non-object right-hand
                 // sides throw, like the ordinary `in` operator.
@@ -5503,48 +5610,55 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     if (vm.deadline_tick & 4095) == 0 && vm_clock_ns() > vm.deadline_ns {
                         // once: a catch around the loop gets to run
                         vm.deadline_ns = 0;
+                        vm.sp = sp;
                         vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
                     }
                 }
                 pc = code + target;
+                continue;
             }
             case OP_JUMPF: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
                 // what a comparison leaves is a boolean, which needs no test
-                vm.sp--;
-                if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(false)) { pc = code + target; }
-                } else if !js_truthy(*(vm.stack + vm.sp)) {
+                sp--;
+                if value_is_bool(*(stack + sp)) {
+                    if value_same_bits(*(stack + sp), value_bool(false)) { pc = code + target; }
+                } else if !js_truthy(*(stack + sp)) {
                     pc = code + target;
                 }
+                continue;
             }
             case OP_JUMPT: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                vm.sp--;
-                if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { pc = code + target; }
-                } else if js_truthy(*(vm.stack + vm.sp)) {
+                sp--;
+                if value_is_bool(*(stack + sp)) {
+                    if value_same_bits(*(stack + sp), value_bool(true)) { pc = code + target; }
+                } else if js_truthy(*(stack + sp)) {
                     pc = code + target;
                 }
+                continue;
             }
             case OP_JF_KEEP: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                if !js_truthy(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
+                if !js_truthy(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
             case OP_JT_KEEP: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                if js_truthy(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
+                if js_truthy(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
             case OP_JNN_KEEP: {
                 i32 target = rd_targetp(pc);
                 pc += 4;
-                if !is_nullish(vpeek(vm, 0)) { pc = code + target; } else { vm.sp--; }
+                if !is_nullish(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
-            case OP_CLOSURE: {
+            case OP_CLOSURE: { vm.sp = sp;
                 FnTemplate* sub = *(t.subs + rd_u16p(pc));
                 pc += 2;
                 JsFunction* f = js_new_function(&vm.heap, sub, sub.n_upvals);
@@ -5558,7 +5672,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vpush(vm, value_cell(&f.head));
             }
-            case OP_CALL, OP_NEW, OP_SUPERCALL: {
+            case OP_CALL, OP_NEW, OP_SUPERCALL: { vm.sp = sp;
                 i32 argc = rd_u16p(pc);
                 pc += 2;
                 fr.cur_ip = cast(i32, pc - code);   // this frame's call site, for stack traces
@@ -5657,44 +5771,53 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_RETURN_UNDEF: {
-                vpush(vm, value_undefined());
+                *(stack + sp) = value_undefined();
+                sp++;
                 fallthrough;
             }
             case OP_RETURN: {
-                Value res = vpop(vm);
+                sp--;
+                Value res = *(stack + sp);
                 // A derived constructor that never called super() has no
                 // instance to hand back, and returning is where that shows.
                 // Returning an object of its own is allowed, and says the
                 // constructor meant it.
                 if fr.super_pending && !value_is_reference(res) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-                } else {
-                    if fr.is_ctor || fr.super_for >= 0 { res = ctor_result(vm, fr, res); }
-                    vm.sp = fr.base - 2;
-                    vpush(vm, res);
-                    // A return inside a try leaves that try's handler open;
-                    // drop every handler still belonging to this frame so a
-                    // later throw doesn't unwind into the dead frame.
-                    while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
-                        vm.hp--;
-                    }
-                    vm.fp--;
-                    if vm.fp < stop_fp { return 0; }
-                    Frame* popped = vm.frames + vm.fp;
-                    fr = vm.frames + (vm.fp - 1);
-                    t = fr.tmpl;
-                    code = t.code;
-                    pc = code + popped.ret_ip;
+                    continue;
                 }
+                if fr.is_ctor || fr.super_for >= 0 {
+                    vm.sp = sp;
+                    res = ctor_result(vm, fr, res);
+                    sp = vm.sp;
+                }
+                sp = fr.base - 2;
+                *(stack + sp) = res;
+                sp++;
+                // A return inside a try leaves that try's handler open;
+                // drop every handler still belonging to this frame so a
+                // later throw doesn't unwind into the dead frame.
+                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                    vm.hp--;
+                }
+                vm.fp--;
+                if vm.fp < stop_fp { vm.sp = sp; return 0; }
+                Frame* popped = vm.frames + vm.fp;
+                fr = vm.frames + (vm.fp - 1);
+                t = fr.tmpl;
+                code = t.code;
+                pc = code + popped.ret_ip;
+                continue;
             }
-            case OP_NEWOBJ: {
+            case OP_NEWOBJ: { vm.sp = sp;
                 i32 nprops = rd_u16p(pc);
                 pc += 2;
                 JsObject* o = js_new_object(&vm.heap, vm.object_proto);
                 props_reserve(&o.props, nprops);
                 vpush(vm, value_cell(&o.head));
             }
-            case OP_NEWARR: {
+            case OP_NEWARR: { vm.sp = sp;
                 i32 n = rd_u16p(pc);
                 pc += 2;
                 JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
@@ -5709,12 +5832,17 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
                 Value out;
+                if prop_get_ic_fast(*(stack + sp - 1), a, &out, pc - 2) {
+                    *(stack + sp - 1) = out;
+                    continue;
+                }
+                vm.sp = sp;
                 if prop_get_ic(vm, vpeek(vm, 0), a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                 }
             }
-            case OP_GETPROP_THIS: {
+            case OP_GETPROP_THIS: { vm.sp = sp;
                 Value objv = this_of(vm, fr.this_val, t.sloppy);
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
@@ -5722,45 +5850,55 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
             case OP_LT_JF_LL: {
-                Value a = *(vm.stack + fr.base + rd_u16p(pc));
-                Value b = *(vm.stack + fr.base + rd_u16p(pc + 2));
+                Value a = *(stack + fr.base + rd_u16p(pc));
+                Value b = *(stack + fr.base + rd_u16p(pc + 2));
                 pc += 8;
                 if value_is_int(a) && value_is_int(b) {
                     if !(value_as_int(a) < value_as_int(b)) { pc = code + rd_targetp(pc - 4); }
-                } else {
-                    vpush(vm, a);
-                    vpush(vm, b);
-                    i32 r = cmp_rel(vm, OP_LT);
-                    if r == 0 { pc = code + rd_targetp(pc - 4); }
+                    continue;
                 }
+                *(stack + sp) = a;
+                *(stack + sp + 1) = b;
+                sp += 2;
+                vm.sp = sp;
+                i32 r = cmp_rel(vm, OP_LT);
+                if r == 0 { pc = code + rd_targetp(pc - 4); }
             }
             case OP_SEQ_JF, OP_SNEQ_JF: {
+                Value a = *(stack + sp - 2);
+                Value b = *(stack + sp - 1);
                 bool r;
-                if value_same_bits(vpeek(vm, 1), vpeek(vm, 0)) {
-                    r = !value_is_double(vpeek(vm, 0))
-                        || value_as_f64(vpeek(vm, 0)) == value_as_f64(vpeek(vm, 0));
-                } else if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
+                if value_same_bits(a, b) {
+                    r = !value_is_double(b) || value_as_f64(b) == value_as_f64(b);
+                } else if value_is_int(a) && value_is_int(b) {
                     r = false;
                 } else {
-                    r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                    r = js_strict_eq(a, b);
                 }
                 if op == OP_SNEQ_JF { r = !r; }
-                vm.sp -= 2;
+                sp -= 2;
                 pc += 4;
                 if !r { pc = code + rd_targetp(pc - 4); }
+                continue;
             }
             case OP_GETPROP_L: {
-                Value objv = *(vm.stack + fr.base + rd_u16p(pc));
+                Value objv = *(stack + fr.base + rd_u16p(pc));
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
                 pc += 6;
                 Value out;
+                if prop_get_ic_fast(objv, a, &out, pc - 2) {
+                    *(stack + sp) = out;
+                    sp++;
+                    continue;
+                }
+                vm.sp = sp;
                 if prop_get_ic(vm, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
-            case OP_GETIMPORT: {
+            case OP_GETIMPORT: { vm.sp = sp;
                 get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
                 pc += 4;
             }
-            case OP_SETPROP: {
+            case OP_SETPROP: { vm.sp = sp;
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
                 Value v = vpeek(vm, 0);
@@ -5770,20 +5908,20 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, v);
                 }
             }
-            case OP_SETPROP_POP: {
+            case OP_SETPROP_POP: { vm.sp = sp;
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
                 if set_prop_ic(vm, vpeek(vm, 1), a, vpeek(vm, 0), t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2) {
                     vm.sp -= 2;
                 }
             }
-            case OP_DEFPROP_FIXED: {
+            case OP_DEFPROP_FIXED: { vm.sp = sp;
                 pc += 2;
                 def_prop_fixed(vpeek(vm, 1), cast(u32,
                     value_as_int(*(t.consts + rd_u16p(pc - 2)))), vpeek(vm, 0));
                 vm.sp--;
             }
-            case OP_DEFMETHOD: {
+            case OP_DEFMETHOD: { vm.sp = sp;
                 // like SETPROP but installs a non-enumerable property
                 // (class methods, static methods, constructor back-link)
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
@@ -5793,7 +5931,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, v);
             }
-            case OP_DEFMETHOD_DYN: {
+            case OP_DEFMETHOD_DYN: { vm.sp = sp;
                 // a class method with a computed name is still non-enumerable
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
@@ -5801,14 +5939,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 def_method(vpeek(vm, 2), a, vpeek(vm, 0));
                 vm.sp -= 2;
             }
-            case OP_GETINDEX: { op_getindex(vm); }
+            case OP_GETINDEX: { vm.sp = sp; op_getindex(vm); }
             case OP_GETINDEX_LL: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc)));
-                vpush(vm, *(vm.stack + fr.base + rd_u16p(pc + 2)));
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(stack + fr.base + rd_u16p(pc + 2));
+                sp += 2;
                 pc += 4;
+                vm.sp = sp;
                 op_getindex(vm);
             }
-            case OP_SETINDEX: {
+            case OP_SETINDEX: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 Value objv = vpeek(vm, 2);
@@ -5847,23 +5987,30 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_GETMETHOD: {
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 4;
-                Value objv = vpeek(vm, 0);
+                Value objv = *(stack + sp - 1);
                 Value out;
+                if prop_get_ic_fast(objv, a, &out, pc - 2) {
+                    *(stack + sp - 1) = out;
+                    *(stack + sp) = objv;
+                    sp++;
+                    continue;
+                }
+                vm.sp = sp;
                 if prop_get_ic(vm, objv, a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
                 }
             }
-            case OP_DEFPRIVATE: {
+            case OP_DEFPRIVATE: { vm.sp = sp;
                 pc += 4;
                 def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 4)))),
                     cast(i32, rd_u16p(pc - 2)));
             }
-            case OP_GETPRIVATE: { private_get(vm, t, rd_u16p(pc)); pc += 2; }
-            case OP_SETPRIVATE: { private_set(vm, t, rd_u16p(pc)); pc += 2; }
-            case OP_GETMETHOD_PRIV: { private_method(vm, t, rd_u16p(pc)); pc += 2; }
-            case OP_GETMETHOD_DYN: {
+            case OP_GETPRIVATE: { vm.sp = sp; private_get(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_SETPRIVATE: { vm.sp = sp; private_set(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_GETMETHOD_PRIV: { vm.sp = sp; private_method(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_GETMETHOD_DYN: { vm.sp = sp;
                 Value key = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
                 Value out = value_undefined();
@@ -5884,14 +6031,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, objv);
                 }
             }
-            case OP_DELPROP: {
+            case OP_DELPROP: { vm.sp = sp;
                 pc += 2;
                 op_delete_prop(vm, t, rd_u16p(pc - 2));
             }
-            case OP_DELINDEX: {
+            case OP_DELINDEX: { vm.sp = sp;
                 op_delete_index(vm, !t.sloppy);
             }
-            case OP_TRY_PUSH: {
+            case OP_TRY_PUSH: { vm.sp = sp;
                 i32 target = rd_targetp(pc);
                 pc += 4;
                 if vm.hp >= VM_HANDLERS_MAX {
@@ -5904,14 +6051,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm.hp++;
                 }
             }
-            case OP_TRY_POP: { vm.hp--; }
-            case OP_THROW: {
+            case OP_TRY_POP: { vm.sp = sp; vm.hp--; }
+            case OP_THROW: { vm.sp = sp;
                 // a fresh throw, whatever completion was unwinding
                 vm.unwind_return = false;
                 vm_throw(vm, vpop(vm));
             }
-            case OP_RETHROW: { vm_throw(vm, vpop(vm)); }
-            case OP_SETPROTO: {
+            case OP_RETHROW: { vm.sp = sp; vm_throw(vm, vpop(vm)); }
+            case OP_SETPROTO: { vm.sp = sp;
                 Value protov = vpop(vm);
                 Value objv = vpeek(vm, 0);
                 if value_is_object(objv) {
@@ -5929,19 +6076,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     value_as_function(objv).fproto = protov;
                 }
             }
-            case OP_DEFPROP, OP_DEFPROP_NEW: {
+            case OP_DEFPROP, OP_DEFPROP_NEW: { vm.sp = sp;
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 2;
                 if op == OP_DEFPROP_NEW { def_prop_new(vm, a); } else { def_prop(vm, a); }
             }
-            case OP_REQUIRE_OBJ: {
+            case OP_REQUIRE_OBJ: { vm.sp = sp;
                 require_object(vm);
             }
-            case OP_DEFPROP_DYN: {
+            case OP_DEFPROP_DYN: { vm.sp = sp;
                 pc += 2;
                 def_prop_dyn(vm, rd_u16p(pc - 2) != 0);
             }
-            case OP_DEFGETTER, OP_DEFSETTER: {
+            case OP_DEFGETTER, OP_DEFSETTER: { vm.sp = sp;
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 2;
                 bool enumer = rd_u16p(pc) != 0;
@@ -5949,7 +6096,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 def_accessor(vm, vpeek(vm, 1), a, vpeek(vm, 0), op == OP_DEFGETTER, enumer);
                 vm.sp--;
             }
-            case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: {
+            case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: { vm.sp = sp;
                 // computed accessor: `get [expr]() {}` / `set [expr](v) {}`
                 bool enumer = rd_u16p(pc) != 0;
                 pc += 2;
@@ -5959,7 +6106,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 def_accessor(vm, vpeek(vm, 2), a, vpeek(vm, 0), op == OP_DEFGETTER_DYN, enumer);
                 vm.sp -= 2;
             }
-            case OP_ARR_APPEND: {
+            case OP_ARR_APPEND: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value arrv = vpeek(vm, 1);
                 if value_is_array(arrv) {
@@ -5968,7 +6115,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vm.sp--;
             }
-            case OP_ARR_SPREAD: {
+            case OP_ARR_SPREAD: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 Value arrv = vpeek(vm, 1);
                 if value_is_array(arrv) {
@@ -6013,7 +6160,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 if !vm.has_pending { vm.sp--; }
             }
-            case OP_OBJ_SPREAD: {
+            case OP_OBJ_SPREAD: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 Value dstv = vpeek(vm, 1);
                 // `export * from "m"` spreads into the namespace, whose names
@@ -6067,11 +6214,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if into_ns && !vm.has_pending { vm_ns_sort(vm, value_as_object(dstv)); }
                 if !vm.has_pending { vm.sp--; }
             }
-            case OP_OBJ_REST: {
+            case OP_OBJ_REST: { vm.sp = sp;
                 pc += 2;
                 op_obj_rest(vm, fr, rd_u16p(pc - 2));
             }
-            case OP_ARR_SLICE_FROM: {
+            case OP_ARR_SLICE_FROM: { vm.sp = sp;
                 i32 start = rd_u16p(pc);
                 pc += 2;
                 Value src = vpeek(vm, 0);
@@ -6100,7 +6247,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, ov);
             }
-            case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: {
+            case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: { vm.sp = sp;
                 fr.cur_ip = cast(i32, pc - code);   // call site, for stack traces
                 // new.target for the frame vm_call_stack is about to build:
                 // the constructor for `new`, the inherited target for super()
@@ -6148,7 +6295,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
-            case OP_JUMP_NULLISH: {
+            case OP_JUMP_NULLISH: { vm.sp = sp;
                 i32 target = rd_targetp(pc);
                 pc += 4;
                 if is_nullish(vpeek(vm, 0)) {
@@ -6156,7 +6303,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     pc = code + target;
                 }
             }
-            case OP_JUMP_NULLISH_METH: {
+            case OP_JUMP_NULLISH_METH: { vm.sp = sp;
                 i32 target = rd_targetp(pc);
                 pc += 4;
                 if is_nullish(vpeek(vm, 1)) {
@@ -6164,19 +6311,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     pc = code + target;
                 }
             }
-            case OP_CHECK_ITERABLE: {
+            case OP_CHECK_ITERABLE: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 if !value_is_array(v) && !value_is_string(v) {
                     vm_throw_error(vm, ERR_TYPE, "value is not iterable");
                 }
             }
-            case OP_KEYS: {
+            case OP_KEYS: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 JsObject* arr = forin_keys(vm, src);
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
             }
-            case OP_GEN_START: {
+            case OP_GEN_START: { vm.sp = sp;
                 if fr.gen == null {
                     vm_throw_error(vm, ERR_TYPE, "generator body outside a generator");
                 } else {
@@ -6191,7 +6338,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     pc = code + (vm.frames + vm.fp).ret_ip;
                 }
             }
-            case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: {
+            case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: { vm.sp = sp;
                 JsGenerator* g = fr.gen;
                 if g == null {
                     vm_throw_error(vm, ERR_TYPE, "yield outside a generator");
@@ -6241,7 +6388,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     pc = code + popped.ret_ip;
                 }
             }
-            case OP_GET_ITER: {
+            case OP_GET_ITER: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value it;
                 if vm_get_iterator(vm, v, &it) {
@@ -6249,19 +6396,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, it);
                 }
             }
-            case OP_GET_AITER: {
+            case OP_GET_AITER: { vm.sp = sp;
                 do_get_aiter(vm);
             }
-            case OP_GET_AITER_W: {
+            case OP_GET_AITER_W: { vm.sp = sp;
                 do_get_aiter_w(vm);
             }
-            case OP_CATCH_ENTER: {
+            case OP_CATCH_ENTER: { vm.sp = sp;
                 catch_enter(vm);
             }
-            case OP_ITER_SEND: {
+            case OP_ITER_SEND: { vm.sp = sp;
                 do_iter_send(vm);
             }
-            case OP_ITER_NEXT: {
+            case OP_ITER_NEXT: { vm.sp = sp;
                 Value iter = vpeek(vm, 0);
                 Value val;
                 bool done = false;
@@ -6271,12 +6418,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(done));
                 }
             }
-            case OP_ITER_STEP: {
+            case OP_ITER_STEP: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 iter_step(vm, fr.base + dslot);
             }
-            case OP_GET_ITER_S: {
+            case OP_GET_ITER_S: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 Value v = vpeek(vm, 0);
@@ -6291,7 +6438,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
-            case OP_ITER_NEXT_S: {
+            case OP_ITER_NEXT_S: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 Value iter = vpeek(vm, 0);
@@ -6309,7 +6456,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(done));
                 }
             }
-            case OP_PROTOGET: {
+            case OP_PROTOGET: { vm.sp = sp;
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
                 pc += 2;
                 Value* pv = props_get(&vm.object_proto.props, a);
@@ -6326,28 +6473,28 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
-            case OP_ITER_REST: {
+            case OP_ITER_REST: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 iter_rest(vm, fr.base + dslot);
             }
-            case OP_ITER_CLOSE: {
+            case OP_ITER_CLOSE: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 iter_close(vm, fr.base + dslot);
             }
-            case OP_ITER_CLOSE_ABRUPT: {
+            case OP_ITER_CLOSE_ABRUPT: { vm.sp = sp;
                 i32 dslot = rd_u16p(pc);
                 pc += 2;
                 iter_close_abrupt(vm, fr.base + dslot);
             }
-            case OP_ITER_CHECK: {
+            case OP_ITER_CHECK: { vm.sp = sp;
                 iter_check_result(vm);
             }
-            case OP_FREEZE: {
+            case OP_FREEZE: { vm.sp = sp;
                 freeze_top(vm);
             }
-            case OP_REGEX: {
+            case OP_REGEX: { vm.sp = sp;
                 Value srcv = *(t.consts + rd_u16p(pc));
                 pc += 2;
                 Value flgv = *(t.consts + rd_u16p(pc));
@@ -6356,12 +6503,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     gc_string_view(value_as_string(flgv)));
                 if !vm.has_pending { vpush(vm, re); }
             }
-            default: {
+            default: { vm.sp = sp;
                 eprint("vm: bad opcode {}\n", op);
                 exit(70);
             }
         }
-
+        sp = vm.sp;
     }
     return 0;
 }
