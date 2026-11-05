@@ -26,8 +26,17 @@ struct DiagList {
     i32 n_suppressed;   // adds dropped while muted
 }
 
+// A vector with no room yet: its first push allocates. For the vectors
+// most functions, scopes and compiles never fill, whose room was a
+// malloc and a free each time.
+void vec_lazy<T>(Vec<T>* v) {
+    v.data = null;
+    v.len = 0;
+    v.cap = 0;
+}
+
 void diags_init(DiagList* d) {
-    vec_init<Diag>(&d.list, 8);
+    vec_lazy<Diag>(&d.list);
     d.n_errors = 0;
     d.muted = 0;
     d.n_suppressed = 0;

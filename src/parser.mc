@@ -74,7 +74,7 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.strict = 0;
     p.single = 0;
     vec_init<NodePtr>(&p.scratch, 64);
-    vec_init<str>(&p.labels, 4);
+    vec_lazy<str>(&p.labels);
     p.label_floor = 0;
     p.in_async = 0;
     p.in_gen = 0;
@@ -108,7 +108,7 @@ void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset
     p.strict = strict ? 1 : 0;
     p.single = 0;
     vec_init<NodePtr>(&p.scratch, 64);
-    vec_init<str>(&p.labels, 4);
+    vec_lazy<str>(&p.labels);
     p.label_floor = 0;
     p.in_async = 0;
     p.in_gen = 0;

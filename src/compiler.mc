@@ -232,7 +232,7 @@ struct Compiler {
 type NameSet = StrMap<i32>*;
 
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
-    co.name_sets = vec_new<NameSet>(16);
+    vec_lazy<NameSet>(&co.name_sets);
     co.lazy_ok = false;
     co.lazy_src = null;
     co.prefill = null;
@@ -248,7 +248,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.strict = false;
     co.static_this = false;
     co.next_static_home = false;
-    vec_init<str>(&co.outer_names, 4);
+    vec_lazy<str>(&co.outer_names);
     co.outer_is_body = false;
     co.next_is_derived_ctor = false;
     co.in_static_block = false;
@@ -257,8 +257,8 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.ns_name = "";
     co.next_with = 0;
     strmap_init<i32>(&co.export_heads);
-    vec_init<ExportName>(&co.export_names, 8);
-    vec_init<PrivScope>(&co.priv_scopes, 4);
+    vec_lazy<ExportName>(&co.export_names);
+    vec_lazy<PrivScope>(&co.priv_scopes);
     co.src.data = null;
     co.src.len = 0;
     co.src_name = "";
@@ -359,7 +359,7 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     chunk_init(&fs.ch);
     vec_init<CBind>(&fs.binds, 16);
     strmap_init<i32>(&fs.index);
-    vec_init<CUp>(&fs.ups, 4);
+    vec_lazy<CUp>(&fs.ups);
     strmap_init<i32>(&fs.inner);
     strmap_init<i32>(&fs.cell_names);
     strmap_init<i32>(&fs.hoisted_names);
@@ -379,11 +379,11 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.static_home = is_arrow && parent != null ? parent.static_home : false;
     fs.loop_floor = 0;
     fs.switch_depth = 0 - 1;
-    vec_init<BrkJump>(&fs.break_jumps, 8);
-    vec_init<BrkJump>(&fs.cont_jumps, 8);
-    vec_init<LoopCtx>(&fs.loops, 4);
-    vec_init<FinEntry>(&fs.finallys, 4);
-    vec_init<WithScope>(&fs.withs, 2);
+    vec_lazy<BrkJump>(&fs.break_jumps);
+    vec_lazy<BrkJump>(&fs.cont_jumps);
+    vec_lazy<LoopCtx>(&fs.loops);
+    vec_lazy<FinEntry>(&fs.finallys);
+    vec_lazy<WithScope>(&fs.withs);
     // a `with` scope is lexical, so a function defined in the body keeps
     // resolving against its object; the hidden binding is captured like any
     // other name the body mentions
@@ -797,7 +797,7 @@ private str hidden_name(Compiler* co, str prefix, i32 n) {
 // `t`) is not what it captures.
 private StrMap<i32>* fn_names(Compiler* co, Node* f) {
     if f.names != null { return f.names; }
-    StrMap<i32>* set = new(StrMap<i32>);
+    StrMap<i32>* set = cast(StrMap<i32>*, bump_alloc(co.arena, cast(i32, sizeof(StrMap<i32>))));
     strmap_init<i32>(set);
     FreeScan fsn;
     free_scan_init(&fsn, co, set);
@@ -1066,7 +1066,6 @@ private void names_free(Compiler* co) {
     for i32 i = 0; i < co.name_sets.len; i++ {
         StrMap<i32>* set = vec_get(&co.name_sets, i);
         strmap_free<i32>(set);
-        free(set);
     }
     co.name_sets.len = 0;
 }
@@ -3590,7 +3589,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         check_strict_binding(co, f, f.name);
     }
     if !simple_params || co.strict || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
-        Vec<str> pnames = vec_new<str>(4);
+        Vec<str> pnames;
+        vec_lazy<str>(&pnames);
         for i32 i = 0; i < f.kids.len; i++ {
             collect_pattern_names((*(f.kids.items + i)).a, &pnames);
         }
@@ -3950,7 +3950,8 @@ private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
     FScope fs;
     fscope_init(&fs, co.cur, arrow);
     // what the function declares itself is its own, not the scope's around it
-    Vec<str> own = vec_new<str>(16);
+    Vec<str> own;
+    vec_lazy<str>(&own);
     for i32 i = 0; i < f.kids.len; i++ { collect_pattern_names((*(f.kids.items + i)).a, &own); }
     // the body's vars are its own too, unless a default value in the
     // parameters can see past them to the names outside
@@ -3990,12 +3991,17 @@ private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
     lz.name_inferred = (f.flags & NF_NAME_INFERRED) != 0;
     lz.n_ups = fs.ups.len;
     lz.ups = lz.n_ups > 0 ? alloc<LazyUp>(lz.n_ups) : null;
+    i32 names_len = 0;
+    for i32 i = 0; i < lz.n_ups; i++ { names_len += vec_get(&fs.ups, i).name.len; }
+    lz.names_buf = lz.n_ups > 0 ? alloc<u8>(names_len > 0 ? names_len : 1) : null;
+    i32 at = 0;
     for i32 i = 0; i < lz.n_ups; i++ {
         CUp u = vec_get(&fs.ups, i);
         LazyUp* lu = lz.ups + i;
-        lu.name.data = alloc<u8>(u.name.len > 0 ? u.name.len : 1);
+        lu.name.data = lz.names_buf + at;
         memcpy(lu.name.data, u.name.data, u.name.len);
         lu.name.len = u.name.len;
+        at += u.name.len;
         lu.is_const = u.is_const;
         lu.tdz = u.tdz;
         lu.exported = u.exported;
@@ -4745,7 +4751,8 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     // repeat, along with the parameters of the function whose body this is
     // or the catch parameter the block belongs to
     bool body = co.outer_is_body;
-    Vec<str> vnames = vec_new<str>(4);
+    Vec<str> vnames;
+    vec_lazy<str>(&vnames);
     for i32 i = 0; i < co.outer_names.len; i++ { vec_push(&vnames, vec_get(&co.outer_names, i)); }
     co.outer_names.len = 0;
     co.outer_is_body = false;
@@ -4762,7 +4769,8 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
         }
     }
     hoist_lexical_decls(co, list, &vnames);
-    Vec<NodePtr> seen = vec_new<NodePtr>(4);
+    Vec<NodePtr> seen;
+    vec_lazy<NodePtr>(&seen);
     hoist_function_decls(co, list, &vnames, body, &seen);
     vec_free(&seen);
     vec_free(&vnames);
@@ -5437,7 +5445,8 @@ private void compile_stmt(Compiler* co, Node* n) {
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_lexical_decls(co, &(*(n.kids.items + i)).kids, &svars);
         }
-        Vec<NodePtr> seen = vec_new<NodePtr>(4);
+        Vec<NodePtr> seen;
+    vec_lazy<NodePtr>(&seen);
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_function_decls(co, &(*(n.kids.items + i)).kids, &svars, false, &seen);
         }

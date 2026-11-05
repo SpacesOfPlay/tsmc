@@ -6,6 +6,7 @@
 
 import vec;
 import value;
+import diag;
 
 enum Op {
     OP_CONST,        // u16 const idx
@@ -262,10 +263,11 @@ struct LazyFn {
     bool name_inferred;
     LazyUp* ups;
     i32 n_ups;
+    u8* names_buf;       // the upvalues' names, one block
 }
 
 void lazy_free(LazyFn* lz) {
-    for i32 i = 0; i < lz.n_ups; i++ { free((lz.ups + i).name.data); }
+    if lz.names_buf != null { free(lz.names_buf); }
     if lz.ups != null { free(lz.ups); }
     free(lz);
 }
@@ -347,9 +349,9 @@ void chunk_init(Chunk* ch) {
     vec_init<u8>(&ch.code, 64);
     ch.last_op = 0 - 1;
     ch.max_target = 0 - 1;
-    vec_init<Value>(&ch.consts, 8);
-    vec_init<TmplUpval>(&ch.upvals, 4);
-    vec_init<TmplPtr>(&ch.subs, 4);
+    vec_lazy<Value>(&ch.consts);
+    vec_lazy<TmplUpval>(&ch.upvals);
+    vec_lazy<TmplPtr>(&ch.subs);
     vec_init<PosEntry>(&ch.pos, 16);
 }
 

@@ -24,7 +24,7 @@ struct Lower {
 void lower_init(Lower* lw, Bump* arena, DiagList* diags) {
     lw.arena = arena;
     lw.diags = diags;
-    vec_init<NodePtr>(&lw.scratch, 32);
+    vec_lazy<NodePtr>(&lw.scratch);
     lw.depth = 0;
     lw.too_deep = false;
 }
