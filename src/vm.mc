@@ -252,7 +252,7 @@ struct VM {
     JsObject* ta_proto;        // %TypedArray%.prototype (shared methods)
     JsObject* arraybuffer_proto;
     JsObject* dataview_proto;
-    JsObject*[9] ta_protos;    // per-kind TypedArray.prototype (instanceof)
+    JsObject*[11] ta_protos;   // per-kind TypedArray.prototype (instanceof)
     u32 atom_ta_off;
     u32 atom_ta_len;
     u32 atom_ta_kind;
@@ -279,6 +279,11 @@ struct VM {
     Vec<GcString*> regex_flgs;
     Vec<GcString*> atom_strs;   // by atom: the string a pinned atom's name is handed out as (Object.keys, for-in), made once
     GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
+    GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
+    GcString*[128] latin1_chars; // one-character strings for U+0080..U+00FF, as ascii_chars: what atob's output is indexed by
+    Value array_values;         // Array.prototype.values, which every arguments object iterates by
+    Value map_entries;          // Map.prototype[Symbol.iterator] and Set.prototype's as made: a
+    Value set_values;           // collection whose prototype still has them is iterated directly
     GcString*[8] http_strs;     // the http natives' constant strings, made when first used
     u32 atom_rx;
     u32 atom_source;
@@ -336,11 +341,6 @@ struct VM {
     u32 atom_done;
     u32 atom_next;
     i32 exec_depth;   // nested vm_execute invocations (C-stack guard)
-    GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
-    GcString*[128] latin1_chars; // one-character strings for U+0080..U+00FF, as ascii_chars: what atob's output is indexed by
-    Value array_values;         // Array.prototype.values, which every arguments object iterates by
-    Value map_entries;          // Map.prototype[Symbol.iterator] and Set.prototype's as made: a
-    Value set_values;           // collection whose prototype still has them is iterated directly
 }
 
 const i32 ERR_ERROR = 0;
@@ -519,7 +519,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.ta_proto != null { gc_mark_cell(h, &vm.ta_proto.head); }
     if vm.arraybuffer_proto != null { gc_mark_cell(h, &vm.arraybuffer_proto.head); }
     if vm.dataview_proto != null { gc_mark_cell(h, &vm.dataview_proto.head); }
-    for i32 i = 0; i < 9; i++ {
+    for i32 i = 0; i < 11; i++ {
         if vm.ta_protos[i] != null { gc_mark_cell(h, &vm.ta_protos[i].head); }
     }
     if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
@@ -2318,7 +2318,7 @@ private i32 val_to_index(Value v) {
 i32 ta_elem_size(i32 kind) {
     if kind <= 2 { return 1; }
     if kind <= 4 { return 2; }
-    if kind == 8 { return 8; }
+    if kind >= 8 { return 8; }
     return 4;
 }
 
@@ -2341,6 +2341,8 @@ i32 ta_atom_index(VM* vm, u32 a) {
 }
 
 str ta_kind_name(i32 kind) {
+    if kind == 9 { return "BigInt64Array"; }
+    if kind == 10 { return "BigUint64Array"; }
     if kind == 0 { return "Int8Array"; }
     if kind == 1 { return "Uint8Array"; }
     if kind == 2 { return "Uint8ClampedArray"; }
@@ -2370,13 +2372,37 @@ Value ta_read(u8* p, i32 kind) {
     if kind == 5 { i32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_int(v); }
     if kind == 6 { u32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_number(cast(f64, v)); }
     if kind == 7 { f32 f; memcpy(cast(u8*, &f), p, cast(i64, 4)); return value_number(cast(f64, f)); }
+    if kind == 9 { i64 v; memcpy(cast(u8*, &v), p, cast(i64, 8)); return value_number(cast(f64, v)); }
+    if kind == 10 { u64 v; memcpy(cast(u8*, &v), p, cast(i64, 8)); return value_number(cast(f64, v)); }
     f64 d;
     memcpy(cast(u8*, &d), p, cast(i64, 8));
     return value_number(d);
 }
 
+// As ta_read, with the 64-bit integer kinds (BigInt64Array 9,
+// BigUint64Array 10) read as the BigInts they hold.
+Value ta_read_vm(VM* vm, u8* p, i32 kind) {
+    if kind == 9 {
+        i64 v;
+        memcpy(cast(u8*, &v), p, cast(i64, 8));
+        return value_cell(&js_new_bigint(&vm.heap, bn_from_i64(v)).head);
+    }
+    if kind == 10 {
+        u64 v;
+        memcpy(cast(u8*, &v), p, cast(i64, 8));
+        return value_cell(&js_new_bigint(&vm.heap, bn_from_u64(v)).head);
+    }
+    return ta_read(p, kind);
+}
+
 void ta_write(u8* p, i32 kind, f64 num) {
     if kind == 8 { memcpy(p, cast(u8*, &num), cast(i64, 8)); return; }
+    if kind == 9 || kind == 10 {
+        // a number into a 64-bit integer view, as the builtins' fills hand one
+        i64 v = num != num ? 0 : cast(i64, num);
+        memcpy(p, cast(u8*, &v), cast(i64, 8));
+        return;
+    }
     if kind == 7 { f32 f = cast(f32, num); memcpy(p, cast(u8*, &f), cast(i64, 4)); return; }
     if kind == 2 {   // Uint8Clamped: ties round to the even value
         i32 c;
@@ -2420,7 +2446,7 @@ Value vm_ta_get(VM* vm, JsObject* o, i32 idx) {
     if idx < 0 || idx >= t.ta_len { return value_undefined(); }
     if o.elen < 1 { return value_undefined(); }
     GcBytes* gb = value_as_bytes(*(o.elems));
-    return ta_read(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind);
+    return ta_read_vm(vm, gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind);
 }
 
 void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
@@ -2428,6 +2454,12 @@ void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
     if idx < 0 || idx >= t.ta_len { return; }
     if o.elen < 1 { return; }
     GcBytes* gb = value_as_bytes(*(o.elems));
+    if t.ta_kind >= 9 {
+        // a BigInt into a 64-bit integer view, its low 64 bits; a number is taken as one
+        u64 bits = value_is_bigint(v) ? bn_to_u64_wrap(bigint_view(value_as_bigint(v))) : cast(u64, cast(i64, js_to_number(v)));
+        memcpy(gb_data(gb) + t.ta_off + idx * 8, cast(u8*, &bits), cast(i64, 8));
+        return;
+    }
     f64 num = js_to_number(v);
     ta_write(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind, num);
 }
@@ -4378,7 +4410,7 @@ void vm_init(VM* vm) {
     vm.ta_proto = null;
     vm.arraybuffer_proto = null;
     vm.dataview_proto = null;
-    for i32 i = 0; i < 9; i++ { vm.ta_protos[i] = null; }
+    for i32 i = 0; i < 11; i++ { vm.ta_protos[i] = null; }
     vm.textenc_proto = null;
     vm.textdec_proto = null;
     vm.timeout_proto = null;
@@ -9585,6 +9617,47 @@ private FnTemplate* vm_verify_cache(VM* vm, FnTemplate* t, str src, str src_name
 
 i32 vm_run_source(VM* vm, str src, str src_name) {
     return vm_run_source_root(vm, src, src_name, null);
+}
+
+// A script compiled and kept, not run: its root template, or null with the
+// first diagnostic's message in `err` (owned by the caller). What the
+// Function constructor needs: the function expression the script holds is
+// its first sub-template.
+FnTemplate* vm_compile_source(VM* vm, str src, str src_name, string* err) {
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    Parser p;
+    parser_init(&p, src, &d, &arena);
+    Node* prog = parse_program_skipping(&p, false);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if p.ts_seen { lower_program(&lw, prog); }
+    FnTemplate* t = null;
+    if d.n_errors == 0 {
+        i32 rmark = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_source(&co, src, src_name);
+        co.script_globals = vm.script_globals;
+        t = compile_program(&co, prog);
+        vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
+        gc_root_reset(&vm.heap, rmark);
+        vm.compiles++;
+    }
+    if d.n_errors > 0 {
+        t = null;
+        str msg = "invalid or unexpected token";
+        for i32 i = 0; i < d.list.len; i++ { if d.list.data[i].severity != 0 || i == d.list.len - 1 { msg = d.list.data[i].message; break; } }
+        *err = str_concat("", msg);
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    return t;
 }
 
 // A script compiled on its own heap and atom table into the code cache's

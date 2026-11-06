@@ -5684,12 +5684,43 @@ private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, 
 
 // --- Function.prototype ------------------------------------------------------------------
 
-// The Function constructor compiles source at runtime; the interpreter
-// does not support dynamic code. The global exists so that references to
-// `Function` and `Function.prototype` resolve (only calling it throws).
+// The Function constructor: the parameters and the body spelled as a
+// function expression in parentheses, compiled as a script of its own,
+// whose one sub-template the function is. It closes over nothing, as
+// the spec has it (its scope is the global one), so a template with
+// upvalues is a compile the caller cannot have asked for.
 private Value nat_function_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    vm_throw_error(as_vm(vmp), ERR_TYPE, "Function constructor (dynamic code) is not supported");
-    return value_undefined();
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
+    defer str_buf_free(&sb);
+    str_buf_add(&sb, "(function anonymous(");
+    for i32 i = 0; i + 1 < argc; i++ {
+        if i > 0 { str_buf_add(&sb, ","); }
+        Value s = js_to_string_value(vm, *(args + i));
+        if vm.has_pending { return value_undefined(); }
+        str_buf_add(&sb, gc_string_view(value_as_string(s)));
+    }
+    str_buf_add(&sb, "\n) {\n");
+    if argc > 0 {
+        Value b = js_to_string_value(vm, *(args + argc - 1));
+        if vm.has_pending { return value_undefined(); }
+        str_buf_add(&sb, gc_string_view(value_as_string(b)));
+    }
+    str_buf_add(&sb, "\n})");
+    string err = str_concat("", "");
+    defer free(err);
+    FnTemplate* root = vm_compile_source(vm, str_buf_to_str(&sb), "Function", &err);
+    if root == null {
+        vm_throw_error(vm, ERR_SYNTAX, str_from(err.data, err.len));
+        return value_undefined();
+    }
+    if root.n_subs != 1 || (*(root.subs + 0)).n_upvals != 0 {
+        vm_throw_error(vm, ERR_SYNTAX, "Function constructor: not a function body");
+        return value_undefined();
+    }
+    JsFunction* f = js_new_function(&vm.heap, *(root.subs + 0), 0);
+    return value_cell(&f.head);
 }
 
 private Value nat_fn_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -12744,6 +12775,8 @@ private void typedarray_install(VM* vm) {
     install_one_ta(vm, 6, "Uint32Array");
     install_one_ta(vm, 7, "Float32Array");
     install_one_ta(vm, 8, "Float64Array");
+    install_one_ta(vm, 9, "BigInt64Array");
+    install_one_ta(vm, 10, "BigUint64Array");
 
     dataview_install(vm);
 }

@@ -68,6 +68,31 @@ BigNum bn_from_i64(i64 v) {
     return r;
 }
 
+BigNum bn_from_u64(u64 m) {
+    BigNum r = bn_zero();
+    if m == 0 { return r; }
+    u32[3] tmp;
+    i32 n = 0;
+    while m > 0 {
+        tmp[n] = cast(u32, m % BN_BASE);
+        m = m / BN_BASE;
+        n++;
+    }
+    r.limbs = bn_alloc(n);
+    r.n = n;
+    for i32 i = 0; i < n; i++ { *(r.limbs + i) = tmp[i]; }
+    return r;
+}
+
+// The low 64 bits of the value in two's complement, as a BigInt64Array
+// or BigUint64Array stores it: the magnitude modulo 2^64, negated when
+// the number is.
+u64 bn_to_u64_wrap(BigNum a) {
+    u64 m = 0;
+    for i32 i = a.n - 1; i >= 0; i-- { m = m * BN_BASE + cast(u64, *(a.limbs + i)); }
+    return a.neg ? 0 - m : m;
+}
+
 // --- magnitude helpers (ignore sign) ---------------------------------
 
 // Compares magnitudes: -1 if |a|<|b|, 0 if equal, 1 if greater.
