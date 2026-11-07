@@ -111,9 +111,9 @@ or an attribute on the loop), would let the engine say which six matter.
 - `--unchecked` changes nothing here (3146 to 3137 ms over the bench
   suite): the loop indexes through pointers already.
 - `break` inside a `switch` case leaves the enclosing loop, not the
-  switch (checked with a small program). The engine wanted a way out of
-  a case to the code after the switch and restructured instead; a note
-  in LANGUAGE.md would save the next reader the experiment.
+  switch. Withdrawn: `break case;` is the statement for that, in
+  LANGUAGE.md's control-flow section and already in this file 21
+  times. The engine's author missed it, not the language.
 
 ## What the engine did meanwhile, for scale
 
@@ -134,3 +134,140 @@ Together: bsky.app busy 1959 to 1964 ms against 1880 to 1895, the first
 frame 2169 to 2182 against 2090 to 2110, the peak working set 795 to
 777 MB; the bench suite 3145 to 3103. The patterns above are what is
 left per op, and they are the compiler's.
+
+## After the compiler's answer (minc at lang 0fa308b5, 2026-11-07)
+
+Three lang commits took the report up: small struct copies lower to a
+load and a store so the address fusion sees them (b7b65e1b), the jump
+table is 8-byte absolute entries in `.rdata` and the dispatch is
+`lea rax, [rip + table]; jmp qword ptr [rax + r11*8]` (d0626513,
+0fa308b5), and the `mov rax, rbp` copy is gone. Verified on the same
+engine source rebuilt with the new compiler:
+
+- `vm_execute` 14698 to 14142 instructions. The dispatch copy is four
+  instructions where it was seven; GETLOCAL is eight before its
+  dispatch where it was thirteen, the frame slot read as
+  `mov rdi, [rdi + rsi*8]` and the push as `mov [r13 + r9*8], rdi`;
+  the 102 `mov rax, rbp` are zero.
+- Both suites pass: ts-minc's 396 checks, brmc's 35 modules.
+- The bench suite 3105 to 3057 ms (fib 380 to 365, classes 366 to 356,
+  nothing slower beyond noise). bsky.app, three interleaved runs, is
+  within noise: busy 1808 to 1841 ms against 1795 to 1846, the shots
+  the same. Which is the report's own premise measured: the op's cost
+  is its memory traffic, and these fixes removed instructions.
+
+What the new code still shows, in order of the traffic it costs:
+
+### 5. The invariants are spilled, not merely reloaded
+
+Pattern 3 stands and is the one that still touches memory. `t` lives
+at `[rsp + 0x78]` (80 uses) and `t.code` at `[rsp + 0x80]` (34 uses):
+every taken jump is `add r14, qword ptr [rsp + 0x80]`, and CONST is
+three dependent loads for a constant,
+
+```
+  mov r8, qword ptr [rsp + 0x78]         ; t, from the stack frame
+  mov r8, qword ptr [r8 + 0x38]          ; t.consts
+  mov r8, qword ptr [r8 + r9*8]          ; the constant
+```
+
+while `fr.base` is still `movsxd rdi, dword ptr [r15 + 0x18]` per
+local access (40 sites). The six callee-saved registers hold `vm`,
+`stack`, `sp`, `pc`, `fr` and the int-tag mask; the frame base, the
+code base and the constants would be three more. A register hint, or
+an allocator that weighs the loop's reads over the cold paths', is the
+ask as before.
+
+### 6. A store with a displacement does not fuse
+
+The load side fuses with a displacement (`mov rsi, [r13 + rdi*8 - 8]`
+in SETLOCAL and ADD); the store side does not. ADD's result store,
+`*(stack + sp - 1) = v` after `sp--`, is
+
+```
+  lea r8, [r12 - 1]
+  mov r12, r8
+  movsxd r8, r8d
+  shl r8, 3
+  add r8, r13
+  mov qword ptr [r8 - 8], r9
+```
+
+where `movsxd r8, r8d; mov [r13 + r8*8 - 8], r9` would do. Twelve
+such stores in the function; 137 `movsxd; shl 3; add` triples remain
+in all, 91 of them feeding a plain `mov r, [r]` load.
+
+### 7. A second load of the same address is recomputed
+
+JUMPF reads `*(stack + sp)` twice with no store between (is it a
+boolean; is it false). The first is fused, the second rebuilds the
+address and reloads a value that is still in r8:
+
+```
+  movsxd r8, r9d
+  mov r8, qword ptr [r13 + r8*8]
+  ...two compares on r8...
+  movsxd r9, r9d
+  shl r9, 3
+  add r9, r13
+  mov r9, qword ptr [r9]
+```
+
+One load and three instructions per occurrence.
+
+### 8. A value for the cold path is spilled on the hot path
+
+ADD computes the i64 sum, stores it to `[rsp + 0x88]`, tests the i32
+range, and on the common in-range path never reads it back; only the
+overflow path reloads it for `vcvtsi2sd`. The store belongs on that
+path. GETPROP's inline-cache hit path begins with six stores to the
+stack frame (`[rsp + 0x88]` to `[rsp + 0xb8]`) of values the hit never
+needs again. The function's frame is 0x758 bytes and `[rsp + ...]`
+appears 2912 times.
+
+### 9. A boolean goes through memory
+
+A `bool` assigned in more than one branch is kept in a stack byte and
+tested from there. LT_JF's comparison result:
+
+```
+  cmp esi, edi
+  setl dil
+  movzx edi, dil
+  mov byte ptr [rsp + 0x230], dil
+  jmp .L319
+  ...
+.L319:
+  movzx rsi, byte ptr [rsp + 0x230]
+  test rsi, rsi
+  jne .L3
+```
+
+A `cmp; jl` per branch would replace nine instructions and a store and
+a load. Nine such sites in the function; JUMP's `bool back` is the
+same shape without the store (`setb sil; movzx esi, sil; test rsi,
+rsi; je`).
+
+### Small things seen this time
+
+- `lea r9, [r12 - 1]; mov r12, r9` for `sp--` when the new value is
+  used as an index (eight sites); `dec r12` and index by r12.
+- LT_JF's `movsxd rsi, esi; mov r9, rsi; movsxd rdi, edi; mov r8, rdi`:
+  each operand in two registers, a copy each.
+- A 10-byte `movabs` for a tag constant repeated within a handler
+  (JUMPF loads the false value twice); the int tag is hoisted into r10
+  and the mask into rbx, so the allocator can hoist them, and these
+  would go the same way if a register were free (item 5).
+
+### On the engine's side, from the same reading
+
+Not the compiler's, noted for the engine's next batch:
+
+- GETUPVAL walks `fr.fun` then `fun.upvals`, two dependent loads per
+  upvalue read; the upvals pointer could sit in the frame record.
+- The four relational jump ops share a case and pick the comparison by
+  testing the op byte up to three times; four cases, which the
+  dispatch already distinguishes, would be straight-line.
+- The pending-check restructuring of the hole-check and return ops
+  nested if/else where `break case;` says the same thing; a cleanup,
+  to be timed like any loop change.
