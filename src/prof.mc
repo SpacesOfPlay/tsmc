@@ -27,6 +27,8 @@ struct Prof {
     i64 js_calls;
     i64 native_calls;
     i64[256] hist;
+    i64* pairs;          // 256 by 256: each op followed by each, for the fusions
+    i32 prev_op;
     i32 budget;
     u64 last_ns;
     u64 start_ns;
@@ -47,6 +49,9 @@ Prof* prof_new() {
     p.js_calls = 0;
     p.native_calls = 0;
     for i32 i = 0; i < 256; i++ { p.hist[i] = 0; }
+    p.pairs = alloc<i64>(65536);
+    for i32 i = 0; i < 65536; i++ { *(p.pairs + i) = 0; }
+    p.prev_op = -1;
     p.budget = PROF_STRIDE;
     p.start_ns = vm_clock_ns();
     p.last_ns = p.start_ns;
@@ -58,7 +63,11 @@ Prof* prof_new() {
 
 void prof_step(Prof* p, FnTemplate* t, i32 op) {
     p.ops++;
-    if op >= 0 && op < 256 { p.hist[op]++; }
+    if op >= 0 && op < 256 {
+        p.hist[op]++;
+        if p.prev_op >= 0 { *(p.pairs + p.prev_op * 256 + op) += 1; }
+        p.prev_op = op;
+    }
     if t.prof_ops == 0 {
         vec_push(&p.seen, t);
         vec_push(&p.files, format("{}", t.src_name.len > 0 ? t.src_name : "<anonymous>"));
@@ -398,6 +407,20 @@ void prof_report(Prof* p, i64 collections) {
     }
     eprint("\n");
 
+    // the pairs: each op and the one after it, the twenty-four most seen
+    eprint("  pairs:");
+    for i32 k = 0; k < 24; k++ {
+        i32 best = -1;
+        i64 most = 0;
+        for i32 i = 0; i < 65536; i++ { if *(p.pairs + i) > most { most = *(p.pairs + i); best = i; } }
+        if best < 0 { break; }
+        string c = pct(most, p.ops);
+        eprint(" {}+{} {}%", op_name(best / 256), op_name(best % 256), c);
+        free(c);
+        *(p.pairs + best) = 0;
+    }
+    eprint("\n");
+
     // the allocations
     eprint("  allocations:");
     for i32 k = 0; k < 16; k++ {
@@ -504,6 +527,8 @@ void prof_report_reset(Prof* p, i64 collections) {
     p.js_calls = 0;
     p.native_calls = 0;
     for i32 i = 0; i < 256; i++ { p.hist[i] = 0; }
+    for i32 i = 0; i < 65536; i++ { *(p.pairs + i) = 0; }
+    p.prev_op = -1;
     p.budget = PROF_STRIDE;
     p.start_ns = vm_clock_ns();
     p.last_ns = p.start_ns;
