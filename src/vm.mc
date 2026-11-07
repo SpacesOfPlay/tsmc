@@ -5293,11 +5293,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = v;
+                sp++;
+                continue;
             }
             case OP_SETLOCAL: {
                 *(stack + fr.base + rd_u16p(pc)) = *(stack + sp - 1);
@@ -5344,11 +5344,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(b.v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = b.v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_SETCELL: { vm.sp = sp;
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
@@ -5376,11 +5376,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(b.v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = b.v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETUPVALV: {
                 Value uv = *(fr.fun.upvals + rd_u16p(pc));
@@ -5388,11 +5388,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(uv) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = uv;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = uv;
+                sp++;
+                continue;
             }
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
@@ -5423,12 +5423,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(uv) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = uv;
-                    *(stack + sp + 1) = value_undefined();
-                    sp += 2;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = uv;
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                continue;
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: { vm.sp = sp;
                 pc += 2;
@@ -6168,32 +6168,31 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.super_pending && !value_is_reference(res) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-                } else {
-                    if fr.is_ctor || fr.super_for >= 0 {
-                        vm.sp = sp;
-                        res = ctor_result(vm, fr, res);
-                        sp = vm.sp;
-                    }
-                    if !vm.has_pending {
-                        sp = fr.base - 2;
-                        *(stack + sp) = res;
-                        sp++;
-                        // A return inside a try leaves that try's handler open;
-                        // drop every handler still belonging to this frame so a
-                        // later throw doesn't unwind into the dead frame.
-                        while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
-                            vm.hp--;
-                        }
-                        vm.fp--;
-                        if vm.fp < stop_fp { vm.sp = sp; return 0; }
-                        Frame* popped = vm.frames + vm.fp;
-                        fr = vm.frames + (vm.fp - 1);
-                        t = fr.tmpl;
-                        code = t.code;
-                        pc = code + popped.ret_ip;
-                        continue;
-                    }
+                    break case;
                 }
+                if fr.is_ctor || fr.super_for >= 0 {
+                    vm.sp = sp;
+                    res = ctor_result(vm, fr, res);
+                    sp = vm.sp;
+                }
+                if vm.has_pending { break case; }
+                sp = fr.base - 2;
+                *(stack + sp) = res;
+                sp++;
+                // A return inside a try leaves that try's handler open;
+                // drop every handler still belonging to this frame so a
+                // later throw doesn't unwind into the dead frame.
+                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                    vm.hp--;
+                }
+                vm.fp--;
+                if vm.fp < stop_fp { vm.sp = sp; return 0; }
+                Frame* popped = vm.frames + vm.fp;
+                fr = vm.frames + (vm.fp - 1);
+                t = fr.tmpl;
+                code = t.code;
+                pc = code + popped.ret_ip;
+                continue;
             }
             case OP_NEWOBJ: { vm.sp = sp;
                 i32 nprops = rd_u16p(pc);
