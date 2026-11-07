@@ -406,6 +406,63 @@ private FnTemplate* cc_read_template(CcIn* r) {
     return t;
 }
 
+// --- one template, for the lazy functions compiled ahead ----------------
+
+// A compiled template with its subs as a buffer of its own, for an
+// embedder's thread that compiles a script's lazy functions ahead of
+// their first call (vm.mc, AheadCompile): the VM reads it into the lazy
+// template with codecache_read_lazy. The caller frees it.
+CcOut codecache_write_one(AtomTable* atoms, FnTemplate* t) {
+    CcOut o = CcOut{};
+    cc_u32(&o, CC_MAGIC);
+    cc_u32(&o, cc_format());
+    cc_write_template(&o, atoms, t);
+    return o;
+}
+
+// The lazy template `t` filled from bytes codecache_write_one made of the
+// same function compiled elsewhere, as compile_lazy would fill it; false,
+// with `t` as it was, when the bytes are not that. The string constants
+// are rooted; the caller resets the root mark once the VM owns them.
+bool codecache_read_lazy(GcHeap* heap, AtomTable* atoms, u8* data, i32 len, FnTemplate* t) {
+    LazyFn* lz = t.lazy;
+    CcIn r = CcIn{};
+    r.data = data;
+    r.len = len;
+    if cc_rd_u32(&r) != CC_MAGIC || cc_rd_u32(&r) != cc_format() { return false; }
+    r.heap = heap;
+    r.atoms = atoms;
+    r.src = lz.source.src;
+    r.src_name = lz.source.src_name;
+    r.source = lz.source;   // the lazy functions inside it share the source
+    FnTemplate* nt = cc_read_template(&r);
+    if r.bad || r.at != r.len || nt.lazy != null || nt.n_upvals != t.n_upvals || nt.src_start != t.src_start {
+        cc_discard(nt);
+        return false;
+    }
+    t.n_params = nt.n_params;
+    t.n_slots = nt.n_slots;
+    t.has_rest = nt.has_rest;
+    t.needs_arguments = nt.needs_arguments;
+    t.sloppy = nt.sloppy;
+    free(t.code);
+    t.code = nt.code;
+    t.code_len = nt.code_len;
+    t.consts = nt.consts;
+    t.n_consts = nt.n_consts;
+    t.catom = nt.catom;
+    t.subs = nt.subs;
+    t.n_subs = nt.n_subs;
+    t.pos = nt.pos;
+    t.n_pos = nt.n_pos;
+    if nt.upvals != null { free(nt.upvals); }
+    if nt.name.data != null { free(nt.name.data); }
+    free(nt);
+    lazy_free(lz);
+    t.lazy = null;
+    return true;
+}
+
 // a tree the reader left half-made: every template allocated so far,
 // through the sub pointers that are set
 private void cc_discard(FnTemplate* t) {

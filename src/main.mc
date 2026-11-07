@@ -101,17 +101,35 @@ i32 tsmc_main() {
             m.cc_len = cast(i32, cached.len);
         }
     }
+    // the script compiled ahead, and every lazy function of it, which the
+    // run then takes through the hook, as an embedder's thread serves them
     CcOut ahead = CcOut{};
+    CliAhead la = CliAhead{};
     if cc_ahead && cached.data == null {
-        ahead = vm_compile_ahead(source, arg, m.script_globals);
-        if ahead.data != null { m.cc_data = ahead.data; m.cc_len = ahead.len; }
+        AheadCompile a;
+        if ahead_begin(&a, source, arg, m.script_globals) {
+            ahead = ahead_cache(&a);
+            m.cc_data = ahead.data;
+            m.cc_len = ahead.len;
+            vec_init<CliAheadEntry>(&la.entries, 64);
+            i32 start = 0;
+            CcOut one = CcOut{};
+            while ahead_next(&a, &start, &one) { vec_push(&la.entries, CliAheadEntry{ start, one }); }
+            la.src_name = module_entry_name(arg);
+            la.src_len = source.len;
+            ahead_end(&a);
+            m.lazy_ahead = &cli_lazy_ahead;
+            m.lazy_ahead_ctx = &la;
+        }
     }
     i32 status = module_run_entry(&m, source, arg);
     if ahead.data != null {
-        if m.cache_loads == 0 { eprint("tsmc: the compile ahead was not taken
-"); }
+        if m.cache_loads == 0 { eprint("tsmc: the compile ahead was not taken\n"); }
+        if la.entries.len > 0 && m.lazy_compiles > 0 { eprint("tsmc: {} lazy functions compiled ahead were not taken\n", m.lazy_compiles); }
         free(ahead.data);
     }
+    for i32 k = 0; k < la.entries.len; k++ { free(vec_get(&la.entries, k).bytes.data); }
+    if la.entries.data != null { vec_free(&la.entries); }
     if code_cache.len > 0 && m.first_root != null {
         CcOut o = vm_save_templates(&m, m.first_root, source);
         FileData fd = FileData{ .data = o.data, .len = o.len };
@@ -128,5 +146,32 @@ i32 tsmc_main() {
 // program. On the freestanding target the embedder writes main(), calls
 // tsmc_set_uefi_host() and then tsmc_main().
 when !os(uefi) {
-    i32 main() { return tsmc_main(); }
+    // --code-cache-ahead's lazy functions, compiled before the run and
+// served at their calls; in source order, so found by bisection
+struct CliAheadEntry {
+    i32 start;
+    CcOut bytes;
+}
+
+struct CliAhead {
+    Vec<CliAheadEntry> entries;
+    str src_name;
+    i32 src_len;
+}
+
+private u8* cli_lazy_ahead(void* ctx, str src_name, i32 src_len, i32 start, i32* len_out) {
+    CliAhead* la = cast(CliAhead*, ctx);
+    if src_len != la.src_len || !str_equal(src_name, la.src_name) { return null; }
+    i32 lo = 0;
+    i32 hi = la.entries.len;
+    while lo < hi {
+        i32 mid = (lo + hi) / 2;
+        CliAheadEntry* e = &la.entries.data[mid];
+        if e.start == start { *len_out = e.bytes.len; return e.bytes.data; }
+        if e.start < start { lo = mid + 1; } else { hi = mid; }
+    }
+    return null;
+}
+
+i32 main() { return tsmc_main(); }
 }

@@ -2366,6 +2366,13 @@ private Value dynimport_hook(VM* vm, Value specv, Value referrerv) {
     return pv;
 }
 
+// The name the entry's source runs under, which module_run_entry gives
+// it: its own when absolute, else the canonical absolute path.
+str module_entry_name(str path) {
+    if spec_is_absolute(path) { return path; }
+    return strip_unc(canon_path(path));
+}
+
 i32 module_run_entry(VM* vm, str src, str path) {
     // `fetch` is a global in Node 18+; install it as a lazy native.
     vm_set_global(vm, "fetch", vm_make_native(vm, &nat_fetch, "fetch"));

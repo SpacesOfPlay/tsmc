@@ -224,6 +224,26 @@ takes 149 ms where the VM's own compile takes 137 and the writing 9, and
 the reading 18. `--code-cache-ahead` runs a script that way; the golden
 tests run under it too.
 
+The compile ahead goes on to the lazy functions. `AheadCompile` is the
+compile as an object: `ahead_begin` parses and compiles the script on
+its own heap and atom table, `ahead_cache` gives the cache bytes, and
+`ahead_next` compiles the script's lazy functions one at a time in
+source order, each into bytes of one template (`codecache_write_one`,
+the functions inside it queued after it), until none is left;
+`ahead_share` lets threads split a script's top-level functions
+between them. At a lazy function's first call the VM asks the
+embedder's hook (`vm.lazy_ahead`), by the source's name and length and
+the function's start, and reads the bytes it gets into the template
+(`codecache_read_lazy`) as it reads the cache, in place of parsing and
+compiling: 9 µs against 85. Source order, since a bundle runs its
+modules about as they are laid out; what the threads have not reached
+is compiled at the call as before. `--code-cache-ahead` compiles every
+lazy function ahead and serves it so, which the lazy goldens run under.
+On brmc's saved bsky.app the bundle has 9300 lazy functions, 632 ms of
+one thread; four threads have them all within the bundle's run, and the
+page's thread compiles 329 to 423 of its 4034 instead, 28 to 39 ms in
+place of 344.
+
 ## Exceptions
 
 A handler stack of `{ frame count, stack depth, catch ip }`.

@@ -126,6 +126,12 @@ type UncaughtHook = fn(VM*, Value, bool): void;
 // builtins so vm.mc's call sites stay free of the object/iterator builtins.
 type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 
+// An embedder's lazy functions compiled ahead (AheadCompile): asked at a
+// lazy function's first call, by its source's name and length and the
+// function's start, for the bytes codecache_write_one made of it; null
+// when there are none. The bytes stay the embedder's.
+type LazyAheadFn = fn(void*, str, i32, i32, i32*): u8*;
+
 struct VM {
     GcHeap heap;
     AtomTable atoms;
@@ -133,6 +139,10 @@ struct VM {
     Prof* prof;                // the `--prof` accounting, or null
     i32 lazy_compiles;         // lazy functions compiled on their first call
     i64 lazy_ns;               // and the time that took
+    LazyAheadFn lazy_ahead;    // the embedder's functions compiled ahead, or null
+    void* lazy_ahead_ctx;
+    i32 lazy_ahead_hits;       // lazy functions taken from it instead
+    i64 lazy_ahead_ns;
     i32 compiles;              // scripts and modules compiled
     i64 compile_ns;            // their parse, lower and compile time
     // The code cache (codecache.mc): bytes offered for the next
@@ -4366,6 +4376,8 @@ void vm_init(VM* vm) {
     vec_init<TmplPtr>(&vm.fresh_tmpls, 16);
     vm.cc_data = null;
     vm.cc_len = 0;
+    vm.lazy_ahead = null;
+    vm.lazy_ahead_ctx = null;
     vm.first_root = null;
     vm.cache_loads = 0;
     vm.cache_ns = 0;
@@ -9516,6 +9528,7 @@ else {
 // A lazy function's first call: reparsed from its source and compiled
 // into its template. False with a SyntaxError thrown when it does not.
 bool vm_lazy_compile(VM* vm, FnTemplate* t) {
+    if vm.lazy_ahead != null && vm_lazy_from_ahead(vm, t) { return true; }
     u64 t0 = vm_clock_ns();
     defer vm_lazy_account(vm, t0);
     LazyFn* lz = t.lazy;
@@ -9556,6 +9569,25 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
 private void vm_lazy_account(VM* vm, u64 t0) {
     vm.lazy_compiles++;
     vm.lazy_ns += cast(i64, vm_clock_ns() - t0);
+}
+
+// The function's template from the embedder's compile ahead, when that
+// has reached it: read as the cache is read.
+private bool vm_lazy_from_ahead(VM* vm, FnTemplate* t) {
+    u64 t0 = vm_clock_ns();
+    LazyFn* lz = t.lazy;
+    i32 n = 0;
+    u8* b = vm.lazy_ahead(vm.lazy_ahead_ctx, lz.source.src_name, lz.source.src.len, lz.start, &n);
+    if b == null { return false; }
+    i32 rmark = gc_root_mark(&vm.heap);
+    bool ok = codecache_read_lazy(&vm.heap, &vm.atoms, b, n, t);
+    if ok { vec_push(&vm.fresh_tmpls, t); t.owner.compiled++; }
+    gc_root_reset(&vm.heap, rmark);
+    if ok {
+        vm.lazy_ahead_hits++;
+        vm.lazy_ahead_ns += cast(i64, vm_clock_ns() - t0);
+    }
+    return ok;
 }
 
 // The run of a script's root template: the body, then the jobs it queued.
@@ -9660,49 +9692,154 @@ FnTemplate* vm_compile_source(VM* vm, str src, str src_name, string* err) {
     return t;
 }
 
-// A script compiled on its own heap and atom table into the code cache's
-// form, for a thread that is not the VM's: the VM reads the bytes as it
-// would a cache of the script (vm.cc_data). The heap never collects, so
-// it needs no roots; what the compile made goes with it. Empty when the
-// script does not compile, which the VM then reports.
-CcOut vm_compile_ahead(str src, str src_name, bool script_globals) {
-    CcOut out = CcOut{};
+// A script compiled apart from the VM, on a heap and atom table of its
+// own, for a thread that is not the VM's: first into the code cache's
+// form, which the VM reads as it would a cache of the script (vm.cc_data),
+// then its lazy functions one by one in source order, each into bytes of
+// its own, which the VM takes at the function's first call in place of
+// compiling it (vm.lazy_ahead). Source order, since a bundle runs its
+// modules about as they are laid out. The heap never collects, so it
+// needs no roots; everything made goes with ahead_end.
+struct AheadCompile {
+    GcHeap heap;
+    AtomTable atoms;
+    string src;          // its own copy: the embedder's text need not outlive it
+    string src_name;
+    bool script_globals;
+    FnTemplate* root;
+    Vec<TmplPtr> todo;   // the lazy functions not compiled yet, the next last
+    i32 compiled;
+}
+
+// the lazy functions under `t`, pushed last first so they pop in source order
+private void ahead_collect(AheadCompile* a, FnTemplate* t) {
+    for i32 i = t.n_subs - 1; i >= 0; i-- {
+        FnTemplate* s = *(t.subs + i);
+        if s.lazy != null { vec_push(&a.todo, s); } else { ahead_collect(a, s); }
+    }
+}
+
+// The script parsed and compiled. False, with nothing left to end, when
+// it does not compile, which the VM then reports.
+bool ahead_begin(AheadCompile* a, str src, str src_name, bool script_globals) {
+    a.src = str_concat("", src);
+    a.src_name = str_concat("", src_name);
+    a.script_globals = script_globals;
+    a.root = null;
+    a.compiled = 0;
+    gc_init(&a.heap);
+    a.heap.tracer = &js_trace;
+    a.heap.finalizer = &js_finalize;
+    a.heap.props_trace = &js_props_trace;
+    a.heap.minor_threshold = 0x7fffffffffffffff;
+    a.heap.next_gc = 0x7fffffffffffffff;
+    atoms_init(&a.atoms);
+    vec_init<TmplPtr>(&a.todo, 64);
+    str s = str_from(a.src.data, a.src.len);
     DiagList d;
     diags_init(&d);
     Bump arena;
     bump_init(&arena);
-    GcHeap heap;
-    gc_init(&heap);
-    heap.tracer = &js_trace;
-    heap.finalizer = &js_finalize;
-    heap.props_trace = &js_props_trace;
-    heap.minor_threshold = 0x7fffffffffffffff;
-    heap.next_gc = 0x7fffffffffffffff;
-    AtomTable atoms;
-    atoms_init(&atoms);
     Parser p;
-    parser_init(&p, src, &d, &arena);
-    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
+    parser_init(&p, s, &d, &arena);
+    Node* prog = parse_program_skipping(&p, lazy_functions && s.len >= LAZY_MIN_SOURCE);
     Lower lw;
     lower_init(&lw, &arena, &d);
     if p.ts_seen { lower_program(&lw, prog); }
     if d.n_errors == 0 {
         Compiler co;
-        compiler_init(&co, &d, &heap, &atoms, &arena);
-        compiler_set_source(&co, src, src_name);
+        compiler_init(&co, &d, &a.heap, &a.atoms, &arena);
+        compiler_set_source(&co, s, str_from(a.src_name.data, a.src_name.len));
         co.script_globals = script_globals;
         FnTemplate* t = compile_program(&co, prog);
-        if d.n_errors == 0 {
-            out = codecache_write(&atoms, t, src, lazy_functions && src.len >= LAZY_MIN_SOURCE, script_globals);
-        }
-        template_free(t);
+        if d.n_errors == 0 { a.root = t; } else { template_free(t); }
     }
     lower_destroy(&lw);
     parser_destroy(&p);
     bump_destroy(&arena);
     diags_free(&d);
-    atoms_free(&atoms);
-    gc_destroy(&heap);
+    if a.root == null { ahead_end(a); return false; }
+    ahead_collect(a, a.root);
+    return true;
+}
+
+// For threads that split a script between them, before any ahead_next:
+// this one keeps every `parts`-th of the top-level lazy functions from
+// `part` on, with the functions inside them.
+void ahead_share(AheadCompile* a, i32 part, i32 parts) {
+    if parts <= 1 { return; }
+    i32 n = a.todo.len;
+    i32 k = 0;
+    for i32 i = 0; i < n; i++ {
+        if (n - 1 - i) % parts == part { a.todo.data[k] = a.todo.data[i]; k++; }
+    }
+    a.todo.len = k;
+}
+
+// The tree as the code cache's bytes, which the caller frees: before any
+// ahead_next, so it is the tree the VM would have compiled itself.
+CcOut ahead_cache(AheadCompile* a) {
+    str s = str_from(a.src.data, a.src.len);
+    return codecache_write(&a.atoms, a.root, s, lazy_functions && s.len >= LAZY_MIN_SOURCE, a.script_globals);
+}
+
+// The next lazy function compiled, its bytes in *out (the caller frees
+// them) and its start in *start_out; false when none is left. One that
+// does not compile is passed over: the VM compiles it at its call and
+// reports it.
+bool ahead_next(AheadCompile* a, i32* start_out, CcOut* out) {
+    while a.todo.len > 0 {
+        FnTemplate* t = vec_pop(&a.todo);
+        LazyFn* lz = t.lazy;
+        i32 start = lz.start;
+        DiagList d;
+        diags_init(&d);
+        Bump arena;
+        bump_init(&arena);
+        Parser p;
+        parser_init_at(&p, lz.source.src, &d, &arena, lz.start, lz.strict);
+        Node* f = parse_function_skipping(&p, lz.method, true);
+        bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
+        Lower lw;
+        lower_init(&lw, &arena, &d);
+        if ok && p.ts_seen { lower_function(&lw, &f); ok = d.n_errors == 0; }
+        if ok {
+            Compiler co;
+            compiler_init(&co, &d, &a.heap, &a.atoms, &arena);
+            compiler_set_lazy_source(&co, lz.source);
+            co.script_globals = a.script_globals;
+            ok = compile_lazy(&co, f, t);
+        }
+        lower_destroy(&lw);
+        parser_destroy(&p);
+        bump_destroy(&arena);
+        diags_free(&d);
+        if !ok { continue; }
+        a.compiled++;
+        ahead_collect(a, t);
+        *out = codecache_write_one(&a.atoms, t);
+        *start_out = start;
+        return true;
+    }
+    return false;
+}
+
+void ahead_end(AheadCompile* a) {
+    if a.root != null { template_free(a.root); a.root = null; }
+    vec_free(&a.todo);
+    atoms_free(&a.atoms);
+    gc_destroy(&a.heap);
+    free(a.src);
+    free(a.src_name);
+}
+
+// A script compiled on its own heap into the code cache's form, for a
+// thread that is not the VM's. Empty when the script does not compile.
+CcOut vm_compile_ahead(str src, str src_name, bool script_globals) {
+    AheadCompile a;
+    if !ahead_begin(&a, src, src_name, script_globals) { return CcOut{}; }
+    CcOut out = ahead_cache(&a);
+    ahead_end(&a);
     return out;
 }
 
