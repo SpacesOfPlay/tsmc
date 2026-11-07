@@ -821,14 +821,34 @@ private bool define_property_core(void* vmp, Value* args, i32 argc, bool report)
     } else if (existing.flags & PROP_CONFIGURABLE) == 0 {
         // A non-configurable property admits almost no change: only turning a
         // writable data property read-only, or rewriting its value while it is
-        // still writable.
-        bool bad = desc_has(vm, desc, "configurable") || wants_accessor
-            || value_is_accessor(existing.val);
+        // still writable. A descriptor that restates what the property has
+        // is allowed, as ValidateAndApplyPropertyDescriptor allows it: a
+        // library that reads every own descriptor and defines them again
+        // (axios's freezeMethods over a function's prototype) relies on it.
+        bool bad = false;
+        if desc_has(vm, desc, "configurable") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "configurable"), &tmp0);
+            if js_truthy(tmp0) { bad = true; }
+        }
         if desc_has(vm, desc, "enumerable") {
             ignore vm_get_prop_value(vm, desc, bi_atom(vm, "enumerable"), &tmp0);
             if js_truthy(tmp0) != ((existing.flags & PROP_ENUMERABLE) != 0) { bad = true; }
         }
-        if (existing.flags & PROP_WRITABLE) == 0 {
+        bool generic = !wants_accessor && !desc_has(vm, desc, "value") && !desc_has(vm, desc, "writable");
+        bool was_accessor = value_is_accessor(existing.val);
+        if !generic && wants_accessor != was_accessor { bad = true; }
+        else if !generic && was_accessor {
+            // the same getter and setter, or halves left out
+            JsAccessor* was = value_as_accessor(existing.val);
+            if desc_has(vm, desc, "get") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "get"), &tmp0);
+                if !js_strict_eq(tmp0, was.get) { bad = true; }
+            }
+            if desc_has(vm, desc, "set") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "set"), &tmp0);
+                if !js_strict_eq(tmp0, was.set) { bad = true; }
+            }
+        } else if !generic && (existing.flags & PROP_WRITABLE) == 0 {
             if desc_has(vm, desc, "writable") {
                 ignore vm_get_prop_value(vm, desc, bi_atom(vm, "writable"), &tmp0);
                 if js_truthy(tmp0) { bad = true; }
