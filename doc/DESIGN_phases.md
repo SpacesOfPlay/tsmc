@@ -108,11 +108,44 @@ is a caution for every A/B on the page, not a cost of this: a build
 that differs by a struct's size can move 40 ms of collection in or out
 of busy, and the trace's collection counts say when it has.
 
+## Below the phases: the loop by case, sampled
+
+The phases do not divide the interpreter's time by opcode, and no
+clock in the loop could without costing more than an op. What can is a
+sample of the thread's instruction pointer from outside, mapped back
+to the case it is in. `tools/ripsample.mc` (Windows x64) starts the
+program and every `interval_us` suspends its main thread, reads RIP
+and resumes it, into a histogram of addresses as the image sees them;
+`tools/ripmap.py` maps the histogram to functions (the header lines of
+`minc-dbg --disasm --all` on the same `-g` binary), to files, and
+inside `vm_execute` to the case each instruction belongs to, walking
+`minc-dbg --disasm <exe> vm_execute` in address order with the
+source's `case` lines; a tag from an inlined callee keeps the case it
+is in, the code before the first case is `loop head`, after the switch
+`loop tail`. `--lines CASE` lists a case's source lines by sample.
+
+```
+minc -g src/main.mc -o tsmc_g.exe
+minc-dbg --disasm --all tsmc_g.exe | grep -E '^\S.*  \S+:[0-9]+  0x' > fns.txt
+minc-dbg --disasm tsmc_g.exe vm_execute > loop.asm
+ripsample hist.txt 250 tsmc_g.exe bench/fib.js
+python tools/ripmap.py --fns fns.txt --loop loop.asm --src src/vm.mc hist.txt
+```
+
+A sample is a suspend and a resume, about 10 us of the program's time
+at 250 us apart, 4% spread evenly; `-g` changes no code. Checked on
+fib: 99.8% of the samples in `vm_execute`, CALL and RETURN first. Two
+things the mapping has to work around until the sampler does this
+itself: the function table of `--disasm --all` omits every function
+whose line info has no file (`str_find <unknown>:78`; in brmc 2.1 MB
+of the 5.6 MB of text), so those are looked up by name
+(`fill_fns.py`), and an inlined callee's tag names the caller's file
+with the callee's line, so the mapping goes by case, not by line, for
+anything outside `vm_execute`'s own lines. Both are asked of the lang
+project in its `doc/REPORT_codegen_vm_loop.md`.
+
 ## What it does not do
 
-It does not divide the interpreter's time by opcode: that needs a
-sample of the loop's instruction address mapped back to the case, which
-the native sampler does not give yet (lang's
-`doc/REPORT_codegen_vm_loop.md`). It does not see other threads: the
-loader's compiles ahead are their own report. A native's name is what
-the table keys on, so two natives of one name are one row.
+It does not see other threads: the loader's compiles ahead are their
+own report. A native's name is what the table keys on, so two natives
+of one name are one row.
