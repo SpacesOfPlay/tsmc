@@ -29,7 +29,14 @@ value tests themselves; everything else here is ours.
 An object is a `JsObject` with its own `PropList`: an array of
 `{key, value, flags}` scanned linearly, with an `IntMap` index built once a
 table passes eight entries. A read walks the prototype chain and looks in each
-table until it hits.
+table until it hits. The array's first entries lie in the object's own cell
+when the object was made with room for them (`js_new_object_room`: an object
+literal's count, at least four; six for a constructor's instance), so a small
+object is one allocation and its entries are on the lines the object is on;
+a growth past the room moves the entries to the pool and the cell keeps its
+space. A closure's upvalues lie in its cell the same way. On brmc's bsky.app
+the two took marking from 120 to 104 ms and busy about 50 ms, the process no
+larger.
 
 That is fine per level and the levels are the problem. `d.av` where `av` lives
 three levels up does four table lookups. Worse, a *write* of a fresh property

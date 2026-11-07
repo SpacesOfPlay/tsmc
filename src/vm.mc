@@ -1688,7 +1688,7 @@ Value proxy_construct(VM* vm, JsProxy* p, Value* argstart, i32 argc, Value new_t
         if vm_get_prop_value(vm, p.target, vm.atom_prototype, &cpv) && value_is_object(cpv) {
             cproto = value_as_object(cpv);
         }
-        JsObject* cinst = js_new_object(&vm.heap, cproto);
+        JsObject* cinst = js_new_object_room(&vm.heap, cproto, 6);
         Value cinstv = value_cell(&cinst.head);
         gc_root(&vm.heap, cinstv);
         vm.pending_new_target = new_target;
@@ -5106,6 +5106,37 @@ private bool try_bigint_op(VM* vm, Value a, Value b, i32 op, Value* out) {
     return true;
 }
 
+// A pending exception unwound to its handler, when one lies at or above
+// stop_fp: the frames and the stack cut back to it, the exception pushed
+// where its catch block reads it, and its ip in *ip_out. False when no
+// handler is there: the frames above stop_fp are dropped and the caller
+// returns 1.
+private bool unwind_pending(VM* vm, i32 stop_fp, i32* ip_out) {
+    Handler* htop = vm.handlers + (vm.hp - 1);
+    if vm.hp > 0 && htop.frame_count >= stop_fp {
+        vm.hp--;
+        Handler* h = vm.handlers + vm.hp;
+        vm.fp = h.frame_count;
+        vm.sp = h.sp;
+        vpush(vm, vm.pending);
+        vm.pending = value_undefined();
+        vm.has_pending = false;
+        *ip_out = h.ip;
+        return true;
+    }
+    while vm.hp > 0 {
+        Handler* hh = vm.handlers + (vm.hp - 1);
+        if hh.frame_count < stop_fp { break; }
+        vm.hp--;
+    }
+    while vm.fp >= stop_fp {
+        Frame* pf = vm.frames + (vm.fp - 1);
+        if pf.gen != null { pf.gen.state = GEN_DONE; }
+        vm.fp--;
+    }
+    return false;
+}
+
 private i32 vm_execute(VM* vm, i32 stop_fp) {
     Frame* fr = vm.frames + (vm.fp - 1);
     FnTemplate* t = fr.tmpl;
@@ -5116,39 +5147,22 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
     // A case that ends in `continue` keeps it in the register.
     Value* stack = vm.stack;
     i32 sp = vm.sp;
+    i32 ip = 0;
 
+    // The pending exception is looked for after an op that called out,
+    // where the switch is left, and before the first op, so that a
+    // generator resumed with a throw unwinds before it runs. An op that
+    // ends in `continue` has called nothing that throws, or has looked
+    // itself.
+    if vm.has_pending {
+        if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+        fr = vm.frames + (vm.fp - 1);
+        t = fr.tmpl;
+        code = t.code;
+        pc = code + ip;
+        sp = vm.sp;
+    }
     while true {
-        // top-of-loop so resuming a generator with a pending throw
-        // unwinds before its first opcode
-        if vm.has_pending {
-            Handler* htop = vm.handlers + (vm.hp - 1);
-            if vm.hp > 0 && htop.frame_count >= stop_fp {
-                vm.hp--;
-                Handler* h = vm.handlers + vm.hp;
-                vm.fp = h.frame_count;
-                vm.sp = h.sp;
-                fr = vm.frames + (vm.fp - 1);
-                t = fr.tmpl;
-                code = t.code;
-                pc = code + h.ip;
-                vpush(vm, vm.pending);
-                vm.pending = value_undefined();
-                vm.has_pending = false;
-                sp = vm.sp;
-            } else {
-                while vm.hp > 0 {
-                    Handler* hh = vm.handlers + (vm.hp - 1);
-                    if hh.frame_count < stop_fp { break; }
-                    vm.hp--;
-                }
-                while vm.fp >= stop_fp {
-                    Frame* pf = vm.frames + (vm.fp - 1);
-                    if pf.gen != null { pf.gen.state = GEN_DONE; }
-                    vm.fp--;
-                }
-                return 1;
-            }
-        }
         i32 op = *pc;
         pc++;
         when defined(TSMC_PROF) {
@@ -5282,8 +5296,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     *(stack + sp) = v;
                     sp++;
+                    continue;
                 }
-                continue;
             }
             case OP_SETLOCAL: {
                 *(stack + fr.base + rd_u16p(pc)) = *(stack + sp - 1);
@@ -5333,8 +5347,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     *(stack + sp) = b.v;
                     sp++;
+                    continue;
                 }
-                continue;
             }
             case OP_SETCELL: { vm.sp = sp;
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
@@ -5365,8 +5379,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     *(stack + sp) = b.v;
                     sp++;
+                    continue;
                 }
-                continue;
             }
             case OP_GETUPVALV: {
                 Value uv = *(fr.fun.upvals + rd_u16p(pc));
@@ -5377,8 +5391,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 } else {
                     *(stack + sp) = uv;
                     sp++;
+                    continue;
                 }
-                continue;
             }
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
@@ -5413,8 +5427,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     *(stack + sp) = uv;
                     *(stack + sp + 1) = value_undefined();
                     sp += 2;
+                    continue;
                 }
-                continue;
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: { vm.sp = sp;
                 pc += 2;
@@ -5899,17 +5913,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
             case OP_JUMP: {
                 i32 target = rd_targetp(pc);
-                if code + target < pc && vm.deadline_ns != 0 {
-                    vm.deadline_tick++;
-                    if (vm.deadline_tick & 4095) == 0 && vm_clock_ns() > vm.deadline_ns {
-                        // once: a catch around the loop gets to run
-                        vm.deadline_ns = 0;
-                        vm.sp = sp;
-                        vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
-                    }
-                }
+                bool back = code + target < pc;
                 pc = code + target;
-                continue;
+                if !back || vm.deadline_ns == 0 { continue; }
+                vm.deadline_tick++;
+                if (vm.deadline_tick & 4095) != 0 || vm_clock_ns() <= vm.deadline_ns { continue; }
+                // once: a catch around the loop gets to run
+                vm.deadline_ns = 0;
+                vm.sp = sp;
+                vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
             }
             case OP_JUMPF: {
                 i32 target = rd_targetp(pc);
@@ -6030,6 +6042,15 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     sp -= argc + 2;
                     *(stack + sp) = res;
                     sp++;
+                    if vm.has_pending {
+                        vm.sp = sp;
+                        if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+                        fr = vm.frames + (vm.fp - 1);
+                        t = fr.tmpl;
+                        code = t.code;
+                        pc = code + ip;
+                        sp = vm.sp;
+                    }
                     continue;
                 }
                 fallthrough;
@@ -6147,36 +6168,37 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.super_pending && !value_is_reference(res) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-                    continue;
+                } else {
+                    if fr.is_ctor || fr.super_for >= 0 {
+                        vm.sp = sp;
+                        res = ctor_result(vm, fr, res);
+                        sp = vm.sp;
+                    }
+                    if !vm.has_pending {
+                        sp = fr.base - 2;
+                        *(stack + sp) = res;
+                        sp++;
+                        // A return inside a try leaves that try's handler open;
+                        // drop every handler still belonging to this frame so a
+                        // later throw doesn't unwind into the dead frame.
+                        while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                            vm.hp--;
+                        }
+                        vm.fp--;
+                        if vm.fp < stop_fp { vm.sp = sp; return 0; }
+                        Frame* popped = vm.frames + vm.fp;
+                        fr = vm.frames + (vm.fp - 1);
+                        t = fr.tmpl;
+                        code = t.code;
+                        pc = code + popped.ret_ip;
+                        continue;
+                    }
                 }
-                if fr.is_ctor || fr.super_for >= 0 {
-                    vm.sp = sp;
-                    res = ctor_result(vm, fr, res);
-                    sp = vm.sp;
-                }
-                sp = fr.base - 2;
-                *(stack + sp) = res;
-                sp++;
-                // A return inside a try leaves that try's handler open;
-                // drop every handler still belonging to this frame so a
-                // later throw doesn't unwind into the dead frame.
-                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
-                    vm.hp--;
-                }
-                vm.fp--;
-                if vm.fp < stop_fp { vm.sp = sp; return 0; }
-                Frame* popped = vm.frames + vm.fp;
-                fr = vm.frames + (vm.fp - 1);
-                t = fr.tmpl;
-                code = t.code;
-                pc = code + popped.ret_ip;
-                continue;
             }
             case OP_NEWOBJ: { vm.sp = sp;
                 i32 nprops = rd_u16p(pc);
                 pc += 2;
-                JsObject* o = js_new_object(&vm.heap, vm.object_proto);
-                props_reserve(&o.props, nprops);
+                JsObject* o = js_new_object_room(&vm.heap, vm.object_proto, nprops < 4 ? 4 : nprops);
                 vpush(vm, value_cell(&o.head));
             }
             case OP_NEWARR: { vm.sp = sp;
@@ -6627,7 +6649,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         Value protov = ensure_prototype(vm, fnv2);
                         JsObject* proto = null;
                         if value_is_object(protov) { proto = value_as_object(protov); }
-                        JsObject* inst = js_new_object(&vm.heap, proto);
+                        JsObject* inst = js_new_object_room(&vm.heap, proto, 6);
                         // [ctor, arr] -> [ctor, inst, arr]
                         Value arr = vpeek(vm, 0);
                         *(vm.stack + vm.sp - 1) = value_cell(&inst.head);
@@ -6871,6 +6893,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             }
         }
         sp = vm.sp;
+        if vm.has_pending {
+            if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+            fr = vm.frames + (vm.fp - 1);
+            t = fr.tmpl;
+            code = t.code;
+            pc = code + ip;
+            sp = vm.sp;
+        }
     }
     return 0;
 }
@@ -7343,7 +7373,7 @@ private void new_instance(VM* vm, i32 argc) {
     if as_array {
         inst = js_new_array(&vm.heap, proto);
     } else {
-        inst = js_new_object(&vm.heap, proto);
+        inst = js_new_object_room(&vm.heap, proto, 6);
     }
     for i32 i = vm.sp; i > vm.sp - argc; i-- {
         *(vm.stack + i) = *(vm.stack + i - 1);

@@ -81,10 +81,13 @@ struct PropList {
 // size: PROPS_OLD once a collection has traced it (its cell is old), and
 // PROPS_REMEMBERED while it is on the remembered list for holding a young
 // cell (gc.mc, generations).
-const i32 PROPS_CAP_MASK = 0x0FFFFFFF;
+const i32 PROPS_CAP_MASK = 0x07FFFFFF;
 const i32 PROPS_OLD = 0x40000000;
 const i32 PROPS_REMEMBERED = 0x20000000;
 const i32 PROPS_IS_PROTO = 0x10000000;   // the table of some object's prototype
+// the entries lie in the object's own cell (js_new_object_room): the
+// table frees nothing, and a growth past them moves to the pool
+const i32 PROPS_INLINE = 0x08000000;
 
 // Moves when a name is added to or removed from a prototype's table, when
 // an object becomes a prototype, or when a prototype's own prototype
@@ -127,7 +130,7 @@ void props_reserve(PropList* p, i32 n) {
 }
 
 void props_free(PropList* p) {
-    if p.items != null { pool_free(cast(void*, p.items), cast(i64, props_cap(p)) * sizeof(Prop)); }
+    if p.items != null && (p.cap & PROPS_INLINE) == 0 { pool_free(cast(void*, p.items), cast(i64, props_cap(p)) * sizeof(Prop)); }
     if p.idx != null {
         intmap_free<i32>(p.idx);
         free(p.idx);
@@ -183,9 +186,9 @@ private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
         for i32 i = 0; i < p.len; i++ {
             *(ni + i) = *(p.items + i);
         }
-        if p.items != null { pool_free(cast(void*, p.items), cast(i64, cap) * sizeof(Prop)); }
+        if p.items != null && (p.cap & PROPS_INLINE) == 0 { pool_free(cast(void*, p.items), cast(i64, cap) * sizeof(Prop)); }
         p.items = ni;
-        p.cap = (p.cap & ~PROPS_CAP_MASK) | ncap;
+        p.cap = (p.cap & ~(PROPS_CAP_MASK | PROPS_INLINE)) | ncap;
     }
     i32 pos = p.len;
     Prop* pr = p.items + pos;
@@ -339,7 +342,7 @@ GcBytes* value_as_bytes(Value v) { return cast(GcBytes*, value_as_cell(v)); }
 struct JsFunction {
     GcCell head;
     FnTemplate* tmpl;
-    Value* upvals;         // boxes, one per template upvalue
+    Value* upvals;         // boxes, one per template upvalue; in the cell, after the header
     i32 n_upvals;
     PropList props;
     Value fproto;          // [[Prototype]]: parent ctor for derived classes
@@ -594,7 +597,6 @@ void js_finalize(GcCell* c) {
     if c.kind == GC_FUNCTION {
         JsFunction* f = cast(JsFunction*, c);
         props_free(&f.props);
-        if f.upvals != null { pool_free(cast(void*, f.upvals), cast(i64, f.n_upvals) * sizeof(Value)); }
         return;
     }
     if c.kind == GC_NATIVE {
@@ -646,6 +648,18 @@ JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     return o;
 }
 
+// An object with room for `n` properties in its own cell, after the
+// header: one allocation, and the entries on the lines the object is on.
+JsObject* js_new_object_room(GcHeap* h, JsObject* proto, i32 n) {
+    JsObject* o = cast(JsObject*, gc_alloc(h, GC_OBJECT, sizeof(JsObject) + cast(i64, n) * sizeof(Prop)));
+    o.proto = proto;
+    js_mark_proto(proto);
+    props_init(&o.props);
+    o.props.items = cast(Prop*, cast(u8*, o) + sizeof(JsObject));
+    o.props.cap = n | PROPS_INLINE;
+    return o;
+}
+
 // A view, with room for its layout. OBJF_TYPEDARRAY is what says an object is
 // one of these, so nothing else may set that flag.
 JsTypedArray* js_new_typed_array(GcHeap* h, JsObject* proto) {
@@ -675,12 +689,12 @@ JsObject* js_new_array(GcHeap* h, JsObject* proto) {
 }
 
 JsFunction* js_new_function(GcHeap* h, FnTemplate* t, i32 n_upvals) {
-    JsFunction* f = cast(JsFunction*, gc_alloc(h, GC_FUNCTION, sizeof(JsFunction)));
+    JsFunction* f = cast(JsFunction*, gc_alloc(h, GC_FUNCTION, sizeof(JsFunction) + cast(i64, n_upvals) * sizeof(Value)));
     f.tmpl = t;
     f.n_upvals = n_upvals;
     f.upvals = null;
     if n_upvals > 0 {
-        f.upvals = cast(Value*, pool_alloc(cast(i64, n_upvals) * sizeof(Value)));
+        f.upvals = cast(Value*, cast(u8*, f) + sizeof(JsFunction));
         for i32 i = 0; i < n_upvals; i++ {
             *(f.upvals + i) = value_undefined();
         }
