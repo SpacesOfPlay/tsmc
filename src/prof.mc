@@ -301,6 +301,10 @@ str op_name(i32 op) {
         case 208: { return "RJSNEQK"; }
         case 209: { return "RJNULLISH"; }
         case 210: { return "RJNOTNULLISH"; }
+        case 211: { return "RGETPROP"; }
+        case 212: { return "RSETPROP"; }
+        case 213: { return "RGETINDEX"; }
+        case 214: { return "RSETINDEX"; }
     }
     return "?";
 }

@@ -216,7 +216,14 @@ enum Op {
     // u16 a, u16 b, i32 target (the I forms an i32 for b, the K forms a
     // constant's index): jump when a op b is false
     OP_RJLT, OP_RJLTI, OP_RJGT, OP_RJGTI, OP_RJLE, OP_RJLEI, OP_RJGE, OP_RJGEI, OP_RJSEQ, OP_RJSEQK, OP_RJSNEQ, OP_RJSNEQK,
-    OP_RJNULLISH, OP_RJNOTNULLISH   // u16 a, u16 unused, i32 target: jump when a == null is false, a != null
+    OP_RJNULLISH, OP_RJNOTNULLISH,  // u16 a, u16 unused, i32 target: jump when a == null is false, a != null
+    OP_RGETPROP,     // u16 dst, u16 obj, u16 name const, u16 ic: dst = obj.name
+    OP_RSETPROP,     // u16 obj, u16 name const, u16 val, u16 ic: obj.name = val
+    OP_RGETINDEX,    // u16 dst, u16 obj, u16 key: dst = obj[key]
+    // u16 obj, u16 key, u16 val: obj[key] = val on an array's element,
+    // stepping over the ten-byte stack form of the same that follows,
+    // which runs for anything else
+    OP_RSETINDEX
 }
 
 // RBIT's kinds (doc/PLAN_register_bytecode.md, phase 3).

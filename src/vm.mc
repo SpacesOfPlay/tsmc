@@ -6682,6 +6682,59 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if truthy == (op == OP_RJT) { pc = code + target; }
                 continue;
             }
+            case OP_RGETPROP: {
+                Value objv = *(stack + fr.base + rd_u16p(pc + 2));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 4))));
+                pc += 8;
+                Value out;
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
+                    *(stack + fr.base + rd_u16p(pc - 8)) = out;
+                    continue;
+                }
+                vm.sp = sp;
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { *(vm.stack + fr.base + rd_u16p(pc - 8)) = out; }
+            }
+            case OP_RSETPROP: {
+                Value objv = *(stack + fr.base + rd_u16p(pc));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
+                Value v = *(stack + fr.base + rd_u16p(pc + 4));
+                pc += 8;
+                vm.sp = sp;
+                ignore set_prop_ic(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2);
+            }
+            case OP_RGETINDEX: {
+                Value objv = *(stack + fr.base + rd_u16p(pc + 2));
+                Value key = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+                    i32 idx = val_to_index(key);
+                    if idx >= 0 && js_array_has(value_as_object(objv), idx) {
+                        *(stack + fr.base + rd_u16p(pc)) = js_array_get(value_as_object(objv), idx);
+                        pc += 6;
+                        continue;
+                    }
+                }
+                i32 d = rd_u16p(pc);
+                pc += 6;
+                vm.sp = sp;
+                vpush(vm, objv);
+                vpush(vm, key);
+                op_getindex(vm);
+                if !vm.has_pending { *(vm.stack + fr.base + d) = vpop(vm); }
+            }
+            case OP_RSETINDEX: {
+                Value objv = *(stack + fr.base + rd_u16p(pc));
+                if value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+                    JsObject* arr = value_as_object(objv);
+                    i32 idx = val_to_index(*(stack + fr.base + rd_u16p(pc + 2)));
+                    if idx >= 0 && (arr.obj_flags & OBJF_FROZEN) == 0 && (idx < arr.elen || (arr.obj_flags & OBJF_NONEXT) == 0) {
+                        js_array_set(arr, idx, *(stack + fr.base + rd_u16p(pc + 4)));
+                        pc += 16;
+                        continue;
+                    }
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
             case OP_MOV: {
                 *(stack + fr.base + rd_u16p(pc)) = *(stack + fr.base + rd_u16p(pc + 2));
                 pc += 4;

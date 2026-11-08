@@ -38,7 +38,7 @@ const u8 CC_BIGINT = 3;
 // the format's version, with the opcode set folded in so that a new
 // instruction makes every earlier file a miss
 u32 cc_format() {
-    return CC_VERSION * 1024 + cast(u32, cast(i32, OP_RJNOTNULLISH) + 1);
+    return CC_VERSION * 1024 + cast(u32, cast(i32, OP_RSETINDEX) + 1);
 }
 
 u64 cc_hash(str s) {

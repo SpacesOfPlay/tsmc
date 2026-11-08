@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 3 done, level 3 the default.
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 4 done, level 4 the default.
 
 ## Why
 
@@ -433,3 +433,43 @@ A first reading of the bench suite said level 3 was 5% slower: its
 level-3 side ran through a shell wrapper, which costs about 11 ms a run
 under MSYS, 140 ms over the suite. The same wrapper sits in the phase
 accounting's cost in `DESIGN_phases.md`, corrected there.
+
+## Phase 4, done (2026-11-08)
+
+Property and index access on slots, level 4, now the default.
+
+- `RGETPROP dst, obj, name, ic` and `RSETPROP obj, name, val, ic`: the
+  inline cache as before (`prop_get_ic_fast`, then `prop_get_ic`;
+  `set_prop_ic`), the operands read from and the result written to
+  slots. `RGETINDEX dst, obj, key`: an array's own element inline, else
+  `op_getindex` on the pushed pair. `RSETINDEX obj, key, val`: an
+  array's element inline when the array is not frozen and the index is
+  in range or the array extensible, else the ten-byte stack form that
+  follows it.
+- The compiler takes a plain `.name` or `[key]` whose object is a plain
+  local or such a read itself (`a.b.c`), and whose key is a plain local
+  or a literal: as an operand, as `x = o.p`, and as the statements
+  `o.p = v;` and `o[k] = v;`, object, key and value evaluated in that
+  order. `this.p`, optional chains, private names, `super` and `{}.x`
+  keep their stack forms, which have fused ops of their own.
+
+Checks: `tools/reg_check.sh` at level 4, 417 scripts and the 263
+goldens in all five modes, no differences; a probe of reads and writes
+through getters and setters, prototypes, holes, an element on
+Array.prototype, typed arrays in and out of range, string, symbol and
+object keys with a toString, null and undefined receivers, primitives,
+frozen, non-extensible and read-only targets in strict and sloppy code,
+and a value expression that rebinds the object or the key, the same at
+levels 0 and 4. It differs from node in one place at both levels: a
+setter defined on an array index is not called, which is the engine's
+and not this plan's. Both suites pass with level 4 the default, brmc's
+twice.
+
+Ops: bsky.app's load 126.44 to 123.65 million against level 3 (2.2%);
+proto_chain 16.2% fewer, objlit 4.9, bytes 4.1.
+
+Time, levels 3 and 4 in one binary, five interleaved runs: the bench
+suite 2761 to 2742 ms (objlit 176 to 171, proto_chain 204 to 199,
+nothing slower beyond 2 ms); the property micro-loop 8.75 to 8.55 ns;
+bsky.app busy 1740 to 1750 against 1736 to 1761, flat, the shot the
+same.

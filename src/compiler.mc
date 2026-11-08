@@ -1874,7 +1874,7 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
 // through the slots and back, exercising the plumbing and speeding
 // nothing; 2 and up the plan's phases from 2 on. The default is the
 // highest level measured to be faster than the stack form.
-i32 g_reg_level = 3;
+i32 g_reg_level = 4;
 // A check (tsmc --reg-clear): a temporary is overwritten with undefined as
 // it is released, so that code reading one after its release shows.
 bool g_reg_clear = false;
@@ -2025,6 +2025,80 @@ private i32 reg_arith(Compiler* co, Node* n, i32 want) {
     if ch.max_target < ch.code.len { ch.max_target = ch.code.len; }
     reg_release(co, mark);
     return d;
+}
+
+// Whether n is a property or index read the register form takes: a plain
+// `.name` or `[key]`, no optional chain, no private name, no super, no
+// `{}.x`; its object a plain local or such a read itself, its key a plain
+// local or a literal. Anything else stays on the stack, where `this.p`
+// and the chains have fused ops of their own.
+private bool reg_access(Compiler* co, Node* n) {
+    if n.kind != N_MEMBER && n.kind != N_INDEX { return false; }
+    if (n.flags & (NF_OPT_CHAIN | NF_PRIVATE | NF_PARENED)) != 0 || chain_has_opt(n) { return false; }
+    if n.a.kind == N_SUPER || (n.a.kind == N_OBJECT && n.a.kids.len == 0) { return false; }
+    if reg_slot(co, n.a, false) < 0 && !reg_access(co, n.a) { return false; }
+    if n.kind == N_INDEX && reg_slot(co, n.b, false) < 0 && !reg_const_kind(n.b) { return false; }
+    return true;
+}
+
+// A read reg_access takes, into a slot.
+private i32 reg_read(Compiler* co, Node* n, i32 want) {
+    Chunk* ch = &co.cur.ch;
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    i32 mark = co.cur.cur_slots;
+    i32 ro = compile_expr_reg(co, n.a, -1, n.kind == N_INDEX ? n.b : null);
+    if n.kind == N_MEMBER {
+        reg_op3(ch, OP_RGETPROP, d, ro, name_const(co, n.name));
+        ch_u16(ch, IC_EMPTY);
+    } else {
+        i32 rk = compile_expr_reg(co, n.b, -1, null);
+        reg_op3(ch, OP_RGETINDEX, d, ro, rk);
+    }
+    reg_release(co, mark);
+    return d;
+}
+
+private void reg_op3(Chunk* ch, i32 op, i32 a, i32 b, i32 c) {
+    ch_op(ch, op);
+    ch_u16(ch, a);
+    ch_u16(ch, b);
+    ch_u16(ch, c);
+}
+
+// `o.name = v;` and `o[k] = v;` as statements, o and k what reg_access
+// takes: the object, the key and the value in slots, in that order, then
+// one store. False when the statement is not that.
+private bool reg_store_stmt(Compiler* co, Node* e) {
+    if e == null || e.kind != N_ASSIGN || e.op != TOK_EQ { return false; }
+    Node* t = e.a;
+    if !reg_access(co, t) { return false; }
+    Chunk* ch = &co.cur.ch;
+    i32 mark = co.cur.cur_slots;
+    i32 ro = compile_expr_reg(co, t.a, -1, t.kind == N_INDEX ? t.b : e.b);
+    if t.kind == N_MEMBER {
+        i32 rv = compile_expr_reg(co, e.b, -1, null);
+        reg_op3(ch, OP_RSETPROP, ro, name_const(co, t.name), rv);
+        ch_u16(ch, IC_EMPTY);
+    } else {
+        i32 rk = compile_expr_reg(co, t.b, -1, e.b);
+        i32 rv = compile_expr_reg(co, e.b, -1, null);
+        reg_op3(ch, OP_RSETINDEX, ro, rk, rv);
+        // the stack form, raw, ten bytes the fast path steps over
+        i32 at = ch.code.len;
+        vec_push(&ch.code, cast(u8, OP_GETLOCAL));
+        ch_u16(ch, ro);
+        vec_push(&ch.code, cast(u8, OP_GETLOCAL2));
+        ch_u16(ch, rk);
+        ch_u16(ch, rv);
+        vec_push(&ch.code, cast(u8, OP_SETINDEX));
+        vec_push(&ch.code, cast(u8, OP_POP));
+        ch.prev2_op = -1;
+        ch.prev_op = -1;
+        ch.last_op = at + 9;
+        if ch.max_target < ch.code.len { ch.max_target = ch.code.len; }
+    }
+    reg_release(co, mark);
+    return true;
 }
 
 // Whether n is a literal reg_const takes, without adding it to the pool.
@@ -2179,6 +2253,9 @@ private i32 compile_expr_reg(Compiler* co, Node* n, i32 want, Node* later) {
     }
     if g_reg_level >= 3 && n.kind == N_BIN && reg_arith_op(n.op) >= 0 {
         return reg_arith(co, n, want);
+    }
+    if g_reg_level >= 4 && reg_access(co, n) {
+        return reg_read(co, n, want);
     }
     compile_expr(co, n);
     i32 d = want >= 0 ? want : alloc_slot(co.cur);
@@ -5682,6 +5759,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_EXPR_STMT {
         if emit_update_discarded(co, n.a) { return; }
         if g_reg_level >= 2 && reg_assign_stmt(co, n.a) { return; }
+        if g_reg_level >= 4 && reg_store_stmt(co, n.a) { return; }
         compile_expr(co, n.a);
         emit_discard(ch);
         return;
