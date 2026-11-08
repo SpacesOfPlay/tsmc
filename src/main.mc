@@ -51,6 +51,9 @@ i32 tsmc_main() {
         if str_equal(a, "--prof") { profile = true; i++; continue; }
         // where the run's time went, by phase and by native, on stderr at exit
         if str_equal(a, "--phases") { phases = true; i++; continue; }
+        // how far the register form reaches (doc/PLAN_register_bytecode.md)
+        if str_starts_with(a, "--reg=") { g_reg_level = cast(i32, *(a.data + 6) - '0'); i++; continue; }
+        if str_equal(a, "--reg-clear") { g_reg_clear = true; i++; continue; }
         // functions in a large source compiled on their first call
         if str_equal(a, "--lazy") { lazy_functions = true; i++; continue; }
         // the script's templates read from the file when it holds them,

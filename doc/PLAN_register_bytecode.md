@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done, 2026-11-08; the decision on phase 1 is open (below).
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phase 1 done.
 
 ## Why
 
@@ -299,3 +299,42 @@ loop-shaped code. Going on is reasonable if loop-heavy pages and the
 benches matter as much as bsky; stopping here is reasonable if bsky's
 load is the measure, where the projected gain is about what the
 memory-traffic and string work of this week gave together.
+
+The decision, 2026-11-08: phases 1 to 7 go ahead; 20% on loop-shaped
+code is worth it and the form is what later work builds on. The
+bitwise fast path went in first (the bench suite 2960 to 2841 ms;
+bsky.app busy about 50 ms better).
+
+## Phase 1, done (2026-11-08)
+
+`compile_expr_reg(co, n, want, later)` in compiler.mc: a plain local is
+its own slot and costs nothing; anything else compiles to the stack and
+is stored into `want` or a temporary from `alloc_slot`. `later` is what
+the caller evaluates before it reads the slot: a local whose binding
+that may store to (`reg_writes`: an assignment or update naming it,
+destructuring included, nested functions not entered) is copied first,
+so `x + (x = 5)` reads the old `x`. `reg_release` gives temporaries
+back in stack order. `g_reg_level` says how far the form reaches, 0 by
+default; `tsmc --reg=N` and brmc's `BRMC_REG=N` set it for measuring.
+At level 1 a binary operator's operands go through the new path and are
+pushed for the stack op, which exercises everything and speeds nothing.
+
+Checks, all at level 1 against level 0 in the same binary
+(`tools/reg_check.sh`, which every later phase reruns):
+
+- 415 test, golden, bench and example scripts the same plainly, with
+  every compile round-tripped through the code cache, and with every
+  lazy function compiled ahead; the 261 goldens the same under
+  `--gc-stress`, and under `--gc-stress --reg-clear`, which overwrites
+  each temporary with undefined as it is released, so that code
+  reading one afterwards would show.
+- The alias cases (`x + (x = 5)`, `(y = 7) + y`, `z + z++`,
+  destructuring into the operand, a member store between reads) the
+  same as node at both levels. The engine has no mapped `arguments`
+  (sloppy `arguments[0] = v` does not change the parameter), at level
+  0 as well; noted, not this plan's.
+- Exercised: the benches' op counts up 25 to 50% at level 1 (fib 157
+  to 240 million), the fallback's stores and pushes, as planned.
+- Unchanged by default: the code cache head and this build write is
+  byte-identical for all 74 scripts that write one; both suites pass;
+  bsky.app's shot the same at levels 0 and 1.

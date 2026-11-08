@@ -1862,6 +1862,99 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_GETGLOBAL, name_const(co, n.name));
 }
 
+// --- the register form (doc/PLAN_register_bytecode.md) -------------------
+//
+// compile_expr leaves a value on the operand stack; compile_expr_reg says
+// which frame slot holds it. A plain local is its own slot and costs
+// nothing; anything not yet taught the register form compiles to the stack
+// and is stored into a temporary. Temporaries come from alloc_slot like the
+// compiler's other scratch slots, and are released in stack order by the
+// construct that took them. g_reg_level says how far the form reaches:
+// 0 nowhere, which is the default until a level is measured to be faster.
+i32 g_reg_level = 0;
+// A check (tsmc --reg-clear): a temporary is overwritten with undefined as
+// it is released, so that code reading one after its release shows.
+bool g_reg_clear = false;
+
+// Releases the temporaries taken since `mark`.
+private void reg_release(Compiler* co, i32 mark) {
+    if g_reg_clear {
+        for i32 t = mark; t < co.cur.cur_slots; t++ {
+            ch_op(&co.cur.ch, OP_UNDEF);
+            reg_store(&co.cur.ch, t);
+        }
+    }
+    co.cur.cur_slots = mark;
+}
+
+// The slot of a local this frame reads plainly: no cell, no TDZ check,
+// not global, not exported, not under `with`; written too when `dst`, and
+// then not a const. -1 otherwise.
+private i32 reg_slot(Compiler* co, Node* n, bool dst) {
+    if n == null || n.kind != N_IDENT || str_equal(n.name, "arguments") { return -1; }
+    FScope* fs = co.cur;
+    if with_may_bind(fs, n.name) { return -1; }
+    i32 li = find_local(fs, n.name);
+    if li < 0 { return -1; }
+    CBind b = vec_get(&fs.binds, li);
+    if b.is_cell || b.tdz || (dst && b.is_const) || b.global || b.exported { return -1; }
+    return b.slot;
+}
+
+// Whether evaluating n may store to the local named `name`: an assignment
+// or an update whose target mentions it, destructuring included. A nested
+// function is not entered: a binding one can write is a cell, never a
+// plain slot.
+private bool reg_writes(Node* n, str name) {
+    if n == null { return false; }
+    i32 k = n.kind;
+    if k == N_FUNCTION || k == N_CLASS { return false; }
+    if (k == N_ASSIGN || k == N_UPDATE) && reg_mentions(n.a, name) { return true; }
+    if reg_writes(n.a, name) || reg_writes(n.b, name) || reg_writes(n.c, name) || reg_writes(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_writes(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+// Whether a target names `name` anywhere in it: an identifier, or one in
+// a destructuring pattern.
+private bool reg_mentions(Node* n, str name) {
+    if n == null { return false; }
+    if n.kind == N_IDENT { return str_equal(n.name, name); }
+    if n.kind == N_MEMBER || n.kind == N_INDEX { return false; }
+    if reg_mentions(n.a, name) || reg_mentions(n.b, name) || reg_mentions(n.c, name) || reg_mentions(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_mentions(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+private void reg_store(Chunk* ch, i32 d) {
+    ch_op_u16(ch, OP_SETLOCAL, d);
+    emit_discard(ch);
+}
+
+// The value of n in a slot: `want` when the caller names one (>= 0),
+// else the local's own slot or a temporary. `later` is what the caller
+// evaluates after n before it reads the slot: a local whose binding that
+// may store to is copied first, so that the read sees the value it had.
+private i32 compile_expr_reg(Compiler* co, Node* n, i32 want, Node* later) {
+    Chunk* ch = &co.cur.ch;
+    i32 s = reg_slot(co, n, false);
+    if s >= 0 {
+        if (want < 0 || want == s) && !reg_writes(later, n.name) { return s; }
+        ch_op_u16(ch, OP_GETLOCAL, s);
+        i32 d = want >= 0 ? want : alloc_slot(co.cur);
+        reg_store(ch, d);
+        return d;
+    }
+    compile_expr(co, n);
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    reg_store(ch, d);
+    return d;
+}
+
 private void emit_load_name(Compiler* co, str name, Node* at) {
     Node tmp;
     tmp.kind = N_IDENT;
@@ -3235,6 +3328,17 @@ private void compile_expr(Compiler* co, Node* n) {
         // evaluates to itself, in either order)
         bool swap = (op == OP_SEQ || op == OP_SNEQ || op == OP_EQ || op == OP_NEQ)
             && (n.a.kind == N_NULL || (n.a.kind == N_UNARY && n.a.op == TOK_KW_VOID && is_pure_literal(n.a.a)));
+        if g_reg_level >= 1 && !swap {
+            // the operands in slots, then pushed for the stack op
+            i32 mark = co.cur.cur_slots;
+            i32 ra = compile_expr_reg(co, n.a, -1, n.b);
+            i32 rb = compile_expr_reg(co, n.b, -1, null);
+            ch_op_u16(ch, OP_GETLOCAL, ra);
+            ch_op_u16(ch, OP_GETLOCAL, rb);
+            reg_release(co, mark);
+            ch_op(ch, op);
+            return;
+        }
         if swap {
             compile_expr(co, n.b);
             compile_expr(co, n.a);
