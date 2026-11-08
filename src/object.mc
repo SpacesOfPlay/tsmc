@@ -369,10 +369,25 @@ type IterFastFn = fn(void*, Value, Value*, bool*): i32;
 // Map in *out. Returns that entry's sequence number, or -1 past the end.
 type MapDirectFn = fn(void*, JsMap*, i32, Value*): i32;
 
+// The phases of the runtime's time (vm_phase_* in vm.mc): what owns the
+// clock at any moment. A native carries the phase its calls are charged
+// to, PH_NATIVE for a builtin and PH_HOST for an embedder's.
+const i32 PH_INTERP = 0;    // the bytecode loop itself
+const i32 PH_NATIVE = 1;    // a builtin's own time
+const i32 PH_HOST = 2;      // an embedder's native: the DOM, a readback
+const i32 PH_GC = 3;        // the collector, marking and sweeping
+const i32 PH_LAZY = 4;      // a lazy function's compile at its first call
+const i32 PH_COMPILE = 5;   // a script's or module's compile
+const i32 PH_CACHE = 6;     // a code cache read
+const i32 PH_IDLE = 7;      // the event loop waiting
+const i32 PH_COUNT = 8;
+const i32 PH_STACK = 256;   // the loop's re-entries under natives the accounting follows
+
 struct JsNative {
     GcCell head;
     NativeFn fun;
     str name;              // static or atom-owned view
+    i32 phase;             // PH_NATIVE or PH_HOST
     PropList props;
     Value env0;            // bound target / wrapper state
     Value env1;
@@ -708,6 +723,7 @@ JsNative* js_new_native(GcHeap* h, NativeFn fun, str name) {
     JsNative* n = cast(JsNative*, gc_alloc(h, GC_NATIVE, sizeof(JsNative)));
     n.fun = fun;
     n.name = name;
+    n.phase = PH_NATIVE;
     props_init(&n.props);
     n.env0 = value_undefined();
     n.env1 = value_undefined();

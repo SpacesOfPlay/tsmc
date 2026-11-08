@@ -1081,6 +1081,11 @@ GcString* gc_new_string(GcHeap* h, str s) {
     str view;
     view.data = gs.data;
     view.len = s.len;
+    // all ASCII, the common case: a unit a byte and no surrogate halves
+    if ascii_run(view, 0) == s.len {
+        gs.u16len = s.len;
+        return gs;
+    }
     // halves of an astral code point that met in this string become the
     // code point; the cell keeps its allocation, the payload shrinks
     if s.len >= 6 && wtf8_has_surrogate(view) {

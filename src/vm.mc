@@ -40,19 +40,22 @@ const i32 VM_FRAMES_MAX = 8000;
 const i32 VM_HANDLERS_MAX = 4096;
 const i32 VM_EXEC_DEPTH_MAX = 120;
 
+// 64 bytes, and the frames array starts on a cache line, so a frame is
+// one line: a call writes one and a return reads one. The eight-byte
+// fields come first, so that nothing pads.
 struct Frame {
     JsFunction* fun;    // null for the script frame
     FnTemplate* tmpl;
-    i32 ret_ip;
-    i32 cur_ip;         // this frame's active site (call/throw), for stacks
-    i32 base;
     Value this_val;
     Value arguments_obj;  // the `arguments` object, or undefined if unused
     Value new_target;   // new.target: the constructor, or undefined; super() propagates it
+    JsGenerator* gen;   // non-null while running a generator/async body
+    i32 ret_ip;
+    i32 cur_ip;         // this frame's active site (call/throw), for stacks
+    i32 base;
+    i16 super_for;      // a frame index, below VM_FRAMES_MAX, or -1
     bool is_ctor;
     bool super_pending;  // a derived constructor that has not called super()
-    i32 super_for;
-    JsGenerator* gen;   // non-null while running a generator/async body
 }
 
 struct Handler {
@@ -156,9 +159,34 @@ struct VM {
     i32 cache_loads;
     i64 cache_ns;
     bool cc_verify;
+    // Phase accounting (vm_phase_*). With `phases` set, one phase owns
+    // the clock at any moment between vm_phase_begin and vm_phase_end,
+    // and a change of phase charges the time elapsed to the phase that
+    // was running; the collector's time, which gc.mc measures itself, is
+    // taken out of whichever phase it ran in. The sum of the phases is
+    // the time between begin and end by construction, so the residual
+    // against the embedder's own clock checks only that every entry into
+    // the runtime lies inside a span; `phase_outside` counts the changes
+    // that did not. Level 2 also keeps each native's own time by name.
+    i32 phases;
+    i32 phase;                 // the phase running
+    i32 phase_depth;           // begin/end nesting; the clock runs above 0
+    i64 phase_t0;              // the counter when the running phase began
+    i64 phase_span0;           // the counter at the outermost begin
+    i64 phase_gc0;             // the collector's ticks at phase_t0
+    i64[PH_COUNT] phase_ticks; // counter ticks, the collector's included
+    i64[PH_COUNT] phase_gc;    // of which the collector's
+    i64 phase_wall;            // the spans between begin and end, in ticks
+    i64 phase_switches;
+    i64 phase_outside;
+    i64 phase_switch_cost;     // 4096 switches, in ticks, measured when the accounting was turned on
+    i32[PH_STACK] phase_stack; // the phase to go back to when a nested run of the loop returns
+    i32 phase_sp;
+    NativeStats* nstats;       // level 2, else null
     Value* stack;
     i32 sp;
     Frame* frames;
+    void* frames_block;        // the allocation frames is aligned within
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     i32 pending_super_for;     // super_for for the next vm_call_stack frame
@@ -619,7 +647,12 @@ bool js_truthy(Value v) {
 
 private i32 f64_to_i32(f64 v) {
     if v != v { return 0; }
-    return cast(i32, cast(i64, v));
+    if v > -9.0e18 && v < 9.0e18 { return cast(i32, cast(i64, v)); }
+    // past an i64 the spec's modulo 2^32 is taken in doubles, where every
+    // step is exact: the value is an integer and 2^32 a power of two
+    if v == v + 1.0 && (v > 1.0e308 || v < -1.0e308) { return 0; }   // the infinities
+    f64 m = v - floor(v / 4294967296.0) * 4294967296.0;
+    return cast(i32, cast(i64, m));
 }
 
 // Bytes of the whitespace run starting at i, or 0. Covers the whole of the
@@ -4355,7 +4388,8 @@ void vm_init(VM* vm) {
     vm.key_marks_cap = 0;
     vm.stack = alloc<Value>(VM_STACK_MAX);
     vm.sp = 0;
-    vm.frames = alloc<Frame>(VM_FRAMES_MAX);
+    vm.frames_block = cast(void*, alloc<u8>(cast(i64, VM_FRAMES_MAX) * sizeof(Frame) + 64));
+    vm.frames = cast(Frame*, (cast(i64, vm.frames_block) + 63) & ~cast(i64, 63));
     vm.fp = 0;
     vm.pending_new_target = value_undefined();
     vm.pending_super_for = 0 - 1;
@@ -4382,6 +4416,19 @@ void vm_init(VM* vm) {
     vm.cache_loads = 0;
     vm.cache_ns = 0;
     vm.cc_verify = false;
+    vm.phases = 0;
+    vm.phase = PH_INTERP;
+    vm.phase_depth = 0;
+    vm.phase_t0 = 0;
+    vm.phase_span0 = 0;
+    vm.phase_gc0 = 0;
+    for i32 k = 0; k < PH_COUNT; k++ { vm.phase_ticks[k] = 0; vm.phase_gc[k] = 0; }
+    vm.phase_wall = 0;
+    vm.phase_switches = 0;
+    vm.phase_outside = 0;
+    vm.phase_switch_cost = 0;
+    vm.phase_sp = 0;
+    vm.nstats = null;
     vm.pending = value_undefined();
     vm.has_pending = false;
     vm.unwind_return = false;
@@ -4559,7 +4606,7 @@ void vm_destroy(VM* vm) {
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
-    free(vm.frames);
+    free(vm.frames_block);
     free(vm.handlers);
 }
 
@@ -5138,6 +5185,10 @@ private bool unwind_pending(VM* vm, i32 stop_fp, i32* ip_out) {
 }
 
 private i32 vm_execute(VM* vm, i32 stop_fp) {
+    // a run of the loop under a native is the interpreter's time, not the
+    // native's; the native's phase comes back when the run returns
+    if vm.phases != 0 { vm_phase_push_interp(vm); }
+    defer vm_phase_pop_interp(vm);
     Frame* fr = vm.frames + (vm.fp - 1);
     FnTemplate* t = fr.tmpl;
     u8* code = t.code;
@@ -5293,11 +5344,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = v;
+                sp++;
+                continue;
             }
             case OP_SETLOCAL: {
                 *(stack + fr.base + rd_u16p(pc)) = *(stack + sp - 1);
@@ -5344,11 +5395,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(b.v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = b.v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_SETCELL: { vm.sp = sp;
                 JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
@@ -5376,11 +5427,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(b.v) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = b.v;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETUPVALV: {
                 Value uv = *(fr.fun.upvals + rd_u16p(pc));
@@ -5388,11 +5439,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(uv) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = uv;
-                    sp++;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = uv;
+                sp++;
+                continue;
             }
             case OP_SETUPVAL: {
                 JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
@@ -5423,12 +5474,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if value_is_hole(uv) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    *(stack + sp) = uv;
-                    *(stack + sp + 1) = value_undefined();
-                    sp += 2;
-                    continue;
+                    break case;
                 }
+                *(stack + sp) = uv;
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                continue;
             }
             case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: { vm.sp = sp;
                 pc += 2;
@@ -5792,7 +5843,23 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 r = cmp_rel(vm, rel_base(op));
                 if r == 0 { pc = code + rd_targetp(pc - 4); }
             }
-            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: { vm.sp = sp;
+            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+                // two ints, which is what `x | 0` and a mask are, need none of
+                // the coercion below
+                if value_is_int(*(stack + sp - 2)) && value_is_int(*(stack + sp - 1)) {
+                    i32 x = value_as_int(*(stack + sp - 2));
+                    i32 y = value_as_int(*(stack + sp - 1));
+                    i32 r = 0;
+                    if op == OP_BAND { r = x & y; }
+                    else if op == OP_BOR { r = x | y; }
+                    else if op == OP_BXOR { r = x ^ y; }
+                    else if op == OP_SHL { r = x << (y & 31); }
+                    else { r = x >> (y & 31); }
+                    sp--;
+                    *(stack + sp - 1) = value_int(r);
+                    continue;
+                }
+                vm.sp = sp;
                 // an object operand becomes a primitive first, which is how
                 // a wrapped BigInt reaches the BigInt path
                 if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
@@ -6038,7 +6105,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     when defined(TSMC_PROF) {
                         if vm.prof != null { vm.prof.native_calls++; }
                     }
-                    Value res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                    Value res;
+                    if vm.phases == 0 {
+                        res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                    } else {
+                        NativeSpan nsp = vm_native_begin(vm, na);
+                        res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                        vm_native_end(vm, na, nsp);
+                    }
                     sp -= argc + 2;
                     *(stack + sp) = res;
                     sp++;
@@ -6077,7 +6151,14 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         when defined(TSMC_PROF) {
                             if vm.prof != null { vm.prof.native_calls++; }
                         }
-                        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                        Value res;
+                        if vm.phases == 0 {
+                            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                        } else {
+                            NativeSpan nsp = vm_native_begin(vm, na);
+                            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                            vm_native_end(vm, na, nsp);
+                        }
                         if op == OP_NEW && !value_is_reference(res) { res = thisv; }
                         if op == OP_SUPERCALL && !vm.has_pending { super_native_result(vm, res, inherited_target, thisv, derived_ctor_index(vm)); }
                         vm.sp -= argc + 2;
@@ -6121,7 +6202,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
                             nf.super_pending = ft.derived_ctor;
-                            nf.super_for = op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1;
+                            nf.super_for = cast(i16, op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1);
                             if op == OP_NEW { nf.new_target = fnv; }
                             else if op == OP_SUPERCALL { nf.new_target = inherited_target; }
                             else { nf.new_target = value_undefined(); }
@@ -6168,32 +6249,31 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if fr.super_pending && !value_is_reference(res) {
                     vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-                } else {
-                    if fr.is_ctor || fr.super_for >= 0 {
-                        vm.sp = sp;
-                        res = ctor_result(vm, fr, res);
-                        sp = vm.sp;
-                    }
-                    if !vm.has_pending {
-                        sp = fr.base - 2;
-                        *(stack + sp) = res;
-                        sp++;
-                        // A return inside a try leaves that try's handler open;
-                        // drop every handler still belonging to this frame so a
-                        // later throw doesn't unwind into the dead frame.
-                        while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
-                            vm.hp--;
-                        }
-                        vm.fp--;
-                        if vm.fp < stop_fp { vm.sp = sp; return 0; }
-                        Frame* popped = vm.frames + vm.fp;
-                        fr = vm.frames + (vm.fp - 1);
-                        t = fr.tmpl;
-                        code = t.code;
-                        pc = code + popped.ret_ip;
-                        continue;
-                    }
+                    break case;
                 }
+                if fr.is_ctor || fr.super_for >= 0 {
+                    vm.sp = sp;
+                    res = ctor_result(vm, fr, res);
+                    sp = vm.sp;
+                }
+                if vm.has_pending { break case; }
+                sp = fr.base - 2;
+                *(stack + sp) = res;
+                sp++;
+                // A return inside a try leaves that try's handler open;
+                // drop every handler still belonging to this frame so a
+                // later throw doesn't unwind into the dead frame.
+                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                    vm.hp--;
+                }
+                vm.fp--;
+                if vm.fp < stop_fp { vm.sp = sp; return 0; }
+                Frame* popped = vm.frames + vm.fp;
+                fr = vm.frames + (vm.fp - 1);
+                t = fr.tmpl;
+                code = t.code;
+                pc = code + popped.ret_ip;
+                continue;
             }
             case OP_NEWOBJ: { vm.sp = sp;
                 i32 nprops = rd_u16p(pc);
@@ -6263,6 +6343,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 sp -= 2;
                 pc += 4;
                 if !r { pc = code + rd_targetp(pc - 4); }
+                continue;
+            }
+            case OP_MOV: {
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + fr.base + rd_u16p(pc + 2));
+                pc += 4;
+                continue;
+            }
+            case OP_LOADK: {
+                *(stack + fr.base + rd_u16p(pc)) = *(t.consts + rd_u16p(pc + 2));
+                pc += 4;
                 continue;
             }
             case OP_GETPROP_L: {
@@ -8864,9 +8954,11 @@ when defined(NET_POLLER) {
 private void reactor_poll(VM* vm, i64 timeout_ms) {
     vm.last_poll_ms = vm_now_ms(vm);
     u64 w0 = vm_clock_ns();
+    i32 ph_idle = vm_phase_enter(vm, PH_IDLE);
     if vm.poller < 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
         vm.loop_idle_ns += vm_clock_ns() - w0;
+        vm_phase_leave(vm, ph_idle);
         return;
     }
     if vm.poll_events == null { vm.poll_events = cast(void*, alloc<NetPollEvent>(REACTOR_EVENTS)); }
@@ -8874,6 +8966,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
     i32 r = net_poller_wait(vm.poller, evs, REACTOR_EVENTS, to);
     vm.loop_idle_ns += vm_clock_ns() - w0;
+    vm_phase_leave(vm, ph_idle);
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < r; j++ {
             NetPollEvent* e = evs + j;
@@ -8911,9 +9004,11 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     }
     i32 npoll = vm.poll_set.len;
     u64 w0 = vm_clock_ns();
+    i32 ph_idle = vm_phase_enter(vm, PH_IDLE);
     if npoll == 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
         vm.loop_idle_ns += vm_clock_ns() - w0;
+        vm_phase_leave(vm, ph_idle);
         return;
     }
     NetPollFd* pf = vm.poll_set.data;
@@ -8930,6 +9025,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     // The wait counts as idle, as node counts the time in its poll: the
     // event loop utilisation is the rest.
     vm.loop_idle_ns += vm_clock_ns() - w0;
+    vm_phase_leave(vm, ph_idle);
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;
@@ -9191,7 +9287,14 @@ Value vm_call_stack(VM* vm, i32 argc) {
         vm.pending_super_for = 0 - 1;
         vm.pending_new_target = value_undefined();
         JsNative* na = value_as_native(fnv);
-        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        Value res;
+        if vm.phases == 0 {
+            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        } else {
+            NativeSpan nsp = vm_native_begin(vm, na);
+            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+            vm_native_end(vm, na, nsp);
+        }
         if super_for >= 0 && !vm.has_pending { super_native_result(vm, res, new_target, thisv, super_for); }
         vm.sp = entry_sp;
         return res;
@@ -9243,7 +9346,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.arguments_obj = argobj;
     nf.is_ctor = false;
     nf.super_pending = ft.derived_ctor;
-    nf.super_for = vm.pending_super_for;
+    nf.super_for = cast(i16, vm.pending_super_for);
     vm.pending_super_for = 0 - 1;
     // a super()/new spread call stashes the new.target here; consume it once
     nf.new_target = vm.pending_new_target;
@@ -9558,6 +9661,8 @@ else {
 // A lazy function's first call: reparsed from its source and compiled
 // into its template. False with a SyntaxError thrown when it does not.
 bool vm_lazy_compile(VM* vm, FnTemplate* t) {
+    i32 ph = vm_phase_enter(vm, PH_LAZY);
+    defer vm_phase_leave(vm, ph);
     if vm.lazy_ahead != null && vm_lazy_from_ahead(vm, t) { return true; }
     u64 t0 = vm_clock_ns();
     defer vm_lazy_account(vm, t0);
@@ -9594,6 +9699,243 @@ bool vm_lazy_compile(VM* vm, FnTemplate* t) {
     bump_destroy(&arena);
     diags_free(&d);
     return ok;
+}
+
+// --- phases --------------------------------------------------------------
+//
+// The time of a run between vm_phase_begin and vm_phase_end is charged to
+// the phases (PH_* in object.mc). The boundaries are the native calls, the
+// loop's re-entry under a native, the compiles and the cache reads, and
+// the event loop's waits; the collector's time is taken out of the phase
+// it interrupted from gc.mc's own counters. An op of the loop costs
+// nothing here: the interpreter's time is what is left when everything
+// else is charged, measured rather than inferred. A switch is one read of
+// the counter and a few adds, in the counter's own ticks; the report
+// converts. Its cost is measured when the accounting is turned on and the
+// report says what the switches came to, so a reader can take it out.
+
+struct NativeStat {
+    str name;
+    i64 calls;
+    i64 self;             // ticks of the native's own time: its JS callbacks and the natives under them taken out
+}
+
+struct NativeStats {
+    StrMap<i32> at;       // name to index in list
+    Vec<NativeStat> list;
+    i64 self_total;       // every native's own time so far, for the nesting
+}
+
+// A native call's span: the phase to go back to and the native totals at
+// its start, for its own time.
+struct NativeSpan {
+    i32 prev;
+    i64 n0;
+    i64 s0;
+}
+
+private i64 gc_ticks_total() { return gc_stat_ticks + gc_stat_sweep_ticks + gc_stat_step_ticks; }
+
+// The running phase's time up to `now` goes to its account, the
+// collector's share noted beside it.
+private void vm_phase_flush(VM* vm, i64 now) {
+    i64 gt = gc_ticks_total();
+    vm.phase_ticks[vm.phase] += now - vm.phase_t0;
+    vm.phase_gc[vm.phase] += gt - vm.phase_gc0;
+    vm.phase_t0 = now;
+    vm.phase_gc0 = gt;
+}
+
+void vm_phase_switch(VM* vm, i32 ph) {
+    vm.phase_switches++;
+    if vm.phase_depth == 0 { vm.phase_outside++; vm.phase = ph; return; }
+    vm_phase_flush(vm, qpc());
+    vm.phase = ph;
+}
+
+// A span of the runtime's time: the embedder's call into it. Nested
+// spans are one.
+void vm_phase_begin(VM* vm) {
+    if vm.phases == 0 { return; }
+    if vm.phase_depth == 0 {
+        vm.phase_t0 = qpc();
+        vm.phase_span0 = vm.phase_t0;
+        vm.phase_gc0 = gc_ticks_total();
+        vm.phase = PH_INTERP;
+    }
+    vm.phase_depth++;
+}
+
+void vm_phase_end(VM* vm) {
+    if vm.phases == 0 || vm.phase_depth == 0 { return; }
+    vm.phase_depth--;
+    if vm.phase_depth == 0 {
+        i64 now = qpc();
+        vm_phase_flush(vm, now);
+        vm.phase_wall += now - vm.phase_span0;
+    }
+}
+
+// Enter a phase; returns the one to hand vm_phase_leave, -1 when off.
+@inline
+i32 vm_phase_enter(VM* vm, i32 ph) {
+    if vm.phases == 0 { return -1; }
+    i32 prev = vm.phase;
+    vm_phase_switch(vm, ph);
+    return prev;
+}
+
+void vm_phase_leave(VM* vm, i32 prev) {
+    if prev >= 0 { vm_phase_switch(vm, prev); }
+}
+
+// The loop's entry under whatever phase was running, and its return to it.
+void vm_phase_push_interp(VM* vm) {
+    if vm.phase_sp < PH_STACK { vm.phase_stack[vm.phase_sp] = vm.phase; }
+    vm.phase_sp++;
+    if vm.phase != PH_INTERP { vm_phase_switch(vm, PH_INTERP); }
+}
+
+void vm_phase_pop_interp(VM* vm) {
+    if vm.phases == 0 { return; }
+    vm.phase_sp--;
+    i32 back = vm.phase_sp < PH_STACK ? vm.phase_stack[vm.phase_sp] : PH_INTERP;
+    if back != vm.phase { vm_phase_switch(vm, back); }
+}
+
+// The natives' own ticks so far, both phases, the collector's taken out.
+@inline
+i64 vm_native_ticks(VM* vm) {
+    return vm.phase_ticks[PH_NATIVE] - vm.phase_gc[PH_NATIVE] + vm.phase_ticks[PH_HOST] - vm.phase_gc[PH_HOST];
+}
+
+// The call sites take these only with the accounting on.
+@inline
+NativeSpan vm_native_begin(VM* vm, JsNative* na) {
+    NativeSpan nsp = NativeSpan{ -1, 0, 0 };
+    nsp.prev = vm.phase;
+    nsp.n0 = vm_native_ticks(vm);
+    nsp.s0 = vm.nstats != null ? vm.nstats.self_total : 0;
+    vm_phase_switch(vm, na.phase);
+    return nsp;
+}
+
+@inline
+void vm_native_end(VM* vm, JsNative* na, NativeSpan nsp) {
+    vm_phase_switch(vm, nsp.prev);
+    if vm.nstats == null { return; }
+    // what the native phases gained during the call, less what the natives
+    // under it took for themselves, is this native's own time
+    i64 self = (vm_native_ticks(vm) - nsp.n0) - (vm.nstats.self_total - nsp.s0);
+    vm.nstats.self_total += self;
+    i32* at = strmap_slot<i32>(&vm.nstats.at, na.name, -1);
+    if *at < 0 {
+        *at = vm.nstats.list.len;
+        vec_push(&vm.nstats.list, NativeStat{ na.name, 0, 0 });
+    }
+    NativeStat* st = vm.nstats.list.data + *at;
+    st.calls++;
+    st.self += self;
+}
+
+// Turns the accounting on: 1 the phases, 2 the natives by name as well.
+// Measures a switch while at it: 4096 of them between two phases, the
+// least of eight rounds, the counters then cleared.
+void vm_phases_on(VM* vm, i32 level) {
+    vm.phases = level;
+    if level >= 2 && vm.nstats == null {
+        vm.nstats = new(NativeStats);
+        strmap_init<i32>(&vm.nstats.at);
+        vec_init<NativeStat>(&vm.nstats.list, 256);
+        vm.nstats.self_total = 0;
+    }
+    i64 best = 0;
+    for i32 round = 0; round < 8; round++ {
+        vm_phase_begin(vm);
+        i64 t0 = qpc();
+        for i32 k = 0; k < 2048; k++ {
+            vm_phase_switch(vm, PH_NATIVE);
+            vm_phase_switch(vm, PH_INTERP);
+        }
+        i64 dt = qpc() - t0;
+        vm_phase_end(vm);
+        if round == 0 || dt < best { best = dt; }
+    }
+    vm.phase_switch_cost = best;
+    for i32 k = 0; k < PH_COUNT; k++ { vm.phase_ticks[k] = 0; vm.phase_gc[k] = 0; }
+    vm.phase_wall = 0;
+    vm.phase_switches = 0;
+    vm.phase_outside = 0;
+}
+
+private str ph_name(i32 ph) {
+    if ph == PH_INTERP { return "interp"; }
+    if ph == PH_NATIVE { return "natives"; }
+    if ph == PH_HOST { return "host"; }
+    if ph == PH_GC { return "gc"; }
+    if ph == PH_LAZY { return "lazy"; }
+    if ph == PH_COMPILE { return "compile"; }
+    if ph == PH_CACHE { return "cache"; }
+    return "idle";
+}
+
+private i64 ticks_ms(i64 t) { return t * 1000 / qpf(); }
+private i64 ticks_us(i64 t) { return t * 1000000 / qpf(); }
+
+// The report, each line opened with `prefix`: the phases in ms with the
+// wall of the spans and the residual, the switches and their cost, then
+// at level 2 the `top` natives by their own time. The idle phase is
+// outside the wall's sum; the collector's time is one phase, taken from
+// the others.
+string vm_phase_report(VM* vm, str prefix, i32 top) {
+    str_buf b;
+    str_buf_init(&b);
+    i64 gc = 0;
+    i64 sum = 0;
+    for i32 k = 0; k < PH_COUNT; k++ { gc += vm.phase_gc[k]; if k != PH_IDLE { sum += vm.phase_ticks[k]; } }
+    str_buf_add(&b, prefix);
+    str_buf_add(&b, "phases:");
+    for i32 k = 0; k < PH_COUNT; k++ {
+        i64 t = k == PH_GC ? gc : vm.phase_ticks[k] - vm.phase_gc[k];
+        using string one = format("{} {} {}", k == 0 ? "" : ",", ph_name(k), ticks_ms(t));
+        str_buf_add(&b, str_from(one.data, one.len));
+    }
+    i64 cost = vm.phase_switches * vm.phase_switch_cost / 4096;
+    using string tail = format("; wall {} ms, residual {} us; {} switches at {} ns, about {} ms where the phases met; {} outside a span, depth {}\n",
+        ticks_ms(vm.phase_wall), ticks_us(vm.phase_wall - sum - vm.phase_ticks[PH_IDLE]), vm.phase_switches,
+        ticks_us(vm.phase_switch_cost * 1000) / 4096, ticks_ms(cost), vm.phase_outside, vm.phase_depth);
+    str_buf_add(&b, str_from(tail.data, tail.len));
+    if vm.nstats != null && top > 0 {
+        // selection by own time, the list is a few hundred long
+        Vec<NativeStat>* l = &vm.nstats.list;
+        i32 n = l.len < top ? l.len : top;
+        for i32 i = 0; i < n; i++ {
+            i32 best = i;
+            for i32 j = i + 1; j < l.len; j++ {
+                i64 a = (l.data + j).self - (l.data + j).calls * vm.phase_switch_cost / 4096;
+                i64 bb = (l.data + best).self - (l.data + best).calls * vm.phase_switch_cost / 4096;
+                if a > bb { best = j; }
+            }
+            NativeStat tmp = l.data[i];
+            l.data[i] = l.data[best];
+            l.data[best] = tmp;
+        }
+        str_buf_add(&b, prefix);
+        using string head = format("natives by own time less the switch cost of their calls, {} of {}:", n, l.len);
+        str_buf_add(&b, str_from(head.data, head.len));
+        for i32 i = 0; i < n; i++ {
+            NativeStat* st = l.data + i;
+            // the switch cost of its calls is the accounting's, not the native's
+            i64 us = ticks_us(st.self - st.calls * vm.phase_switch_cost / 4096);
+            if us < 0 { us = 0; }
+            using string one = format("{} {} {}.{} ms/{}", i == 0 ? "" : ",", st.name, us / 1000, (us / 100) % 10, st.calls);
+            str_buf_add(&b, str_from(one.data, one.len));
+        }
+        str_buf_add(&b, "\n");
+    }
+    string out = str_concat("", str_buf_to_str(&b));
+    str_buf_free(&b);
+    return out;
 }
 
 private void vm_lazy_account(VM* vm, u64 t0) {
@@ -9638,6 +9980,8 @@ CcOut vm_save_templates(VM* vm, FnTemplate* root, str src) {
 // bytes are not a cache of it.
 FnTemplate* vm_load_templates(VM* vm, u8* data, i32 len, str src, str src_name) {
     u64 c0 = vm_clock_ns();
+    i32 ph = vm_phase_enter(vm, PH_CACHE);
+    defer vm_phase_leave(vm, ph);
     i32 rmark = gc_root_mark(&vm.heap);
     i32 n = 0;
     FnTemplate* t = codecache_read(&vm.heap, &vm.atoms, data, len, src, src_name,
@@ -9686,6 +10030,8 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
 // Function constructor needs: the function expression the script holds is
 // its first sub-template.
 FnTemplate* vm_compile_source(VM* vm, str src, str src_name, string* err) {
+    i32 ph = vm_phase_enter(vm, PH_COMPILE);
+    defer vm_phase_leave(vm, ph);
     DiagList d;
     diags_init(&d);
     Bump arena;
@@ -9893,6 +10239,7 @@ i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {
     Bump arena;
     bump_init(&arena);
     u64 c0 = vm_clock_ns();
+    i32 ph = vm_phase_enter(vm, PH_COMPILE);
     Parser p;
     parser_init(&p, src, &d, &arena);
     Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
@@ -9918,6 +10265,7 @@ i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {
         gc_root_reset(&vm.heap, rmark);
         vm.compiles++;
         vm.compile_ns += cast(i64, vm_clock_ns() - c0);
+        vm_phase_leave(vm, ph);
         if vm.first_root == null { vm.first_root = t; }
         if root_out != null { *root_out = t; }
         if d.n_errors == 0 && status == 2 {
@@ -9925,6 +10273,7 @@ i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {
         }
     }
     if d.n_errors > 0 {
+        vm_phase_leave(vm, ph);
         if !vm.quiet_errors { diags_print(&d, src_name, src); }
         status = 2;
     }

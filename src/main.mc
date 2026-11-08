@@ -17,7 +17,7 @@ const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
 
 private void print_usage() {
-    print("usage: tsmc [--gc-stress] [--prof] [--lazy] <script.ts>\n");
+    print("usage: tsmc [--gc-stress] [--prof] [--phases] [--lazy] <script.ts>\n");
     print("       tsmc --version\n");
 }
 
@@ -32,6 +32,7 @@ i32 tsmc_main() {
     bool cc_verify = false;
     bool cc_ahead = false;
     bool profile = false;
+    bool phases = false;
     i32 i = 1;
     while i < get_argc() {
         str a = str_from_cstr(get_arg(i));
@@ -48,6 +49,11 @@ i32 tsmc_main() {
         if str_equal(a, "--gc-stress") { gc_stress = true; i++; continue; }
         // a sampling profile of the run and its counts, on stderr at exit
         if str_equal(a, "--prof") { profile = true; i++; continue; }
+        // where the run's time went, by phase and by native, on stderr at exit
+        if str_equal(a, "--phases") { phases = true; i++; continue; }
+        // how far the register form reaches (doc/PLAN_register_bytecode.md)
+        if str_starts_with(a, "--reg=") { g_reg_level = cast(i32, *(a.data + 6) - '0'); i++; continue; }
+        if str_equal(a, "--reg-clear") { g_reg_clear = true; i++; continue; }
         // functions in a large source compiled on their first call
         if str_equal(a, "--lazy") { lazy_functions = true; i++; continue; }
         // the script's templates read from the file when it holds them,
@@ -122,7 +128,14 @@ i32 tsmc_main() {
             m.lazy_ahead_ctx = &la;
         }
     }
+    if phases { vm_phases_on(&m, 2); }
+    vm_phase_begin(&m);
     i32 status = module_run_entry(&m, source, arg);
+    vm_phase_end(&m);
+    if phases {
+        using string rep = vm_phase_report(&m, "tsmc: ", 20);
+        eprint("{}", rep);
+    }
     if ahead.data != null {
         if m.cache_loads == 0 { eprint("tsmc: the compile ahead was not taken\n"); }
         if la.entries.len > 0 && m.lazy_compiles > 0 { eprint("tsmc: {} lazy functions compiled ahead were not taken\n", m.lazy_compiles); }

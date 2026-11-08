@@ -1862,6 +1862,145 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_GETGLOBAL, name_const(co, n.name));
 }
 
+// --- the register form (doc/PLAN_register_bytecode.md) -------------------
+//
+// compile_expr leaves a value on the operand stack; compile_expr_reg says
+// which frame slot holds it. A plain local is its own slot and costs
+// nothing; anything not yet taught the register form compiles to the stack
+// and is stored into a temporary. Temporaries come from alloc_slot like the
+// compiler's other scratch slots, and are released in stack order by the
+// construct that took them. g_reg_level says how far the form reaches:
+// 0 nowhere, which is the default until a level is measured to be faster;
+// 1 a check that routes every binary operator's operands through the slots
+// and back, exercising the plumbing and speeding nothing; 2 and up the
+// plan's phases from 2 on.
+i32 g_reg_level = 0;
+// A check (tsmc --reg-clear): a temporary is overwritten with undefined as
+// it is released, so that code reading one after its release shows.
+bool g_reg_clear = false;
+
+// Releases the temporaries taken since `mark`.
+private void reg_release(Compiler* co, i32 mark) {
+    if g_reg_clear {
+        for i32 t = mark; t < co.cur.cur_slots; t++ {
+            ch_op(&co.cur.ch, OP_UNDEF);
+            reg_store(&co.cur.ch, t);
+        }
+    }
+    co.cur.cur_slots = mark;
+}
+
+// The slot of a local this frame reads plainly: no cell, no TDZ check,
+// not global, not exported, not under `with`; written too when `dst`, and
+// then not a const. -1 otherwise.
+private i32 reg_slot(Compiler* co, Node* n, bool dst) {
+    if n == null || n.kind != N_IDENT || str_equal(n.name, "arguments") { return -1; }
+    FScope* fs = co.cur;
+    if with_may_bind(fs, n.name) { return -1; }
+    i32 li = find_local(fs, n.name);
+    if li < 0 { return -1; }
+    CBind b = vec_get(&fs.binds, li);
+    if b.is_cell || b.tdz || (dst && b.is_const) || b.global || b.exported { return -1; }
+    if dst && co.strict && str_equal(n.name, "eval") { return -1; }
+    return b.slot;
+}
+
+// The constant a literal is, as an index in the pool, or -1: numbers,
+// strings, booleans, null and `void` of a literal.
+private i32 reg_const(Compiler* co, Node* n) {
+    Chunk* ch = &co.cur.ch;
+    if n.kind == N_NUMBER { return ch_add_const(ch, num_value(n.num)); }
+    if n.kind == N_STRING { return str_const(co, n.name); }
+    if n.kind == N_BOOL { return ch_add_const(ch, value_bool(str_equal(n.name, "true"))); }
+    if n.kind == N_NULL { return ch_add_const(ch, value_null()); }
+    if n.kind == N_UNARY && n.op == TOK_KW_VOID && is_pure_literal(n.a) { return ch_add_const(ch, value_undefined()); }
+    return -1;
+}
+
+// Whether evaluating n may store to the local named `name`: an assignment
+// or an update whose target mentions it, destructuring included. A nested
+// function is not entered: a binding one can write is a cell, never a
+// plain slot.
+private bool reg_writes(Node* n, str name) {
+    if n == null { return false; }
+    i32 k = n.kind;
+    if k == N_FUNCTION || k == N_CLASS { return false; }
+    if (k == N_ASSIGN || k == N_UPDATE) && reg_mentions(n.a, name) { return true; }
+    if reg_writes(n.a, name) || reg_writes(n.b, name) || reg_writes(n.c, name) || reg_writes(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_writes(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+// Whether a target names `name` anywhere in it: an identifier, or one in
+// a destructuring pattern.
+private bool reg_mentions(Node* n, str name) {
+    if n == null { return false; }
+    if n.kind == N_IDENT { return str_equal(n.name, name); }
+    if n.kind == N_MEMBER || n.kind == N_INDEX { return false; }
+    if reg_mentions(n.a, name) || reg_mentions(n.b, name) || reg_mentions(n.c, name) || reg_mentions(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_mentions(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+private void reg_op2(Chunk* ch, i32 op, i32 a, i32 b) {
+    ch_op(ch, op);
+    ch_u16(ch, a);
+    ch_u16(ch, b);
+}
+
+// `x = e;` as a statement, x a plain local: e compiled into x's slot, no
+// value left behind. False when the statement is not that.
+private bool reg_assign_stmt(Compiler* co, Node* e) {
+    if e == null || e.kind != N_ASSIGN || e.op != TOK_EQ || e.a.kind != N_IDENT { return false; }
+    if co.strict && strict_reserved(e.a.name) { return false; }
+    i32 d = reg_slot(co, e.a, true);
+    if d < 0 { return false; }
+    infer_name(e.b, e.a.name);
+    ignore compile_expr_reg(co, e.b, d, null);
+    return true;
+}
+
+private void reg_store(Chunk* ch, i32 d) {
+    ch_op_u16(ch, OP_SETLOCAL, d);
+    emit_discard(ch);
+}
+
+// The value of n in a slot: `want` when the caller names one (>= 0),
+// else the local's own slot or a temporary. `later` is what the caller
+// evaluates after n before it reads the slot: a local whose binding that
+// may store to is copied first, so that the read sees the value it had.
+private i32 compile_expr_reg(Compiler* co, Node* n, i32 want, Node* later) {
+    Chunk* ch = &co.cur.ch;
+    i32 s = reg_slot(co, n, false);
+    if s >= 0 {
+        if (want < 0 || want == s) && !reg_writes(later, n.name) { return s; }
+        i32 d = want >= 0 ? want : alloc_slot(co.cur);
+        if g_reg_level >= 2 {
+            reg_op2(ch, OP_MOV, d, s);
+        } else {
+            ch_op_u16(ch, OP_GETLOCAL, s);
+            reg_store(ch, d);
+        }
+        return d;
+    }
+    if g_reg_level >= 2 {
+        i32 k = reg_const(co, n);
+        if k >= 0 {
+            i32 d = want >= 0 ? want : alloc_slot(co.cur);
+            reg_op2(ch, OP_LOADK, d, k);
+            return d;
+        }
+    }
+    compile_expr(co, n);
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    reg_store(ch, d);
+    return d;
+}
+
 private void emit_load_name(Compiler* co, str name, Node* at) {
     Node tmp;
     tmp.kind = N_IDENT;
@@ -2036,6 +2175,21 @@ private void emit_discard(Chunk* ch) {
 // their TDZ check. A captured binding keeps it (a hoisted function may run
 // before the declaration), and so does one declared in a switch's clause
 // scope, which a jump into a later clause skips.
+// A declaration's initializer compiled into the binding's own slot, when
+// the binding is one: not global, not a cell, not exported, not a `var`
+// a `with` answers for. What emit_init_binding does after its store, the
+// TDZ check dropped for the reads after it, is done here as well.
+private bool reg_init_binding(Compiler* co, i32 bind_idx, Node* init, bool through_with) {
+    FScope* fs = co.cur;
+    CBind b = vec_get(&fs.binds, bind_idx);
+    if through_with || b.global || b.is_cell || b.exported || b.slot < 0 { return false; }
+    ignore compile_expr_reg(co, init, b.slot, null);
+    if b.tdz && b.depth != fs.switch_depth {
+        (fs.binds.data + bind_idx).tdz = false;
+    }
+    return true;
+}
+
 private void emit_init_binding(Compiler* co, i32 bind_idx) {
     FScope* fs = co.cur;
     CBind b = vec_get(&fs.binds, bind_idx);
@@ -3235,6 +3389,17 @@ private void compile_expr(Compiler* co, Node* n) {
         // evaluates to itself, in either order)
         bool swap = (op == OP_SEQ || op == OP_SNEQ || op == OP_EQ || op == OP_NEQ)
             && (n.a.kind == N_NULL || (n.a.kind == N_UNARY && n.a.op == TOK_KW_VOID && is_pure_literal(n.a.a)));
+        if g_reg_level == 1 && !swap {
+            // the operands in slots, then pushed for the stack op
+            i32 mark = co.cur.cur_slots;
+            i32 ra = compile_expr_reg(co, n.a, -1, n.b);
+            i32 rb = compile_expr_reg(co, n.b, -1, null);
+            ch_op_u16(ch, OP_GETLOCAL, ra);
+            ch_op_u16(ch, OP_GETLOCAL, rb);
+            reg_release(co, mark);
+            ch_op(ch, op);
+            return;
+        }
         if swap {
             compile_expr(co, n.b);
             compile_expr(co, n.a);
@@ -4811,6 +4976,7 @@ private void compile_var_stmt(Compiler* co, Node* n) {
             }
             if d.b != null {
                 infer_name(d.b, d.a.name);
+                if g_reg_level >= 2 && reg_init_binding(co, li, d.b, !lexical && with_may_bind(co.cur, d.a.name)) { continue; }
                 compile_expr(co, d.b);
                 // a `var` declares in the function scope, but its initializer
                 // is an ordinary assignment: inside a `with` body it lands on
@@ -5328,6 +5494,7 @@ private void compile_stmt(Compiler* co, Node* n) {
 
     if k == N_EXPR_STMT {
         if emit_update_discarded(co, n.a) { return; }
+        if g_reg_level >= 2 && reg_assign_stmt(co, n.a) { return; }
         compile_expr(co, n.a);
         emit_discard(ch);
         return;

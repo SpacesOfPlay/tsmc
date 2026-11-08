@@ -638,6 +638,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     src.len = cast(i32, fd.len);
 
     u64 c0 = vm_clock_ns();
+    i32 ph = vm_phase_enter(ld.vm, PH_COMPILE);
     Parser p;
     parser_init(&p, src, &ld.diags, &mod.arena);
     parser_set_module_top(&p, true);   // top-level await belongs to a module
@@ -652,6 +653,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
         lower_destroy(&lw);
         parser_destroy(&p);
         ld.failed = true;
+        vm_phase_leave(ld.vm, ph);
         return my_idx;
     }
 
@@ -667,6 +669,7 @@ private i32 load_module_from(Loader* ld, str path, str canon, FileData fd) {
     gc_root_reset(&ld.vm.heap, rmark);
     ld.vm.compiles++;
     ld.vm.compile_ns += cast(i64, vm_clock_ns() - c0);
+    vm_phase_leave(ld.vm, ph);
 
     // namespace object, rooted for the run
     mod.ns = vm_new_namespace(ld.vm);
