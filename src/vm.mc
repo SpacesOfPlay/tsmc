@@ -40,19 +40,22 @@ const i32 VM_FRAMES_MAX = 8000;
 const i32 VM_HANDLERS_MAX = 4096;
 const i32 VM_EXEC_DEPTH_MAX = 120;
 
+// 64 bytes, and the frames array starts on a cache line, so a frame is
+// one line: a call writes one and a return reads one. The eight-byte
+// fields come first, so that nothing pads.
 struct Frame {
     JsFunction* fun;    // null for the script frame
     FnTemplate* tmpl;
-    i32 ret_ip;
-    i32 cur_ip;         // this frame's active site (call/throw), for stacks
-    i32 base;
     Value this_val;
     Value arguments_obj;  // the `arguments` object, or undefined if unused
     Value new_target;   // new.target: the constructor, or undefined; super() propagates it
+    JsGenerator* gen;   // non-null while running a generator/async body
+    i32 ret_ip;
+    i32 cur_ip;         // this frame's active site (call/throw), for stacks
+    i32 base;
+    i16 super_for;      // a frame index, below VM_FRAMES_MAX, or -1
     bool is_ctor;
     bool super_pending;  // a derived constructor that has not called super()
-    i32 super_for;
-    JsGenerator* gen;   // non-null while running a generator/async body
 }
 
 struct Handler {
@@ -183,6 +186,7 @@ struct VM {
     Value* stack;
     i32 sp;
     Frame* frames;
+    void* frames_block;        // the allocation frames is aligned within
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     i32 pending_super_for;     // super_for for the next vm_call_stack frame
@@ -4379,7 +4383,8 @@ void vm_init(VM* vm) {
     vm.key_marks_cap = 0;
     vm.stack = alloc<Value>(VM_STACK_MAX);
     vm.sp = 0;
-    vm.frames = alloc<Frame>(VM_FRAMES_MAX);
+    vm.frames_block = cast(void*, alloc<u8>(cast(i64, VM_FRAMES_MAX) * sizeof(Frame) + 64));
+    vm.frames = cast(Frame*, (cast(i64, vm.frames_block) + 63) & ~cast(i64, 63));
     vm.fp = 0;
     vm.pending_new_target = value_undefined();
     vm.pending_super_for = 0 - 1;
@@ -4596,7 +4601,7 @@ void vm_destroy(VM* vm) {
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
-    free(vm.frames);
+    free(vm.frames_block);
     free(vm.handlers);
 }
 
@@ -6176,7 +6181,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
                             nf.super_pending = ft.derived_ctor;
-                            nf.super_for = op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1;
+                            nf.super_for = cast(i16, op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1);
                             if op == OP_NEW { nf.new_target = fnv; }
                             else if op == OP_SUPERCALL { nf.new_target = inherited_target; }
                             else { nf.new_target = value_undefined(); }
@@ -9310,7 +9315,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.arguments_obj = argobj;
     nf.is_ctor = false;
     nf.super_pending = ft.derived_ctor;
-    nf.super_for = vm.pending_super_for;
+    nf.super_for = cast(i16, vm.pending_super_for);
     vm.pending_super_for = 0 - 1;
     // a super()/new spread call stashes the new.target here; consume it once
     nf.new_target = vm.pending_new_target;
