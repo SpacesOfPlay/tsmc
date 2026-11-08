@@ -5391,6 +5391,18 @@ private void json_ws(JsonParser* p) {
     }
 }
 
+// Where the run of plain string bytes from p.pos ends: at a quote, a
+// backslash or the end of the text.
+private i32 json_plain_end(JsonParser* p) {
+    i32 i = p.pos;
+    while i < p.s.len {
+        u8 d = *(p.s.data + i);
+        if d == '"' || d == '\\' { break; }
+        i++;
+    }
+    return i;
+}
+
 private Value json_parse_value(VM* vm, JsonParser* p) {
     json_ws(p);
     if p.pos >= p.s.len {
@@ -5412,9 +5424,23 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
     }
     if c == '"' {
         p.pos++;
+        // most strings have no escape: the bytes up to the quote are the string
+        i32 end = json_plain_end(p);
+        if end < p.s.len && *(p.s.data + end) == '"' {
+            Value plain = new_str(vm, str_from(p.s.data + p.pos, end - p.pos));
+            p.pos = end + 1;
+            return plain;
+        }
         str_buf sb;
         str_buf_init(&sb);
         while p.pos < p.s.len {
+            // the run up to the next quote or escape, whole
+            i32 run = json_plain_end(p);
+            if run > p.pos {
+                str_buf_add(&sb, str_from(p.s.data + p.pos, run - p.pos));
+                p.pos = run;
+                if p.pos >= p.s.len { break; }
+            }
             u8 d = *(p.s.data + p.pos);
             if d == '"' { break; }
             if d == '\\' && p.pos + 1 < p.s.len {
@@ -5527,13 +5553,32 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
         } else {
             while !p.failed {
                 json_ws(p);
-                Value key = json_parse_value(vm, p);
-                if p.failed { break; }
-                if !value_is_string(key) {
-                    p.failed = true;
-                    break;
+                // a key without escapes goes to its atom from the text,
+                // with no string made for it; interned after the value, so
+                // that nothing the value allocates can find it unused
+                i32 kstart = -1;
+                i32 klen = 0;
+                Value key = value_undefined();
+                if p.pos < p.s.len && *(p.s.data + p.pos) == '"' {
+                    p.pos++;
+                    i32 kend = json_plain_end(p);
+                    if kend < p.s.len && *(p.s.data + kend) == '"' {
+                        kstart = p.pos;
+                        klen = kend - p.pos;
+                        p.pos = kend + 1;
+                    } else {
+                        p.pos--;
+                    }
                 }
-                gc_root(&vm.heap, key);
+                if kstart < 0 {
+                    key = json_parse_value(vm, p);
+                    if p.failed { break; }
+                    if !value_is_string(key) {
+                        p.failed = true;
+                        break;
+                    }
+                    gc_root(&vm.heap, key);
+                }
                 json_ws(p);
                 if p.pos >= p.s.len || *(p.s.data + p.pos) != ':' {
                     p.failed = true;
@@ -5542,7 +5587,8 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
                 p.pos++;
                 Value val = json_parse_value(vm, p);
                 if p.failed { break; }
-                js_set_prop(obj, vm_atom_of_string(vm, value_as_string(key)), val);
+                u32 katom = kstart >= 0 ? vm_atom_dyn(vm, str_from(p.s.data + kstart, klen)) : vm_atom_of_string(vm, value_as_string(key));
+                js_set_prop(obj, katom, val);
                 json_ws(p);
                 if p.pos < p.s.len && *(p.s.data + p.pos) == ',' {
                     p.pos++;
