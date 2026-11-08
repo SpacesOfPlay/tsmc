@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 4 done, level 4 the default.
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 4 done, level 4 the default; phase 5's register call measured flat and not kept, its finding about the return kept; phases 6 and 7 wait on a decision.
 
 ## Why
 
@@ -473,3 +473,59 @@ suite 2761 to 2742 ms (objlit 176 to 171, proto_chain 204 to 199,
 nothing slower beyond 2 ms); the property micro-loop 8.75 to 8.55 ns;
 bsky.app busy 1740 to 1750 against 1736 to 1761, flat, the shot the
 same.
+
+## Phase 5, measured (2026-11-08)
+
+The plan's form, the callee's frame starting at arguments already in
+the caller's top registers, does not fit an engine that keeps the
+operand stack above the slots: a call inside a stack expression would
+lay its frame over the values that expression holds. Two drafts of the
+form that fits were built and measured instead.
+
+- `RCALL n, operands, argc`: the callee and `this` pushed as before
+  (with their fused and cached ops), the trailing arguments that are
+  plain locals or literals read from their slots and the pool inside
+  the call op, then the call as `CALL` makes it. The second draft also
+  took arithmetic and property reads, computed into temporaries, a
+  local a later argument stores to copied first.
+- Checks: a probe of every callee kind (plain, method, class, bound,
+  proxy, generator, async, native, not a function), surplus and missing
+  arguments, `arguments`, rest and spread on either side, a later
+  argument that stores to an earlier local, valueOf and getter order,
+  recursion to the stack limit, the same at levels 0, 4 and 5.
+- Ops: bsky.app's load 124.29 to 120.20 million (3.3%); fib 13.3%
+  fewer, promises 7.7, strindex 7.0, arrays 5.8, nothing more. A first
+  cut took `"k" + i` as an argument and cost the collections bench 2.2%
+  more ops, its string operand running the stack form after the
+  register op's; the literal operands but numbers stay on the stack.
+- Time, levels 4 and 5 in one binary: the call loop 19.8 and 20.0 ns,
+  the bench suite 2774 and 2778 ms (fib 325 and 332), bsky.app busy
+  1817 and 1836. Flat to worse. The sampler on the call loop says why:
+  the GETLOCAL the register form removed cost 11 ms a run and RCALL's
+  copy of the same argument 14.
+
+Not kept, by this plan's rule. A third draft, a return that stores the
+result straight into the local the caller's next op would have, or
+drops it for a POP, measured worse too (proto_chain 208 to 222).
+
+**What the sampler found instead.** CALL and RETURN were 32% of the
+call loop, and two lines of RETURN half of its share: the reload of
+the caller's template and then its code, a chain of dependent loads
+from the frame that the next dispatch waits on. Loaded at the top of
+RETURN, before the constructor and handler checks, the chain runs
+beside them. The call loop 19.2 to 16.6 ns, fib 332 to 301 ms, the
+bench suite 2769 to 2737 (iterators 282 to 290, which returns little:
+the loop's layout), bsky.app busy 1807 to 1781, its first frame 2049 to
+2029, the shot the same. Kept: it is the stack VM's, at every level.
+
+**What it says about the plan.** Phases 3 and 4 bought their time on
+loops, where a value no longer goes through the stack between two ops;
+phase 5's register call removes dispatches and moves the same values,
+and the dispatches measured free. The calls' cost is the frame's
+dependent loads, which a register form does not change. Phase 6's
+constructs are of phase 5's kind more than of phase 3's, so the
+decision to make is whether 6 is converted only where the op counts
+and a prototype say it wins, and 7 is done for what is converted, or
+whether the effort goes to the call path's chains first (CALL's own,
+from the callee value to its template and code, is the next of them).
+

@@ -6242,6 +6242,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
             case OP_RETURN: {
                 sp--;
                 Value res = *(stack + sp);
+                // The caller's template and code, loaded before the checks
+                // below: the next dispatch waits on the chain from the frame
+                // to the code, and here it runs beside them. A frame below
+                // stop_fp is not this loop's to return to.
+                FnTemplate* ct = vm.fp > stop_fp ? (fr - 1).tmpl : t;
+                u8* cc = ct.code;
                 // A derived constructor that never called super() has no
                 // instance to hand back, and returning is where that shows.
                 // Returning an object of its own is allowed, and says the
@@ -6268,11 +6274,11 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vm.fp--;
                 if vm.fp < stop_fp { vm.sp = sp; return 0; }
-                Frame* popped = vm.frames + vm.fp;
-                fr = vm.frames + (vm.fp - 1);
-                t = fr.tmpl;
-                code = t.code;
-                pc = code + popped.ret_ip;
+                i32 rip = fr.ret_ip;
+                fr = fr - 1;
+                t = ct;
+                code = cc;
+                pc = cc + rip;
                 continue;
             }
             case OP_NEWOBJ: { vm.sp = sp;
