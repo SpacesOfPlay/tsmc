@@ -110,11 +110,32 @@ i32 u16_offset_cur(str s, i32 idx, i32* cu, i32* co) {
     return *co + n;
 }
 
+// How many bytes from `off` on are ASCII, eight at a time: most of a
+// page's strings are all ASCII, where a byte is a UTF-16 unit and there
+// is nothing to decode.
+i32 ascii_run(str s, i32 off) {
+    i32 i = off;
+    while i + 8 <= s.len {
+        u64 w;
+        memcpy(cast(u8*, &w), s.data + i, 8);
+        if (w & 0x8080808080808080) != 0 { break; }
+        i += 8;
+    }
+    while i < s.len && *(s.data + i) < 0x80 { i++; }
+    return i - off;
+}
+
 // Number of UTF-16 code units in the string.
 i32 u16_count(str s) {
-    i32 units = 0;
-    i32 off = 0;
+    i32 off = ascii_run(s, 0);
+    i32 units = off;
     while off < s.len {
+        if *(s.data + off) < 0x80 {
+            i32 run = ascii_run(s, off);
+            units += run;
+            off += run;
+            continue;
+        }
         i32 n;
         i32 cp = utf8_decode(s, off, &n);
         units += cp_units(cp);
