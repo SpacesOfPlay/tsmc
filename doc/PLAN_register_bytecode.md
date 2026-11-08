@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: proposed, 2026-11-08. Nothing built.
+Status: phase 0 done, 2026-11-08; the decision on phase 1 is open (below).
 
 ## Why
 
@@ -225,3 +225,77 @@ or two together, depending on how much of 6 the numbers say is worth
 converting. The compiler is 6300 lines and the loop's switch about 150
 cases; phases 2 to 5 touch most of `compile_expr` and add about 40
 register ops.
+
+## Phase 0, measured (2026-11-08)
+
+A throwaway prototype (kept outside the tree): four register ops,
+`R_ADD` and `R_SUB` (slot = slot op slot), `R_BORK` (slot = slot | k)
+and `R_GETPROP` (slot = slot.name, with the inline cache), emitted by
+the compiler for `local = a + b`, `local = (a + b) | k`, `local = a | k`
+and `local = o.name` when every operand is a plain local, behind
+`tsmc --regproto`, so that one binary runs both forms.
+
+**Validated six ways.**
+
+1. *Op counts* (a profiling build, the flag off and on): `s = (s + i) |
+   0` 8 ops an iteration to 5; `s = s + i` 6 to 4; `v = o.x; s = (s +
+   v) | 0` 10 to 6; a loop with a call, which the prototype does not
+   touch, 14 and 14. As predicted for each.
+2. *Behaviour*: 445 test, bench and example scripts the same off and
+   on (one live-network test differs run to run either way); the 261
+   goldens the same under `--gc-stress`, 23 of them executing register
+   ops; a probe of the slow paths (overflow, doubles, strings, BigInt,
+   valueOf, a throwing valueOf, getters, a primitive receiver, a null
+   receiver, a slot that is operand and destination) the same off, on
+   and in node.
+3. *The loop's register seats* (`minc asm`): unchanged.
+4. *Time*, five interleaved rounds, the least and the greatest ns per
+   iteration. Against head the gain looked like 2.5x on the first loop;
+   that was a confound, the stack `BOR` having no int fast path where
+   `R_BORK` had one. With the same fast path in the stack ops (the
+   control):
+
+   | loop | stack, fast path | register | gain | ops |
+   |---|---|---|---|---|
+   | `s = (s + i) \| 0` | 6.80–6.85 | 5.50–5.55 | 19% | 8 to 5 |
+   | `s = s + i` | 6.15–6.25 | 4.90–5.45 | 20% | 6 to 4 |
+   | `v = o.x; s = (s + v) \| 0` | 10.70–10.85 | 8.95–9.10 | 16% | 10 to 6 |
+   | a call, untouched | 19.70–20.00 | 19.75–20.15 | 0 | 14 and 14 |
+
+5. *The sampler*, independent of the wall clock: the property loop's
+   samples 488 ms off and 391 on (20%); the ops removed (the two loads,
+   the store, the add, the or) cost 123 ms and their register forms 90;
+   the property read costs the same in either form.
+6. *Against node --jitless*: the register forms are under node's
+   interpreter on all three loops (5.5, 4.9, 9.0 ns against 11.6, 11.7,
+   13.7); the call loop is 20 against 22.
+
+**What it says.** The premise holds in direction and not in size: 37
+to 40% fewer ops buy 16 to 20% on the loops, the gate's 20% at best.
+A removed op saves 0.4 to 0.6 ns on a hot loop, its dispatch and its
+stack store, where the op count alone would have said more.
+
+**bsky.app.** The whole op mix of the load (a profiling build, 133.5
+million ops): the moves a register bytecode removes are 37.7% (GETLOCAL
+13.6, PUTLOCAL 7.8, CONST 4.9, POP 4.0, GETLOCAL2 2.2, GETLOCAL_CONST
+1.2, SETLOCAL 1.0, NULL, UNDEF, THIS, DUP), less the moves a call's
+arguments keep: 31 to 40% of the ops, 41 to 53 million. Two
+projections of what that is worth: at the micro-loops' 0.4 to 0.6 ns a
+removed op, 18 to 33 ms; at the 2.6 ns a removed op the pair fusions
+measured on this page (28 million removed, 72 ms), 106 to 137 ms. The
+second is the page's own figure and the likelier; it is 5 to 7% of
+busy, under this plan's estimate of 150 to 300 ms.
+
+**Found on the way.** The stack bitwise ops have no int fast path:
+every `x | 0`, `x & m`, `x >> n` calls the coercion helper. With one,
+the first loop goes 14.1 to 6.8 ns and the call loop 35 to 20. Bitwise
+ops are 1.4% of bsky's ops, more of minified and asm-shaped code. This
+is a change of its own, small, and worth taking whatever is decided
+here.
+
+**The decision.** Phases 1 to 7 are four to six weeks for a projected
+100 to 140 ms of bsky's busy and the 16 to 20% the micro-loops show on
+loop-shaped code. Going on is reasonable if loop-heavy pages and the
+benches matter as much as bsky; stopping here is reasonable if bsky's
+load is the measure, where the projected gain is about what the
+memory-traffic and string work of this week gave together.
