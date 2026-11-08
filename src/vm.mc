@@ -6345,6 +6345,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !r { pc = code + rd_targetp(pc - 4); }
                 continue;
             }
+            case OP_MOV: {
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + fr.base + rd_u16p(pc + 2));
+                pc += 4;
+                continue;
+            }
+            case OP_LOADK: {
+                *(stack + fr.base + rd_u16p(pc)) = *(t.consts + rd_u16p(pc + 2));
+                pc += 4;
+                continue;
+            }
             case OP_GETPROP_L: {
                 Value objv = *(stack + fr.base + rd_u16p(pc));
                 u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));

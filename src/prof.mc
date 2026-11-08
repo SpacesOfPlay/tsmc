@@ -271,6 +271,8 @@ str op_name(i32 op) {
         case 178: { return "SEQ_LC_JT"; }
         case 179: { return "SEQ_NULL_JF"; }
         case 180: { return "SNEQ_NULL_JF"; }
+        case 181: { return "MOV"; }
+        case 182: { return "LOADK"; }
     }
     return "?";
 }

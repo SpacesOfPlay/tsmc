@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phase 1 done.
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 and 2 done.
 
 ## Why
 
@@ -338,3 +338,38 @@ Checks, all at level 1 against level 0 in the same binary
 - Unchanged by default: the code cache head and this build write is
   byte-identical for all 74 scripts that write one; both suites pass;
   bsky.app's shot the same at levels 0 and 1.
+
+## Phase 2, done (2026-11-08)
+
+Two ops, `MOV dst, src` and `LOADK dst, const`, and at level 2 an
+assignment statement `x = e;` and a declaration `let x = e` to a plain
+local compile `e` into the local's slot: a local source is a `MOV`, a
+literal (number, string, boolean, null, `void` of a literal) a `LOADK`,
+anything else the stack form and its store as before. Level 1 becomes
+the exercise mode alone (`--reg=1`); the levels from 2 are the phases.
+The code cache's version counts the new ops.
+
+Checks at level 2, `tools/reg_check.sh`: 415 scripts plainly, through
+the code cache's round trip and its compile ahead, and the 261 goldens
+under `--gc-stress` with and without `--reg-clear`, no differences; a
+probe of TDZ inside an initializer, shadowing, named function and
+class expressions, a `var` initializer inside `with`, the same as node
+at levels 0 and 2; both suites pass.
+
+The op count moved less than this plan said it would. bsky.app's load
+133.46 to 132.92 million (0.4%), the benches within a few thousand ops,
+the shot the same. A statement that only moves a value is rare; the
+loads and stores are other ops' operands and results. The load's pair
+counts (600 pairs, 89% of the ops) say where they go:
+
+- GETLOCAL (12.9% of the ops) feeds a call's arguments (2.2% with
+  GETLOCAL2), the null comparisons that jump (1.8%), the nullish tests
+  (0.6), returns (0.6), property reads and method lookups (1.1);
+- PUTLOCAL (7.5%) stores a property read (2.6%, `x = o.p`), a local
+  (0.7), a call's result (0.5), an addition (0.5), an index read (0.7);
+- CONST (4.7%) feeds a property read or a local load beside it (2.3).
+
+So the drop comes with the consumers: phase 3's comparisons and jumps
+on slots, phase 4's property reads into slots, phase 5's arguments in
+slots. Phase 2's `MOV` and `LOADK` are what those use to place their
+operands; the phase is judged on behaviour, and its level stays off.

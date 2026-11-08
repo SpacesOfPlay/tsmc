@@ -201,7 +201,10 @@ enum Op {
     OP_SEQ_JT, OP_SNEQ_JT,       // i32 target: SEQ then JUMPT, SNEQ then JUMPT
     OP_SEQ_LC_JF,    // u16 slot, u16 const idx, i32 target: GETLOCAL, CONST, SEQ, jump when false
     OP_SEQ_LC_JT,    // u16 slot, u16 const idx, i32 target: the same, jump when true (a switch's case)
-    OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF // i32 target: SEQ_NULL then JUMPF, SNEQ_NULL then JUMPF
+    OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF, // i32 target: SEQ_NULL then JUMPF, SNEQ_NULL then JUMPF
+    // the register form (doc/PLAN_register_bytecode.md): operands are frame slots
+    OP_MOV,          // u16 dst, u16 src: slot = slot
+    OP_LOADK         // u16 dst, u16 const idx: slot = constant
 }
 
 struct TmplUpval {
