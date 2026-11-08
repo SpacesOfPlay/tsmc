@@ -13,6 +13,7 @@ import value;
 import gc;
 import atom;
 import bigint;
+import memtrace;
 
 // continues GcKind: 0..1 are built into gc.mc
 const i32 GC_OBJECT   = 2;
@@ -127,9 +128,11 @@ void props_reserve(PropList* p, i32 n) {
     if props_cap(p) > 0 || n <= 0 { return; }
     p.items = cast(Prop*, pool_alloc(cast(i64, n) * sizeof(Prop)));
     p.cap = (p.cap & ~PROPS_CAP_MASK) | n;
+    when defined(TSMC_MEMTRACE) { mt_ev(MT_GROW, cast(u64, p), cast(u64, p.items), cast(u32, n), 0); }
 }
 
 void props_free(PropList* p) {
+    when defined(TSMC_MEMTRACE) { mt_ev(MT_GROW, cast(u64, p), 0, 0, 0); }
     if p.items != null && (p.cap & PROPS_INLINE) == 0 { pool_free(cast(void*, p.items), cast(i64, props_cap(p)) * sizeof(Prop)); }
     if p.idx != null {
         intmap_free<i32>(p.idx);
@@ -189,7 +192,9 @@ private Prop* props_append(PropList* p, u32 key, Value v, u8 flags) {
         if p.items != null && (p.cap & PROPS_INLINE) == 0 { pool_free(cast(void*, p.items), cast(i64, cap) * sizeof(Prop)); }
         p.items = ni;
         p.cap = (p.cap & ~(PROPS_CAP_MASK | PROPS_INLINE)) | ncap;
+        when defined(TSMC_MEMTRACE) { mt_ev(MT_GROW, cast(u64, p), cast(u64, ni), cast(u32, ncap), 0); }
     }
+    when defined(TSMC_MEMTRACE) { mt_ev(MT_ADD, cast(u64, p), 0, key, cast(u32, flags)); }
     i32 pos = p.len;
     Prop* pr = p.items + pos;
     pr.key = key;
@@ -226,6 +231,7 @@ void props_set_desc(PropList* p, u32 key, Value v, u8 flags) {
     Prop* ex = props_entry(p, key);
     if ex != null {
         if (p.cap & PROPS_OLD) != 0 { props_barrier(p, v); }
+        when defined(TSMC_MEMTRACE) { if ex.flags != flags { mt_ev(MT_FLAGS, cast(u64, p), 0, key, cast(u32, flags)); } }
         ex.val = v;
         ex.flags = flags;
         return;
@@ -247,6 +253,7 @@ bool props_remove(PropList* p, u32 key) {
     if (p.cap & PROPS_IS_PROTO) != 0 { g_proto_epoch++; }
     for i32 i = 0; i < p.len; i++ {
         if (p.items + i).key == key {
+            when defined(TSMC_MEMTRACE) { mt_ev(MT_REMOVE, cast(u64, p), 0, key, cast(u32, i)); }
             for i32 j = i; j + 1 < p.len; j++ {
                 *(p.items + j) = *(p.items + j + 1);
             }
@@ -501,7 +508,10 @@ struct JsGenerator {
 
 private void mark_props(GcHeap* h, PropList* p) {
     if h.verifying { h.verify_cap = p.cap; }
-    else { p.cap = p.cap | PROPS_OLD; }
+    else {
+        p.cap = p.cap | PROPS_OLD;
+        when defined(TSMC_MEMTRACE) { mt_ev(MT_TRACE, cast(u64, p), 0, cast(u32, p.len), 0); }
+    }
     for i32 i = 0; i < p.len; i++ {
         Prop* pr = p.items + i;
         if h.verifying { h.verify_key = cast(i32, pr.key); }
@@ -655,11 +665,24 @@ void js_set_proto(JsObject* o, JsObject* p) {
     js_mark_proto(p);
 }
 
+// The tables' offsets in their cells, once, for the trace's reader.
+private bool g_mt_header = false;
+private void mt_header() {
+    if g_mt_header { return; }
+    g_mt_header = true;
+    JsObject o;
+    JsFunction f;
+    JsNative n;
+    mt_ev(MT_HEADER, cast(u64, cast(u8*, &o.props) - cast(u8*, &o)), cast(u64, cast(u8*, &f.props) - cast(u8*, &f)),
+        cast(u32, cast(u8*, &n.props) - cast(u8*, &n)), cast(u32, sizeof(JsObject)));
+}
+
 JsObject* js_new_object(GcHeap* h, JsObject* proto) {
     JsObject* o = cast(JsObject*, gc_alloc(h, GC_OBJECT, sizeof(JsObject)));
     o.proto = proto;
     js_mark_proto(proto);
     props_init(&o.props);
+    when defined(TSMC_MEMTRACE) { mt_header(); mt_ev(MT_OBJECT, cast(u64, o), 0, 0, 0); }
     return o;
 }
 
@@ -672,6 +695,7 @@ JsObject* js_new_object_room(GcHeap* h, JsObject* proto, i32 n) {
     props_init(&o.props);
     o.props.items = cast(Prop*, cast(u8*, o) + sizeof(JsObject));
     o.props.cap = n | PROPS_INLINE;
+    when defined(TSMC_MEMTRACE) { mt_header(); mt_ev(MT_OBJECT, cast(u64, o), 0, cast(u32, n), 0); }
     return o;
 }
 

@@ -1,7 +1,11 @@
 # Plan: shapes
 
-Status: written 2026-11-08, not started. Phase 0 decides whether the rest
-is built.
+Status: phase 0 measured 2026-11-08, the gate not met: shapes would cut
+the property reads' deeper misses by a quarter or more, the allocations'
+lines by 23% and the marking's not at all, for an estimated 5% of
+bsky.app's busy time and a quarter of its heap. The plan stops here
+unless that memory is wanted for its own sake ("Phase 0, measured"
+below). The accessor test alone measured worse and is not kept.
 
 ## Why
 
@@ -78,7 +82,7 @@ prototype caches keep their epoch.
 
 **Dictionary mode.** `delete` of a property not last, a `defineProperty`
 that changes an existing property's flags, more than 64 properties, or
-a shape whose transitions pass 32 children, and the object takes a
+a shape whose transitions pass 32 children (phase 0: far too few), and the object takes a
 private table of today's form (`PropList` with its index). Such objects
 are rare on the pages measured; phase 0 counts them.
 
@@ -195,6 +199,75 @@ otherwise recorded as not needed.
 **5. Cleanup.** The old entry form kept only for dictionary mode;
 `DESIGN_property_access.md` rewritten for shapes; this plan records what
 each phase measured.
+
+## Phase 0, measured (2026-11-08)
+
+**The trace.** `src/memtrace.mc` and its hooks in gc.mc, object.mc and
+vm.mc, compiled in only with TSMC_MEMTRACE (a default build is byte for
+byte the same binary), log the allocations, the frees, the tables'
+growth, additions, removals and flag changes, the cache's own-slot and
+prototype hits, reads and writes, and the marker's visits.
+`tools/memsim.mc` replays the log into four copies of the heap (the real
+addresses, and a model of the allocator and the pool under today's
+layout, shapes with a 56-byte header, and with a 64-byte one that keeps
+the elements' fields) through an L1, L2 and L3 of the machine measured
+on (32 KB, 512 KB, 32 MB; 64-byte lines, LRU). bsky.app's saved page,
+one load: 38.7 million events, 1.43 million objects. The allocator's
+model against the real addresses: within 2% on reads and marking, 11% on
+the allocations' L3 misses.
+
+**Misses, today against shapes56:**
+
+| | L1 | L2 | L3 | lines touched |
+|---|---|---|---|---|
+| own-slot reads | 10.52M to 8.61M, -18% | 2.74M to 1.98M, -28% | 503k to 318k, -37% | -5% |
+| prototype reads | 523k to 337k | 109k to 63k | 14k to 5k | -28% |
+| allocation (the zeroing) | 4.66M to 3.82M, -18% | 4.56M to 3.67M, -19% | 2.50M to 2.02M, -19% | 6.25M to 4.79M, -23% |
+| marking | 7.20M to 6.18M, -14% | 6.56M to 5.47M, -17% | 1.89M to 1.31M, -31% | +4.5% (a shape line per object) |
+| additions | 354k to 1.16M | 336k to 477k | 164k to 129k | +71% (the transitions) |
+| all | -14% | -19% | -26% | +0.5% |
+
+Weighted by latency (3 ns an L2 hit, 10 an L3 hit, 80 a miss), the
+three areas the plan is about fall by 23%, reads 28%, marking 26%,
+allocation 19%. The sampler puts those areas at about 430 ms of a
+1790 ms busy load, so the estimate is about 100 ms, some 5%. The model
+leaves out every other access (the stack, the code, strings, the DOM),
+and measured on the accessor test below it took a removed read for a
+gain that the hardware did not show; it is an upper bound.
+
+**The shapes a page makes.** 29,500 shapes (1.6 MB), 22,800 of them
+with one child; the root and one depth-1 shape reach the 1,536-child cap
+that stands in for a transition limit, with 1,220 objects (0.08%) sent
+to a dictionary, 716 of them by that cap, 418 by a removal, 65 past 64
+properties, 21 by a change of flags. A cap of 32 children, as first
+written above, sent 770,000 objects to dictionaries: the root's
+children are the first keys of every object literal and constructor,
+so the cap has to be per shape and far larger, or the root exempt.
+
+**Memory.** The live objects and their tables at the end: 90.2 MB today,
+56.3 MB with shapes; every cell and table, 125.7 MB to 91.9 MB, 27% less.
+That is the plain win: the entries' keys and flags move out of 521,000
+objects into 29,500 shapes.
+
+**The accessor test alone.** A table bit set when an accessor is
+stored, and the cache's hits on a table without it not reading the
+value's cell: no script differs from head (417, plainly and under
+`--gc-stress`), a build that checks the bit at every hit never fired,
+and the probe matched node. The bench suite 2734 to 2750 ms; bsky.app
+busy 1790 to 1802 (median 1801 to 1822), the shot the same. The model
+had said 12% fewer read misses: the value's cell is read soon after by
+whoever uses the value, and the miss moves there, as the per-entry flag
+found before. Not kept.
+
+**The gate.** Reads' misses: a quarter or more at L2 and L3, 18% at L1.
+Allocation's lines 23%, marking's lines up, their deeper misses down
+17 to 31%. Shapes within a few tens of thousands, dictionaries well
+under a few percent. Two of the three conditions on misses are not met
+as written, and the time they would buy, about 5% at most, is less
+than the weeks of phase 1 and the risk in it. The memory is a
+different case: a quarter of the heap on a page this size. If memory
+becomes the goal, phase 1 alone (shapes behind the API, the caches as
+they are) is where it comes from, and its own check 3 measures it.
 
 ## Risks, and where each is caught
 

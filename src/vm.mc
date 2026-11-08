@@ -4726,7 +4726,11 @@ private bool ic_hit(VM* vm, Value v, i32 k, u32 a, i32 ic, Value* out) {
         PropList* pl = ic_own_table(v, k);
         if pl != null && ic < pl.len {
             Prop* pr = pl.items + ic;
-            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_READ, cast(u64, pl), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
+                *out = pr.val;
+                return true;
+            }
         }
         return false;
     }
@@ -4749,7 +4753,11 @@ private bool ic_hit(VM* vm, Value v, i32 k, u32 a, i32 ic, Value* out) {
         JsObject* p = o.proto;
         if p != null && at < p.props.len && ic_index_of(o, a) < 0 {
             Prop* pr = p.props.items + at;
-            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev3(MT_PREAD, cast(u64, &o.props), cast(u64, &p.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, at), 0); }
+                *out = pr.val;
+                return true;
+            }
         }
         return false;
     }
@@ -4761,7 +4769,11 @@ private bool ic_hit(VM* vm, Value v, i32 k, u32 a, i32 ic, Value* out) {
             if ic_index_in(ic_own_table(v, k), a) >= 0 { return false; }
         }
         Prop* pr = p.props.items + at;
-        if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+        if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+            when defined(TSMC_MEMTRACE) { mt_ev3(MT_PREAD, 0, cast(u64, &p.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, at), 0); }
+            *out = pr.val;
+            return true;
+        }
         return false;
     }
     return false;
@@ -4799,7 +4811,11 @@ private bool prop_get_ic_fast(VM* vm, FnTemplate* t, Value objv, u32 a, Value* o
         PropList* pl = ic_own_table(objv, k);
         if pl != null && ic < pl.len {
             Prop* pr = pl.items + ic;
-            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR { *out = pr.val; return true; }
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_READ, cast(u64, pl), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
+                *out = pr.val;
+                return true;
+            }
         }
         return false;
     }
@@ -4949,6 +4965,7 @@ private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) 
             Prop* pr = o.props.items + ic;
             if pr.key == a && value_kind(pr.val) != GC_ACCESSOR && (pr.flags & PROP_WRITABLE) != 0 {
                 if (o.props.cap & PROPS_OLD) != 0 { props_barrier(&o.props, v); }
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_WRITE, cast(u64, &o.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
                 pr.val = v;
                 return true;
             }
