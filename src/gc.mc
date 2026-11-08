@@ -231,10 +231,19 @@ void pool_free(void* p, i64 bytes) {
 // When the next collection comes, from what the last one found live: at
 // twice that for a small heap; later for a large one, whose every full
 // mark and sweep costs more than the memory it would give back sooner.
-private i64 gc_next_threshold(i64 live) {
+// A major that found nine tenths of the old still live came while the
+// heap was growing, as a page's load does, and gave back next to nothing:
+// the next waits for four times as much, by at most GC_GROW_MAX more.
+const i64 GC_GROW_MAX = 268435456;
+
+private i64 gc_next_threshold(i64 live, i64 old_before) {
     i64 next = live * 2;
     if live > 134217728 { next = live * 3; }
     else if live > 33554432 { next = live * 5 / 2; }
+    if live * 10 >= old_before * 9 {
+        i64 grown = live * 4 < live + GC_GROW_MAX ? live * 4 : live + GC_GROW_MAX;
+        if grown > next { next = grown; }
+    }
     return next < GC_MIN_THRESHOLD ? GC_MIN_THRESHOLD : next;
 }
 
@@ -871,9 +880,9 @@ private void gc_account(GcHeap* h, bool minor, i64 marked_bytes, i64 marked_cell
         h.old_cells += marked_cells;
         h.n_minor++;
     } else {
+        h.next_gc = gc_next_threshold(marked_bytes, h.old_bytes);
         h.old_bytes = marked_bytes;
         h.old_cells = marked_cells;
-        h.next_gc = gc_next_threshold(marked_bytes);
     }
     h.bytes_live = h.old_bytes;
     h.n_cells = h.old_cells;
