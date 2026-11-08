@@ -3976,7 +3976,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     // declared non-const: the spec makes it immutable (assignment is a no-op
     // in sloppy mode), but rejecting a write at compile time would break a
     // whole module, so a stray write is tolerated as a plain reassignment.
-    if self_name && f.name.len > 0 && (f.flags & NF_ARROW) == 0
+    // A name inferred from a property key or a binding is only the
+    // function's .name: `{ i: function () { i.K } }` reads the outer i.
+    if self_name && f.name.len > 0 && (f.flags & (NF_ARROW | NF_NAME_INFERRED)) == 0
        && find_local(&fs, f.name) < 0 {
         co.decl_kind = 3;
         i32 bi = declare(co, f.name, false, false);
@@ -4655,7 +4657,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // initializers run. `declare` cellifies it automatically when a method
     // or field initializer closes over it.
     i32 name_bind = 0 - 1;
-    if c.name.len > 0 {
+    // an inferred name (`{ n: class {} }`) is the class's .name alone, not a binding
+    if c.name.len > 0 && (c.flags & NF_NAME_INFERRED) == 0 {
         name_bind = declare(co, c.name, true, true);
         CBind* nb = fs.binds.data + name_bind;
         if nb.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, nb.slot); }
