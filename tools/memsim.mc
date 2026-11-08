@@ -12,11 +12,12 @@
 // more copy, today's layout as it ran, which checks the allocator's model.
 //
 // Layouts: "real" and "today" are the 80-byte object and 16-byte entries;
+// "entry24" and "header96" today's padded, which a build can be made of
+// and timed to scale the model's times (they come out ten times the hardware's);
 // "shapes56" and "shapes64" an object of its header (56 or 64 bytes: the
 // cell's, the flags and shape id, the prototype, the values' pointer, and
 // for 64 the elements' three fields) and 8-byte values, the keys in shared
-// shapes. A "-nv" layout does not read the value's cell on a cached read
-// (an accessor test that needs no load). The log also replays into a
+// shapes. The log also replays into a
 // transition tree: how many shapes, their fan-out, and which objects would
 // take a dictionary instead.
 
@@ -365,12 +366,19 @@ void pool_put(Alloc* a, u64 p, i64 bytes) {
 
 // --- the cells and their tables ---------------------------------------------
 
-// Layouts: 0 real, 1 today, 2 shapes56, 3 shapes64.
-const i32 NL = 4;
+// Layouts: the real addresses; today's; shapes with a 56- and a 64-byte
+// header; and two of today's padded, a 24-byte entry and a 96-byte object
+// header, which a build can be made of and timed, to check the model.
+const i32 NL = 6;
 const i32 L_REAL = 0;
 const i32 L_TODAY = 1;
 const i32 L_S56 = 2;
 const i32 L_S64 = 3;
+const i32 L_E24 = 4;
+const i32 L_H96 = 5;
+i64[NL] g_hdr = { 80, 80, 56, 64, 80, 96 };
+i64[NL] g_ent = { 16, 16, 8, 8, 24, 16 };
+bool[NL] g_shp = { false, false, true, true, false, false };
 
 struct Cell {
     u64 real;
@@ -445,23 +453,25 @@ i32 shape_child(i32 s, u32 key, u8 flags) {
 
 // --- the caches, one per layout and variant ---------------------------------
 
-// 0 real, 1 today, 2 today-nv, 3 shapes56, 4 shapes56-nv, 5 shapes64
+// A cache per layout. A "-nv" variant (the value's cell not read on a hit)
+// was tried and measured against the hardware: the read moves, not goes.
 const i32 NC = 6;
 Cache[NC] g_cache;
-i32[NC] g_cache_layout = { 0, 1, 1, 2, 2, 3 };
-bool[NC] g_cache_nv = { false, false, true, false, true, false };
-str[NC] g_cache_name = { "real", "today", "today-nv", "shapes56", "shapes56-nv", "shapes64" };
+i32[NC] g_cache_layout = { 0, 1, 2, 3, 4, 5 };
+bool[NC] g_cache_nv = { false, false, false, false, false, false };
+str[NC] g_cache_name = { "real", "today", "shapes56", "shapes64", "entry24", "header96" };
 
-i64 hdr_bytes(i32 l) { return l == L_S56 ? 56 : (l == L_S64 ? 64 : 80); }
-bool shaped_in(Cell* c, i32 l) { return l >= L_S56 && c.shaped && !c.dict; }
-bool dict_in(Cell* c, i32 l) { return l >= L_S56 && c.shaped && c.dict; }
+i64 hdr_bytes(i32 l) { return g_hdr[l]; }
+bool shaped_in(Cell* c, i32 l) { return g_shp[l] && c.shaped && !c.dict; }
+bool dict_in(Cell* c, i32 l) { return g_shp[l] && c.shaped && c.dict; }
 
-// The bytes of entry or value i in layout l.
-u64 slot_addr(Cell* c, i32 l, i32 i) {
-    if shaped_in(c, l) { return c.items[l] + cast(u64, i) * 8; }
-    return c.items[l] + cast(u64, i) * 16;
+// The size of an entry or value in layout l: a shape's 8 bytes, its
+// dictionary's 16, every other table's the layout's entry.
+i64 slot_size(Cell* c, i32 l) {
+    if shaped_in(c, l) { return 8; }
+    return g_shp[l] ? 16 : g_ent[l];
 }
-i64 slot_size(Cell* c, i32 l) { return shaped_in(c, l) ? 8 : 16; }
+u64 slot_addr(Cell* c, i32 l, i32 i) { return c.items[l] + cast(u64, i) * cast(u64, slot_size(c, l)); }
 
 // The table header's bytes a cached access reads: the kind, the flags, the
 // prototype and the table (today) or the shape and the values' pointer.
@@ -500,7 +510,7 @@ void place(i32 id) {
     Cell* c = cell_of(id);
     for i32 l = 0; l < NL; l++ {
         i64 bytes = c.size;
-        if l >= L_S56 && c.shaped { bytes = block_of(hdr_bytes(l) + cast(i64, c.room) * 8); }
+        if l != L_REAL && l != L_TODAY && c.shaped { bytes = block_of(hdr_bytes(l) + cast(i64, c.room) * slot_size(c, l)); }
         c.bytes[l] = cast(i32, bytes);
         if l == L_REAL { c.base[l] = c.real; } else { c.base[l] = alloc_cell(&g_alloc[l], bytes); }
         if c.shaped && c.room > 0 { c.items[l] = c.base[l] + cast(u64, hdr_bytes(l)); }
@@ -565,7 +575,8 @@ void ev_alloc(u64 a, i32 size, i32 kind) {
 // A dictionary for a shaped object: its values copied into 16-byte entries.
 void to_dict(Cell* c, i64* reason) {
     *reason += 1;
-    for i32 l = L_S56; l < NL; l++ {
+    for i32 l = 0; l < NL; l++ {
+        if !g_shp[l] { continue; }
         if c.cap == 0 { c.items[l] = 0; c.pooled[l] = false; continue; }
         u64 nd = pool_get(&g_alloc[l], cast(i64, c.cap) * 16);
         for i32 k = 0; k < NC; k++ {
@@ -621,7 +632,7 @@ void ev_add(u64 t, u32 key, u8 flags) {
             if s < 0 { to_dict(c, &g_dict_fanout); }
             else {
                 for i32 k = 0; k < NC; k++ {
-                    if g_cache_layout[k] < L_S56 { continue; }
+                    if !g_shp[g_cache_layout[k]] { continue; }
                     touch(&g_cache[k], CAT_ADD, shape_addr(c.shape), 64);
                     touch(&g_cache[k], CAT_ADD, shape_addr(s), 64);
                 }
@@ -650,7 +661,7 @@ void ev_remove(u64 t, i32 pos) {
         i32 l = g_cache_layout[k];
         touch_head(&g_cache[k], CAT_TABLE, c, l);
         if !shaped_in(c, l) && c.items[l] != 0 {
-            touch(&g_cache[k], CAT_TABLE, slot_addr(c, l, pos), cast(i64, c.len - pos) * 16);
+            touch(&g_cache[k], CAT_TABLE, slot_addr(c, l, pos), cast(i64, c.len - pos) * slot_size(c, l));
         }
     }
     c.len--;
@@ -672,7 +683,7 @@ void ev_read(u64 t, u64 v, i32 slot, i32 cat) {
         touch_head(&g_cache[k], cat, c, l);
         if c.items[l] != 0 { touch(&g_cache[k], cat, slot_addr(c, l, slot), slot_size(c, l)); }
         // today's write tests the old value; a shape knows it is a data property
-        bool want_v = cat == CAT_READ ? !g_cache_nv[k] : (l < L_S56 && !g_cache_nv[k]);
+        bool want_v = cat == CAT_READ ? !g_cache_nv[k] : (!g_shp[l] && !g_cache_nv[k]);
         if want_v { touch_value(&g_cache[k], cat, l, v); }
     }
 }
@@ -689,7 +700,7 @@ void ev_pread(u64 rt, u64 pt, u64 v, i32 slot) {
             touch_head(&g_cache[k], CAT_PREAD, r, l);
             // today the receiver's own entries are scanned for the name; a
             // shape id says it has none of that name
-            if !shaped_in(r, l) && r.items[l] != 0 { touch(&g_cache[k], CAT_PREAD, r.items[l], cast(i64, r.len) * 16); }
+            if !shaped_in(r, l) && r.items[l] != 0 { touch(&g_cache[k], CAT_PREAD, r.items[l], cast(i64, r.len) * slot_size(r, l)); }
         }
         touch_head(&g_cache[k], CAT_PREAD, p, l);
         if p.items[l] != 0 { touch(&g_cache[k], CAT_PREAD, slot_addr(p, l, slot), slot_size(p, l)); }
@@ -778,13 +789,14 @@ void report() {
         for i32 k = 0; k < NC; k++ { padn(g_cache[k].acc[cat], 13); }
         print("\n");
     }
-    // what the live objects hold at the end
+    // what the live cells hold at the end
     i64[NL] obj_bytes;
     i64[NL] all_bytes;
+    i64[NL] cell_bytes;
     i64 n_obj = 0;
     i64 n_dict = 0;
     i64 n_live = 0;
-    for i32 l = 0; l < NL; l++ { obj_bytes[l] = 0; all_bytes[l] = 0; }
+    for i32 l = 0; l < NL; l++ { obj_bytes[l] = 0; all_bytes[l] = 0; cell_bytes[l] = 0; }
     for i32 i = 0; i < g_cells.len; i++ {
         Cell* c = cell_of(i);
         if !c.live { continue; }
@@ -792,15 +804,21 @@ void report() {
         for i32 l = 0; l < NL; l++ {
             i64 tb = c.pooled[l] || (l == L_REAL && c.pooled[L_TODAY]) ? block_of(pool_bytes(c, l, c.cap)) : 0;
             all_bytes[l] += c.bytes[l] + tb;
+            cell_bytes[l] += c.bytes[l];
             if c.shaped { obj_bytes[l] += c.bytes[l] + tb; }
         }
         if c.shaped { n_obj++; if c.dict { n_dict++; } }
     }
     print("\nat the end: {} live cells, {} shaped objects, {} of them dictionaries\n", n_live, n_obj, n_dict);
-    print("objects and their tables, KB:   today {}, shapes56 {}, shapes64 {} (real {})\n",
-        obj_bytes[L_TODAY] / 1024, obj_bytes[L_S56] / 1024, obj_bytes[L_S64] / 1024, obj_bytes[L_REAL] / 1024);
-    print("every cell and table, KB:       today {}, shapes56 {}, shapes64 {}\n",
-        all_bytes[L_TODAY] / 1024, all_bytes[L_S56] / 1024, all_bytes[L_S64] / 1024);
+    print("KB at the end:");
+    for i32 l = 1; l < NL; l++ { print(" {}", g_cache_name[l]); }
+    print("\n  cells          ");
+    for i32 l = 1; l < NL; l++ { print(" {}", cell_bytes[l] / 1024); }
+    print("\n  objects, tables");
+    for i32 l = 1; l < NL; l++ { print(" {}", obj_bytes[l] / 1024); }
+    print("\n  all, tables    ");
+    for i32 l = 1; l < NL; l++ { print(" {}", all_bytes[l] / 1024); }
+    print("\n  (real: cells {}, all {})\n", cell_bytes[L_REAL] / 1024, all_bytes[L_REAL] / 1024);
     i32 maxk = 0;
     i64[6] hist;
     for i32 i = 0; i < 6; i++ { hist[i] = 0; }

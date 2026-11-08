@@ -1,11 +1,13 @@
 # Plan: shapes
 
-Status: phase 0 measured 2026-11-08, the gate not met: shapes would cut
-the property reads' deeper misses by a quarter or more, the allocations'
-lines by 23% and the marking's not at all, for an estimated 5% of
-bsky.app's busy time and a quarter of its heap. The plan stops here
-unless that memory is wanted for its own sake ("Phase 0, measured"
-below). The accessor test alone measured worse and is not kept.
+Status: phase 0 measured and checked 2026-11-08, the gate not met. The
+cache model said shapes would take 23% off the misses of the reads, the
+allocations and the marking; the hardware, made to carry the opposite
+change (entries and headers padded), moved a tenth of what the model
+said, so shapes are worth about 1% of bsky.app's busy time. They would
+take a quarter of bsky.app's heap and 6 to 9% of the smaller pages'. The
+plan stops ("Phase 0, measured" and "Phase 0, checked" below). The
+accessor test alone measured worse and is not kept.
 
 ## Why
 
@@ -268,6 +270,61 @@ than the weeks of phase 1 and the risk in it. The memory is a
 different case: a quarter of the heap on a page this size. If memory
 becomes the goal, phase 1 alone (shapes behind the API, the caches as
 they are) is where it comes from, and its own check 3 measures it.
+
+## Phase 0, checked (2026-11-08)
+
+Four checks of the numbers above, after asking how sure they were.
+
+**The accessor test, twelve runs each.** Head 1773 to 1833 ms busy,
+median 1784; the bit 1779 to 1828, median 1806; the bit's run slower in
+three pairs of four. Worse by about 1%, not flat.
+
+**The memory, accounted.** The trace now ends with a full collection
+swept to the end (brmc's `realm_memtrace_end`, after the page settles),
+and the model's cells at the end are the heap's to the kilobyte: 103,487
+KB. The 20 MB between that and the model's 124 MB are the property
+tables in the pool, which the heap's figure does not count; the dead
+cells the first trace left were 0.3 MB, not the difference. With shapes,
+bsky.app's cells and tables go from 124.1 to 90.6 MB (-27%).
+
+**The model against the hardware.** Two builds that make objects bigger,
+which the model can replay from the same trace and the hardware can
+run: a Prop padded to 24 bytes (every table, functions' too) and a
+JsObject padded to 96. Latency-weighted model against bsky.app, ten
+interleaved runs each, the shot the same:
+
+| | model | heap | busy, median | busy, least |
+|---|---|---|---|---|
+| head | 670 | 105.3 MB | 1796 | 1777 |
+| 24-byte entries | 798 (+128) | 121.1 MB | 1810 (+14) | 1777 (0) |
+| 96-byte header | 710 (+40) | 113.5 MB | 1799 (+4) | 1773 (-4) |
+| shapes56 | 509 (-161) | | | |
+
+The hardware moves about a tenth of what the model says: it overlaps
+misses and prefetches the next line, where the model charges each miss
+in full. Scaled by that, shapes are worth about 16 ms of 1796, under 1%,
+within the noise of ten runs. The model's ranking of layouts holds; its
+milliseconds do not.
+
+**Two more pages.** No other saved page is close to bsky.app's size;
+the largest two, traced the same way:
+
+| | busy | heap | shapes | objects made | dictionaries | cells and tables, shapes56 | model, shapes56 |
+|---|---|---|---|---|---|---|---|
+| medium-tag | 291 ms | 13.1 MB | 13,576 (742 KB) | 74,621 | 51 | 13.8 to 12.2 MB (-11%) | -6% of 31 |
+| angular-dev | 215 ms | 6.0 MB | 7,778 (425 KB) | 36,960 | 16 | 6.6 to 5.6 MB (-15%) | -5% of 16 |
+
+On these a shape serves five objects, not forty-five as on bsky.app, and
+the shapes' own memory takes half the saving back (6% and 9% net). The
+time the model puts in the areas shapes touch is a tenth of these pages'
+busy time, so their gain is a fraction of a percent.
+
+**What the checks change.** The gate's decision stands, and more firmly:
+the time is about 1% on the one large page and nothing on the others.
+The memory is real on bsky.app (a quarter) and small elsewhere. The
+model is kept (`tools/memsim.mc`, with the padded layouts) for its
+ranking and its memory figures, which the heap confirms; its times are
+to be scaled by what a padded build measures, not read as they are.
 
 ## Risks, and where each is caught
 
