@@ -647,7 +647,12 @@ bool js_truthy(Value v) {
 
 private i32 f64_to_i32(f64 v) {
     if v != v { return 0; }
-    return cast(i32, cast(i64, v));
+    if v > -9.0e18 && v < 9.0e18 { return cast(i32, cast(i64, v)); }
+    // past an i64 the spec's modulo 2^32 is taken in doubles, where every
+    // step is exact: the value is an integer and 2^32 a power of two
+    if v == v + 1.0 && (v > 1.0e308 || v < -1.0e308) { return 0; }   // the infinities
+    f64 m = v - floor(v / 4294967296.0) * 4294967296.0;
+    return cast(i32, cast(i64, m));
 }
 
 // Bytes of the whitespace run starting at i, or 0. Covers the whole of the
@@ -5838,7 +5843,23 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 i32 r = cmp_rel(vm, rel_base(op));
                 if r == 0 { pc = code + rd_targetp(pc - 4); }
             }
-            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: { vm.sp = sp;
+            case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+                // two ints, which is what `x | 0` and a mask are, need none of
+                // the coercion below
+                if value_is_int(*(stack + sp - 2)) && value_is_int(*(stack + sp - 1)) {
+                    i32 x = value_as_int(*(stack + sp - 2));
+                    i32 y = value_as_int(*(stack + sp - 1));
+                    i32 r = 0;
+                    if op == OP_BAND { r = x & y; }
+                    else if op == OP_BOR { r = x | y; }
+                    else if op == OP_BXOR { r = x ^ y; }
+                    else if op == OP_SHL { r = x << (y & 31); }
+                    else { r = x >> (y & 31); }
+                    sp--;
+                    *(stack + sp - 1) = value_int(r);
+                    continue;
+                }
+                vm.sp = sp;
                 // an object operand becomes a primitive first, which is how
                 // a wrapped BigInt reaches the BigInt path
                 if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
