@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 4 done, level 4 the default; phase 5's register call measured flat and not kept, its finding about the return kept; phases 6 and 7 wait on a decision.
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 4 done, level 4 the default; phase 5's register call measured flat and not kept, its finding about the return kept; phases 6 and 7 wait on a decision; CALL's chain looked at and left (below).
 
 ## Why
 
@@ -528,4 +528,16 @@ decision to make is whether 6 is converted only where the op counts
 and a prototype say it wins, and 7 is done for what is converted, or
 whether the effort goes to the call path's chains first (CALL's own,
 from the callee value to its template and code, is the next of them).
+
+**CALL's chain, looked at (2026-11-08).** On the call loop CALL is 72
+ms a run of 349 after the return's change, and caching the callee's
+code pointer in the function object, a load shorter to its first
+opcode, measured flat (16.5 to 17.2 ns against 16.7 to 17.5). On
+bsky.app (the sampler, three runs) CALL is 71 ms a run of the loop's
+686: 22 on the callee's value as the case begins, 15 on the first read
+of the callee's template (its call shape), 7.5 in the natives. The
+template's read is a miss on a line the callee touches at once anyway,
+its constants beside its code, so keeping the shape and the code in
+the function object would move the miss and not remove it. Left as it
+is.
 
