@@ -1,6 +1,6 @@
 # Plan: register bytecode
 
-Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 and 2 done.
+Status: phase 0 done and phases 1 to 7 decided, 2026-11-08; phases 1 to 3 done, level 3 the default.
 
 ## Why
 
@@ -373,3 +373,63 @@ So the drop comes with the consumers: phase 3's comparisons and jumps
 on slots, phase 4's property reads into slots, phase 5's arguments in
 slots. Phase 2's `MOV` and `LOADK` are what those use to place their
 operands; the phase is judged on behaviour, and its level stays off.
+
+## Phase 3, done (2026-11-08)
+
+Arithmetic and conditions on slots, level 3, now the default.
+
+- `RADD`, `RSUB`, `RMUL`, `RDIV` (slot op slot) and their I forms (slot
+  op an integer carried in the instruction); `RBIT` and `RBITI` for the
+  bitwise and shift operators with a kind byte, and `RBORI` and `RBANDI`
+  for `x | k` and `x & k`. Each writes its destination on the int and
+  double fast paths and steps over the stack form of the same operation
+  that follows it in the bytecode, nine bytes always (the two-operand
+  load, the one-byte op, the store); anything else (strings, objects,
+  BigInt, valueOf) runs that stack form, so the semantics are the stack
+  VM's exactly. A string or other non-number literal operand keeps the
+  expression on the stack, where `w + "px"` is no slower.
+- `RJLT`, `RJGT`, `RJLE`, `RJGE` with their I forms, `RJSEQ` and `RJSNEQ`
+  with a pool-constant K form, `RJNULLISH`, `RJNOTNULLISH`, `RJF`, `RJT`:
+  the conditions of `if`, `while`, `for` and `?:` when the operands are
+  plain locals or literals.
+- `x = (a + b) | 0` computes the inner operation straight into `x`.
+
+Three drafts, measured, before this one. A single `RARITH` and a single
+`RJREL` with a kind byte spilled five values in the loop and lost to
+the stack (the arith loop 6.75 to 10.55 ns). An op per operation with
+constants from the pool was level (6.8 to 6.85). Then the sampler and a
+side-by-side with phase 0's prototype found the last cost: the fast
+path's `pc += size + skip` waited on loading the skip from the
+bytecode, a dependent load on the dispatch's critical path. A fixed
+nine-byte stack form makes the step a constant. The arith loop 6.65 to
+5.10 ns, past the prototype's 5.6.
+
+Checks: `tools/reg_check.sh` at level 3 (now parallel; the five modes
+in about five minutes where they took over an hour), 417 scripts
+plainly, through the code cache's round trip and its compile ahead,
+and the 263 goldens under `--gc-stress` with and without `--reg-clear`,
+no differences; a probe of every arithmetic and comparison operator
+over nineteen operand kinds (-0, NaN, Infinity, strings, null,
+undefined, booleans, BigInt, valueOf, a throwing valueOf), 35 KB of
+results, the same at level 0, level 3 and in node; both suites pass
+with level 3 the default (one brmc run of seven had a failure whose
+output was not kept; six did not repeat it, and it is noted as open).
+
+Ops: bsky.app's load 131.97 to 126.51 million (4.1%); the benches 0.4
+to 17% fewer (strindex 17, bytes 13.6, iterators 13.5, fib 11.8).
+
+Time, levels 0 and 3 in one binary, five interleaved runs:
+
+| | level 0 | level 3 |
+|---|---|---|
+| `s = (s + i) \| 0` | 6.65 ns | 5.10 |
+| `s = s + i` | 6.20 | 5.05 |
+| `v = o.x; s = (s + v) \| 0` | 10.80 | 8.80 |
+| a loop with a call | 19.40 | 19.50 |
+| the bench suite | 2827 ms | 2779 (fib 347 to 332, bytes 198 to 191; none slower) |
+| bsky.app busy | 1767 to 1789 | 1753 to 1785 |
+
+A first reading of the bench suite said level 3 was 5% slower: its
+level-3 side ran through a shell wrapper, which costs about 11 ms a run
+under MSYS, 140 ms over the suite. The same wrapper sits in the phase
+accounting's cost in `DESIGN_phases.md`, corrected there.

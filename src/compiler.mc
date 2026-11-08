@@ -1870,11 +1870,11 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
 // and is stored into a temporary. Temporaries come from alloc_slot like the
 // compiler's other scratch slots, and are released in stack order by the
 // construct that took them. g_reg_level says how far the form reaches:
-// 0 nowhere, which is the default until a level is measured to be faster;
-// 1 a check that routes every binary operator's operands through the slots
-// and back, exercising the plumbing and speeding nothing; 2 and up the
-// plan's phases from 2 on.
-i32 g_reg_level = 0;
+// 0 nowhere; 1 a check that routes every binary operator's operands
+// through the slots and back, exercising the plumbing and speeding
+// nothing; 2 and up the plan's phases from 2 on. The default is the
+// highest level measured to be faster than the stack form.
+i32 g_reg_level = 3;
 // A check (tsmc --reg-clear): a temporary is overwritten with undefined as
 // it is released, so that code reading one after its release shows.
 bool g_reg_clear = false;
@@ -1946,6 +1946,188 @@ private bool reg_mentions(Node* n, str name) {
     return false;
 }
 
+// The register op for an arithmetic operator's token (its K form is the
+// next opcode), RBIT for the bitwise ones, or -1.
+private i32 reg_arith_op(i32 tok) {
+    if tok == TOK_PLUS { return OP_RADD; }
+    if tok == TOK_MINUS { return OP_RSUB; }
+    if tok == TOK_STAR { return OP_RMUL; }
+    if tok == TOK_SLASH { return OP_RDIV; }
+    if tok == TOK_AMP || tok == TOK_PIPE || tok == TOK_CARET || tok == TOK_LSHIFT || tok == TOK_RSHIFT || tok == TOK_URSHIFT { return OP_RBIT; }
+    return -1;
+}
+
+private i32 reg_bit_kind(i32 tok) {
+    if tok == TOK_AMP { return RK_BAND; }
+    if tok == TOK_PIPE { return RK_BOR; }
+    if tok == TOK_CARET { return RK_BXOR; }
+    if tok == TOK_LSHIFT { return RK_SHL; }
+    if tok == TOK_RSHIFT { return RK_SHR; }
+    return RK_USHR;
+}
+
+// An integer literal's value in *v, or false: what an I form carries inline.
+private bool reg_int_lit(Node* n, i32* v) {
+    if n.kind != N_NUMBER { return false; }
+    f64 x = n.num;
+    if x != x || x < -2147483648.0 || x > 2147483647.0 || x != cast(f64, cast(i32, x)) { return false; }
+    if x == 0.0 && 1.0 / x < 0.0 { return false; }
+    *v = cast(i32, x);
+    return true;
+}
+
+// `a op b` into a slot: the register op, then the stack form of the same
+// for the values its fast path does not take, nine bytes the fast path
+// steps over.
+// An integer constant b rides in the instruction; any other literal b
+// that is not a number keeps the whole expression on the stack, where
+// `w + "px"` is no slower.
+private i32 reg_arith(Compiler* co, Node* n, i32 want) {
+    Chunk* ch = &co.cur.ch;
+    i32 imm = 0;
+    bool has_imm = reg_int_lit(n.b, &imm);
+    if !has_imm && reg_const_kind(n.b) && n.b.kind != N_NUMBER {
+        compile_expr(co, n);
+        i32 d0 = want >= 0 ? want : alloc_slot(co.cur);
+        reg_store(ch, d0);
+        return d0;
+    }
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    i32 mark = co.cur.cur_slots;
+    i32 op = reg_arith_op(n.op);
+    // `x = (a + b) | 0`: with a constant second operand nothing reads the
+    // destination after the first is in it, so an operator first operand
+    // is computed straight into the destination
+    bool inner = want >= 0 && n.a.kind == N_BIN && reg_arith_op(n.a.op) >= 0 && reg_const_kind(n.b);
+    i32 ra = compile_expr_reg(co, n.a, inner ? d : -1, n.b);
+    i32 rb = has_imm ? 0 : compile_expr_reg(co, n.b, -1, null);
+    if op == OP_RBIT && has_imm && n.op == TOK_PIPE { ch_op(ch, OP_RBORI); }
+    else if op == OP_RBIT && has_imm && n.op == TOK_AMP { ch_op(ch, OP_RBANDI); }
+    else {
+        ch_op(ch, has_imm ? op + 1 : op);
+        if op == OP_RBIT { vec_push(&ch.code, cast(u8, reg_bit_kind(n.op))); }
+    }
+    ch_u16(ch, d);
+    ch_u16(ch, ra);
+    if has_imm { ch_target(ch, imm); } else { ch_u16(ch, rb); }
+    // the stack form, written raw so that no fold changes its nine bytes:
+    // the fast path steps over it by that count
+    i32 at = ch.code.len;
+    vec_push(&ch.code, cast(u8, has_imm ? OP_GETLOCAL_CONST : OP_GETLOCAL2));
+    ch_u16(ch, ra);
+    ch_u16(ch, has_imm ? ch_add_const(ch, value_int(imm)) : rb);
+    vec_push(&ch.code, cast(u8, bin_op_code(n.op)));
+    vec_push(&ch.code, cast(u8, OP_PUTLOCAL));
+    ch_u16(ch, d);
+    ch.prev2_op = -1;
+    ch.prev_op = -1;
+    ch.last_op = at + 6;
+    if ch.max_target < ch.code.len { ch.max_target = ch.code.len; }
+    reg_release(co, mark);
+    return d;
+}
+
+// Whether n is a literal reg_const takes, without adding it to the pool.
+private bool reg_const_kind(Node* n) {
+    return n.kind == N_NUMBER || n.kind == N_STRING || n.kind == N_BOOL || n.kind == N_NULL || is_void_literal(n);
+}
+
+// A slot a condition can read at no cost: a plain local's, or -1.
+private i32 reg_cheap(Compiler* co, Node* n) { return reg_slot(co, n, false); }
+
+private bool is_void_literal(Node* n) { return n.kind == N_UNARY && n.op == TOK_KW_VOID && is_pure_literal(n.a); }
+
+// A condition's jump when it is false, on slots: a comparison of plain
+// locals or of a plain local and a literal, a nullish test, a plain local's
+// truth. The position to patch, or -1 when the condition is not one of
+// these, which the caller then compiles to the stack.
+private i32 reg_cond_jf(Compiler* co, Node* c) {
+    Chunk* ch = &co.cur.ch;
+    if c.kind == N_IDENT {
+        i32 r = reg_cheap(co, c);
+        if r < 0 { return -1; }
+        ch_op_u16(ch, OP_RJF, r);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if c.kind == N_UNARY && c.op == TOK_BANG && c.a.kind == N_IDENT {
+        i32 r = reg_cheap(co, c.a);
+        if r < 0 { return -1; }
+        ch_op_u16(ch, OP_RJT, r);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if c.kind != N_BIN { return -1; }
+    Node* a = c.a;
+    Node* b = c.b;
+    i32 kind = -1;
+    if c.op == TOK_LT { kind = OP_RJLT; }
+    if c.op == TOK_GT { kind = OP_RJGT; }
+    if c.op == TOK_LE { kind = OP_RJLE; }
+    if c.op == TOK_GE { kind = OP_RJGE; }
+    if c.op == TOK_EQEQEQ { kind = OP_RJSEQ; }
+    if c.op == TOK_NEQEQEQ { kind = OP_RJSNEQ; }
+    if c.op == TOK_EQEQ || c.op == TOK_NEQ {
+        // only a nullish test: `x == null`, `null != x`, `x == void 0`
+        Node* x = null;
+        if b.kind == N_NULL || is_void_literal(b) { x = a; }
+        if a.kind == N_NULL || is_void_literal(a) { x = b; }
+        if x == null { return -1; }
+        i32 r = reg_cheap(co, x);
+        if r < 0 { return -1; }
+        ch_op(ch, c.op == TOK_EQEQ ? OP_RJNULLISH : OP_RJNOTNULLISH);
+        ch_u16(ch, r);
+        ch_u16(ch, 0);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if kind < 0 { return -1; }
+    // a literal goes second: `null === x` as `x === null`, `0 < i` as `i > 0`
+    if reg_cheap(co, a) < 0 && reg_cheap(co, b) >= 0 {
+        Node* t = a;
+        a = b;
+        b = t;
+        if kind == OP_RJLT { kind = OP_RJGT; } else if kind == OP_RJGT { kind = OP_RJLT; }
+        else if kind == OP_RJLE { kind = OP_RJGE; } else if kind == OP_RJGE { kind = OP_RJLE; }
+    }
+    i32 ra = reg_cheap(co, a);
+    if ra < 0 { return -1; }
+    i32 rb = reg_cheap(co, b);
+    bool imm = false;
+    i32 iv = 0;
+    if rb < 0 {
+        if kind == OP_RJSEQ || kind == OP_RJSNEQ {
+            if !reg_const_kind(b) { return -1; }
+            rb = reg_const(co, b);
+        } else {
+            // a relational compare takes an integer inline, nothing else
+            if !reg_int_lit(b, &iv) { return -1; }
+            imm = true;
+        }
+        kind++;   // the I or K form is the next opcode
+    }
+    ch_op(ch, kind);
+    ch_u16(ch, ra);
+    if imm { ch_target(ch, iv); } else { ch_u16(ch, rb); }
+    i32 at = ch.code.len;
+    ch_target(ch, -1);
+    return at;
+}
+
+// A condition's jump when it is false: on slots where reg_cond_jf can,
+// else the value on the stack and the stack's jump.
+private i32 compile_cond_jf(Compiler* co, Node* c) {
+    if g_reg_level >= 3 {
+        i32 j = reg_cond_jf(co, c);
+        if j >= 0 { return j; }
+    }
+    compile_expr(co, c);
+    return emit_jumpf(&co.cur.ch);
+}
+
 private void reg_op2(Chunk* ch, i32 op, i32 a, i32 b) {
     ch_op(ch, op);
     ch_u16(ch, a);
@@ -1994,6 +2176,9 @@ private i32 compile_expr_reg(Compiler* co, Node* n, i32 want, Node* later) {
             reg_op2(ch, OP_LOADK, d, k);
             return d;
         }
+    }
+    if g_reg_level >= 3 && n.kind == N_BIN && reg_arith_op(n.op) >= 0 {
+        return reg_arith(co, n, want);
     }
     compile_expr(co, n);
     i32 d = want >= 0 ? want : alloc_slot(co.cur);
@@ -3412,8 +3597,7 @@ private void compile_expr(Compiler* co, Node* n) {
     }
     if k == N_ASSIGN { compile_assign(co, n); return; }
     if k == N_COND {
-        compile_expr(co, n.a);
-        i32 j1 = emit_jumpf(ch);
+        i32 j1 = compile_cond_jf(co, n.a);
         compile_expr(co, n.b);
         i32 j2 = ch_jump(ch, OP_JUMP);
         ch_patch(ch, j1);
@@ -5506,8 +5690,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_BLOCK { compile_block_stmts(co, n); return; }
     if k == N_EMPTY { return; }
     if k == N_IF {
-        compile_expr(co, n.a);
-        i32 j1 = emit_jumpf(ch);
+        i32 j1 = compile_cond_jf(co, n.a);
         compile_stmt(co, n.b);
         if n.c != null {
             i32 j2 = ch_jump(ch, OP_JUMP);
@@ -5526,8 +5709,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_WHILE {
         LoopCtx lc = make_loop_ctx(co, true);
         i32 lcond = ch_pos(ch);
-        compile_expr(co, n.a);
-        i32 jend = emit_jumpf(ch);
+        i32 jend = compile_cond_jf(co, n.a);
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.b);
         ignore vec_pop(&fs.loops);
@@ -5577,8 +5759,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 lcond = ch_pos(ch);
         i32 jend = -1;
         if n.b != null {
-            compile_expr(co, n.b);
-            jend = emit_jumpf(ch);
+            jend = compile_cond_jf(co, n.b);
         }
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.d);

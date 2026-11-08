@@ -273,6 +273,34 @@ str op_name(i32 op) {
         case 180: { return "SNEQ_NULL_JF"; }
         case 181: { return "MOV"; }
         case 182: { return "LOADK"; }
+        case 183: { return "RJF"; }
+        case 184: { return "RJT"; }
+        case 185: { return "RADD"; }
+        case 186: { return "RADDI"; }
+        case 187: { return "RSUB"; }
+        case 188: { return "RSUBI"; }
+        case 189: { return "RMUL"; }
+        case 190: { return "RMULI"; }
+        case 191: { return "RDIV"; }
+        case 192: { return "RDIVI"; }
+        case 193: { return "RBIT"; }
+        case 194: { return "RBITI"; }
+        case 195: { return "RBORI"; }
+        case 196: { return "RBANDI"; }
+        case 197: { return "RJLT"; }
+        case 198: { return "RJLTI"; }
+        case 199: { return "RJGT"; }
+        case 200: { return "RJGTI"; }
+        case 201: { return "RJLE"; }
+        case 202: { return "RJLEI"; }
+        case 203: { return "RJGE"; }
+        case 204: { return "RJGEI"; }
+        case 205: { return "RJSEQ"; }
+        case 206: { return "RJSEQK"; }
+        case 207: { return "RJSNEQ"; }
+        case 208: { return "RJSNEQK"; }
+        case 209: { return "RJNULLISH"; }
+        case 210: { return "RJNOTNULLISH"; }
     }
     return "?";
 }

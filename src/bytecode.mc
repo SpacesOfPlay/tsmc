@@ -204,8 +204,28 @@ enum Op {
     OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF, // i32 target: SEQ_NULL then JUMPF, SNEQ_NULL then JUMPF
     // the register form (doc/PLAN_register_bytecode.md): operands are frame slots
     OP_MOV,          // u16 dst, u16 src: slot = slot
-    OP_LOADK         // u16 dst, u16 const idx: slot = constant
+    OP_LOADK,        // u16 dst, u16 const idx: slot = constant
+    OP_RJF, OP_RJT,  // u16 slot, i32 target: jump when the slot is falsy, truthy
+    // u16 dst, u16 a, u16 b; the I forms an i32 in place of b: dst = a op b
+    // on numbers, stepping over the nine-byte stack form of the same that
+    // follows, which runs instead for anything else
+    OP_RADD, OP_RADDI, OP_RSUB, OP_RSUBI, OP_RMUL, OP_RMULI, OP_RDIV, OP_RDIVI,
+    // RBIT and RBITI: u8 kind (RK_BAND..RK_USHR) first, then as above;
+    // RBORI and RBANDI: `a | k` and `a & k`, the two a page has most
+    OP_RBIT, OP_RBITI, OP_RBORI, OP_RBANDI,
+    // u16 a, u16 b, i32 target (the I forms an i32 for b, the K forms a
+    // constant's index): jump when a op b is false
+    OP_RJLT, OP_RJLTI, OP_RJGT, OP_RJGTI, OP_RJLE, OP_RJLEI, OP_RJGE, OP_RJGEI, OP_RJSEQ, OP_RJSEQK, OP_RJSNEQ, OP_RJSNEQK,
+    OP_RJNULLISH, OP_RJNOTNULLISH   // u16 a, u16 unused, i32 target: jump when a == null is false, a != null
 }
+
+// RBIT's kinds (doc/PLAN_register_bytecode.md, phase 3).
+const i32 RK_BAND = 4;
+const i32 RK_BOR = 5;
+const i32 RK_BXOR = 6;
+const i32 RK_SHL = 7;
+const i32 RK_SHR = 8;
+const i32 RK_USHR = 9;
 
 struct TmplUpval {
     bool from_parent_slot;   // else from parent's upvalues

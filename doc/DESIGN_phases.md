@@ -90,8 +90,10 @@ tsmc: natives by own time less the switch cost of their calls, 25 of 210: geomet
 A switch is about 19 ns on this machine: a `QueryPerformanceCounter`
 read and a few adds. The count is the natives' calls times two plus the
 loop's re-entries times two. Measured, the flag on against off on the
-same binary: the 13-bench suite 3137 to 3797 ms (21%; the benches that
-live in natives most, arrays 257 to 465), brmc's bsky.app busy 1834 to
+same binary: the 13-bench suite 3137 to 3797 ms, of which about 140 ms
+was the shell wrapper the measurement ran the accounting's side through
+(11 ms a run under MSYS), so about 17% (the benches that live in
+natives most, arrays 257 to 465), brmc's bsky.app busy 1834 to
 1870 against 2003 to 2063 (9%, about 170 ms for 7.5 million switches
 where the report estimated 143). So the figures a run reports are read
 with the switches in mind: the phases line carries them where the

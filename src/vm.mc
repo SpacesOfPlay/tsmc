@@ -6345,6 +6345,343 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !r { pc = code + rd_targetp(pc - 4); }
                 continue;
             }
+            case OP_RADD: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) + value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) + value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RADDI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) + cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) + cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RSUB: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) - value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) - value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RSUBI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) - cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) - cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RMUL: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) * value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 && !(r == 0 && (value_as_int(x) < 0 || value_as_int(y) < 0)) {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) * value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RMULI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) * cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 && !(r == 0 && (value_as_int(x) < 0 || cast(i32, rd_targetp(pc + 4)) < 0)) {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) * cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RDIV: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) / value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RDIVI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) / cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBIT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 3));
+                Value y = *(stack + fr.base + rd_u16p(pc + 5));
+                if value_is_int(x) && value_is_int(y) {
+                    i32 kind = *pc;
+                    i32 xi = value_as_int(x);
+                    i32 yi = value_as_int(y);
+                    i32 r = 0;
+                    if kind == RK_BOR { r = xi | yi; }
+                    else if kind == RK_BAND { r = xi & yi; }
+                    else if kind == RK_BXOR { r = xi ^ yi; }
+                    else if kind == RK_SHL { r = xi << (yi & 31); }
+                    else if kind == RK_SHR { r = xi >> (yi & 31); }
+                    else {
+                        // an unsigned shift past an int's range is the stack form's
+                        r = cast(i32, cast(u32, xi) >> cast(u32, yi & 31));
+                        if r < 0 { pc += 7; continue; }
+                    }
+                    *(stack + fr.base + rd_u16p(pc + 1)) = value_int(r);
+                    pc += 16;
+                    continue;
+                }
+                pc += 7;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBITI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 3));
+                if value_is_int(x) {
+                    i32 kind = *pc;
+                    i32 xi = value_as_int(x);
+                    i32 yi = cast(i32, rd_targetp(pc + 5));
+                    i32 r = 0;
+                    if kind == RK_BOR { r = xi | yi; }
+                    else if kind == RK_BAND { r = xi & yi; }
+                    else if kind == RK_BXOR { r = xi ^ yi; }
+                    else if kind == RK_SHL { r = xi << (yi & 31); }
+                    else if kind == RK_SHR { r = xi >> (yi & 31); }
+                    else {
+                        // an unsigned shift past an int's range is the stack form's
+                        r = cast(i32, cast(u32, xi) >> cast(u32, yi & 31));
+                        if r < 0 { pc += 9; continue; }
+                    }
+                    *(stack + fr.base + rd_u16p(pc + 1)) = value_int(r);
+                    pc += 18;
+                    continue;
+                }
+                pc += 9;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBORI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = value_int(value_as_int(x) | cast(i32, rd_targetp(pc + 4)));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBANDI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = value_int(value_as_int(x) & cast(i32, rd_targetp(pc + 4)));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RJLT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) < value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLTI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) < value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) > value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGTI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) > value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLE: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) <= value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLEI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) <= value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGE: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) >= value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGEI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) >= value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJSEQ: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(stack + fr.base + rd_u16p(pc + 2)));
+                if eq { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSEQK: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(t.consts + rd_u16p(pc + 2)));
+                if eq { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSNEQ: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(stack + fr.base + rd_u16p(pc + 2)));
+                if eq == false { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSNEQK: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(t.consts + rd_u16p(pc + 2)));
+                if eq == false { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJNULLISH, OP_RJNOTNULLISH: {
+                if is_nullish(*(stack + fr.base + rd_u16p(pc))) == (op == OP_RJNULLISH) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJF, OP_RJT: {
+                Value x = *(stack + fr.base + rd_u16p(pc));
+                i32 target = rd_targetp(pc + 2);
+                pc += 6;
+                bool truthy = value_is_bool(x) ? value_same_bits(x, value_bool(true)) : js_truthy(x);
+                if truthy == (op == OP_RJT) { pc = code + target; }
+                continue;
+            }
             case OP_MOV: {
                 *(stack + fr.base + rd_u16p(pc)) = *(stack + fr.base + rd_u16p(pc + 2));
                 pc += 4;
