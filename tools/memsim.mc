@@ -24,19 +24,19 @@
 import vec;
 import file;
 
-const u32 MT_HEADER = 1;
-const u32 MT_ALLOC = 2;
-const u32 MT_FREE = 3;
-const u32 MT_OBJECT = 4;
-const u32 MT_GROW = 5;
-const u32 MT_ADD = 6;
-const u32 MT_REMOVE = 7;
-const u32 MT_FLAGS = 8;
-const u32 MT_READ = 9;
-const u32 MT_WRITE = 10;
-const u32 MT_MARK = 11;
-const u32 MT_TRACE = 12;
-const u32 MT_PREAD = 13;
+const u32 MTR_HEADER = 1;
+const u32 MTR_ALLOC = 2;
+const u32 MTR_FREE = 3;
+const u32 MTR_OBJECT = 4;
+const u32 MTR_GROW = 5;
+const u32 MTR_ADD = 6;
+const u32 MTR_REMOVE = 7;
+const u32 MTR_FLAGS = 8;
+const u32 MTR_READ = 9;
+const u32 MTR_WRITE = 10;
+const u32 MTR_MARK = 11;
+const u32 MTR_TRACE = 12;
+const u32 MTR_PREAD = 13;
 
 struct MtRec {
     u64 a;
@@ -883,23 +883,23 @@ i32 main() {
             u32 ty = r.t & 255;
             u32 d = r.t >> 8;
             g_events++;
-            if ty != MT_OBJECT && ty != MT_HEADER { settle_pending(); }
-            if ty == MT_HEADER {
+            if ty != MTR_OBJECT && ty != MTR_HEADER { settle_pending(); }
+            if ty == MTR_HEADER {
                 g_off_obj = cast(i64, r.a);
                 g_off_fn = cast(i64, r.b);
                 g_off_nat = cast(i64, r.c);
-            } else if ty == MT_ALLOC { ev_alloc(r.a, cast(i32, r.c), cast(i32, d)); }
-            else if ty == MT_FREE { ev_free(r.a); }
-            else if ty == MT_OBJECT { ev_object(r.a, cast(i32, r.c)); }
-            else if ty == MT_GROW { ev_grow(r.a, r.b, cast(i32, r.c)); }
-            else if ty == MT_ADD { ev_add(r.a, r.c, cast(u8, d & 255)); }
-            else if ty == MT_REMOVE { ev_remove(r.a, cast(i32, d)); }
-            else if ty == MT_FLAGS { ev_flags(r.a); }
-            else if ty == MT_READ { ev_read(r.a, r.b, cast(i32, r.c), CAT_READ); }
-            else if ty == MT_WRITE { ev_read(r.a, r.b, cast(i32, r.c), CAT_WRITE); }
-            else if ty == MT_PREAD { ev_pread(r.a, r.b, r.e, cast(i32, r.c)); }
-            else if ty == MT_MARK { ev_mark(r.a); }
-            else if ty == MT_TRACE { ev_trace(r.a, cast(i32, r.c)); }
+            } else if ty == MTR_ALLOC { ev_alloc(r.a, cast(i32, r.c), cast(i32, d)); }
+            else if ty == MTR_FREE { ev_free(r.a); }
+            else if ty == MTR_OBJECT { ev_object(r.a, cast(i32, r.c)); }
+            else if ty == MTR_GROW { ev_grow(r.a, r.b, cast(i32, r.c)); }
+            else if ty == MTR_ADD { ev_add(r.a, r.c, cast(u8, d & 255)); }
+            else if ty == MTR_REMOVE { ev_remove(r.a, cast(i32, d)); }
+            else if ty == MTR_FLAGS { ev_flags(r.a); }
+            else if ty == MTR_READ { ev_read(r.a, r.b, cast(i32, r.c), CAT_READ); }
+            else if ty == MTR_WRITE { ev_read(r.a, r.b, cast(i32, r.c), CAT_WRITE); }
+            else if ty == MTR_PREAD { ev_pread(r.a, r.b, r.e, cast(i32, r.c)); }
+            else if ty == MTR_MARK { ev_mark(r.a); }
+            else if ty == MTR_TRACE { ev_trace(r.a, cast(i32, r.c)); }
         }
         have = 0;
         if n <= 0 { break; }

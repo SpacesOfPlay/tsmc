@@ -180,7 +180,7 @@ private i64 gc_class_size(i32 cls) {
 // The class of a size, with the common small sizes computed in place: the
 // function has a loop, which keeps the inliner away from it.
 private void gc_cell_release(GcHeap* h, GcCell* c) {
-    when defined(TSMC_MEMTRACE) { mt_ev(MT_FREE, cast(u64, c), 0, 0, 0); }
+    when defined(TSMC_MEMTRACE) { mtr_ev(MTR_FREE, cast(u64, c), 0, 0, 0); }
     if c.chunk > 0 {
         c.kind = GC_FREE;
         GcChunk* ch = &h.chunks.data[c.chunk - 1];
@@ -508,7 +508,7 @@ void gc_mark_cell(GcHeap* h, GcCell* c) {
         vec_push(&h.mark_stack, c);
         return;
     }
-    when defined(TSMC_MEMTRACE) { mt_ev(MT_MARK, cast(u64, c), 0, 0, 0); }
+    when defined(TSMC_MEMTRACE) { mtr_ev(MTR_MARK, cast(u64, c), 0, 0, 0); }
     if c.mark != 0 { return; }
     c.mark = GC_OLD;
     h.marked_bytes += c.size;
@@ -984,7 +984,7 @@ GcCell* gc_alloc_zeroing(GcHeap* h, i32 kind, i64 size, i64 zero) {
     }
     h.bytes_live += block;
     h.n_cells++;
-    when defined(TSMC_MEMTRACE) { mt_ev(MT_ALLOC, cast(u64, c), 0, cast(u32, block), cast(u32, kind)); }
+    when defined(TSMC_MEMTRACE) { mtr_ev(MTR_ALLOC, cast(u64, c), 0, cast(u32, block), cast(u32, kind)); }
     return c;
 }
 
