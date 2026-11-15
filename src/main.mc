@@ -155,11 +155,7 @@ i32 tsmc_main() {
     return status;
 }
 
-// Everywhere with an operating system under it, the CLI is the whole
-// program. On the freestanding target the embedder writes main(), calls
-// tsmc_set_uefi_host() and then tsmc_main().
-when !os(uefi) {
-    // --code-cache-ahead's lazy functions, compiled before the run and
+// --code-cache-ahead's lazy functions, compiled before the run and
 // served at their calls; in source order, so found by bisection
 struct CliAheadEntry {
     i32 start;
@@ -186,5 +182,9 @@ private u8* cli_lazy_ahead(void* ctx, str src_name, i32 src_len, i32 start, i32*
     return null;
 }
 
+// Everywhere with an operating system under it, the CLI is the whole
+// program. On the freestanding target the embedder writes main(), calls
+// tsmc_set_uefi_host() and then tsmc_main().
+when !os(uefi) {
 i32 main() { return tsmc_main(); }
 }
