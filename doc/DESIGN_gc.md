@@ -14,9 +14,8 @@ Decision: **precise, non-moving mark-sweep**, designed in from M1.
   globals. Runtime kinds plug in via tracer/finalizer/mark-roots
   hooks so the heap stays generic.
 
-Non-goals for now: moving/compacting, generations, incremental marking.
-The design leaves room (cell header has spare bits; allocation is
-behind one function) but none of it is built until profiling asks.
+Non-goals: moving/compacting and incremental marking. Generations came
+with profiling (below); the cells still never move.
 
 ## Cells
 
@@ -84,6 +83,82 @@ returned at `gc_destroy`.
 **Contract: any `gc_alloc` may collect.** Native code roots every
 intermediate Value it needs across a subsequent allocation. The stress
 mode exists to make violations fail fast in tests.
+
+## Generations
+
+A cell keeps its mark once set: a cell that survived a collection is
+old, and the marks are the generation. A **minor collection** marks from
+the roots and from the old cells written since the last collection,
+traces only the young cells it reaches (`gc_mark_cell` stops at a set
+mark), and sweeps only where young cells can be. A **major collection**
+clears every mark first and does the whole heap as before. Minors come
+every `minor_threshold` bytes of allocation; a collection is a major
+instead when the minors' survivors have grown the old past the
+threshold the last major set from its live bytes. The young garbage
+never brings a major on its own: a benchmark with a tiny live set used
+to run a full collection every 256 KB (the floor of that threshold),
+and now runs minors only. The young size is small, 1 MB (ts-minc
+`GC_MINOR_THRESHOLD`, brmc `BRMC_GC_MINOR_KB`): the young live in a
+few chunks that stay in the cache when they are recycled every
+megabyte, and bsky.app ran slower with each doubling of it, 8 MB
+costing 10% more and 32 MB a third.
+
+**The write barrier.** A store of a young cell into an old one goes
+through `gc_barrier(holder, v)`, or `props_barrier` for a property
+table, which puts the holder on a remembered list; the next collection
+traces the remembered cells and tables before it drains its mark
+stack. The barrier is needed on every store into a cell's slots, the
+ones made right after the cell's allocation included: an allocation in
+between (the child's own, say) can run a collection that ages the
+holder. The stores are few places: the property-table primitives in
+`object.mc`, `js_array_set`, the box writes of `OP_SETCELL` and
+`OP_SETUPVAL`, the accessor halves, a map's entries, a generator's
+saved stack and queue, a prototype change, and the natives' `env`
+slots. A property table's generation rides in the top bits of its
+`cap` (`PROPS_OLD`, `PROPS_REMEMBERED`), set when the table is traced,
+so the table needs neither its owner nor the heap to decide.
+
+The remembered lists are the thread's, shared by every heap on it
+(brmc has a heap per tab), since the barrier knows neither: every
+collection on the thread drains both lists, tracing an entry into
+whichever heap collects first. A foreign entry marks its young
+referents old a little early and nothing else; an entry never outlives
+its cell, because a cell dies only in a collection of its own heap,
+and a heap being destroyed takes its entries off the lists.
+
+**Where the young go.** A chunk keeps its own free list, and a class
+fills one chunk at a time (`bump[cls]`): its free cells, then its
+unused tail, then the next chunk on the class's list of chunks with
+free cells (`avail`), which a major's sweep orders emptiest first.
+A chunk less than half free is passed over for a new chunk until the
+chunks' memory reaches the major's threshold: the young filling the
+holes of a nearly full chunk lay a cell here and a cell there, and
+each cost a cache miss to sweep and to mark (38 ns a cell against 10
+in a stream, on bsky.app). The chunks a minor empties go to the front
+of their class's list, so the next young fill the same chunks: a
+nursery, with no space set aside for one.
+
+**The sweep.** A minor sweeps at once, and only the chunks allocated
+into since the last collection (`young_chunks`), each over the range
+of cells handed out (`lo..hi`, kept by the allocator, the index by a
+multiply with `inv` rather than a division); an old cell in the range
+is marked and passed by. A major's sweep is lazy as before, every
+chunk, and a cell allocated where it has yet to reach is `GC_FRESH`:
+young, but the sweep passes it by instead of freeing it, and the chunk
+stays young for the next minor. Large cells made since the last
+collection sit on `young_large`, apart from the old ones on `all`.
+Template constants, which never change after a compile, are marked by
+a minor only for the templates compiled since the last collection
+(`fresh_tmpls`).
+
+**Checking the barriers.** Under `--gc-stress` every allocation runs a
+minor collection, every 64th a major, and after each one `gc_verify`
+walks the whole graph from the roots again, with its own visited bit,
+and stops the program naming the kinds of holder and cell when a live
+cell is unmarked: a store that went without its barrier. The embedder
+can run the same walk without the stress (brmc: `BRMC_GC_VERIFY=1`),
+which is how the barriers were found on a page that allocates too much
+for stress to be practical.
 
 ## Shutdown
 

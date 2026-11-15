@@ -27,11 +27,114 @@ struct Parser {
     i32 in_async;      // > 0 where `await` is a keyword
     i32 in_gen;        // > 0 where `yield` is a keyword
     i32 fn_depth;      // functions entered; 0 is the top level
+    i32 depth;         // parse_assign, parse_unary, parse_statement open
+    bool too_deep;     // past PARSE_DEPTH_MAX: the rest skipped, its errors not said
     bool module_top;   // the top level is a module's, where `await` is a
                        // keyword; in a script it is an ordinary name
     DiagList* diags;
     Bump* arena;
     Vec<NodePtr> scratch;
+    // per source position, the contexts an arrow attempt failed in
+    // (arrow_ctx): a '(' tried as an arrow head is tried once. Without it
+    // the parameter defaults, which try every '(' inside them again, make
+    // nested parentheses exponential (reCAPTCHA's bundle never finished).
+    ArrowMemo arrow_fail;
+    // a function compiled on its first call has its body passed over here,
+    // only scanned for the names it mentions (skip_body); off inside a class
+    // and a with statement, whose bodies the lazy compile cannot take
+    bool skip_bodies;
+    bool skipped_any;
+    i32 skip_depth;     // functions nested deeper than this are passed over
+    i32 class_depth;
+    i32 with_depth;
+    // a TypeScript form was parsed: the lowering pass has something to
+    // do. Plain JavaScript skips it (lower.mc changes nothing in it).
+    bool ts_seen;
+    // skip_body's name set and bracket stack, kept from one body to the next
+    SkipSet skip_names;
+    Vec<u8> skip_stack;
+}
+
+// The names a passed-over body mentions, with what the scan learned of
+// each: 1 mentioned, 2 declared by one of its vars, 4 stored to. Emptied
+// by a stamp: a table cleared by bytes, at the size the largest body
+// needed, cost more than the scan of the small bodies that are most.
+struct SkipSet {
+    str* keys;
+    i32* flags;
+    u32* stamps;
+    i32 cap;
+    i32 count;
+    u32 gen;
+    Vec<i32> order;   // the slots in use, in the order made: the table is read by them
+}
+
+private void skip_set_init(SkipSet* d) {
+    d.cap = 64;
+    d.keys = alloc<str>(d.cap);
+    d.flags = alloc<i32>(d.cap);
+    d.stamps = alloc<u32>(d.cap);
+    memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+    d.count = 0;
+    d.gen = 1;
+    vec_init<i32>(&d.order, 64);
+}
+
+private void skip_set_free(SkipSet* d) {
+    free(d.keys);
+    free(d.flags);
+    free(d.stamps);
+    vec_free(&d.order);
+}
+
+private void skip_set_clear(SkipSet* d) {
+    d.gen++;
+    d.count = 0;
+    d.order.len = 0;
+    if d.gen == 0 {
+        memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+        d.gen = 1;
+    }
+}
+
+// The flags of `name`, a slot made for it if the set has none.
+private i32* skip_set_slot(SkipSet* d, str name) {
+    if (d.count + 1) * 2 > d.cap {
+        // twice the room, the live names rehashed
+        i32 ocap = d.cap;
+        str* okeys = d.keys;
+        i32* oflags = d.flags;
+        u32* ostamps = d.stamps;
+        d.cap = ocap * 2;
+        d.keys = alloc<str>(d.cap);
+        d.flags = alloc<i32>(d.cap);
+        d.stamps = alloc<u32>(d.cap);
+        memset(cast(u8*, d.stamps), 0, cast(i64, d.cap) * 4);
+        for i32 k = 0; k < d.order.len; k++ {
+            i32 i = vec_get(&d.order, k);
+            i32 j = cast(i32, map_hash_str(*(okeys + i))) & (d.cap - 1);
+            while *(d.stamps + j) == d.gen { j = (j + 1) & (d.cap - 1); }
+            *(d.keys + j) = *(okeys + i);
+            *(d.flags + j) = *(oflags + i);
+            *(d.stamps + j) = d.gen;
+            vec_set(&d.order, k, j);
+        }
+        free(okeys);
+        free(oflags);
+        free(ostamps);
+    }
+    i32 mask = d.cap - 1;
+    i32 i = cast(i32, map_hash_str(name)) & mask;
+    while *(d.stamps + i) == d.gen {
+        if str_equal(*(d.keys + i), name) { return d.flags + i; }
+        i = (i + 1) & mask;
+    }
+    *(d.keys + i) = name;
+    *(d.flags + i) = 0;
+    *(d.stamps + i) = d.gen;
+    d.count++;
+    vec_push(&d.order, i);
+    return d.flags + i;
 }
 
 struct PState {
@@ -39,6 +142,7 @@ struct PState {
     Token cur;
     i32 prev_end;
     i32 scratch_len;
+    bool ts_seen;     // an attempt that fails leaves no TypeScript behind
 }
 
 void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
@@ -50,26 +154,121 @@ void parser_init(Parser* p, str src, DiagList* diags, Bump* arena) {
     p.strict = 0;
     p.single = 0;
     vec_init<NodePtr>(&p.scratch, 64);
-    vec_init<str>(&p.labels, 4);
+    vec_lazy<str>(&p.labels);
     p.label_floor = 0;
     p.in_async = 0;
     p.in_gen = 0;
     p.fn_depth = 0;
+    p.depth = 0;
+    p.too_deep = false;
     p.module_top = false;
+    p.arrow_fail = ArrowMemo{};
+    p.skip_bodies = false;
+    p.skipped_any = false;
+    p.skip_depth = 0;
+    p.class_depth = 0;
+    p.with_depth = 0;
+    p.ts_seen = false;
+    skip_set_init(&p.skip_names);
+    vec_init<u8>(&p.skip_stack, 16);
     p.cur = contextualize(p, lexer_next(&p.lx));
 }
 
+// A parser that starts at `offset` of `src`, for one function reparsed
+// on its first call; positions stay those of the whole source.
+void parser_init_at(Parser* p, str src, DiagList* diags, Bump* arena, i32 offset, bool strict) {
+    lexer_init(&p.lx, src, diags);
+    p.lx.pos = offset;
+    p.diags = diags;
+    p.arena = arena;
+    p.prev_end = offset;
+    p.no_in = 0;
+    p.strict = strict ? 1 : 0;
+    p.single = 0;
+    vec_init<NodePtr>(&p.scratch, 64);
+    vec_lazy<str>(&p.labels);
+    p.label_floor = 0;
+    p.in_async = 0;
+    p.in_gen = 0;
+    p.fn_depth = 0;
+    p.depth = 0;
+    p.too_deep = false;
+    p.module_top = false;
+    p.arrow_fail = ArrowMemo{};
+    p.skip_bodies = false;
+    p.skipped_any = false;
+    p.skip_depth = 0;
+    p.class_depth = 0;
+    p.with_depth = 0;
+    p.ts_seen = false;
+    skip_set_init(&p.skip_names);
+    vec_init<u8>(&p.skip_stack, 16);
+    p.cur = contextualize(p, lexer_next(&p.lx));
+}
+
+// The function at the parser's start: a `function`, declaration or
+// expression alike, an arrow, or with `method` a method from its key;
+// null when the text there is none of them.
+Node* parse_function_at(Parser* p, bool method) {
+    Node* n = null;
+    if method {
+        i32 start = p.cur.start;
+        ignore prop_name(p);
+        if !at(p, TOK_LPAREN) { return null; }
+        n = parse_callable(p, NF_METHOD, start);
+    } else if p.cur.kind == TOK_KW_FUNCTION {
+        i32 fstart = p.cur.start;
+        advance(p);
+        n = parse_function_rest(p, 0, false, fstart);
+    } else {
+        n = parse_assign(p);
+        if n == null || n.kind != N_FUNCTION || (n.flags & NF_ARROW) == 0 { return null; }
+    }
+    return n;
+}
+
 void parser_destroy(Parser* p) {
+    if p.arrow_fail.keys != null { free(p.arrow_fail.keys); free(p.arrow_fail.vals); }
     vec_free(&p.scratch);
     vec_free(&p.labels);
+    skip_set_free(&p.skip_names);
+    vec_free(&p.skip_stack);
     lexer_destroy(&p.lx);
+}
+
+// --- nesting limits -------------------------------------------------
+
+// The parser recurses per level of nesting, and lowering and the
+// compiler per level of the tree, which a left-deep chain (a+b+c...,
+// f()()..., a.b.c...) deepens without the parser recursing. Past these
+// the source is a SyntaxError, as an engine's stack limit makes it,
+// rather than the end of the program's stack. A wasm module's stack is
+// a sixth of a native thread's: 600 parentheses overflow it.
+when os(wasm) {
+    const i32 PARSE_DEPTH_MAX = 500;
+}
+when !os(wasm) {
+    const i32 PARSE_DEPTH_MAX = 3000;
+}
+
+
+// The rest of the source skipped, once the nesting is past the limit:
+// every caller up the stack then meets the end and returns.
+private Node* too_deep(Parser* p) {
+    perror(p, "Nesting too deep");
+    p.too_deep = true;
+    Node* n = nnew(p, N_ERROR);
+    p.lx.pos = p.lx.src.len;
+    advance(p);
+    return nfin(p, n);
 }
 
 // --- core helpers ---------------------------------------------------
 
 private void advance(Parser* p) {
     p.prev_end = p.cur.end;
-    p.cur = contextualize(p, lexer_next(&p.lx));
+    lexer_next_into(&p.lx, &p.cur);
+    contextualize_in(p, &p.cur);
 }
 
 // `await` and `yield` are keywords only where the grammar says so: inside
@@ -84,7 +283,7 @@ private bool await_is_keyword(Parser* p) {
     return p.in_async > 0 || (p.fn_depth == 0 && p.module_top);
 }
 
-private Token contextualize(Parser* p, Token t) {
+private void contextualize_in(Parser* p, Token* t) {
     if t.kind == TOK_KW_AWAIT {
         if !await_is_keyword(p) { t.kind = TOK_IDENT; }
     } else if t.kind == TOK_KW_YIELD {
@@ -93,6 +292,10 @@ private Token contextualize(Parser* p, Token t) {
         if await_is_keyword(p) && str_equal(t.text, "await") { t.kind = TOK_KW_AWAIT; }
         else if p.in_gen > 0 && str_equal(t.text, "yield") { t.kind = TOK_KW_YIELD; }
     }
+}
+
+private Token contextualize(Parser* p, Token t) {
+    contextualize_in(p, &t);
     return t;
 }
 
@@ -121,6 +324,7 @@ private PState psave(Parser* p) {
     s.cur = p.cur;
     s.prev_end = p.prev_end;
     s.scratch_len = p.scratch.len;
+    s.ts_seen = p.ts_seen;
     return s;
 }
 
@@ -129,6 +333,7 @@ private void prestore(Parser* p, PState s) {
     p.cur = s.cur;
     p.prev_end = s.prev_end;
     p.scratch.len = s.scratch_len;
+    p.ts_seen = s.ts_seen;
 }
 
 private bool at(Parser* p, i32 k) {
@@ -144,6 +349,8 @@ private bool eat(Parser* p, i32 k) {
 }
 
 private void perror(Parser* p, str msg) {
+    // each level the skip unwinds would say what it missed
+    if p.too_deep { return; }
     diag_add(p.diags, DIAG_ERROR, Span{p.cur.start, p.cur.end}, msg);
 }
 
@@ -384,6 +591,7 @@ private void ts_entity(Parser* p) {
 }
 
 private void ts_type_args(Parser* p) {
+    p.ts_seen = true;
     split_lt(p);
     while true {
         ts_type(p);
@@ -394,6 +602,7 @@ private void ts_type_args(Parser* p) {
 }
 
 private void ts_type_params(Parser* p) {
+    p.ts_seen = true;
     split_lt(p);
     while true {
         while (p.cur.kind == TOK_KW_CONST || p.cur.kind == TOK_KW_IN
@@ -527,6 +736,7 @@ private void ts_union(Parser* p) {
 }
 
 private void ts_type(Parser* p) {
+    p.ts_seen = true;
     ts_union(p);
     while p.cur.kind == TOK_KW_EXTENDS {
         advance(p);
@@ -540,6 +750,7 @@ private void ts_type(Parser* p) {
 
 // After ':' in a return-type position: allows type predicates.
 private void ts_return_type(Parser* p) {
+    p.ts_seen = true;
     if p.cur.kind == TOK_KW_ASSERTS
         && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_KW_THIS) {
         advance(p);
@@ -717,6 +928,7 @@ private void parse_params_into(Parser* p) {
                     || p.cur.kind == TOK_KW_PROTECTED || p.cur.kind == TOK_KW_READONLY
                     || p.cur.kind == TOK_KW_OVERRIDE) && starts_binding(peek(p)) {
                 prm.flags |= NF_PARAM_PROP;
+                p.ts_seen = true;
                 advance(p);
             }
             if eat(p, TOK_DOTDOTDOT) { prm.flags |= NF_REST; }
@@ -762,6 +974,14 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
     if eat(p, TOK_COLON) { ts_return_type(p); }
     if at(p, TOK_LBRACE) {
         bool strict_body = peek(p).kind == TOK_STRING && str_equal(peek(p).text, "use strict");
+        if p.skip_bodies && p.fn_depth > p.skip_depth && p.class_depth == 0 && p.with_depth == 0
+                && (flags & (NF_GENERATOR | NF_ASYNC | NF_GETTER | NF_SETTER | NF_METHOD | NF_ARROW)) == 0
+                && skip_body(p, fun, strict_body) {
+            p.fn_depth--;
+            p.in_async = saved_async;
+            p.in_gen = saved_gen;
+            return fun;
+        }
         if strict_body { p.strict++; }
         i32 saved_floor = p.label_floor;
         p.label_floor = p.labels.len;
@@ -770,12 +990,285 @@ private Node* parse_callable(Parser* p, i32 flags, i32 start) {
         if strict_body { p.strict--; }
     } else {
         fun.flags |= NF_SIGNATURE;
+        p.ts_seen = true;
         expect_semi(p);
     }
     p.fn_depth--;
     p.in_async = saved_async;
     p.in_gen = saved_gen;
     return nfin(p, fun);
+}
+
+// --- bodies passed over -----------------------------------------------
+
+// A program parsed with the bodies of the functions in it passed over
+// when `skip` says so. A body the scan misread leaves the rest of the
+// source unparsable: then the whole of it is parsed again, nothing passed
+// over, so a skip can cost time but never change what the source means.
+Node* parse_program_skipping(Parser* p, bool skip) {
+    Token cur0 = p.cur;
+    i32 pos0 = lexer_tell(&p.lx);
+    i32 prev0 = p.prev_end;
+    i32 errs0 = p.diags.n_errors;
+    i32 list0 = p.diags.list.len;
+    p.skip_bodies = skip;
+    Node* prog = parse_program(p);
+    if p.skipped_any && p.diags.n_errors > errs0 {
+        p.diags.n_errors = errs0;
+        p.diags.list.len = list0;
+        p.skip_bodies = false;
+        p.skipped_any = false;
+        p.fn_depth = 0;
+        p.class_depth = 0;
+        p.with_depth = 0;
+        lexer_seek(&p.lx, pos0);
+        p.cur = cur0;
+        p.prev_end = prev0;
+        prog = parse_program(p);
+    }
+    return prog;
+}
+
+// A function parsed from its source for its first call, the functions
+// nested in it passed over when `skip` says so, with the same fallback.
+Node* parse_function_skipping(Parser* p, bool method, bool skip) {
+    Token cur0 = p.cur;
+    i32 pos0 = lexer_tell(&p.lx);
+    i32 prev0 = p.prev_end;
+    i32 errs0 = p.diags.n_errors;
+    i32 list0 = p.diags.list.len;
+    p.skip_bodies = skip;
+    p.skip_depth = 1;
+    Node* f = parse_function_at(p, method);
+    if p.skipped_any && p.diags.n_errors > errs0 {
+        p.diags.n_errors = errs0;
+        p.diags.list.len = list0;
+        p.skip_bodies = false;
+        p.skipped_any = false;
+        p.fn_depth = 0;
+        p.class_depth = 0;
+        p.with_depth = 0;
+        lexer_seek(&p.lx, pos0);
+        p.cur = cur0;
+        p.prev_end = prev0;
+        f = parse_function_at(p, method);
+    }
+    return f;
+}
+
+// The shortest function worth passing over, from its keyword to its
+// closing brace: a short one costs more to scan and parse again than to
+// parse now. The compiler's lazy_eligible has the same floor.
+const i32 SKIP_MIN_FN = 256;
+
+// The '/' at a token after `prev` begins a regular expression, not a
+// division: after an operator, a keyword other than a value, an opening
+// bracket or a brace.
+private bool skip_regex_after(i32 prev) {
+    if prev == TOK_IDENT || prev == TOK_NUMBER || prev == TOK_STRING || prev == TOK_BIGINT || prev == TOK_REGEX
+        || prev == TOK_TEMPLATE_FULL || prev == TOK_TEMPLATE_TAIL || prev == TOK_RPAREN || prev == TOK_RBRACK
+        || prev == TOK_KW_THIS || prev == TOK_KW_SUPER || prev == TOK_KW_NULL || prev == TOK_KW_TRUE || prev == TOK_KW_FALSE
+        || prev == TOK_PLUSPLUS || prev == TOK_MINUSMINUS {
+        return false;
+    }
+    return true;
+}
+
+// A function body at '{' passed over: its tokens are scanned to the brace
+// that closes it, the names it mentions collected, and a stand-in body
+// made of them, so the compiler sees what it captures as it would in the
+// real one; the lazy compile parses the real one on the first call. Not
+// done, the position restored, for a body that names eval or has a with
+// statement, for one too short to be worth it, and for a function called
+// where it is written.
+private bool skip_assign_tok(i32 k) {
+    return (k >= TOK_EQ && k <= TOK_PIPEPIPE_EQ) || k == TOK_QUESTION_QUESTION_EQ;
+}
+
+private bool skip_body(Parser* p, Node* fun, bool strict_body) {
+    i32 at_pos = lexer_tell(&p.lx);
+    Token open = p.cur;
+    i32 prev_end0 = p.prev_end;
+    i32 mark = p.scratch.len;
+    SkipSet* names = &p.skip_names;
+    skip_set_clear(names);
+    // the brackets open, and for a template's substitution a 't'
+    Vec<u8>* stack = &p.skip_stack;
+    stack.len = 0;
+    vec_push(stack, '{');
+    i32 prev = TOK_LBRACE;
+    i32 prev2 = TOK_EOF;
+    bool ok = true;
+    i32 end = -1;
+    i32 n_diags = p.diags.n_errors;
+    // a name is placed by the token after it: before `:` after `{` or `,`
+    // it is a key, a label or a typed declaration, not a reference, and
+    // before `=>` a parameter; before an assignment operator, `++` or `--`,
+    // after `++` or `--`, or between a for's `(` and its `in` or `of`, it
+    // is written, which the stand-in says with an assignment, so the scope
+    // that owns the binding keeps it in a box. A `]` or `}` closing an
+    // array or object before `=` is a destructuring assignment, which may
+    // write any name in it: then every name is taken as written.
+    str pending;
+    pending.data = null;
+    pending.len = 0;
+    i32 pend_prev = TOK_EOF;
+    bool pend_for = false;
+    bool open_for = false;
+    bool assign_all = false;
+    u8 last_close = 0;
+    // a `var` statement open at this bracket depth, outside any function
+    // nested here: the names it declares are the function's own, however
+    // the body uses them. A brace after a parenthesis that no if, for,
+    // while, switch, catch or with opened, or after an arrow, is a nested
+    // function's body ('F' on the stack, 'c' for a control parenthesis).
+    i32 var_depth = -1;
+    i32 fn_depth = 0;
+    bool last_paren_ctrl = false;
+    while true {
+        noinit Token t;
+        lexer_next_into(&p.lx, &t);
+        i32 k = t.kind;
+        if k == TOK_EOF || k == TOK_ERROR { ok = false; break; }
+        if pending.len > 0 {
+            bool key = (k == TOK_COLON && (pend_prev == TOK_LBRACE || pend_prev == TOK_COMMA))
+                || k == TOK_ARROW || pend_prev == TOK_KW_FUNCTION || pend_prev == TOK_KW_CLASS;
+            bool stored = skip_assign_tok(k) || k == TOK_PLUSPLUS || k == TOK_MINUSMINUS
+                || pend_prev == TOK_PLUSPLUS || pend_prev == TOK_MINUSMINUS
+                || ((k == TOK_KW_IN || k == TOK_KW_OF) && pend_for);
+            if !key { *skip_set_slot(names, pending) |= stored ? 5 : 1; }
+            pending.len = 0;
+        }
+        if k == TOK_EQ && ((prev == TOK_RBRACK && last_close == '[') || (prev == TOK_RBRACE && last_close == '{')) { assign_all = true; }
+        // the declarators end at `;`, at the bracket that closes them, and at
+        // a for-in's `in` or for-of's `of`, after which the commas are the expression's
+        if var_depth >= 0 && (k == TOK_SEMI || k == TOK_KW_IN || k == TOK_KW_OF || stack.len < var_depth) { var_depth = -1; }
+        if (k == TOK_SLASH || k == TOK_SLASH_EQ) && skip_regex_after(prev) {
+            t = lexer_rescan_regex(&p.lx, t);
+            k = t.kind;
+            if k != TOK_REGEX { ok = false; break; }
+        } else if k == TOK_LBRACE {
+            bool fn_body = (prev == TOK_RPAREN && !last_paren_ctrl) || prev == TOK_ARROW;
+            if fn_body { fn_depth++; }
+            vec_push(stack, fn_body ? cast(u8, 'F') : cast(u8, '{'));
+        } else if k == TOK_LPAREN {
+            bool ctrl = prev == TOK_KW_IF || prev == TOK_KW_FOR || prev == TOK_KW_WHILE
+                || prev == TOK_KW_SWITCH || prev == TOK_KW_CATCH || prev == TOK_KW_WITH;
+            open_for = prev == TOK_KW_FOR;
+            vec_push(stack, ctrl ? cast(u8, 'c') : cast(u8, '('));
+        } else if k == TOK_LBRACK {
+            // an index into what came before ('i'), else an array, which may be a pattern
+            bool index = prev == TOK_IDENT || prev == TOK_RPAREN || prev == TOK_RBRACK || prev == TOK_KW_THIS || prev == TOK_KW_SUPER;
+            vec_push(stack, index ? cast(u8, 'i') : cast(u8, '['));
+        } else if k == TOK_TEMPLATE_HEAD {
+            vec_push(stack, 't');
+        } else if k == TOK_RBRACE {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top == 't' {
+                t = lexer_rescan_template(&p.lx, t);
+                k = t.kind;
+                if k == TOK_TEMPLATE_TAIL { stack.len--; }
+                else if k != TOK_TEMPLATE_MIDDLE { ok = false; break; }
+            } else {
+                if top != '{' && top != 'F' { ok = false; break; }
+                if top == 'F' { fn_depth--; }
+                last_close = top;
+                stack.len--;
+                if stack.len == 0 { end = lexer_tell(&p.lx); break; }
+            }
+        } else if k == TOK_RPAREN {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top != '(' && top != 'c' { ok = false; break; }
+            last_paren_ctrl = top == 'c';
+            stack.len--;
+        } else if k == TOK_RBRACK {
+            if stack.len == 0 { ok = false; break; }
+            u8 top = stack.data[stack.len - 1];
+            if top != '[' && top != 'i' { ok = false; break; }
+            last_close = top;
+            stack.len--;
+        } else if k == TOK_KW_WITH {
+            // a super or a private name here belongs to a class inside, which the lazy compile parses whole
+            ok = false;
+            break;
+        } else if k == TOK_KW_THIS {
+            *skip_set_slot(names, "this") |= 1;
+        } else if k == TOK_IDENT || tok_is_keyword(k) {
+            bool member = prev == TOK_DOT || prev == TOK_QUESTION_DOT;
+            if member && prev2 == TOK_KW_NEW && str_equal(t.text, "target") { *skip_set_slot(names, "%newtarget") |= 1; }
+            else if !member && t.text.len > 0 {
+                if str_equal(t.text, "eval") { ok = false; break; }
+                if k == TOK_KW_VAR { if fn_depth == 0 { var_depth = stack.len; } }
+                else if var_depth == stack.len && (prev == TOK_KW_VAR || prev == TOK_COMMA) { *skip_set_slot(names, t.text) |= 2; }
+                else {
+                    pending = t.text;
+                    pend_prev = prev;
+                    pend_for = prev == TOK_LPAREN && open_for;
+                }
+            }
+        }
+        prev2 = prev;
+        prev = k;
+    }
+    if pending.len > 0 { *skip_set_slot(names, pending) |= 1; }
+    // too short, or something here the lazy compile does not take
+    ok = ok && end >= 0 && p.diags.n_errors == n_diags && end - fun.span.start >= SKIP_MIN_FN;
+    // called where it is written: function () {...}() or (function () {...})()
+    if ok {
+        Token n1 = lexer_next(&p.lx);
+        Token n2 = lexer_next(&p.lx);
+        if n1.kind == TOK_LPAREN || n1.kind == TOK_DOT || (n1.kind == TOK_RPAREN && (n2.kind == TOK_LPAREN || n2.kind == TOK_DOT)) { ok = false; }
+        lexer_seek(&p.lx, end);
+    }
+    if !ok {
+        lexer_seek(&p.lx, at_pos);
+        p.cur = open;
+        p.prev_end = prev_end0;
+        return false;
+    }
+    // the stand-in: a body with the directive when the real one has it,
+    // and the names on the node, which the compiler's scans read as the
+    // body's mentions (a store as an assignment to the name)
+    Node* body = nnew(p, N_BLOCK);
+    if strict_body {
+        Node* st = nnew(p, N_EXPR_STMT);
+        Node* lit = nnew(p, N_STRING);
+        lit.name = "use strict";
+        st.a = lit;
+        vec_push(&p.scratch, st);
+    }
+    i32 n_refs = 0;
+    for i32 k = 0; k < names.order.len; k++ {
+        if (*(names.flags + vec_get(&names.order, k)) & 2) == 0 { n_refs++; }
+    }
+    NodeMemo* memo = cast(NodeMemo*, bump_alloc(p.arena, cast(i32, sizeof(NodeMemo))));
+    memo.refs = cast(NameRef*, bump_alloc(p.arena, cast(i32, (n_refs > 0 ? n_refs : 1) * sizeof(NameRef))));
+    memo.n_refs = n_refs;
+    i32 w = 0;
+    for i32 k = 0; k < names.order.len; k++ {
+        i32 i = vec_get(&names.order, k);
+        i32 f = *(names.flags + i);
+        if (f & 2) != 0 { continue; }
+        str key = *(names.keys + i);
+        NameRef* r = memo.refs + w;
+        w++;
+        r.name = key;
+        if str_equal(key, "this") { r.flags = 2; }
+        else if str_equal(key, "%newtarget") { r.flags = 4; }
+        else { r.flags = assign_all || (f & 4) != 0 ? 1 : 0; }
+    }
+    fun.memo = memo;
+    body.kids = finish_kids(p, mark);
+    fun.a = body;
+    fun.flags |= NF_SKIPPED;
+    p.skipped_any = true;
+    // on past the closing brace
+    p.prev_end = end;
+    fun.span.end = end;
+    p.cur = contextualize(p, lexer_next(&p.lx));
+    return true;
 }
 
 // After the 'function' keyword; `start` is where that keyword was.
@@ -818,7 +1311,9 @@ private Node* parse_template(Parser* p) {
     i32 mark = p.scratch.len;
     Node* q = nnew(p, N_TEMPLATE_ELEM);
     q.name = p.cur.text;
-    q.aux = p.cur.aux;   // raw quasi
+    Node* qraw = nnew(p, N_STRING);
+    qraw.name = p.cur.aux;   // raw quasi
+    q.a = qraw;
     vec_push(&p.scratch, q);
     if at(p, TOK_TEMPLATE_FULL) {
         advance(p);
@@ -837,7 +1332,9 @@ private Node* parse_template(Parser* p) {
         if tk.kind == TOK_ERROR { break; }
         Node* e = nnew(p, N_TEMPLATE_ELEM);
         e.name = tk.text;
-        e.aux = tk.aux;   // raw quasi
+        Node* eraw = nnew(p, N_STRING);
+        eraw.name = tk.aux;   // raw quasi
+        e.a = eraw;
         vec_push(&p.scratch, e);
         advance(p);
         if tk.kind == TOK_TEMPLATE_TAIL { break; }
@@ -1042,7 +1539,9 @@ private Node* parse_primary(Parser* p) {
         p.cur = r;
         Node* n = nnew(p, N_REGEX);
         n.name = r.text;
-        n.aux = r.aux;
+        Node* fl = nnew(p, N_STRING);
+        fl.name = r.aux;
+        n.a = fl;
         advance(p);
         return n;
     }
@@ -1097,7 +1596,7 @@ private bool try_type_args_call(Parser* p) {
         && (p.cur.kind == TOK_LPAREN || p.cur.kind == TOK_TEMPLATE_FULL
             || p.cur.kind == TOK_TEMPLATE_HEAD);
     diags_unmute(p.diags);
-    if !ok { prestore(p, st); }
+    if !ok { prestore(p, st); p.diags.n_suppressed = base; }
     return ok;
 }
 
@@ -1161,7 +1660,13 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
     } else {
         e = parse_primary(p);
     }
+    // every link deepens the tree under the first operand, which the
+    // compiler recurses through, so a chain counts as nesting too
+    i32 chain = 0;
     while true {
+        p.depth++;
+        chain++;
+        if p.depth >= PARSE_DEPTH_MAX { p.depth -= chain; return too_deep(p); }
         i32 k = p.cur.kind;
         if k == TOK_DOT {
             advance(p);
@@ -1222,6 +1727,7 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
         }
         if k == TOK_BANG && !p.cur.newline_before {
             Node* nn = nnew(p, N_NONNULL);
+            p.ts_seen = true;
             nn.span.start = e.span.start;
             nn.a = e;
             advance(p);
@@ -1234,6 +1740,7 @@ private Node* parse_member_or_call(Parser* p, bool allow_call) {
         }
         break;
     }
+    p.depth -= chain;
     return e;
 }
 
@@ -1253,6 +1760,14 @@ private Node* parse_postfix(Parser* p) {
 }
 
 private Node* parse_unary(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_unary_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_unary_in(Parser* p) {
     i32 k = p.cur.kind;
     if k == TOK_BANG || k == TOK_TILDE || k == TOK_PLUS || k == TOK_MINUS
         || k == TOK_KW_TYPEOF || k == TOK_KW_VOID || k == TOK_KW_DELETE {
@@ -1283,12 +1798,17 @@ private Node* parse_unary(Parser* p) {
 
 private Node* parse_bin(Parser* p, i32 min_prec) {
     Node* left = parse_unary(p);
+    i32 chain = 0;
     while true {
+        p.depth++;
+        chain++;
+        if p.depth >= PARSE_DEPTH_MAX { p.depth -= chain; return too_deep(p); }
         i32 k = p.cur.kind;
         if k == TOK_KW_AS || k == TOK_KW_SATISFIES {
             if min_prec > 7 { break; }
             advance(p);
             Node* w = nnew(p, N_AS);
+            p.ts_seen = true;
             w.span.start = left.span.start;
             w.a = left;
             if k == TOK_KW_SATISFIES {
@@ -1331,6 +1851,7 @@ private Node* parse_bin(Parser* p, i32 min_prec) {
         b.b = right;
         left = nfin(p, b);
     }
+    p.depth -= chain;
     return left;
 }
 
@@ -1366,9 +1887,69 @@ private Node* parse_yield(Parser* p) {
     return nfin(p, y);
 }
 
+// The arrow attempts that failed, by the position they began at: a bit per
+// context. A table of the few positions tried, where a word per byte of the
+// source was allocated and cleared for each parse, and a function compiled
+// on its first call is a parse of its own: bsky.app's 9 MB bundle cleared
+// 38 MB for every one of them.
+struct ArrowMemo {
+    i32* keys;      // -1 for an empty slot
+    u32* vals;
+    i32 cap;        // a power of two, or 0
+    i32 n;
+}
+
+private i32 arrow_slot(ArrowMemo* m, i32 pos) {
+    u32 h = cast(u32, pos) * 2654435761;
+    i32 i = cast(i32, h >> 8) & (m.cap - 1);
+    while *(m.keys + i) != pos && *(m.keys + i) != -1 { i = (i + 1) & (m.cap - 1); }
+    return i;
+}
+
+private u32 arrow_failed(ArrowMemo* m, i32 pos) {
+    if m.cap == 0 { return 0; }
+    i32 i = arrow_slot(m, pos);
+    return *(m.keys + i) == pos ? *(m.vals + i) : 0;
+}
+
+private void arrow_fail_add(ArrowMemo* m, i32 pos, u32 ctx) {
+    if (m.n + 1) * 2 > m.cap {
+        i32 ocap = m.cap;
+        i32* okeys = m.keys;
+        u32* ovals = m.vals;
+        m.cap = ocap == 0 ? 64 : ocap * 2;
+        m.keys = alloc<i32>(m.cap);
+        m.vals = alloc<u32>(m.cap);
+        for i32 i = 0; i < m.cap; i++ { *(m.keys + i) = -1; *(m.vals + i) = 0; }
+        m.n = 0;
+        for i32 i = 0; i < ocap; i++ {
+            if *(okeys + i) == -1 { continue; }
+            i32 j = arrow_slot(m, *(okeys + i));
+            *(m.keys + j) = *(okeys + i);
+            *(m.vals + j) = *(ovals + i);
+            m.n++;
+        }
+        if okeys != null { free(okeys); free(ovals); }
+    }
+    i32 i = arrow_slot(m, pos);
+    if *(m.keys + i) == -1 { *(m.keys + i) = pos; m.n++; }
+    *(m.vals + i) = *(m.vals + i) | ctx;
+}
+
+// The context an arrow attempt's outcome depends on, as one bit of
+// arrow_fail.
+private u32 arrow_ctx(Parser* p, i32 flags) {
+    i32 b = ((flags & NF_ASYNC) != 0 ? 1 : 0) | (p.in_async > 0 ? 2 : 0) | (p.in_gen > 0 ? 4 : 0)
+        | (p.no_in > 0 ? 8 : 0) | (p.strict > 0 ? 16 : 0);
+    return cast(u32, 1) << cast(u32, b);
+}
+
 // Arrow attempt from '(' or '<'. Returns null (state restored) if the
 // tokens are not an arrow head.
 private Node* try_arrow(Parser* p, i32 flags) {
+    i32 at_pos = p.cur.start;
+    u32 ctx = arrow_ctx(p, flags);
+    if at_pos >= 0 && (arrow_failed(&p.arrow_fail, at_pos) & ctx) != 0 { return null; }
     PState st = psave(p);
     i32 base = p.diags.n_suppressed;
     diags_mute(p.diags);
@@ -1392,17 +1973,23 @@ private Node* try_arrow(Parser* p, i32 flags) {
     diags_unmute(p.diags);
     if !ok {
         prestore(p, st);
+        // what this attempt suppressed is forgotten with it: an arrow being
+        // tried around this one counts only its own
+        p.diags.n_suppressed = base;
+        if at_pos >= 0 && at_pos < p.lx.src.len { arrow_fail_add(&p.arrow_fail, at_pos, ctx); }
         return null;
     }
     Node* fun = nnew(p, N_FUNCTION);
     fun.span.start = start;
     fun.flags = NF_ARROW | flags;
     fun.kids = finish_kids(p, mark);
-    advance(p);   // =>
+    // the body's context is set before the token after `=>` is read,
+    // since reading it classifies `await` and `yield`
     i32 saved_async = p.in_async;
     i32 saved_gen = p.in_gen;
     p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
     p.in_gen = 0;
+    advance(p);   // =>
     p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
@@ -1426,13 +2013,14 @@ private Node* ident_arrow(Parser* p, i32 flags) {
     prm.a = id;
     vec_push(&p.scratch, prm);
     fun.kids = finish_kids(p, mark);
-    advance(p);   // =>
     // the body of an arrow is its own: a plain one is neither await nor
-    // yield context, however it is nested
+    // yield context, however it is nested. Set before the token after
+    // `=>` is read, since reading it classifies `await` and `yield`.
     i32 saved_async = p.in_async;
     i32 saved_gen = p.in_gen;
     p.in_async = (flags & NF_ASYNC) != 0 ? 1 : 0;
     p.in_gen = 0;
+    advance(p);   // =>
     p.fn_depth++;
     if at(p, TOK_LBRACE) {
         fun.a = parse_block(p);
@@ -1446,6 +2034,14 @@ private Node* ident_arrow(Parser* p, i32 flags) {
 }
 
 Node* parse_assign(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_assign_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_assign_in(Parser* p) {
     i32 k = p.cur.kind;
     if k == TOK_KW_YIELD {
         if p.cur.escaped { perror(p, "Keyword must not contain escaped characters"); }
@@ -1741,8 +2337,8 @@ private Node* parse_class_member(Parser* p) {
         else if k == TOK_KW_ASYNC { add = NF_ASYNC; }
         else if k == TOK_KW_GET { add = NF_GETTER; }
         else if k == TOK_KW_SET { add = NF_SETTER; }
-        else if k == TOK_KW_ABSTRACT { add = NF_ABSTRACT; }
-        else if k == TOK_KW_DECLARE { add = NF_DECLARE; }
+        else if k == TOK_KW_ABSTRACT { add = NF_ABSTRACT; p.ts_seen = true; }
+        else if k == TOK_KW_DECLARE { add = NF_DECLARE; p.ts_seen = true; }
         else if k == TOK_KW_READONLY || k == TOK_KW_PUBLIC || k == TOK_KW_PRIVATE
             || k == TOK_KW_PROTECTED || k == TOK_KW_OVERRIDE { add = 0; }
         if add < 0 { break; }
@@ -1810,6 +2406,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     // a class definition is strict-mode code throughout: its own name, the
     // expression it extends, and its body
     p.strict++;
+    p.class_depth++;
     if is_binding_ident(p.cur.kind) {
         c.name = p.cur.text;
         advance(p);
@@ -1841,6 +2438,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
     }
     expect(p, TOK_RBRACE, "expected '}'");
     p.strict--;
+    p.class_depth--;
     c.kids = finish_kids(p, mark);
     return nfin(p, c);
 }
@@ -1849,6 +2447,7 @@ private Node* parse_class(Parser* p, i32 flags, bool need_name) {
 
 private Node* parse_enum(Parser* p, i32 flags) {
     Node* e = nnew(p, N_ENUM);
+    p.ts_seen = true;
     e.flags = flags;
     advance(p);
     if is_binding_ident(p.cur.kind) {
@@ -1886,6 +2485,7 @@ private Node* parse_enum(Parser* p, i32 flags) {
 
 private Node* parse_namespace_rest(Parser* p, i32 flags) {
     Node* n = nnew(p, N_NAMESPACE);
+    p.ts_seen = true;
     n.flags = flags;
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -1917,6 +2517,7 @@ private Node* parse_namespace_rest(Parser* p, i32 flags) {
 
 private Node* parse_interface(Parser* p) {
     Node* n = nnew(p, N_INTERFACE);
+    p.ts_seen = true;
     advance(p);
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -1942,6 +2543,7 @@ private Node* parse_interface(Parser* p) {
 
 private Node* parse_type_alias(Parser* p) {
     Node* n = nnew(p, N_TYPE_ALIAS);
+    p.ts_seen = true;
     advance(p);
     if is_binding_ident(p.cur.kind) {
         n.name = p.cur.text;
@@ -1961,6 +2563,7 @@ private Node* parse_declare(Parser* p) {
     if at(p, TOK_KW_GLOBAL) && peek(p).kind == TOK_LBRACE {
         Node* n = nnew(p, N_EMPTY);
         n.flags = NF_DECLARE;
+        p.ts_seen = true;
         advance(p);
         ts_balanced(p, TOK_LBRACE, TOK_RBRACE);
         return nfin(p, n);
@@ -1968,13 +2571,14 @@ private Node* parse_declare(Parser* p) {
     if at(p, TOK_KW_MODULE) && peek(p).kind == TOK_STRING {
         Node* n = nnew(p, N_EMPTY);
         n.flags = NF_DECLARE;
+        p.ts_seen = true;
         advance(p);
         advance(p);
         if at(p, TOK_LBRACE) { ts_balanced(p, TOK_LBRACE, TOK_RBRACE); }
         return nfin(p, n);
     }
     Node* s = parse_statement(p);
-    if s != null { s.flags |= NF_DECLARE; }
+    if s != null { s.flags |= NF_DECLARE; p.ts_seen = true; }
     return s;
 }
 
@@ -1994,6 +2598,7 @@ private Node* parse_import_decl(Parser* p) {
         if pk.kind == TOK_LBRACE || pk.kind == TOK_STAR
             || (is_binding_ident(pk.kind) && pk.kind != TOK_KW_FROM) {
             n.flags |= NF_TYPE_ONLY;
+            p.ts_seen = true;
             advance(p);
         }
     }
@@ -2022,6 +2627,7 @@ private Node* parse_import_decl(Parser* p) {
             Node* sp = nnew(p, N_IMPORT_SPEC);
             if at(p, TOK_KW_TYPE) && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_STRING) {
                 sp.flags |= NF_TYPE_ONLY;
+                p.ts_seen = true;
                 advance(p);
             }
             if is_ident_like(p.cur.kind) || at(p, TOK_STRING) {
@@ -2112,6 +2718,7 @@ private Node* parse_export_decl(Parser* p) {
             n.a = parse_class(p, 0, false);
         } else if at(p, TOK_KW_ABSTRACT) && peek(p).kind == TOK_KW_CLASS {
             advance(p);
+            p.ts_seen = true;
             n.a = parse_class(p, NF_ABSTRACT, false);
         } else {
             n.a = parse_assign(p);
@@ -2123,6 +2730,7 @@ private Node* parse_export_decl(Parser* p) {
     if at(p, TOK_KW_TYPE) && peek(p).kind == TOK_LBRACE {
         type_only = true;
         n.flags |= NF_TYPE_ONLY;
+        p.ts_seen = true;
         advance(p);
     }
     if at(p, TOK_LBRACE) {
@@ -2133,6 +2741,7 @@ private Node* parse_export_decl(Parser* p) {
             if at(p, TOK_KW_TYPE) && !type_only && is_ident_like(peek(p).kind)
                 && peek(p).kind != TOK_KW_AS {
                 sp.flags |= NF_TYPE_ONLY;
+                p.ts_seen = true;
                 advance(p);
             }
             if is_ident_like(p.cur.kind) || at(p, TOK_STRING) {
@@ -2206,6 +2815,14 @@ private void refuse_function_in_single(Parser* p, i32 single, bool gen, bool asy
 }
 
 Node* parse_statement(Parser* p) {
+    if p.depth >= PARSE_DEPTH_MAX { return too_deep(p); }
+    p.depth++;
+    Node* n = parse_statement_in(p);
+    p.depth--;
+    return n;
+}
+
+private Node* parse_statement_in(Parser* p) {
     i32 single = p.single;
     p.single = 0;
     i32 k = p.cur.kind;
@@ -2260,6 +2877,7 @@ Node* parse_statement(Parser* p) {
     }
     if k == TOK_KW_ABSTRACT && peek(p).kind == TOK_KW_CLASS {
         advance(p);
+        p.ts_seen = true;
         return parse_class(p, NF_ABSTRACT, true);
     }
     if k == TOK_KW_IF { return parse_if(p); }
@@ -2283,7 +2901,9 @@ Node* parse_statement(Parser* p) {
         expect(p, TOK_LPAREN, "expected '('");
         n.a = parse_expression(p);
         expect(p, TOK_RPAREN, "expected ')'");
+        p.with_depth++;
         n.b = parse_body(p, 2);
+        p.with_depth--;
         return nfin(p, n);
     }
     if k == TOK_KW_DO {

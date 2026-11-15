@@ -1,0 +1,16 @@
+c1 50,65,67,67,79,2019,73
+c2 78,d83c,df38,79
+c3 e0,2028,7a
+c4 50,65,67,67,79,2019,73
+t1 false
+pair 78,23,79
+hi true true
+dot null 4
+dotu 4
+cls 61,5f,62,5f,63
+astral-cls 78,5f,5f,79
+idx 4 4
+split a|b|c
+sep false true
+neg 3f,3f,21
+emoji 68,69,20,20,74,68,65,72,65

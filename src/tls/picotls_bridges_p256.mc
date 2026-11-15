@@ -1,5 +1,5 @@
 // Imports added on export so this module resolves standalone (LSP).
-import cstdlib_shim;
+import ext_libc;
 import picotls_shim;
 import picotls_lib;
 import picotls_bridges;

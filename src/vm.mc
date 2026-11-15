@@ -25,6 +25,7 @@ import bump;
 import parser;
 import lower;
 import compiler;
+import codecache;
 import math;
 import format_f64;
 import regex;
@@ -39,19 +40,22 @@ const i32 VM_FRAMES_MAX = 8000;
 const i32 VM_HANDLERS_MAX = 4096;
 const i32 VM_EXEC_DEPTH_MAX = 120;
 
+// 64 bytes, and the frames array starts on a cache line, so a frame is
+// one line: a call writes one and a return reads one. The eight-byte
+// fields come first, so that nothing pads.
 struct Frame {
     JsFunction* fun;    // null for the script frame
     FnTemplate* tmpl;
-    i32 ret_ip;
-    i32 cur_ip;         // this frame's active site (call/throw), for stacks
-    i32 base;
     Value this_val;
     Value arguments_obj;  // the `arguments` object, or undefined if unused
     Value new_target;   // new.target: the constructor, or undefined; super() propagates it
+    JsGenerator* gen;   // non-null while running a generator/async body
+    i32 ret_ip;
+    i32 cur_ip;         // this frame's active site (call/throw), for stacks
+    i32 base;
+    i16 super_for;      // a frame index, below VM_FRAMES_MAX, or -1
     bool is_ctor;
     bool super_pending;  // a derived constructor that has not called super()
-    i32 super_for;
-    JsGenerator* gen;   // non-null while running a generator/async body
 }
 
 struct Handler {
@@ -118,24 +122,99 @@ type ReactorHook = fn(VM*, i32, i16): void;
 // there, so vm.mc stays free of the module/loader machinery. Takes (spec,
 // referrer path) and returns a promise of the module namespace.
 type DynImportHook = fn(VM*, Value, Value): Value;
+// An embedder's report of an uncaught error; `rejection` for an unhandled promise.
+type UncaughtHook = fn(VM*, Value, bool): void;
 
 // Builds the `arguments` object from a call's argument values, installed by
 // builtins so vm.mc's call sites stay free of the object/iterator builtins.
 type ArgumentsBuilder = fn(VM*, Value*, i32): Value;
 
+// An embedder's lazy functions compiled ahead (AheadCompile): asked at a
+// lazy function's first call, by its source's name and length and the
+// function's start, for the bytes codecache_write_one made of it; null
+// when there are none. The bytes stay the embedder's.
+type LazyAheadFn = fn(void*, str, i32, i32, i32*): u8*;
+
 struct VM {
     GcHeap heap;
     AtomTable atoms;
+    AtomCacheEntry[ATOM_CACHE] atom_cache;   // vm_atom_dyn's cache, zero at start
     Prof* prof;                // the `--prof` accounting, or null
+    i32 lazy_compiles;         // lazy functions compiled on their first call
+    i64 lazy_ns;               // and the time that took
+    LazyAheadFn lazy_ahead;    // the embedder's functions compiled ahead, or null
+    void* lazy_ahead_ctx;
+    i32 lazy_ahead_hits;       // lazy functions taken from it instead
+    i64 lazy_ahead_ns;
+    i32 compiles;              // scripts and modules compiled
+    i64 compile_ns;            // their parse, lower and compile time
+    // The code cache (codecache.mc): bytes offered for the next
+    // vm_run_source, taken whether or not they match; the first root
+    // compiled or loaded, the entry's, for the CLI to write out; how many
+    // loads and their time; and --code-cache-verify's round trip of every
+    // compile.
+    u8* cc_data;
+    i32 cc_len;
+    FnTemplate* first_root;
+    i32 cache_loads;
+    i64 cache_ns;
+    bool cc_verify;
+    // Phase accounting (vm_phase_*). With `phases` set, one phase owns
+    // the clock at any moment between vm_phase_begin and vm_phase_end,
+    // and a change of phase charges the time elapsed to the phase that
+    // was running; the collector's time, which gc.mc measures itself, is
+    // taken out of whichever phase it ran in. The sum of the phases is
+    // the time between begin and end by construction, so the residual
+    // against the embedder's own clock checks only that every entry into
+    // the runtime lies inside a span; `phase_outside` counts the changes
+    // that did not. Level 2 also keeps each native's own time by name.
+    i32 phases;
+    i32 phase;                 // the phase running
+    i32 phase_depth;           // begin/end nesting; the clock runs above 0
+    i64 phase_t0;              // the counter when the running phase began
+    i64 phase_span0;           // the counter at the outermost begin
+    i64 phase_gc0;             // the collector's ticks at phase_t0
+    i64[PH_COUNT] phase_ticks; // counter ticks, the collector's included
+    i64[PH_COUNT] phase_gc;    // of which the collector's
+    i64 phase_wall;            // the spans between begin and end, in ticks
+    i64 phase_switches;
+    i64 phase_outside;
+    i64 phase_switch_cost;     // 4096 switches, in ticks, measured when the accounting was turned on
+    i32[PH_STACK] phase_stack; // the phase to go back to when a nested run of the loop returns
+    i32 phase_sp;
+    NativeStats* nstats;       // level 2, else null
     Value* stack;
     i32 sp;
     Frame* frames;
+    void* frames_block;        // the allocation frames is aligned within
     i32 fp;
     Value pending_new_target;  // new.target for the next vm_call_stack frame
     i32 pending_super_for;     // super_for for the next vm_call_stack frame
     u64 start_ns;              // monotonic clock at startup, for process.uptime
     u64 loop_start_ns;         // when the event loop first ran, 0 before
     u64 loop_idle_ns;          // time since then spent waiting for I/O or a timer
+    // An embedder's budget for one run of the event loop, in ms; 0 is
+    // none. With a budget the loop returns when it is spent, timers and
+    // handles still alive, and the embedder calls it again from its own
+    // loop. The CLI never sets it.
+    f64 loop_budget_ms;
+    // Set by vm_step, or for good by an embedder that owns the loop: the
+    // loop runs what is due and returns rather than wait for a timer or a
+    // socket, so a script's run ends with its microtasks.
+    bool loop_no_wait;
+    // Set by an embedder whose scripts share one global scope, as a
+    // browser's do: a script's top-level declarations bind globals, so
+    // the next script sees them (vm_run_source).
+    bool script_globals;
+    // An embedder's deadline on the monotonic clock, 0 for none: a loop
+    // still running past it throws, as a browser stops a script that
+    // hangs its page. Checked on backward jumps, every 4096 of them.
+    u64 deadline_ns;
+    i32 deadline_tick;
+    // An embedder's report of an uncaught exception or an unhandled
+    // rejection, or null. With one, neither ends the run: a browser
+    // reports the error and goes on.
+    UncaughtHook host_uncaught;
     f64 last_poll_ms;          // when the sockets were last polled
     i32 stack_limit;           // Error.stackTraceLimit: frames kept in a stack
     bool before_exit_done;     // 'beforeExit' already asked for more work
@@ -153,11 +232,13 @@ struct VM {
     // Steps an index iterator directly (see IterFastFn), or null before the
     // built-ins are installed.
     IterFastFn iter_fast;
+    MapDirectFn map_direct;     // and a Map or Set stepped as its own iterator
     // Whether a WeakMap or WeakSet has ever been made. The ephemeron pass and
     // the pass that drops dead keys both walk every cell in the heap looking
     // for one, and the marking pass is looped until it marks nothing new, so a
     // program that has none should not pay for them at all.
     bool any_weak;
+    Vec<JsMap*> weak_maps;     // every WeakMap and WeakSet made, for the ephemeron passes; the dead drop out at the sweep
     // Bindings stored in the globals table that the global object must not
     // report. In node these are module-scoped, so a bare `__dirname` resolves
     // while `globalThis.__dirname` is undefined; tsmc keeps them in the one
@@ -165,6 +246,7 @@ struct VM {
     u32[4] hidden_globals;
     i32 n_hidden_globals;
     Vec<TmplPtr> troots;   // owned root templates; consts are GC roots
+    Vec<TmplPtr> fresh_tmpls;  // the templates compiled since the last collection: what a minor collection marks
     Value pending;
     bool has_pending;
     bool unwind_return;   // the pending value is a return completion, not a throw
@@ -190,6 +272,7 @@ struct VM {
     JsObject* async_generator_proto;
     JsObject* iterator_proto;      // shared by every iterator: the helpers live here
     JsObject* iter_helper_proto;   // what map/filter/take/drop/flatMap return
+    JsObject*[5] iter_kind_protos; // %ArrayIteratorPrototype% and its kin, by ITER_KIND_*: each over iterator_proto
     JsObject* promise_proto;
     JsObject* regexp_proto;
     JsObject* map_proto;
@@ -207,7 +290,7 @@ struct VM {
     JsObject* ta_proto;        // %TypedArray%.prototype (shared methods)
     JsObject* arraybuffer_proto;
     JsObject* dataview_proto;
-    JsObject*[9] ta_protos;    // per-kind TypedArray.prototype (instanceof)
+    JsObject*[11] ta_protos;   // per-kind TypedArray.prototype (instanceof)
     u32 atom_ta_off;
     u32 atom_ta_len;
     u32 atom_ta_kind;
@@ -230,7 +313,15 @@ struct VM {
     Vec<RegexProgPtr> regexps;
     StrMap<i32> regex_cache;    // "flags\nsource" -> index into regexps
     Vec<str> regex_keys;        // owned keys of regex_cache
+    Vec<GcString*> regex_srcs;  // by program: the source and flags strings every object made from it shares
+    Vec<GcString*> regex_flgs;
+    Vec<GcString*> atom_strs;   // by atom: the string a pinned atom's name is handed out as (Object.keys, for-in), made once
     GcString*[128] ascii_chars; // one-byte strings, shared by every index and split
+    GcString*[8] typeof_strs;   // typeof's answers, made once: a minified bundle asks on most calls
+    GcString*[128] latin1_chars; // one-character strings for U+0080..U+00FF, as ascii_chars: what atob's output is indexed by
+    Value array_values;         // Array.prototype.values, which every arguments object iterates by
+    Value map_entries;          // Map.prototype[Symbol.iterator] and Set.prototype's as made: a
+    Value set_values;           // collection whose prototype still has them is iterated directly
     GcString*[8] http_strs;     // the http natives' constant strings, made when first used
     u32 atom_rx;
     u32 atom_source;
@@ -329,26 +420,21 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
     VM* vmw = cast(VM*, ctx);
     if !vmw.any_weak { return false; }
     bool any = false;
-    GcCell* c = h.all;
-    while c != null {
-        if c.mark != 0 && c.kind == GC_MAP {
-            JsMap* m = cast(JsMap*, c);
-            if m.weak {
-                for i32 i = 0; i < m.len; i++ {
-                    if *(m.live + i) {
-                        Value k = *(m.keys + i);
-                        if value_is_cell(k) && value_as_cell(k).mark != 0 {
-                            Value v = *(m.vals + i);
-                            if value_is_cell(v) && value_as_cell(v).mark == 0 {
-                                gc_mark_value(h, v);
-                                any = true;
-                            }
-                        }
+    for i32 wi = 0; wi < vmw.weak_maps.len; wi++ {
+        JsMap* m = vmw.weak_maps.data[wi];
+        if m.head.mark == 0 { continue; }
+        for i32 i = 0; i < m.len; i++ {
+            if *(m.live + i) {
+                Value k = *(m.keys + i);
+                if value_is_cell(k) && value_as_cell(k).mark != 0 {
+                    Value v = *(m.vals + i);
+                    if value_is_cell(v) && value_as_cell(v).mark == 0 {
+                        gc_mark_value(h, v);
+                        any = true;
                     }
                 }
             }
         }
-        c = c.next;
     }
     return any;
 }
@@ -357,35 +443,35 @@ private bool vm_weak_mark(GcHeap* h, void* ctx) {
 // collection. Runs before the sweep, while marks are still valid.
 private void vm_weak_sweep(GcHeap* h, void* ctx) {
     VM* vms = cast(VM*, ctx);
-    if h.key_marks_len > 0 {
+    // a minor collection's marks cover its young cells only: the atoms wait for a major
+    if h.key_marks_len > 0 && !h.minor_pass {
         ignore atoms_sweep(&vms.atoms, h.key_marks, h.key_marks_len, h.alloc_total);
     }
     if !vms.any_weak { return; }
-    GcCell* c = h.all;
-    while c != null {
-        if c.mark != 0 && c.kind == GC_MAP {
-            JsMap* m = cast(JsMap*, c);
-            if m.weak {
-                for i32 i = 0; i < m.len; i++ {
-                    if *(m.live + i) {
-                        Value k = *(m.keys + i);
-                        if !value_is_cell(k) || value_as_cell(k).mark == 0 {
-                            *(m.live + i) = false;
-                            m.count--;
-                        }
-                    }
+    i32 kept = 0;
+    for i32 wi = 0; wi < vms.weak_maps.len; wi++ {
+        JsMap* m = vms.weak_maps.data[wi];
+        if m.head.mark == 0 { continue; }      // the sweep frees it
+        vms.weak_maps.data[kept] = m;
+        kept++;
+        for i32 i = 0; i < m.len; i++ {
+            if *(m.live + i) {
+                Value k = *(m.keys + i);
+                if !value_is_cell(k) || value_as_cell(k).mark == 0 {
+                    *(m.live + i) = false;
+                    m.count--;
                 }
             }
         }
-        c = c.next;
     }
+    vms.weak_maps.len = kept;
 }
 
 // The key marks for this collection: a byte per atom, when there are
 // dynamic atoms for atoms_sweep to consider.
 private void vm_key_marks_reset(GcHeap* h, VM* vm) {
     h.key_marks_len = 0;
-    if vm.atoms.n_dynamic == 0 { return; }
+    if vm.atoms.n_dynamic == 0 || h.minor_pass || h.verifying { return; }
     i32 n = atom_count(&vm.atoms);
     if n > vm.key_marks_cap {
         if h.key_marks != null { free(h.key_marks); }
@@ -404,6 +490,9 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     for i32 i = 0; i < vm.sp; i++ {
         gc_mark_value(h, *(vm.stack + i));
     }
+    for i32 i = 0; i < vm.atom_strs.len; i++ { if vm.atom_strs.data[i] != null { gc_mark_cell(h, &vm.atom_strs.data[i].head); } }
+    for i32 i = 0; i < vm.regex_srcs.len; i++ { gc_mark_cell(h, &vm.regex_srcs.data[i].head); }
+    for i32 i = 0; i < vm.regex_flgs.len; i++ { gc_mark_cell(h, &vm.regex_flgs.data[i].head); }
     for i32 i = 0; i < vm.fp; i++ {
         Frame* fr = vm.frames + i;
         if fr.fun != null { gc_mark_cell(h, &fr.fun.head); }
@@ -418,9 +507,15 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
             if sl.key < cast(u32, h.key_marks_len) { *(h.key_marks + sl.key) = cast(u8, 1); }
         }
     }
-    for i32 i = 0; i < vm.troots.len; i++ {
-        mark_template(h, vec_get(&vm.troots, i));
+    // a template's constants are made when it is compiled and never after:
+    // a minor collection marks those of the templates compiled since the
+    // last collection, a major every template's
+    if h.minor_pass && !h.verifying {
+        for i32 i = 0; i < vm.fresh_tmpls.len; i++ { mark_template(h, vec_get(&vm.fresh_tmpls, i)); }
+    } else {
+        for i32 i = 0; i < vm.troots.len; i++ { mark_template(h, vec_get(&vm.troots, i)); }
     }
+    if !h.verifying { vm.fresh_tmpls.len = 0; }
     if vm.object_proto != null { gc_mark_cell(h, &vm.object_proto.head); }
     if vm.array_proto != null { gc_mark_cell(h, &vm.array_proto.head); }
     if vm.string_proto != null { gc_mark_cell(h, &vm.string_proto.head); }
@@ -429,7 +524,14 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     }
     for i32 c = 0; c < 8; c++ {
         if vm.http_strs[c] != null { gc_mark_cell(h, &vm.http_strs[c].head); }
+        if vm.typeof_strs[c] != null { gc_mark_cell(h, &vm.typeof_strs[c].head); }
     }
+    for i32 c = 0; c < 128; c++ {
+        if vm.latin1_chars[c] != null { gc_mark_cell(h, &vm.latin1_chars[c].head); }
+    }
+    gc_mark_value(h, vm.array_values);
+    gc_mark_value(h, vm.map_entries);
+    gc_mark_value(h, vm.set_values);
     if vm.number_proto != null { gc_mark_cell(h, &vm.number_proto.head); }
     if vm.boolean_proto != null { gc_mark_cell(h, &vm.boolean_proto.head); }
     if vm.function_proto != null { gc_mark_cell(h, &vm.function_proto.head); }
@@ -440,6 +542,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.async_generator_proto != null { gc_mark_cell(h, &vm.async_generator_proto.head); }
     if vm.iterator_proto != null { gc_mark_cell(h, &vm.iterator_proto.head); }
     if vm.iter_helper_proto != null { gc_mark_cell(h, &vm.iter_helper_proto.head); }
+    for i32 i = 0; i < 5; i++ { if vm.iter_kind_protos[i] != null { gc_mark_cell(h, &vm.iter_kind_protos[i].head); } }
     if vm.promise_proto != null { gc_mark_cell(h, &vm.promise_proto.head); }
     if vm.regexp_proto != null { gc_mark_cell(h, &vm.regexp_proto.head); }
     if vm.map_proto != null { gc_mark_cell(h, &vm.map_proto.head); }
@@ -454,7 +557,7 @@ private void vm_mark_roots(GcHeap* h, void* ctx) {
     if vm.ta_proto != null { gc_mark_cell(h, &vm.ta_proto.head); }
     if vm.arraybuffer_proto != null { gc_mark_cell(h, &vm.arraybuffer_proto.head); }
     if vm.dataview_proto != null { gc_mark_cell(h, &vm.dataview_proto.head); }
-    for i32 i = 0; i < 9; i++ {
+    for i32 i = 0; i < 11; i++ {
         if vm.ta_protos[i] != null { gc_mark_cell(h, &vm.ta_protos[i].head); }
     }
     if vm.textenc_proto != null { gc_mark_cell(h, &vm.textenc_proto.head); }
@@ -536,14 +639,20 @@ bool js_truthy(Value v) {
     }
     if value_is_bool(v) { return value_is_true(v); }
     if value_is_undefined(v) || value_is_null(v) || value_is_hole(v) { return false; }
-    if value_is_string(v) { return value_as_string(v).len > 0; }
-    if value_is_bigint(v) { return value_as_bigint(v).nlimbs != 0; }
+    i32 k = value_kind(v);
+    if k == GC_STRING { return value_as_string(v).len > 0; }
+    if k == GC_BIGINT { return value_as_bigint(v).nlimbs != 0; }
     return true;
 }
 
 private i32 f64_to_i32(f64 v) {
     if v != v { return 0; }
-    return cast(i32, cast(i64, v));
+    if v > -9.0e18 && v < 9.0e18 { return cast(i32, cast(i64, v)); }
+    // past an i64 the spec's modulo 2^32 is taken in doubles, where every
+    // step is exact: the value is an integer and 2^32 a power of two
+    if v == v + 1.0 && (v > 1.0e308 || v < -1.0e308) { return 0; }   // the infinities
+    f64 m = v - floor(v / 4294967296.0) * 4294967296.0;
+    return cast(i32, cast(i64, m));
 }
 
 // Bytes of the whitespace run starting at i, or 0. Covers the whole of the
@@ -908,9 +1017,6 @@ Value js_to_string_value(VM* vm, Value v) {
         if value_is_true(v) { lit = "true"; } else { lit = "false"; }
         have = true;
     }
-    if value_is_function(v) || value_is_native(v) {
-        return vm_function_source(vm, v);
-    }
     if have {
         GcString* g = gc_new_string(&vm.heap, lit);
         return value_cell(&g.head);
@@ -1168,20 +1274,21 @@ void vm_throw_error(VM* vm, i32 kind, str msg) {
 // --- property helpers -----------------------------------------------------------
 
 private Value ensure_prototype(VM* vm, Value fnv) {
+    i32 fk = value_kind(fnv);
     // a proxy has no .prototype of its own; its target's is the answer
-    if value_is_object(fnv) && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
+    if fk == GC_OBJECT && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
         return ensure_prototype(vm, cast(JsProxy*, value_as_object(fnv)).target);
     }
     PropList* props = null;
-    if value_is_function(fnv) { props = &value_as_function(fnv).props; }
-    if value_is_native(fnv) { props = &value_as_native(fnv).props; }
+    if fk == GC_FUNCTION { props = &value_as_function(fnv).props; }
+    if fk == GC_NATIVE { props = &value_as_native(fnv).props; }
     if props == null { return value_undefined(); }
     Value* p = props_get(props, vm.atom_prototype);
     if p != null { return *p; }
     // Only something that can be `new`ed, or a generator whose results need an
     // object to inherit from, has a .prototype at all. An arrow, a shorthand
     // method and a plain async function have none -- not an empty one.
-    if value_is_function(fnv) {
+    if fk == GC_FUNCTION {
         FnTemplate* ft0 = value_as_function(fnv).tmpl;
         if ft0 != null && !ft0.is_gen && (ft0.not_ctor || ft0.is_async) {
             return value_undefined();
@@ -1345,6 +1452,16 @@ private bool write_refused(VM* vm, i32 mode, str msg) {
     if mode == SET_SLOPPY { return true; }
     if mode == SET_STRICT { vm_throw_error(vm, ERR_TYPE, msg); }
     return false;
+}
+
+// A write to an accessor without a setter, the property named as V8 does.
+private bool getter_refused(VM* vm, i32 mode, u32 a) {
+    if mode != SET_STRICT { return write_refused(vm, mode, ""); }
+    string name = vm_atom_display(vm, a);
+    defer free(name);
+    string msg = format("Cannot set property {} which has only a getter", name);
+    defer free(msg);
+    return write_refused(vm, mode, msg);
 }
 
 // A delete the object refuses: 0 for `false`, -1 for a thrown TypeError.
@@ -1511,6 +1628,20 @@ private void op_bigint_bitop(VM* vm, i32 op) {
 }
 
 // Where the derived constructor a super() belongs to sits, or -1.
+// A native base constructor reached through super(): the object it built
+// (a typed array, an array, an error) is the derived constructor's `this`,
+// under new.target's prototype, as the spec's OrdinaryCreateFromConstructor
+// gives a derived instance. The object made ahead for `this` is dropped.
+// A result that is not a plain object (a map's cell) keeps the old way.
+private void super_native_result(VM* vm, Value res, Value new_target, Value thisv, i32 super_for) {
+    if !value_is_object(res) || value_same_bits(res, thisv) { return; }
+    if value_is_callable(new_target) {
+        Value protov = ensure_prototype(vm, new_target);
+        if value_is_object(protov) { gc_barrier(value_as_cell(res), protov); js_set_proto(value_as_object(res), value_as_object(protov)); }
+    }
+    if super_for >= 0 { (vm.frames + super_for).this_val = res; }
+}
+
 private i32 derived_ctor_index(VM* vm) {
     for i32 i = vm.fp - 1; i >= 0; i-- {
         if (vm.frames + i).tmpl != null && (vm.frames + i).tmpl.derived_ctor { return i; }
@@ -1590,7 +1721,7 @@ Value proxy_construct(VM* vm, JsProxy* p, Value* argstart, i32 argc, Value new_t
         if vm_get_prop_value(vm, p.target, vm.atom_prototype, &cpv) && value_is_object(cpv) {
             cproto = value_as_object(cpv);
         }
-        JsObject* cinst = js_new_object(&vm.heap, cproto);
+        JsObject* cinst = js_new_object_room(&vm.heap, cproto, 6);
         Value cinstv = value_cell(&cinst.head);
         gc_root(&vm.heap, cinstv);
         vm.pending_new_target = new_target;
@@ -1643,6 +1774,13 @@ private bool chain_get(VM* vm, JsObject* o, u32 a, Value receiver, Value* out) {
             *out = *v;
             return true;
         }
+        // an array further up answers for its length and its elements, as
+        // for an object made with Object.create(array)
+        if cur != o && (cur.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { *out = value_int(cur.elen); return true; }
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 && idx < cur.elen && js_array_has(cur, idx) { *out = js_array_get(cur, idx); return true; }
+        }
         cur = cur.proto;
     }
     return false;
@@ -1655,6 +1793,11 @@ private bool chain_has(VM* vm, JsObject* o, u32 a) {
             return proxy_has(vm, cast(JsProxy*, cur), a);
         }
         if props_get(&cur.props, a) != null { return true; }
+        if cur != o && (cur.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { return true; }
+            i32 idx = ta_atom_index(vm, a);
+            if idx >= 0 && idx < cur.elen && js_array_has(cur, idx) { return true; }
+        }
         cur = cur.proto;
     }
     return false;
@@ -1875,7 +2018,7 @@ const i32 OBJF_NOT_PLAIN = OBJF_PROXY | OBJF_PROXY_REVOKED
 // through to the full path. This is the commonest operation a program performs,
 // and the path it replaces was four nested calls per level.
 private bool prop_get(VM* vm, Value objv, u32 a, Value* out) {
-    JsObject* o = value_is_object(objv) ? value_as_object(objv) : null;
+    JsObject* o = value_kind(objv) == GC_OBJECT ? value_as_object(objv) : null;
     bool plain = o != null;
     while o != null {
         i32 fl = o.obj_flags;
@@ -1887,12 +2030,23 @@ private bool prop_get(VM* vm, Value objv, u32 a, Value* out) {
             plain = false;
             break;
         }
-        Value* p = props_get(&o.props, a);
-        if p == null {
+        // a short table is scanned here: the call to do it would cost more
+        // than its few compares
+        PropList* pl = &o.props;
+        Prop* pr = null;
+        if pl.idx != null {
+            pr = props_entry(pl, a);
+        } else {
+            for i32 i = 0; i < pl.len; i++ {
+                if (pl.items + i).key == a { pr = pl.items + i; break; }
+            }
+        }
+        if pr == null {
             o = o.proto;
             continue;
         }
-        if !value_is_accessor(*p) {
+        Value* p = &pr.val;
+        if value_kind(*p) != GC_ACCESSOR {
             *out = *p;
             return true;
         }
@@ -1961,10 +2115,93 @@ bool vm_delete_prop_report(VM* vm, Value objv, u32 a) {
     return delete_key(vm, objv, a, false) == 1;
 }
 
+// obj[key]: an array's element, a view's, a string's unit, else the
+// property by the key's atom. Shared by OP_GETINDEX and OP_GETINDEX_LL,
+// and out of the loop for its frame's sake.
+// [v] -> [typeof v]: the answer is one of eight strings made once, and
+// this stays out of the interpreter loop, whose code it weighed on
+private void op_typeof(VM* vm) {
+    Value v = vpeek(vm, 0);
+    i32 k = 0;
+    if value_is_undefined(v) || value_is_hole(v) { k = 1; }
+    else if value_is_number(v) { k = 2; }
+    else if value_is_bool(v) { k = 3; }
+    else if value_is_string(v) { k = 4; }
+    else if value_is_symbol(v) { k = 5; }
+    else if value_is_bigint(v) { k = 6; }
+    else if value_is_function(v) || value_is_native(v) { k = 7; }
+    else if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0
+            && value_is_callable(v) { k = 7; }
+    GcString* g = vm.typeof_strs[k];
+    if g == null {
+        str s = "object";
+        if k == 1 { s = "undefined"; } else if k == 2 { s = "number"; }
+        else if k == 3 { s = "boolean"; } else if k == 4 { s = "string"; }
+        else if k == 5 { s = "symbol"; } else if k == 6 { s = "bigint"; }
+        else if k == 7 { s = "function"; }
+        g = gc_new_string(&vm.heap, s);
+        vm.typeof_strs[k] = g;
+    }
+    vm.sp--;
+    vpush(vm, value_cell(&g.head));
+}
+
+private void op_getindex(VM* vm) {
+    Value key = vpeek(vm, 0);
+    Value objv = vpeek(vm, 1);
+    i32 ok = value_kind(objv);
+    if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+        i32 idx = val_to_index(key);
+        // an absent element, in range or past the end, is the
+        // prototype chain's to answer
+        if idx >= 0 && js_array_has(value_as_object(objv), idx) {
+            Value r = js_array_get(value_as_object(objv), idx);
+            vm.sp -= 2;
+            vpush(vm, r);
+            return;
+        }
+    }
+    if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
+        i32 idx = val_to_index(key);
+        if idx >= 0 {
+            JsTypedArray* ta = cast(JsTypedArray*, value_as_object(objv));
+            Value r;
+            // a double or float view read in place: the numeric loops' case
+            if (ta.ta_kind == 8 || ta.ta_kind == 7) && idx < ta.ta_len && ta.elen >= 1 {
+                u8* p = gb_data(value_as_bytes(*(ta.elems))) + ta.ta_off;
+                r = ta.ta_kind == 8 ? value_number(*(cast(f64*, p) + idx)) : value_number(cast(f64, *(cast(f32*, p) + idx)));
+            } else {
+                r = vm_ta_get(vm, value_as_object(objv), idx);
+            }
+            vm.sp -= 2;
+            vpush(vm, r);
+            return;
+        }
+    }
+    if ok == GC_STRING {
+        i32 idx = val_to_index(key);
+        if idx >= 0 {
+            Value ch = value_undefined();
+            if idx < value_as_string(objv).u16len {
+                ch = vm_string_char(vm, value_as_string(objv), idx);
+            }
+            vm.sp -= 2;
+            vpush(vm, ch);
+            return;
+        }
+    }
+    u32 a = key_to_atom(vm, key);
+    Value out;
+    if vm_get_prop_value(vm, objv, a, &out) {
+        vm.sp -= 2;
+        vpush(vm, out);
+    }
+}
+
 // `mode` says what a refusal means to the caller: SET_SLOPPY, SET_STRICT or
 // SET_REPORT.
 private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
-    if value_is_object(objv) {
+    if value_kind(objv) == GC_OBJECT {
         JsObject* o = value_as_object(objv);
         if (o.obj_flags & OBJF_MODULE_NS) != 0 {
             return write_refused(vm, mode,
@@ -2024,22 +2261,30 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
         // a setter anywhere on the chain intercepts the write
         JsObject* cur = o;
         while cur != null {
-            Prop* pe = props_entry(&cur.props, a);
+            PropList* pl = &cur.props;
+            Prop* pe = null;
+            if pl.idx != null {
+                pe = props_entry(pl, a);
+            } else {
+                for i32 i = 0; i < pl.len; i++ {
+                    if (pl.items + i).key == a { pe = pl.items + i; break; }
+                }
+            }
             if pe != null {
-                if value_is_accessor(pe.val) {
+                if value_kind(pe.val) == GC_ACCESSOR {
                     JsAccessor* ac = value_as_accessor(pe.val);
                     if value_is_callable(ac.set) {
                         Value[1] sa = { v };
                         ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                         return !vm.has_pending;
                     }
-                    return write_refused(vm, mode,
-                        "cannot set property which has only a getter");
+                    return getter_refused(vm, mode, a);
                 }
                 if cur == o {
                     if (pe.flags & PROP_WRITABLE) == 0 {
                         return write_refused(vm, mode, "cannot assign to read-only property");
                     }
+                    if (pl.cap & PROPS_OLD) != 0 { props_barrier(pl, v); }
                     pe.val = v;
                     return true;
                 }
@@ -2055,7 +2300,8 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
         if (o.obj_flags & OBJF_NONEXT) != 0 {
             return write_refused(vm, mode, "cannot add property to a non-extensible object");
         }
-        js_set_prop(o, a, v);
+        // the walk began with the object's own table, so the name is new there
+        props_add_new(&o.props, a, v);
         return true;
     }
     if value_is_function(objv) || value_is_native(objv) {
@@ -2068,7 +2314,7 @@ private bool set_prop_atom(VM* vm, Value objv, u32 a, Value v, i32 mode) {
                 ignore vm_call_value(vm, ac.set, objv, &sa[0], 1);
                 return !vm.has_pending;
             }
-            return write_refused(vm, mode, "cannot set property which has only a getter");
+            return getter_refused(vm, mode, a);
         }
         PropList* fprops = value_props(objv);
         if fn_synth_bit(vm, a) != 0 && props_get(fprops, a) == null && !vm_fn_synth_hidden(vm, objv, a) {
@@ -2115,7 +2361,7 @@ private i32 val_to_index(Value v) {
 i32 ta_elem_size(i32 kind) {
     if kind <= 2 { return 1; }
     if kind <= 4 { return 2; }
-    if kind == 8 { return 8; }
+    if kind >= 8 { return 8; }
     return 4;
 }
 
@@ -2138,6 +2384,8 @@ i32 ta_atom_index(VM* vm, u32 a) {
 }
 
 str ta_kind_name(i32 kind) {
+    if kind == 9 { return "BigInt64Array"; }
+    if kind == 10 { return "BigUint64Array"; }
     if kind == 0 { return "Int8Array"; }
     if kind == 1 { return "Uint8Array"; }
     if kind == 2 { return "Uint8ClampedArray"; }
@@ -2167,13 +2415,37 @@ Value ta_read(u8* p, i32 kind) {
     if kind == 5 { i32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_int(v); }
     if kind == 6 { u32 v; memcpy(cast(u8*, &v), p, cast(i64, 4)); return value_number(cast(f64, v)); }
     if kind == 7 { f32 f; memcpy(cast(u8*, &f), p, cast(i64, 4)); return value_number(cast(f64, f)); }
+    if kind == 9 { i64 v; memcpy(cast(u8*, &v), p, cast(i64, 8)); return value_number(cast(f64, v)); }
+    if kind == 10 { u64 v; memcpy(cast(u8*, &v), p, cast(i64, 8)); return value_number(cast(f64, v)); }
     f64 d;
     memcpy(cast(u8*, &d), p, cast(i64, 8));
     return value_number(d);
 }
 
+// As ta_read, with the 64-bit integer kinds (BigInt64Array 9,
+// BigUint64Array 10) read as the BigInts they hold.
+Value ta_read_vm(VM* vm, u8* p, i32 kind) {
+    if kind == 9 {
+        i64 v;
+        memcpy(cast(u8*, &v), p, cast(i64, 8));
+        return value_cell(&js_new_bigint(&vm.heap, bn_from_i64(v)).head);
+    }
+    if kind == 10 {
+        u64 v;
+        memcpy(cast(u8*, &v), p, cast(i64, 8));
+        return value_cell(&js_new_bigint(&vm.heap, bn_from_u64(v)).head);
+    }
+    return ta_read(p, kind);
+}
+
 void ta_write(u8* p, i32 kind, f64 num) {
     if kind == 8 { memcpy(p, cast(u8*, &num), cast(i64, 8)); return; }
+    if kind == 9 || kind == 10 {
+        // a number into a 64-bit integer view, as the builtins' fills hand one
+        i64 v = num != num ? 0 : cast(i64, num);
+        memcpy(p, cast(u8*, &v), cast(i64, 8));
+        return;
+    }
     if kind == 7 { f32 f = cast(f32, num); memcpy(p, cast(u8*, &f), cast(i64, 4)); return; }
     if kind == 2 {   // Uint8Clamped: ties round to the even value
         i32 c;
@@ -2217,7 +2489,7 @@ Value vm_ta_get(VM* vm, JsObject* o, i32 idx) {
     if idx < 0 || idx >= t.ta_len { return value_undefined(); }
     if o.elen < 1 { return value_undefined(); }
     GcBytes* gb = value_as_bytes(*(o.elems));
-    return ta_read(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind);
+    return ta_read_vm(vm, gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind);
 }
 
 void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
@@ -2225,6 +2497,12 @@ void vm_ta_set(VM* vm, JsObject* o, i32 idx, Value v) {
     if idx < 0 || idx >= t.ta_len { return; }
     if o.elen < 1 { return; }
     GcBytes* gb = value_as_bytes(*(o.elems));
+    if t.ta_kind >= 9 {
+        // a BigInt into a 64-bit integer view, its low 64 bits; a number is taken as one
+        u64 bits = value_is_bigint(v) ? bn_to_u64_wrap(bigint_view(value_as_bigint(v))) : cast(u64, cast(i64, js_to_number(v)));
+        memcpy(gb_data(gb) + t.ta_off + idx * 8, cast(u8*, &bits), cast(i64, 8));
+        return;
+    }
     f64 num = js_to_number(v);
     ta_write(gb_data(gb) + t.ta_off + idx * ta_elem_size(t.ta_kind), t.ta_kind, num);
 }
@@ -2261,19 +2539,85 @@ private u32 key_to_atom(VM* vm, Value key) {
         if value_is_symbol(prim) { return value_as_symbol(prim).id; }
         k = prim;
     }
+    // an integer key spelled on the stack: `arguments[i]` and an object
+    // indexed by id made a string cell for every access
+    if value_is_number(k) {
+        f64 d = js_to_number(k);
+        if d == floor(d) && d >= 0.0 && d < 1e15 {
+            u8[24] digits;
+            i32 n = 24;
+            u64 u = cast(u64, d);
+            if u == 0 { n--; digits[n] = '0'; }
+            while u > 0 {
+                n--;
+                digits[n] = cast(u8, 48 + cast(i32, u % 10));
+                u = u / 10;
+            }
+            str ds;
+            ds.data = &digits[n];
+            ds.len = 24 - n;
+            return vm_atom_dyn(vm, ds);
+        }
+    }
     vpush(vm, k);
     Value s = js_to_string_value(vm, k);
     vm.sp--;
     vpush(vm, s);
-    u32 a = vm_atom_dyn(vm, gc_string_view(value_as_string(s)));
+    u32 a = vm_atom_of_string(vm, value_as_string(s));
     vm.sp--;
     return a;
 }
 
 // The atom for a property name that arrives as data: the collector frees
-// it once nothing uses it (atom.mc).
+// it once nothing uses it (atom.mc). A cache by the name's address and
+// length stands before the table: a script that indexes objects by the
+// same few strings (a key read from an array, a field name in a loop)
+// asks for the same bytes at the same address over and over, and the
+// hash and probe were most of the cost. A hit is confirmed by comparing
+// the bytes with the atom's name, so an address reused for other bytes,
+// or an atom freed and reused, cannot answer wrongly.
+const i32 ATOM_CACHE = 1024;
+
+struct AtomCacheEntry {
+    u8* data;
+    i32 len;
+    u32 atom;
+}
+
 u32 vm_atom_dyn(VM* vm, str name) {
+    if name.len > 0 && name.len < 64 {
+        u64 h = (cast(u64, name.data) >> 3) ^ (cast(u64, cast(u32, name.len)) * 0x9E3779B9);
+        AtomCacheEntry* e = &vm.atom_cache[cast(i32, h & cast(u64, ATOM_CACHE - 1))];
+        if e.data == name.data && e.len == name.len && cast(i32, e.atom) < vm.atoms.names.len
+           && str_equal(atom_name(&vm.atoms, e.atom), name) {
+            // the stamp the table would have refreshed, so the atom stays
+            if vec_get(&vm.atoms.stamp, cast(i32, e.atom)) != ATOM_PINNED { vec_set(&vm.atoms.stamp, cast(i32, e.atom), vm.heap.alloc_total); }
+            return e.atom;
+        }
+        u32 a = atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
+        e.data = name.data;
+        e.len = name.len;
+        e.atom = a;
+        return a;
+    }
     return atom_intern_dyn(&vm.atoms, name, vm.heap.alloc_total);
+}
+
+// The atom of a string cell, kept on the cell: a key read from an array
+// or from an object's own keys is the same cell each time it is used, and
+// the by-address cache above still hashed, probed and compared the bytes.
+// The table's generation moves when a dynamic atom is freed, which is the
+// only time a remembered atom can name something else.
+u32 vm_atom_of_string(VM* vm, GcString* g) {
+    if g.atom_gen == vm.atoms.gen {
+        i32 id = cast(i32, g.atom);
+        if vec_get(&vm.atoms.stamp, id) != ATOM_PINNED { vec_set(&vm.atoms.stamp, id, vm.heap.alloc_total); }
+        return g.atom;
+    }
+    u32 a = vm_atom_dyn(vm, gc_string_view(g));
+    g.atom = a;
+    g.atom_gen = vm.atoms.gen;
+    return a;
 }
 
 // a + b for two string values. When a high surrogate at the end of a
@@ -2369,7 +2713,7 @@ private void def_prop(VM* vm, u32 a) {
 private void def_prop_new(VM* vm, u32 a) {
     Value v = vpop(vm);
     Value objv = vpeek(vm, 0);
-    if value_is_object(objv) {
+    if value_kind(objv) == GC_OBJECT {
         props_add_new(&value_as_object(objv).props, a, v);
     }
 }
@@ -2582,6 +2926,7 @@ private void def_accessor(VM* vm, Value objv, u32 a, Value fnv, bool is_getter, 
         if enumer { attrs = PROP_CONFIGURABLE | PROP_ENUMERABLE; }
         props_set_desc(props, a, value_cell(&ac.head), attrs);
     }
+    gc_barrier(&ac.head, fnv);
     if is_getter { ac.get = fnv; } else { ac.set = fnv; }
 }
 
@@ -2622,6 +2967,7 @@ private void def_private(VM* vm, u32 a, i32 kind) {
         ac = js_new_accessor(&vm.heap);
         props_set_desc(value_props(vpeek(vm, 1)), a, value_cell(&ac.head), 0);
     }
+    gc_barrier(&ac.head, vpeek(vm, 0));
     if kind == 1 { ac.get = vpeek(vm, 0); } else { ac.set = vpeek(vm, 0); }
     vm.sp--;
 }
@@ -2987,7 +3333,10 @@ void vm_set_lazy_global(VM* vm, str name, NativeFn getter) {
     JsAccessor* ac = js_new_accessor(&vm.heap);
     Value acv = value_cell(&ac.head);
     gc_root(&vm.heap, acv);
-    ac.get = vm_make_native(vm, getter, name);
+    Value getv = vm_make_native(vm, getter, name);
+    gc_barrier(&ac.head, getv);
+    gc_barrier(&ac.head, getv);
+    ac.get = getv;
     vm_set_global(vm, name, acv);
     gc_root_reset(&vm.heap, rm);
 }
@@ -3014,6 +3363,7 @@ Value vm_make_native(VM* vm, NativeFn f, str name) {
 }
 
 // A primitive value is anything that is not an object-like reference.
+@inline
 bool value_is_primitive(Value v) {
     if !value_is_cell(v) { return true; }
     // one read of the kind rather than three predicates, each of which reads it
@@ -4015,6 +4365,12 @@ void vm_init(VM* vm) {
     vm.start_ns = vm_clock_ns();
     vm.loop_start_ns = 0;
     vm.loop_idle_ns = 0;
+    vm.loop_budget_ms = 0.0;
+    vm.loop_no_wait = false;
+    vm.host_uncaught = null;
+    vm.script_globals = false;
+    vm.deadline_ns = 0;
+    vm.deadline_tick = 0;
     vm.last_poll_ms = 0.0;
     vm.stack_limit = 10;
     vm.before_exit_done = false;
@@ -4026,12 +4382,14 @@ void vm_init(VM* vm) {
     vm.heap.mark_roots = &vm_mark_roots;
     vm.heap.weak_mark = &vm_weak_mark;
     vm.heap.weak_sweep = &vm_weak_sweep;
+    vm.heap.props_trace = &js_props_trace;
     vm.heap.mark_ctx = cast(void*, vm);
     atoms_init(&vm.atoms);
     vm.key_marks_cap = 0;
     vm.stack = alloc<Value>(VM_STACK_MAX);
     vm.sp = 0;
-    vm.frames = alloc<Frame>(VM_FRAMES_MAX);
+    vm.frames_block = cast(void*, alloc<u8>(cast(i64, VM_FRAMES_MAX) * sizeof(Frame) + 64));
+    vm.frames = cast(Frame*, (cast(i64, vm.frames_block) + 63) & ~cast(i64, 63));
     vm.fp = 0;
     vm.pending_new_target = value_undefined();
     vm.pending_super_for = 0 - 1;
@@ -4042,8 +4400,35 @@ void vm_init(VM* vm) {
     vm.main_module = null;
     vm.global_obj = null;
     vm.any_weak = false;
+    vec_init<JsMap*>(&vm.weak_maps, 4);
+    vec_init<GcString*>(&vm.regex_srcs, 8);
+    vec_init<GcString*>(&vm.regex_flgs, 8);
+    vec_init<GcString*>(&vm.atom_strs, 64);
     vm.iter_fast = null;
+    vm.map_direct = null;
     vec_init<TmplPtr>(&vm.troots, 4);
+    vec_init<TmplPtr>(&vm.fresh_tmpls, 16);
+    vm.cc_data = null;
+    vm.cc_len = 0;
+    vm.lazy_ahead = null;
+    vm.lazy_ahead_ctx = null;
+    vm.first_root = null;
+    vm.cache_loads = 0;
+    vm.cache_ns = 0;
+    vm.cc_verify = false;
+    vm.phases = 0;
+    vm.phase = PH_INTERP;
+    vm.phase_depth = 0;
+    vm.phase_t0 = 0;
+    vm.phase_span0 = 0;
+    vm.phase_gc0 = 0;
+    for i32 k = 0; k < PH_COUNT; k++ { vm.phase_ticks[k] = 0; vm.phase_gc[k] = 0; }
+    vm.phase_wall = 0;
+    vm.phase_switches = 0;
+    vm.phase_outside = 0;
+    vm.phase_switch_cost = 0;
+    vm.phase_sp = 0;
+    vm.nstats = null;
     vm.pending = value_undefined();
     vm.has_pending = false;
     vm.unwind_return = false;
@@ -4069,6 +4454,7 @@ void vm_init(VM* vm) {
     vm.async_generator_proto = null;
     vm.iterator_proto = null;
     vm.iter_helper_proto = null;
+    for i32 i = 0; i < 5; i++ { vm.iter_kind_protos[i] = null; }
     vm.promise_proto = null;
     vm.regexp_proto = null;
     vm.map_proto = null;
@@ -4083,7 +4469,7 @@ void vm_init(VM* vm) {
     vm.ta_proto = null;
     vm.arraybuffer_proto = null;
     vm.dataview_proto = null;
-    for i32 i = 0; i < 9; i++ { vm.ta_protos[i] = null; }
+    for i32 i = 0; i < 11; i++ { vm.ta_protos[i] = null; }
     vm.textenc_proto = null;
     vm.textdec_proto = null;
     vm.timeout_proto = null;
@@ -4139,6 +4525,9 @@ void vm_init(VM* vm) {
     vm.dynimport_hook = null;
     vm.esm_loader = null;
     vm.arguments_builder = null;
+    vm.array_values = value_undefined();
+    vm.map_entries = value_undefined();
+    vm.set_values = value_undefined();
     vec_init<Value>(&vm.symbols, 8);
     vm.sym_iterator = value_undefined();
     vm.sym_iterator_id = 0;
@@ -4194,9 +4583,14 @@ void vm_destroy(VM* vm) {
         template_free(vec_get(&vm.troots, i));
     }
     vec_free(&vm.troots);
+    vec_free(&vm.fresh_tmpls);
     vec_free(&vm.jobs);
     vec_free(&vm.rejections);
     vec_free(&vm.timers);
+    vec_free(&vm.weak_maps);
+    vec_free(&vm.regex_srcs);
+    vec_free(&vm.regex_flgs);
+    vec_free(&vm.atom_strs);
     vec_free(&vm.timer_heap);
     vec_free(&vm.handles);
     vec_free(&vm.symbols);
@@ -4212,16 +4606,382 @@ void vm_destroy(VM* vm) {
     intmap_free<Value>(&vm.globals);
     atoms_free(&vm.atoms);
     free(vm.stack);
-    free(vm.frames);
+    free(vm.frames_block);
     free(vm.handlers);
 }
 
 // --- dispatch loop -----------------------------------------------------------------------
 
+// A jump's target: four bytes (bytecode.mc, ch_target).
+private i32 rd_target(u8* code, i32 at) {
+    return cast(i32, cast(u32, *(code + at)) | (cast(u32, *(code + at + 1)) << 8) | (cast(u32, *(code + at + 2)) << 16) | (cast(u32, *(code + at + 3)) << 24));
+}
+
 private i32 rd_u16(u8* code, i32 at) {
     i32 lo = *(code + at);
     i32 hi = *(code + at + 1);
     return lo | (hi << 8);
+}
+
+// The interpreter loop keeps its position as a pointer into the code, which
+// spares it an add per byte read; these read at the pointer.
+private i32 rd_u16p(u8* p) {
+    return *cast(u16*, p);
+}
+
+private void wr_u16p(u8* p, i32 v) {
+    *p = cast(u8, v);
+    *(p + 1) = cast(u8, v >> 8);
+}
+
+// A property read through the instruction's cache: the slot the name was
+// found in the last time, on the object itself or on its prototype (the
+// own table then has to lack the name), tried first on an ordinary
+// object; a hit on a data property is the whole read. A miss takes the
+// full read and fills the cache, once: a site that then misses again
+// sees objects of more than one shape, and is left to the full read
+// (IC_MANY), as is one whose name is found nowhere the cache can say.
+const i32 IC_MANY = 0xFFFE;
+const i32 IC_ARRLEN = 0xFFFD;   // an array's length
+const i32 IC_STRLEN = 0xFFFC;   // a string's length
+const i32 IC_ABSENT_NEW = 0xFFFB;   // ic_learn's answer alone: absent, the chain start in its out-param
+const i32 IC_PROTO = 0x8000;    // from here: the slot is the receiver's prototype's
+const i32 IC_SLOT = 0x7FFF;
+const i32 IC_AUX = 0x7000;      // from here to IC_PROTO: an entry of the template's aux table
+const i32 IC_KPROTO = 0x4000;   // from here to IC_AUX: a slot in the receiver kind's prototype
+const i32 IC_OWN_MAX = 0x4000;  // below: the receiver's own slot
+const i32 IC_KSLOT_MAX = 0x3000;
+const i32 IC_AUX_MAX = 0x1000;
+const i32 IC_PSLOT_MAX = 0x7FF0;
+const i32 AUX_ABSENT = 1;
+const i32 AUX_POLY = 2;
+
+@inline
+private bool ic_plain(Value objv) {
+    return value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & (OBJF_NOT_PLAIN | OBJF_ARRAY | OBJF_TYPEDARRAY)) == 0;
+}
+
+// an object the cache may speak for: not a proxy, a view, the global or a
+// module namespace; an array is one, for a name that is not its length or
+// an index, which ic_learn keeps out
+@inline
+private bool ic_obj_ok(JsObject* o) {
+    return (o.obj_flags & OBJF_NOT_PLAIN) == 0;
+}
+
+// the own slot of `a` in a table, or -1
+@inline
+private i32 ic_index_in(PropList* pl, u32 a) {
+    if pl.idx != null {
+        i32* pos = intmap_get<i32>(pl.idx, a);
+        return pos != null ? *pos : -1;
+    }
+    for i32 i = 0; i < pl.len; i++ { if (pl.items + i).key == a { return i; } }
+    return -1;
+}
+
+@inline
+private i32 ic_index_of(JsObject* o, u32 a) {
+    return ic_index_in(&o.props, a);
+}
+
+// the table of the receiver's own names, for the kinds that keep one
+@inline
+private PropList* ic_own_table(Value v, i32 k) {
+    if k == GC_OBJECT {
+        JsObject* o = value_as_object(v);
+        return ic_obj_ok(o) ? &o.props : null;
+    }
+    if k == GC_FUNCTION { return &value_as_function(v).props; }
+    if k == GC_NATIVE { return &value_as_native(v).props; }
+    return null;
+}
+
+// the prototype a kind-slot names: where a name not the receiver's own is
+// read from, for a receiver that is not an object (an object's is its own
+// prototype, IC_PROTO). Null where the cache does not go: a function whose
+// [[Prototype]] is another function, a null one.
+private JsObject* ic_kind_proto(VM* vm, Value v, i32 k) {
+    if k == GC_STRING { return vm.string_proto; }
+    if k == GC_MAP { return value_as_map(v).proto; }
+    if k == GC_NATIVE { return vm.function_proto; }
+    if k == GC_FUNCTION {
+        Value fp = value_as_function(v).fproto;
+        if value_is_object(fp) { return value_as_object(fp); }
+        if value_is_cell(fp) || value_is_null(fp) { return null; }
+        return vm.function_proto;
+    }
+    if k == GC_SYMBOL { return vm.symbol_proto; }
+    if k == GC_BIGINT { return vm.bigint_proto; }
+    if k < 0 {
+        if value_is_number(v) { return vm.number_proto; }
+        if value_is_bool(v) { return vm.boolean_proto; }
+    }
+    return null;
+}
+
+// a code that is not an aux entry tried on a receiver
+private bool ic_hit(VM* vm, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    if ic < IC_KPROTO {
+        PropList* pl = ic_own_table(v, k);
+        if pl != null && ic < pl.len {
+            Prop* pr = pl.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_READ, cast(u64, pl), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
+                *out = pr.val;
+                return true;
+            }
+        }
+        return false;
+    }
+    if ic >= IC_PROTO {
+        if ic >= IC_STRLEN {
+            if ic == IC_ARRLEN {
+                if k == GC_OBJECT && (value_as_object(v).obj_flags & OBJF_ARRAY) != 0 {
+                    *out = value_int(value_as_object(v).elen);
+                    return true;
+                }
+            } else if ic == IC_STRLEN {
+                if k == GC_STRING { *out = value_int(value_as_string(v).u16len); return true; }
+            }
+            return false;
+        }
+        if k != GC_OBJECT { return false; }
+        JsObject* o = value_as_object(v);
+        if !ic_obj_ok(o) { return false; }
+        i32 at = ic & IC_SLOT;
+        JsObject* p = o.proto;
+        if p != null && at < p.props.len && ic_index_of(o, a) < 0 {
+            Prop* pr = p.props.items + at;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev3(MT_PREAD, cast(u64, &o.props), cast(u64, &p.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, at), 0); }
+                *out = pr.val;
+                return true;
+            }
+        }
+        return false;
+    }
+    if ic < IC_AUX {
+        i32 at = ic - IC_KPROTO;
+        JsObject* p = ic_kind_proto(vm, v, k);
+        if p == null || at >= p.props.len { return false; }
+        if k == GC_FUNCTION || k == GC_NATIVE {
+            if ic_index_in(ic_own_table(v, k), a) >= 0 { return false; }
+        }
+        Prop* pr = p.props.items + at;
+        if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+            when defined(TSMC_MEMTRACE) { mt_ev3(MT_PREAD, 0, cast(u64, &p.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, at), 0); }
+            *out = pr.val;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+private bool ic_try(VM* vm, FnTemplate* t, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    if ic >= IC_AUX && ic < IC_PROTO { return ic_hit_aux(vm, t, v, k, a, ic, out); }
+    return ic_hit(vm, v, k, a, ic, out);
+}
+
+// an aux entry tried: the two codes of a polymorphic site, or an absent
+// name, good for a plain object with the prototype the entry saw, whose
+// own table lacks the name, while no prototype has changed since
+private bool ic_hit_aux(VM* vm, FnTemplate* t, Value v, i32 k, u32 a, i32 ic, Value* out) {
+    IcAux* e = t.ic_aux + (ic - IC_AUX);
+    if e.kind == AUX_POLY {
+        if ic_try(vm, t, v, k, a, e.code_a, out) { return true; }
+        return ic_try(vm, t, v, k, a, e.code_b, out);
+    }
+    if k != GC_OBJECT { return false; }
+    JsObject* o = value_as_object(v);
+    if !ic_obj_ok(o) || cast(u64, o.proto) != e.proto || e.epoch != g_proto_epoch || ic_index_of(o, a) >= 0 { return false; }
+    *out = value_undefined();
+    return true;
+}
+
+// The cache's hit alone, which needs nothing of the stack: the interpreter
+// takes it with its stack pointer still in a register. The receiver's own
+// slot, the common case, is inline; the rest is a call.
+@inline
+private bool prop_get_ic_fast(VM* vm, FnTemplate* t, Value objv, u32 a, Value* out, u8* icp) {
+    i32 ic = rd_u16p(icp);
+    i32 k = value_kind(objv);
+    if ic < IC_KPROTO {
+        PropList* pl = ic_own_table(objv, k);
+        if pl != null && ic < pl.len {
+            Prop* pr = pl.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR {
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_READ, cast(u64, pl), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
+                *out = pr.val;
+                return true;
+            }
+        }
+        return false;
+    }
+    if ic >= IC_MANY { return false; }
+    return ic_try(vm, t, objv, k, a, ic, out);
+}
+
+// the slot of a data property `a` on the kind's prototype, as the cache
+// spells it, or IC_MANY
+private i32 ic_kind_code(JsObject* p, u32 a) {
+    if p == null || !ic_obj_ok(p) { return IC_MANY; }
+    i32 at = ic_index_of(p, a);
+    if at < 0 || at >= IC_KSLOT_MAX || value_kind((p.props.items + at).val) == GC_ACCESSOR { return IC_MANY; }
+    return IC_KPROTO + at;
+}
+
+// whether a name on an array is its length or an element, which the
+// cache leaves to the full read
+private bool ic_array_special(VM* vm, JsObject* o, u32 a) {
+    return (o.obj_flags & OBJF_ARRAY) != 0 && (a == vm.atom_length || ta_atom_index(vm, a) >= 0);
+}
+
+// the code for the way `a` was just found on this receiver: an own slot,
+// a prototype's, a kind prototype's, a length; IC_ABSENT_NEW with the
+// chain start in *chain when the receiver and its chain lack it; or
+// IC_MANY where the cache does not go
+private i32 ic_learn(VM* vm, Value v, u32 a, JsObject** chain) {
+    i32 k = value_kind(v);
+    if k == GC_OBJECT {
+        JsObject* o = value_as_object(v);
+        if !ic_obj_ok(o) { return IC_MANY; }
+        if (o.obj_flags & OBJF_ARRAY) != 0 {
+            if a == vm.atom_length { return IC_ARRLEN; }
+            if ta_atom_index(vm, a) >= 0 { return IC_MANY; }
+        }
+        i32 at = ic_index_of(o, a);
+        if at >= 0 {
+            return at < IC_OWN_MAX && value_kind((o.props.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
+        }
+        JsObject* p = o.proto;
+        if p == null { *chain = null; return IC_ABSENT_NEW; }
+        if !ic_obj_ok(p) || ic_array_special(vm, p, a) { return IC_MANY; }
+        i32 pa = ic_index_of(p, a);
+        if pa >= 0 {
+            return pa < IC_PSLOT_MAX && value_kind((p.props.items + pa).val) != GC_ACCESSOR ? (pa | IC_PROTO) : IC_MANY;
+        }
+        JsObject* w = p.proto;
+        while w != null {
+            if !ic_obj_ok(w) || ic_array_special(vm, w, a) || ic_index_of(w, a) >= 0 { return IC_MANY; }
+            w = w.proto;
+        }
+        *chain = p;
+        return IC_ABSENT_NEW;
+    }
+    if k == GC_STRING {
+        if a == vm.atom_length { return IC_STRLEN; }
+        u32 si = 0;
+        if vm_key_array_index(vm, a, &si) { return IC_MANY; }
+        return ic_kind_code(vm.string_proto, a);
+    }
+    if k == GC_FUNCTION || k == GC_NATIVE {
+        if a == vm.atom_prototype { return IC_MANY; }
+        PropList* pl = ic_own_table(v, k);
+        i32 at = ic_index_in(pl, a);
+        if at >= 0 {
+            return at < IC_OWN_MAX && value_kind((pl.items + at).val) != GC_ACCESSOR ? at : IC_MANY;
+        }
+        // name and length are made up unless set
+        if a == vm.atom_name || a == vm.atom_length { return IC_MANY; }
+        return ic_kind_code(ic_kind_proto(vm, v, k), a);
+    }
+    if k == GC_MAP || k == GC_SYMBOL || k == GC_BIGINT || k < 0 {
+        return ic_kind_code(ic_kind_proto(vm, v, k), a);
+    }
+    return IC_MANY;
+}
+
+private i32 ic_aux_new(FnTemplate* t) {
+    if t.n_ic_aux >= IC_AUX_MAX { return -1; }
+    if t.n_ic_aux >= t.ic_aux_cap {
+        i32 ncap = t.ic_aux_cap == 0 ? 8 : t.ic_aux_cap * 2;
+        IcAux* n = alloc<IcAux>(ncap);
+        for i32 i = 0; i < t.n_ic_aux; i++ { *(n + i) = *(t.ic_aux + i); }
+        if t.ic_aux != null { free(t.ic_aux); }
+        t.ic_aux = n;
+        t.ic_aux_cap = ncap;
+    }
+    i32 i = t.n_ic_aux;
+    t.n_ic_aux++;
+    return i;
+}
+
+// the code a site keeps after a miss: the one learned; an absent entry
+// refreshed in place; a second code beside the first for a site that
+// sees two layouts; IC_MANY for a third
+private i32 ic_site_update(FnTemplate* t, i32 ic, i32 code, JsObject* chain) {
+    if code == IC_MANY { return IC_MANY; }
+    bool was_aux = ic >= IC_AUX && ic < IC_PROTO;
+    if code == IC_ABSENT_NEW {
+        if was_aux && (t.ic_aux + (ic - IC_AUX)).kind == AUX_ABSENT {
+            IcAux* e = t.ic_aux + (ic - IC_AUX);
+            e.proto = cast(u64, chain);
+            e.epoch = g_proto_epoch;
+            return ic;
+        }
+        i32 i = ic_aux_new(t);
+        if i < 0 { return IC_MANY; }
+        IcAux* e = t.ic_aux + i;
+        e.kind = AUX_ABSENT;
+        e.proto = cast(u64, chain);
+        e.epoch = g_proto_epoch;
+        code = IC_AUX + i;
+    }
+    if ic == IC_EMPTY || code == ic { return code; }
+    if was_aux && (t.ic_aux + (ic - IC_AUX)).kind == AUX_POLY { return IC_MANY; }
+    i32 i = ic_aux_new(t);
+    if i < 0 { return IC_MANY; }
+    IcAux* e = t.ic_aux + i;
+    e.kind = AUX_POLY;
+    e.code_a = ic;
+    e.code_b = code;
+    return IC_AUX + i;
+}
+
+@inline
+private bool prop_get_ic(VM* vm, FnTemplate* t, Value objv, u32 a, Value* out, u8* icp) {
+    if prop_get_ic_fast(vm, t, objv, a, out, icp) { return true; }
+    i32 ic = rd_u16p(icp);
+    bool ok = prop_get(vm, objv, a, out);
+    if ok && ic != IC_MANY {
+        JsObject* chain = null;
+        i32 code = ic_learn(vm, objv, a, &chain);
+        wr_u16p(icp, ic_site_update(t, ic, code, chain));
+    }
+    return ok;
+}
+
+// The write the same way: a hit on an own writable data property stores
+// in place, with the collector's barrier when the object is old.
+@inline
+private bool set_prop_ic(VM* vm, Value objv, u32 a, Value v, i32 mode, u8* icp) {
+    i32 ic = rd_u16p(icp);
+    bool plain = ic_plain(objv);
+    if plain && ic < IC_OWN_MAX {
+        JsObject* o = value_as_object(objv);
+        if ic < o.props.len {
+            Prop* pr = o.props.items + ic;
+            if pr.key == a && value_kind(pr.val) != GC_ACCESSOR && (pr.flags & PROP_WRITABLE) != 0 {
+                if (o.props.cap & PROPS_OLD) != 0 { props_barrier(&o.props, v); }
+                when defined(TSMC_MEMTRACE) { mt_ev(MT_WRITE, cast(u64, &o.props), value_is_cell(pr.val) ? cast(u64, value_as_cell(pr.val)) : 0, cast(u32, ic), 0); }
+                pr.val = v;
+                return true;
+            }
+        }
+    }
+    bool ok = set_prop_atom(vm, objv, a, v, mode);
+    if ok && plain && ic != IC_MANY {
+        i32 at = ic_index_of(value_as_object(objv), a);
+        i32 code = at >= 0 && at < IC_OWN_MAX ? at : IC_MANY;
+        wr_u16p(icp, ic == IC_EMPTY || code == ic ? code : IC_MANY);
+    }
+    return ok;
+}
+
+private i32 rd_targetp(u8* p) {
+    return *cast(i32*, p);
 }
 
 // The `process` global, or undefined before the builtins are installed.
@@ -4259,6 +5019,7 @@ bool vm_process_emit(VM* vm, str name, Value a, Value b, i32 nargs) {
 // An error nothing caught. A process listening for it takes over: node keeps
 // running afterwards, so this reports whether the run should carry on.
 bool vm_uncaught(VM* vm, Value e) {
+    if vm.host_uncaught != null { vm.host_uncaught(vm, e, false); return true; }
     if vm_process_emit(vm, "uncaughtException", e, value_undefined(), 1) { return true; }
     print_uncaught(vm, e);
     return false;
@@ -4409,72 +5170,100 @@ private bool try_bigint_op(VM* vm, Value a, Value b, i32 op, Value* out) {
     return true;
 }
 
+// A pending exception unwound to its handler, when one lies at or above
+// stop_fp: the frames and the stack cut back to it, the exception pushed
+// where its catch block reads it, and its ip in *ip_out. False when no
+// handler is there: the frames above stop_fp are dropped and the caller
+// returns 1.
+private bool unwind_pending(VM* vm, i32 stop_fp, i32* ip_out) {
+    Handler* htop = vm.handlers + (vm.hp - 1);
+    if vm.hp > 0 && htop.frame_count >= stop_fp {
+        vm.hp--;
+        Handler* h = vm.handlers + vm.hp;
+        vm.fp = h.frame_count;
+        vm.sp = h.sp;
+        vpush(vm, vm.pending);
+        vm.pending = value_undefined();
+        vm.has_pending = false;
+        *ip_out = h.ip;
+        return true;
+    }
+    while vm.hp > 0 {
+        Handler* hh = vm.handlers + (vm.hp - 1);
+        if hh.frame_count < stop_fp { break; }
+        vm.hp--;
+    }
+    while vm.fp >= stop_fp {
+        Frame* pf = vm.frames + (vm.fp - 1);
+        if pf.gen != null { pf.gen.state = GEN_DONE; }
+        vm.fp--;
+    }
+    return false;
+}
+
 private i32 vm_execute(VM* vm, i32 stop_fp) {
+    // a run of the loop under a native is the interpreter's time, not the
+    // native's; the native's phase comes back when the run returns
+    if vm.phases != 0 { vm_phase_push_interp(vm); }
+    defer vm_phase_pop_interp(vm);
     Frame* fr = vm.frames + (vm.fp - 1);
     FnTemplate* t = fr.tmpl;
     u8* code = t.code;
-    i32 ip = fr.ret_ip;   // 0 for calls; the resume point for generators
+    u8* pc = code + fr.ret_ip;   // the first byte for calls; the resume point for generators
+    // The stack pointer lives here between ops; a case that calls out
+    // writes it back first, and the loop reads it again after the switch.
+    // A case that ends in `continue` keeps it in the register.
+    Value* stack = vm.stack;
+    i32 sp = vm.sp;
+    i32 ip = 0;
 
+    // The pending exception is looked for after an op that called out,
+    // where the switch is left, and before the first op, so that a
+    // generator resumed with a throw unwinds before it runs. An op that
+    // ends in `continue` has called nothing that throws, or has looked
+    // itself.
+    if vm.has_pending {
+        if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+        fr = vm.frames + (vm.fp - 1);
+        t = fr.tmpl;
+        code = t.code;
+        pc = code + ip;
+        sp = vm.sp;
+    }
     while true {
-        // top-of-loop so resuming a generator with a pending throw
-        // unwinds before its first opcode
-        if vm.has_pending {
-            Handler* htop = vm.handlers + (vm.hp - 1);
-            if vm.hp > 0 && htop.frame_count >= stop_fp {
-                vm.hp--;
-                Handler* h = vm.handlers + vm.hp;
-                vm.fp = h.frame_count;
-                vm.sp = h.sp;
-                fr = vm.frames + (vm.fp - 1);
-                t = fr.tmpl;
-                code = t.code;
-                ip = h.ip;
-                vpush(vm, vm.pending);
-                vm.pending = value_undefined();
-                vm.has_pending = false;
-            } else {
-                while vm.hp > 0 {
-                    Handler* hh = vm.handlers + (vm.hp - 1);
-                    if hh.frame_count < stop_fp { break; }
-                    vm.hp--;
-                }
-                while vm.fp >= stop_fp {
-                    Frame* pf = vm.frames + (vm.fp - 1);
-                    if pf.gen != null { pf.gen.state = GEN_DONE; }
-                    vm.fp--;
-                }
-                return 1;
-            }
-        }
-        i32 op = *(code + ip);
-        ip++;
+        i32 op = *pc;
+        pc++;
         when defined(TSMC_PROF) {
             if vm.prof != null { prof_step(vm.prof, t, op); }
         }
         switch op {
             case OP_CONST: {
-                vpush(vm, *(t.consts + rd_u16(code, ip)));
-                ip += 2;
+                *(stack + sp) = *(t.consts + rd_u16p(pc));
+                sp++;
+                pc += 2;
+                continue;
             }
-            case OP_UNDEF: { vpush(vm, value_undefined()); }
-            case OP_HOLE: { vpush(vm, value_hole()); }
-            case OP_NULL: { vpush(vm, value_null()); }
-            case OP_TRUE: { vpush(vm, value_bool(true)); }
-            case OP_FALSE: { vpush(vm, value_bool(false)); }
-            case OP_POP: { vm.sp--; }
-            case OP_DUP: { vpush(vm, vpeek(vm, 0)); }
+            case OP_UNDEF: { *(stack + sp) = value_undefined(); sp++; continue; }
+            case OP_HOLE: { *(stack + sp) = value_hole(); sp++; continue; }
+            case OP_NULL: { *(stack + sp) = value_null(); sp++; continue; }
+            case OP_TRUE: { *(stack + sp) = value_bool(true); sp++; continue; }
+            case OP_FALSE: { *(stack + sp) = value_bool(false); sp++; continue; }
+            case OP_POP: { sp--; continue; }
+            case OP_DUP: { *(stack + sp) = *(stack + sp - 1); sp++; continue; }
             case OP_DUP2: {
-                vpush(vm, vpeek(vm, 1));
-                vpush(vm, vpeek(vm, 1));
+                *(stack + sp) = *(stack + sp - 2);
+                *(stack + sp + 1) = *(stack + sp - 1);
+                sp += 2;
+                continue;
             }
-            case OP_THIS: { vpush(vm, this_of(vm, fr.this_val, t.sloppy)); }
-            case OP_ARGUMENTS: { vpush(vm, fr.arguments_obj); }
-            case OP_CURFUNC: {
+            case OP_THIS: { vm.sp = sp; vpush(vm, this_of(vm, fr.this_val, t.sloppy)); }
+            case OP_ARGUMENTS: { *(stack + sp) = fr.arguments_obj; sp++; continue; }
+            case OP_CURFUNC: { vm.sp = sp;
                 if fr.fun != null { vpush(vm, value_cell(&fr.fun.head)); }
                 else { vpush(vm, value_undefined()); }
             }
-            case OP_NEWTARGET: { vpush(vm, fr.new_target); }
-            case OP_DYNIMPORT: {
+            case OP_NEWTARGET: { *(stack + sp) = fr.new_target; sp++; continue; }
+            case OP_DYNIMPORT: { vm.sp = sp;
                 // spec and referrer stay on the stack (rooted) across the hook,
                 // which allocates the promise and may load/evaluate a module.
                 Value spec = vpeek(vm, 1);
@@ -4488,134 +5277,297 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, result);
             }
             case OP_GETLOCAL: {
-                vpush(vm, *(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                sp++;
+                pc += 2;
+                continue;
+            }
+            case OP_GETLOCAL_UNDEF: {
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                pc += 2;
+                continue;
+            }
+            case OP_GETLOCAL_CONST: {
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(t.consts + rd_u16p(pc + 2));
+                sp += 2;
+                pc += 4;
+                continue;
+            }
+            case OP_GETLOCAL2: {
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(stack + fr.base + rd_u16p(pc + 2));
+                sp += 2;
+                pc += 4;
+                continue;
+            }
+            case OP_SEQ_NULL: { *(stack + sp - 1) = value_bool(value_is_null(*(stack + sp - 1))); continue; }
+            case OP_SNEQ_NULL: { *(stack + sp - 1) = value_bool(!value_is_null(*(stack + sp - 1))); continue; }
+            case OP_SEQ_UNDEF: { *(stack + sp - 1) = value_bool(value_is_undefined(*(stack + sp - 1))); continue; }
+            case OP_SNEQ_UNDEF: { *(stack + sp - 1) = value_bool(!value_is_undefined(*(stack + sp - 1))); continue; }
+            case OP_EQ_NULLISH: { *(stack + sp - 1) = value_bool(is_nullish(*(stack + sp - 1))); continue; }
+            case OP_NEQ_NULLISH: { *(stack + sp - 1) = value_bool(!is_nullish(*(stack + sp - 1))); continue; }
+            case OP_SEQ_NULL_JF, OP_SNEQ_NULL_JF: {
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                sp--;
+                bool isnull = value_is_null(*(stack + sp));
+                if (op == OP_SEQ_NULL_JF) != isnull { pc = code + target; }
+                continue;
+            }
+            case OP_SEQ_JT, OP_SNEQ_JT: {
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                bool eq = js_strict_eq(*(stack + sp - 2), *(stack + sp - 1));
+                sp -= 2;
+                if (op == OP_SEQ_JT) == eq { pc = code + target; }
+                continue;
+            }
+            case OP_SEQ_LC_JF, OP_SEQ_LC_JT: {
+                Value a = *(stack + fr.base + rd_u16p(pc));
+                Value b = *(t.consts + rd_u16p(pc + 2));
+                i32 target = rd_targetp(pc + 4);
+                pc += 8;
+                if (op == OP_SEQ_LC_JT) == js_strict_eq(a, b) { pc = code + target; }
+                continue;
             }
             case OP_INCLOCAL: {
-                ip += 2;
-                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 1);
+                pc += 2;
+                i32 at = fr.base + rd_u16p(pc - 2);
+                Value v = *(stack + at);
+                if value_is_int(v) && value_as_int(v) != 2147483647 {
+                    *(stack + at) = value_int(value_as_int(v) + 1);
+                    continue;
+                }
+                vm.sp = sp;
+                op_step_local(vm, at, 1);
             }
             case OP_DECLOCAL: {
-                ip += 2;
-                op_step_local(vm, fr.base + rd_u16(code, ip - 2), 0 - 1);
+                pc += 2;
+                i32 at = fr.base + rd_u16p(pc - 2);
+                Value v = *(stack + at);
+                if value_is_int(v) && value_as_int(v) != -2147483648 {
+                    *(stack + at) = value_int(value_as_int(v) - 1);
+                    continue;
+                }
+                vm.sp = sp;
+                op_step_local(vm, at, 0 - 1);
             }
             case OP_GETLOCAL_CHK: {
-                Value v = *(vm.stack + fr.base + rd_u16(code, ip));
-                ip += 2;
+                Value v = *(stack + fr.base + rd_u16p(pc));
+                pc += 2;
                 if value_is_hole(v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    vpush(vm, v);
+                    break case;
                 }
+                *(stack + sp) = v;
+                sp++;
+                continue;
             }
             case OP_SETLOCAL: {
-                *(vm.stack + fr.base + rd_u16(code, ip)) = vpeek(vm, 0);
-                ip += 2;
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + sp - 1);
+                pc += 2;
+                continue;
+            }
+            case OP_PUTLOCAL: {
+                sp--;
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + sp);
+                pc += 2;
+                continue;
             }
             case OP_SETHOLE: {
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_hole();
-                ip += 2;
+                *(stack + fr.base + rd_u16p(pc)) = value_hole();
+                pc += 2;
+                continue;
             }
-            case OP_NEWCELL_UNDEF: {
+            case OP_NEWCELL_UNDEF: { vm.sp = sp;
                 JsBox* b = js_new_box(&vm.heap, value_undefined());
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_cell(&b.head);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
+                pc += 2;
             }
-            case OP_NEWCELL_HOLE: {
+            case OP_NEWCELL_HOLE: { vm.sp = sp;
                 JsBox* b = js_new_box(&vm.heap, value_hole());
-                *(vm.stack + fr.base + rd_u16(code, ip)) = value_cell(&b.head);
-                ip += 2;
+                *(vm.stack + fr.base + rd_u16p(pc)) = value_cell(&b.head);
+                pc += 2;
             }
-            case OP_CELLIFY: {
-                i32 slot = rd_u16(code, ip);
-                ip += 2;
+            case OP_CELLIFY: { vm.sp = sp;
+                i32 slot = rd_u16p(pc);
+                pc += 2;
                 JsBox* b = js_new_box(&vm.heap, *(vm.stack + fr.base + slot));
                 *(vm.stack + fr.base + slot) = value_cell(&b.head);
             }
             case OP_GETCELL: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
-                vpush(vm, b.v);
+                JsBox* b = value_as_box(*(stack + fr.base + rd_u16p(pc)));
+                pc += 2;
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETCELL_CHK: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(stack + fr.base + rd_u16p(pc)));
+                pc += 2;
                 if value_is_hole(b.v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    vpush(vm, b.v);
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
-            case OP_SETCELL: {
-                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16(code, ip)));
-                ip += 2;
+            case OP_SETCELL: { vm.sp = sp;
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, vpeek(vm, 0)); }
                 b.v = vpeek(vm, 0);
+            }
+            case OP_SETCELL_POP: { vm.sp = sp;
+                JsBox* b = value_as_box(*(vm.stack + fr.base + rd_u16p(pc)));
+                pc += 2;
+                vm.sp--;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(vm.stack + vm.sp)); }
+                b.v = *(vm.stack + vm.sp);
             }
             case OP_GETUPVAL: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
-                vpush(vm, b.v);
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
             }
             case OP_GETUPVAL_CHK: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
                 if value_is_hole(b.v) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
-                } else {
-                    vpush(vm, b.v);
+                    break case;
                 }
+                *(stack + sp) = b.v;
+                sp++;
+                continue;
+            }
+            case OP_GETUPVALV: {
+                Value uv = *(fr.fun.upvals + rd_u16p(pc));
+                pc += 2;
+                if value_is_hole(uv) {
+                    vm.sp = sp;
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
+                    break case;
+                }
+                *(stack + sp) = uv;
+                sp++;
+                continue;
             }
             case OP_SETUPVAL: {
-                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16(code, ip)));
-                ip += 2;
-                b.v = vpeek(vm, 0);
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(stack + sp - 1)); }
+                b.v = *(stack + sp - 1);
+                continue;
             }
-            case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: {
-                ip += 2;
-                get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+            case OP_SETUPVAL_POP: {
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                sp--;
+                if b.head.mark == GC_OLD { gc_barrier(&b.head, *(stack + sp)); }
+                b.v = *(stack + sp);
+                continue;
+            }
+            case OP_GETUPVAL_UNDEF: {
+                JsBox* b = value_as_box(*(fr.fun.upvals + rd_u16p(pc)));
+                pc += 2;
+                *(stack + sp) = b.v;
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                continue;
+            }
+            case OP_GETUPVALV_UNDEF: {
+                Value uv = *(fr.fun.upvals + rd_u16p(pc));
+                pc += 2;
+                if value_is_hole(uv) {
+                    vm.sp = sp;
+                    vm_throw_error(vm, ERR_REF, "cannot access variable before initialization");
+                    break case;
+                }
+                *(stack + sp) = uv;
+                *(stack + sp + 1) = value_undefined();
+                sp += 2;
+                continue;
+            }
+            case OP_GETGLOBAL, OP_GETGLOBAL_SOFT: { vm.sp = sp;
+                pc += 2;
+                get_global(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     op == OP_GETGLOBAL_SOFT);
             }
-            case OP_SETGLOBAL: {
-                ip += 2;
+            case OP_SETGLOBAL: { vm.sp = sp;
+                pc += 2;
                 ignore set_global(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))),
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))),
                     vpeek(vm, 0), !t.sloppy);
             }
-            case OP_SETEXPORT: {
-                ip += 2;
-                set_export(vm, t, rd_u16(code, ip - 2));
+            case OP_SETEXPORT: { vm.sp = sp;
+                pc += 2;
+                set_export(vm, t, rd_u16p(pc - 2));
             }
-            case OP_WITH_OBJ: { op_with_obj(vm); }
-            case OP_WITH_HAS: {
-                ip += 2;
+            case OP_DEFGLOBAL: { vm.sp = sp;
+                pc += 2;
+                ignore set_global(vm, cast(u32,
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))),
+                    vpeek(vm, 0), false);
+            }
+            case OP_WITH_OBJ: { vm.sp = sp; op_with_obj(vm); }
+            case OP_WITH_HAS: { vm.sp = sp;
+                pc += 2;
                 op_with_has(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
-            case OP_WITH_GET: {
-                ip += 2;
+            case OP_WITH_GET: { vm.sp = sp;
+                pc += 2;
                 op_with_get(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_WITH_SET: {
-                ip += 2;
+            case OP_WITH_SET: { vm.sp = sp;
+                pc += 2;
                 op_with_set(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_WITH_METH: {
-                ip += 2;
+            case OP_WITH_METH: { vm.sp = sp;
+                pc += 2;
                 op_with_meth(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), !t.sloppy);
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), !t.sloppy);
             }
-            case OP_DELGLOBAL: {
-                ip += 2;
+            case OP_DELGLOBAL: { vm.sp = sp;
+                pc += 2;
                 del_global(vm, cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))));
             }
-            case OP_SETCONST_ERR: {
+            case OP_SETCONST_ERR: { vm.sp = sp;
                 // the value was computed first, as the assignment says
                 vm_throw_error(vm, ERR_TYPE, "Assignment to constant variable.");
             }
             case OP_ADD: {
+                {
+                    Value fb = *(stack + sp - 1);
+                    Value fa = *(stack + sp - 2);
+                    if value_is_int(fa) && value_is_int(fb) {
+                        i64 s = cast(i64, value_as_int(fa)) + value_as_int(fb);
+                        sp--;
+                        if s >= -2147483648 && s <= 2147483647 { *(stack + sp - 1) = value_int(cast(i32, s)); }
+                        else { *(stack + sp - 1) = value_number(cast(f64, s)); }
+                        continue;
+                    }
+                    if value_is_number(fa) && value_is_number(fb) {
+                        f64 r = value_number_f64(fa) + value_number_f64(fb);
+                        sp--;
+                        *(stack + sp - 1) = num_norm(r);
+                        continue;
+                    }
+                    vm.sp = sp;
+                }
                 // two numbers is the common case, and needs none of the
                 // ToPrimitive machinery below
                 Value b = vpeek(vm, 0);
@@ -4636,7 +5588,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         vpush(vm, value_number(cast(f64, s)));
                     }
                 } else if value_is_number(a) && value_is_number(b) {
-                    f64 r = js_to_number(a) + js_to_number(b);
+                    f64 r = value_number_f64(a) + value_number_f64(b);
                     vm.sp -= 2;
                     vpush(vm, num_norm(r));
                 } else if value_is_string(a) || value_is_string(b) {
@@ -4659,6 +5611,24 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_SUB: {
+                {
+                    Value fb = *(stack + sp - 1);
+                    Value fa = *(stack + sp - 2);
+                    if value_is_int(fa) && value_is_int(fb) {
+                        i64 s = cast(i64, value_as_int(fa)) - value_as_int(fb);
+                        sp--;
+                        if s >= -2147483648 && s <= 2147483647 { *(stack + sp - 1) = value_int(cast(i32, s)); }
+                        else { *(stack + sp - 1) = value_number(cast(f64, s)); }
+                        continue;
+                    }
+                    if value_is_number(fa) && value_is_number(fb) {
+                        f64 r = value_number_f64(fa) - value_number_f64(fb);
+                        sp--;
+                        *(stack + sp - 1) = num_norm(r);
+                        continue;
+                    }
+                    vm.sp = sp;
+                }
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -4676,6 +5646,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_number(a) && value_is_number(b) {
+                    f64 r = value_number_f64(a) - value_number_f64(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
                 } else if value_is_bigint(a) || value_is_bigint(b) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, OP_SUB, &r);
@@ -4687,7 +5661,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_MUL: {
+            case OP_MUL: { vm.sp = sp;
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -4709,6 +5683,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     } else {
                         vpush(vm, value_number(cast(f64, s)));
                     }
+                } else if value_is_number(a) && value_is_number(b) {
+                    f64 r = value_number_f64(a) * value_number_f64(b);
+                    vm.sp -= 2;
+                    vpush(vm, num_norm(r));
                 } else if value_is_bigint(a) || value_is_bigint(b) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, OP_MUL, &r);
@@ -4720,7 +5698,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_DIV, OP_MOD, OP_POW: {
+            case OP_DIV, OP_MOD, OP_POW: { vm.sp = sp;
                 Value b = vpeek(vm, 0);
                 Value a = vpeek(vm, 1);
                 if !value_is_number(a) || !value_is_number(b) {
@@ -4730,15 +5708,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         a = vpeek(vm, 1);
                     }
                 }
-                if value_is_bigint(a) || value_is_bigint(b) {
+                bool nums = value_is_number(a) && value_is_number(b);
+                if !nums && (value_is_bigint(a) || value_is_bigint(b)) {
                     Value r;
                     ignore try_bigint_op(vm, a, b, op, &r);
                     vm.sp -= 2;
                     if !vm.has_pending { vpush(vm, r); }
                     break case;
                 }
-                f64 x = vm_to_number(vm, a);
-                f64 y = vm_to_number(vm, b);
+                f64 x = nums ? value_number_f64(a) : vm_to_number(vm, a);
+                f64 y = nums ? value_number_f64(b) : vm_to_number(vm, b);
                 f64 r = 0.0;
                 if op == OP_DIV { r = x / y; }
                 if op == OP_POW { r = pow(x, y); }
@@ -4757,30 +5736,30 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, num_norm(r));
             }
-            case OP_NEG: {
+            case OP_NEG: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
-                if value_is_bigint(v) {
+                if !value_is_number(v) && value_is_bigint(v) {
                     vm.sp--;
                     vpush(vm, bigint_negate(vm, v));
                     break case;
                 }
-                f64 r = -vm_to_number(vm, v);
+                f64 r = value_is_number(v) ? -value_number_f64(v) : -vm_to_number(vm, v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
-            case OP_TONUM: {
+            case OP_TONUM: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
-                if value_is_int(v) { break case; }      // already a number
+                if value_is_number(v) { break case; }   // already a number
                 if value_is_bigint(v) { break case; }   // ToNumeric keeps BigInt
                 f64 r = vm_to_number(vm, v);
                 vm.sp--;
                 vpush(vm, num_norm(r));
             }
-            case OP_TONUMBER: { op_to_number(vm); }
-            case OP_TOPROPKEY: {
+            case OP_TONUMBER: { vm.sp = sp; op_to_number(vm); }
+            case OP_TOPROPKEY: { vm.sp = sp;
                 op_to_prop_key(vm);
             }
-            case OP_TOSTR: {
+            case OP_TOSTR: { vm.sp = sp;
                 // ToString with the string hint (template substitutions)
                 Value s = js_to_string_value(vm, vpeek(vm, 0));
                 if !vm.has_pending {
@@ -4788,7 +5767,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, s);
                 }
             }
-            case OP_INC, OP_DEC: {
+            case OP_INC, OP_DEC: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 vm.sp--;
                 if value_is_bigint(v) {
@@ -4802,12 +5781,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, num_norm(r));
                 }
             }
-            case OP_NOT: {
+            case OP_NOT: { vm.sp = sp;
                 bool r = !js_truthy(vpeek(vm, 0));
                 vm.sp--;
                 vpush(vm, value_bool(r));
             }
-            case OP_BITNOT: {
+            case OP_BITNOT: { vm.sp = sp;
                 if value_is_bigint(vpeek(vm, 0)) {
                     op_bitnot_bigint(vm);
                     break case;
@@ -4816,23 +5795,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, value_int(r));
             }
-            case OP_TYPEOF: {
-                Value v = vpeek(vm, 0);
-                str s = "object";
-                if value_is_undefined(v) || value_is_hole(v) { s = "undefined"; }
-                else if value_is_number(v) { s = "number"; }
-                else if value_is_bool(v) { s = "boolean"; }
-                else if value_is_string(v) { s = "string"; }
-                else if value_is_symbol(v) { s = "symbol"; }
-                else if value_is_bigint(v) { s = "bigint"; }
-                else if value_is_function(v) || value_is_native(v) { s = "function"; }
-                else if value_is_object(v) && (value_as_object(v).obj_flags & OBJF_PROXY) != 0
-                        && value_is_callable(v) { s = "function"; }
-                GcString* g = gc_new_string(&vm.heap, s);
-                vm.sp--;
-                vpush(vm, value_cell(&g.head));
-            }
-            case OP_EQ, OP_NEQ: {
+            case OP_TYPEOF: { vm.sp = sp; op_typeof(vm); }
+            case OP_EQ, OP_NEQ: { vm.sp = sp;
                 // object vs a non-nullish primitive: ToPrimitive the object
                 Value a0 = vpeek(vm, 1);
                 Value b0 = vpeek(vm, 0);
@@ -4856,22 +5820,63 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
             }
-            case OP_SEQ, OP_SNEQ: {
-                bool r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+            case OP_SEQ, OP_SNEQ: { vm.sp = sp;
+                // the same bits are the same value, NaN apart; two different
+                // ints are different values; the rest is the general compare
+                bool r;
+                if value_same_bits(vpeek(vm, 1), vpeek(vm, 0)) {
+                    r = !value_is_double(vpeek(vm, 0))
+                        || value_as_f64(vpeek(vm, 0)) == value_as_f64(vpeek(vm, 0));
+                } else if value_is_int(vpeek(vm, 1)) && value_is_int(vpeek(vm, 0)) {
+                    r = false;
+                } else {
+                    r = js_strict_eq(vpeek(vm, 1), vpeek(vm, 0));
+                }
                 if op == OP_SNEQ { r = !r; }
                 vm.sp -= 2;
                 vpush(vm, value_bool(r));
             }
-            case OP_LT, OP_GT, OP_LE, OP_GE: {
+            case OP_LT, OP_GT, OP_LE, OP_GE: { vm.sp = sp;
                 i32 r = cmp_rel(vm, op);
                 if r >= 0 { vpush(vm, value_bool(r == 1)); }
             }
             case OP_LT_JF, OP_GT_JF, OP_LE_JF, OP_GE_JF: {
-                ip += 2;
+                pc += 4;
+                // two ints, which is what a counted loop's condition compares,
+                // are compared here; anything else takes the general path
+                if value_is_int(*(stack + sp - 2)) && value_is_int(*(stack + sp - 1)) {
+                    i32 x = value_as_int(*(stack + sp - 2));
+                    i32 y = value_as_int(*(stack + sp - 1));
+                    sp -= 2;
+                    bool r = false;
+                    if op == OP_LT_JF { r = x < y; }
+                    else if op == OP_GT_JF { r = x > y; }
+                    else if op == OP_LE_JF { r = x <= y; }
+                    else { r = x >= y; }
+                    if !r { pc = code + rd_targetp(pc - 4); }
+                    continue;
+                }
+                vm.sp = sp;
                 i32 r = cmp_rel(vm, rel_base(op));
-                if r == 0 { ip = rd_u16(code, ip - 2); }
+                if r == 0 { pc = code + rd_targetp(pc - 4); }
             }
             case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: {
+                // two ints, which is what `x | 0` and a mask are, need none of
+                // the coercion below
+                if value_is_int(*(stack + sp - 2)) && value_is_int(*(stack + sp - 1)) {
+                    i32 x = value_as_int(*(stack + sp - 2));
+                    i32 y = value_as_int(*(stack + sp - 1));
+                    i32 r = 0;
+                    if op == OP_BAND { r = x & y; }
+                    else if op == OP_BOR { r = x | y; }
+                    else if op == OP_BXOR { r = x ^ y; }
+                    else if op == OP_SHL { r = x << (y & 31); }
+                    else { r = x >> (y & 31); }
+                    sp--;
+                    *(stack + sp - 1) = value_int(r);
+                    continue;
+                }
+                vm.sp = sp;
                 // an object operand becomes a primitive first, which is how
                 // a wrapped BigInt reaches the BigInt path
                 if !coerce_top2_prim(vm, HINT_NUMBER) { break case; }
@@ -4894,7 +5899,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp -= 2;
                 vpush(vm, value_int(r));
             }
-            case OP_USHR: {
+            case OP_USHR: { vm.sp = sp;
                 if value_is_bigint(vpeek(vm, 0)) || value_is_bigint(vpeek(vm, 1)) {
                     vm_throw_error(vm, ERR_TYPE, "BigInts have no unsigned right shift, use >> instead");
                     break case;
@@ -4910,7 +5915,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_number(d));
                 }
             }
-            case OP_INSTANCEOF: {
+            case OP_INSTANCEOF: { vm.sp = sp;
                 if instanceof_hook(vm) { break case; }
                 Value ctor = vpeek(vm, 0);
                 Value v = vpeek(vm, 1);
@@ -4934,7 +5939,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(r));
                 }
             }
-            case OP_IN: {
+            case OP_IN: { vm.sp = sp;
                 Value objv = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 if value_is_function(objv) || value_is_native(objv) {
@@ -4975,12 +5980,12 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(r));
                 }
             }
-            case OP_HASPRIVATE: {
+            case OP_HASPRIVATE: { vm.sp = sp;
                 // #name in obj: an own check for the private element's hidden
                 // atom, never routed through a proxy trap. Non-object right-hand
                 // sides throw, like the ordinary `in` operator.
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value objv = vpeek(vm, 0);
                 if value_props(objv) != null {
                     bool r = has_private(vm, objv, a);
@@ -4990,46 +5995,62 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm_throw_error(vm, ERR_TYPE, "Cannot use 'in' to search for a private field in a non-object");
                 }
             }
-            case OP_JUMP: { ip = rd_u16(code, ip); }
+            case OP_JUMP: {
+                i32 target = rd_targetp(pc);
+                bool back = code + target < pc;
+                pc = code + target;
+                if !back || vm.deadline_ns == 0 { continue; }
+                vm.deadline_tick++;
+                if (vm.deadline_tick & 4095) != 0 || vm_clock_ns() <= vm.deadline_ns { continue; }
+                // once: a catch around the loop gets to run
+                vm.deadline_ns = 0;
+                vm.sp = sp;
+                vm_throw_error(vm, ERR_RANGE, "the script ran past its time and was stopped");
+            }
             case OP_JUMPF: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 // what a comparison leaves is a boolean, which needs no test
-                vm.sp--;
-                if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(false)) { ip = target; }
-                } else if !js_truthy(*(vm.stack + vm.sp)) {
-                    ip = target;
+                sp--;
+                if value_is_bool(*(stack + sp)) {
+                    if value_same_bits(*(stack + sp), value_bool(false)) { pc = code + target; }
+                } else if !js_truthy(*(stack + sp)) {
+                    pc = code + target;
                 }
+                continue;
             }
             case OP_JUMPT: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
-                vm.sp--;
-                if value_is_bool(*(vm.stack + vm.sp)) {
-                    if value_same_bits(*(vm.stack + vm.sp), value_bool(true)) { ip = target; }
-                } else if js_truthy(*(vm.stack + vm.sp)) {
-                    ip = target;
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                sp--;
+                if value_is_bool(*(stack + sp)) {
+                    if value_same_bits(*(stack + sp), value_bool(true)) { pc = code + target; }
+                } else if js_truthy(*(stack + sp)) {
+                    pc = code + target;
                 }
+                continue;
             }
             case OP_JF_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
-                if !js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if !js_truthy(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
             case OP_JT_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
-                if js_truthy(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if js_truthy(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
             case OP_JNN_KEEP: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
-                if !is_nullish(vpeek(vm, 0)) { ip = target; } else { vm.sp--; }
+                i32 target = rd_targetp(pc);
+                pc += 4;
+                if !is_nullish(*(stack + sp - 1)) { pc = code + target; } else { sp--; }
+                continue;
             }
-            case OP_CLOSURE: {
-                FnTemplate* sub = *(t.subs + rd_u16(code, ip));
-                ip += 2;
+            case OP_CLOSURE: { vm.sp = sp;
+                FnTemplate* sub = *(t.subs + rd_u16p(pc));
+                pc += 2;
                 JsFunction* f = js_new_function(&vm.heap, sub, sub.n_upvals);
                 for i32 i = 0; i < sub.n_upvals; i++ {
                     TmplUpval u = *(sub.upvals + i);
@@ -5041,10 +6062,94 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vpush(vm, value_cell(&f.head));
             }
-            case OP_CALL, OP_NEW, OP_SUPERCALL: {
-                i32 argc = rd_u16(code, ip);
-                ip += 2;
-                fr.cur_ip = ip;   // this frame's call site, for stack traces
+            case OP_CALL: {
+                // The call most of a page's are: a compiled function with
+                // no rest parameter or arguments object, not a class,
+                // generator or async body. Its frame is built on the
+                // loop's registers; nothing is allocated, so nothing is
+                // rooted. A native is called in place. The rest falls
+                // through to the general case.
+                i32 argc = rd_u16p(pc);
+                Value fnv = *(stack + sp - 2 - argc);
+                if value_is_function(fnv) {
+                    JsFunction* f = value_as_function(fnv);
+                    FnTemplate* ft = f.tmpl;
+                    u8 shape = ft.call_shape;
+                    if shape == 0 && ft.lazy == null {
+                        shape = !ft.is_gen && !ft.is_async && !ft.is_class && !ft.derived_ctor
+                            && !ft.needs_arguments && !ft.has_rest ? CALL_PLAIN : CALL_SLOW;
+                        ft.call_shape = shape;
+                    }
+                    if shape == CALL_PLAIN && vm.fp < VM_FRAMES_MAX
+                        && sp + ft.n_slots + 8 < VM_STACK_MAX {
+                        pc += 2;
+                        i32 ip = cast(i32, pc - code);
+                        fr.cur_ip = ip;
+                        i32 base = sp - argc;
+                        i32 np = ft.n_params;
+                        i32 have = argc;
+                        if have > np { sp = base + np; have = np; }   // surplus arguments dropped
+                        i32 n = ft.n_slots;
+                        for i32 i = have; i < n; i++ { *(stack + sp) = value_undefined(); sp++; }
+                        Frame* nf = vm.frames + vm.fp;
+                        nf.fun = f;
+                        nf.tmpl = ft;
+                        nf.ret_ip = ip;
+                        nf.cur_ip = 0;
+                        nf.base = base;
+                        nf.this_val = *(stack + base - 1);
+                        nf.arguments_obj = value_undefined();
+                        nf.is_ctor = false;
+                        nf.super_pending = false;
+                        nf.super_for = 0 - 1;
+                        nf.new_target = value_undefined();
+                        nf.gen = null;
+                        vm.fp++;
+                        when defined(TSMC_PROF) {
+                            if vm.prof != null { vm.prof.js_calls++; ft.prof_calls++; }
+                        }
+                        fr = nf;
+                        t = ft;
+                        code = t.code;
+                        pc = code;
+                        continue;
+                    }
+                } else if value_is_native(fnv) {
+                    JsNative* na = value_as_native(fnv);
+                    pc += 2;
+                    fr.cur_ip = cast(i32, pc - code);
+                    vm.sp = sp;
+                    when defined(TSMC_PROF) {
+                        if vm.prof != null { vm.prof.native_calls++; }
+                    }
+                    Value res;
+                    if vm.phases == 0 {
+                        res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                    } else {
+                        NativeSpan nsp = vm_native_begin(vm, na);
+                        res = na.fun(cast(void*, vm), fnv, *(stack + sp - 1 - argc), stack + sp - argc, argc);
+                        vm_native_end(vm, na, nsp);
+                    }
+                    sp -= argc + 2;
+                    *(stack + sp) = res;
+                    sp++;
+                    if vm.has_pending {
+                        vm.sp = sp;
+                        if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+                        fr = vm.frames + (vm.fp - 1);
+                        t = fr.tmpl;
+                        code = t.code;
+                        pc = code + ip;
+                        sp = vm.sp;
+                    }
+                    continue;
+                }
+                fallthrough;
+            }
+            case OP_NEW, OP_SUPERCALL: { vm.sp = sp;
+                i32 argc = rd_u16p(pc);
+                pc += 2;
+                fr.cur_ip = cast(i32, pc - code);   // this frame's call site, for stack traces
                 // super() forwards the current frame's new.target to the base
                 // constructor; captured now, before fr is reassigned
                 Value inherited_target = fr.new_target;
@@ -5057,19 +6162,31 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if !vm.has_pending {
                     fnv = vpeek(vm, argc + 1);
                     thisv = vpeek(vm, argc);
-                    if value_is_native(fnv) {
+                    i32 fk = value_kind(fnv);
+                    if fk == GC_NATIVE {
                         JsNative* na = value_as_native(fnv);
                         when defined(TSMC_PROF) {
                             if vm.prof != null { vm.prof.native_calls++; }
                         }
-                        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                        Value res;
+                        if vm.phases == 0 {
+                            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                        } else {
+                            NativeSpan nsp = vm_native_begin(vm, na);
+                            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+                            vm_native_end(vm, na, nsp);
+                        }
                         if op == OP_NEW && !value_is_reference(res) { res = thisv; }
+                        if op == OP_SUPERCALL && !vm.has_pending { super_native_result(vm, res, inherited_target, thisv, derived_ctor_index(vm)); }
                         vm.sp -= argc + 2;
                         vpush(vm, res);
-                    } else if value_is_function(fnv) {
+                    } else if fk == GC_FUNCTION {
                         JsFunction* f = value_as_function(fnv);
                         FnTemplate* ft = f.tmpl;
-                        if (ft.not_ctor || ft.is_class) && call_kind_error(vm, ft, op) {
+                        if ft.lazy != null && !vm_lazy_compile(vm, ft) {
+                            // threw: its body does not compile
+                        } else if ((op == OP_NEW && ft.not_ctor) || (op == OP_CALL && ft.is_class))
+                                  && call_kind_error(vm, ft, op) {
                             // threw: not constructable, or a class called bare
                         } else if ft.is_gen {
                             Value gv = make_generator_from_call(vm, f, argc);
@@ -5087,7 +6204,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                                 argobj = vm_build_arguments(vm, vm.stack + vm.sp - argc, argc);
                                 gc_root(&vm.heap, argobj);
                             }
-                            normalize_args(vm, ft, argc);
+                            if argc != ft.n_params || ft.has_rest { normalize_args(vm, ft, argc); }
                             i32 base = vm.sp - ft.n_params;
                             for i32 i = ft.n_params; i < ft.n_slots; i++ {
                                 vpush(vm, value_undefined());
@@ -5095,29 +6212,29 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                             Frame* nf = vm.frames + vm.fp;
                             nf.fun = f;
                             nf.tmpl = ft;
-                            nf.ret_ip = ip;
+                            nf.ret_ip = cast(i32, pc - code);
                             nf.cur_ip = 0;
                             nf.base = base;
                             nf.this_val = thisv;
                             nf.arguments_obj = argobj;
                             nf.is_ctor = op == OP_NEW;
                             nf.super_pending = ft.derived_ctor;
-                            nf.super_for = op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1;
+                            nf.super_for = cast(i16, op == OP_SUPERCALL ? derived_ctor_index(vm) : 0 - 1);
                             if op == OP_NEW { nf.new_target = fnv; }
                             else if op == OP_SUPERCALL { nf.new_target = inherited_target; }
                             else { nf.new_target = value_undefined(); }
                             nf.gen = null;
                             vm.fp++;
                             when defined(TSMC_PROF) {
-                                if vm.prof != null { vm.prof.js_calls++; }
+                                if vm.prof != null { vm.prof.js_calls++; ft.prof_calls++; }
                             }
                             gc_root_reset(&vm.heap, arm);
                             fr = nf;
                             t = ft;
                             code = t.code;
-                            ip = 0;
+                            pc = code;
                         }
-                    } else if value_is_object(fnv)
+                    } else if fk == GC_OBJECT
                               && (value_as_object(fnv).obj_flags & OBJF_PROXY) != 0 {
                         // a callable-target proxy: route through apply/construct
                         JsProxy* p = cast(JsProxy*, value_as_object(fnv));
@@ -5134,43 +6251,62 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
+            case OP_RETURN_UNDEF: {
+                *(stack + sp) = value_undefined();
+                sp++;
+                fallthrough;
+            }
             case OP_RETURN: {
-                Value res = vpop(vm);
+                sp--;
+                Value res = *(stack + sp);
+                // The caller's template and code, loaded before the checks
+                // below: the next dispatch waits on the chain from the frame
+                // to the code, and here it runs beside them. A frame below
+                // stop_fp is not this loop's to return to.
+                FnTemplate* ct = vm.fp > stop_fp ? (fr - 1).tmpl : t;
+                u8* cc = ct.code;
                 // A derived constructor that never called super() has no
                 // instance to hand back, and returning is where that shows.
                 // Returning an object of its own is allowed, and says the
                 // constructor meant it.
                 if fr.super_pending && !value_is_reference(res) {
+                    vm.sp = sp;
                     vm_throw_error(vm, ERR_REF, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-                } else {
-                    if fr.is_ctor || fr.super_for >= 0 { res = ctor_result(vm, fr, res); }
-                    vm.sp = fr.base - 2;
-                    vpush(vm, res);
-                    // A return inside a try leaves that try's handler open;
-                    // drop every handler still belonging to this frame so a
-                    // later throw doesn't unwind into the dead frame.
-                    while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
-                        vm.hp--;
-                    }
-                    vm.fp--;
-                    if vm.fp < stop_fp { return 0; }
-                    Frame* popped = vm.frames + vm.fp;
-                    fr = vm.frames + (vm.fp - 1);
-                    t = fr.tmpl;
-                    code = t.code;
-                    ip = popped.ret_ip;
+                    break case;
                 }
+                if fr.is_ctor || fr.super_for >= 0 {
+                    vm.sp = sp;
+                    res = ctor_result(vm, fr, res);
+                    sp = vm.sp;
+                }
+                if vm.has_pending { break case; }
+                sp = fr.base - 2;
+                *(stack + sp) = res;
+                sp++;
+                // A return inside a try leaves that try's handler open;
+                // drop every handler still belonging to this frame so a
+                // later throw doesn't unwind into the dead frame.
+                while vm.hp > 0 && (vm.handlers + (vm.hp - 1)).frame_count >= vm.fp {
+                    vm.hp--;
+                }
+                vm.fp--;
+                if vm.fp < stop_fp { vm.sp = sp; return 0; }
+                i32 rip = fr.ret_ip;
+                fr = fr - 1;
+                t = ct;
+                code = cc;
+                pc = cc + rip;
+                continue;
             }
-            case OP_NEWOBJ: {
-                i32 nprops = rd_u16(code, ip);
-                ip += 2;
-                JsObject* o = js_new_object(&vm.heap, vm.object_proto);
-                props_reserve(&o.props, nprops);
+            case OP_NEWOBJ: { vm.sp = sp;
+                i32 nprops = rd_u16p(pc);
+                pc += 2;
+                JsObject* o = js_new_object_room(&vm.heap, vm.object_proto, nprops < 4 ? 4 : nprops);
                 vpush(vm, value_cell(&o.head));
             }
-            case OP_NEWARR: {
-                i32 n = rd_u16(code, ip);
-                ip += 2;
+            case OP_NEWARR: { vm.sp = sp;
+                i32 n = rd_u16p(pc);
+                pc += 2;
                 JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
                 js_array_reserve(arr, n);
                 for i32 i = 0; i < n; i++ {
@@ -5180,45 +6316,509 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vpush(vm, value_cell(&arr.head));
             }
             case OP_GETPROP: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 4;
                 Value out;
-                if prop_get(vm, vpeek(vm, 0), a, &out) {
+                if prop_get_ic_fast(vm, t, *(stack + sp - 1), a, &out, pc - 2) {
+                    *(stack + sp - 1) = out;
+                    continue;
+                }
+                vm.sp = sp;
+                if prop_get_ic(vm, t, vpeek(vm, 0), a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                 }
             }
-            case OP_GETIMPORT: {
-                get_import(vm, t, rd_u16(code, ip), rd_u16(code, ip + 2));
-                ip += 4;
+            case OP_GETPROP_THIS: { vm.sp = sp;
+                Value objv = this_of(vm, fr.this_val, t.sloppy);
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 4;
+                Value out;
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { vpush(vm, out); }
             }
-            case OP_SETPROP: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+            case OP_LT_JF_LL: {
+                Value a = *(stack + fr.base + rd_u16p(pc));
+                Value b = *(stack + fr.base + rd_u16p(pc + 2));
+                pc += 8;
+                if value_is_int(a) && value_is_int(b) {
+                    if !(value_as_int(a) < value_as_int(b)) { pc = code + rd_targetp(pc - 4); }
+                    continue;
+                }
+                *(stack + sp) = a;
+                *(stack + sp + 1) = b;
+                sp += 2;
+                vm.sp = sp;
+                i32 r = cmp_rel(vm, OP_LT);
+                if r == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_SEQ_JF, OP_SNEQ_JF: {
+                Value a = *(stack + sp - 2);
+                Value b = *(stack + sp - 1);
+                bool r;
+                if value_same_bits(a, b) {
+                    r = !value_is_double(b) || value_as_f64(b) == value_as_f64(b);
+                } else if value_is_int(a) && value_is_int(b) {
+                    r = false;
+                } else {
+                    r = js_strict_eq(a, b);
+                }
+                if op == OP_SNEQ_JF { r = !r; }
+                sp -= 2;
+                pc += 4;
+                if !r { pc = code + rd_targetp(pc - 4); }
+                continue;
+            }
+            case OP_RADD: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) + value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) + value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RADDI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) + cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) + cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RSUB: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) - value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) - value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RSUBI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) - cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) - cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RMUL: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_int(x) && value_is_int(y) {
+                    i64 r = cast(i64, value_as_int(x)) * value_as_int(y);
+                    if r >= -2147483648 && r <= 2147483647 && !(r == 0 && (value_as_int(x) < 0 || value_as_int(y) < 0)) {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 15;
+                        continue;
+                    }
+                }
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) * value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RMULI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    i64 r = cast(i64, value_as_int(x)) * cast(i32, rd_targetp(pc + 4));
+                    if r >= -2147483648 && r <= 2147483647 && !(r == 0 && (value_as_int(x) < 0 || cast(i32, rd_targetp(pc + 4)) < 0)) {
+                        *(stack + fr.base + rd_u16p(pc + 0)) = value_int(cast(i32, r));
+                        pc += 17;
+                        continue;
+                    }
+                }
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) * cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RDIV: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                Value y = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_is_number(x) && value_is_number(y) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) / value_number_f64(y));
+                    pc += 15;
+                    continue;
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RDIVI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_number(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = num_norm(value_number_f64(x) / cast(f64, cast(i32, rd_targetp(pc + 4))));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBIT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 3));
+                Value y = *(stack + fr.base + rd_u16p(pc + 5));
+                if value_is_int(x) && value_is_int(y) {
+                    i32 kind = *pc;
+                    i32 xi = value_as_int(x);
+                    i32 yi = value_as_int(y);
+                    i32 r = 0;
+                    if kind == RK_BOR { r = xi | yi; }
+                    else if kind == RK_BAND { r = xi & yi; }
+                    else if kind == RK_BXOR { r = xi ^ yi; }
+                    else if kind == RK_SHL { r = xi << (yi & 31); }
+                    else if kind == RK_SHR { r = xi >> (yi & 31); }
+                    else {
+                        // an unsigned shift past an int's range is the stack form's
+                        r = cast(i32, cast(u32, xi) >> cast(u32, yi & 31));
+                        if r < 0 { pc += 7; continue; }
+                    }
+                    *(stack + fr.base + rd_u16p(pc + 1)) = value_int(r);
+                    pc += 16;
+                    continue;
+                }
+                pc += 7;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBITI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 3));
+                if value_is_int(x) {
+                    i32 kind = *pc;
+                    i32 xi = value_as_int(x);
+                    i32 yi = cast(i32, rd_targetp(pc + 5));
+                    i32 r = 0;
+                    if kind == RK_BOR { r = xi | yi; }
+                    else if kind == RK_BAND { r = xi & yi; }
+                    else if kind == RK_BXOR { r = xi ^ yi; }
+                    else if kind == RK_SHL { r = xi << (yi & 31); }
+                    else if kind == RK_SHR { r = xi >> (yi & 31); }
+                    else {
+                        // an unsigned shift past an int's range is the stack form's
+                        r = cast(i32, cast(u32, xi) >> cast(u32, yi & 31));
+                        if r < 0 { pc += 9; continue; }
+                    }
+                    *(stack + fr.base + rd_u16p(pc + 1)) = value_int(r);
+                    pc += 18;
+                    continue;
+                }
+                pc += 9;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBORI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = value_int(value_as_int(x) | cast(i32, rd_targetp(pc + 4)));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RBANDI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) {
+                    *(stack + fr.base + rd_u16p(pc + 0)) = value_int(value_as_int(x) & cast(i32, rd_targetp(pc + 4)));
+                    pc += 17;
+                    continue;
+                }
+                pc += 8;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_RJLT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) < value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLTI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) < value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGT: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) > value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGTI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) > value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GT) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLE: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) <= value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJLEI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) <= value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_LE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGE: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = *(stack + fr.base + rd_u16p(pc + 2));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) >= value_as_int(y) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                    continue;
+                }
+                pc += 8;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJGEI: {
+                Value x = *(stack + fr.base + rd_u16p(pc + 0));
+                Value y = value_int(cast(i32, rd_targetp(pc + 2)));
+                if value_is_int(x) && value_is_int(y) {
+                    if value_as_int(x) >= value_as_int(y) { pc += 10; } else { pc = code + rd_targetp(pc + 6); }
+                    continue;
+                }
+                pc += 10;
+                vm.sp = sp;
+                vpush(vm, x);
+                vpush(vm, y);
+                if cmp_rel(vm, OP_GE) == 0 { pc = code + rd_targetp(pc - 4); }
+            }
+            case OP_RJSEQ: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(stack + fr.base + rd_u16p(pc + 2)));
+                if eq { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSEQK: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(t.consts + rd_u16p(pc + 2)));
+                if eq { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSNEQ: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(stack + fr.base + rd_u16p(pc + 2)));
+                if eq == false { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJSNEQK: {
+                bool eq = js_strict_eq(*(stack + fr.base + rd_u16p(pc + 0)), *(t.consts + rd_u16p(pc + 2)));
+                if eq == false { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJNULLISH, OP_RJNOTNULLISH: {
+                if is_nullish(*(stack + fr.base + rd_u16p(pc))) == (op == OP_RJNULLISH) { pc += 8; } else { pc = code + rd_targetp(pc + 4); }
+                continue;
+            }
+            case OP_RJF, OP_RJT: {
+                Value x = *(stack + fr.base + rd_u16p(pc));
+                i32 target = rd_targetp(pc + 2);
+                pc += 6;
+                bool truthy = value_is_bool(x) ? value_same_bits(x, value_bool(true)) : js_truthy(x);
+                if truthy == (op == OP_RJT) { pc = code + target; }
+                continue;
+            }
+            case OP_RGETPROP: {
+                Value objv = *(stack + fr.base + rd_u16p(pc + 2));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 4))));
+                pc += 8;
+                Value out;
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
+                    *(stack + fr.base + rd_u16p(pc - 8)) = out;
+                    continue;
+                }
+                vm.sp = sp;
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { *(vm.stack + fr.base + rd_u16p(pc - 8)) = out; }
+            }
+            case OP_RSETPROP: {
+                Value objv = *(stack + fr.base + rd_u16p(pc));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
+                Value v = *(stack + fr.base + rd_u16p(pc + 4));
+                pc += 8;
+                vm.sp = sp;
+                ignore set_prop_ic(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2);
+            }
+            case OP_RGETINDEX: {
+                Value objv = *(stack + fr.base + rd_u16p(pc + 2));
+                Value key = *(stack + fr.base + rd_u16p(pc + 4));
+                if value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+                    i32 idx = val_to_index(key);
+                    if idx >= 0 && js_array_has(value_as_object(objv), idx) {
+                        *(stack + fr.base + rd_u16p(pc)) = js_array_get(value_as_object(objv), idx);
+                        pc += 6;
+                        continue;
+                    }
+                }
+                i32 d = rd_u16p(pc);
+                pc += 6;
+                vm.sp = sp;
+                vpush(vm, objv);
+                vpush(vm, key);
+                op_getindex(vm);
+                if !vm.has_pending { *(vm.stack + fr.base + d) = vpop(vm); }
+            }
+            case OP_RSETINDEX: {
+                Value objv = *(stack + fr.base + rd_u16p(pc));
+                if value_kind(objv) == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
+                    JsObject* arr = value_as_object(objv);
+                    i32 idx = val_to_index(*(stack + fr.base + rd_u16p(pc + 2)));
+                    if idx >= 0 && (arr.obj_flags & OBJF_FROZEN) == 0 && (idx < arr.elen || (arr.obj_flags & OBJF_NONEXT) == 0) {
+                        js_array_set(arr, idx, *(stack + fr.base + rd_u16p(pc + 4)));
+                        pc += 16;
+                        continue;
+                    }
+                }
+                pc += 6;   // the stack form that follows does the rest
+                continue;
+            }
+            case OP_MOV: {
+                *(stack + fr.base + rd_u16p(pc)) = *(stack + fr.base + rd_u16p(pc + 2));
+                pc += 4;
+                continue;
+            }
+            case OP_LOADK: {
+                *(stack + fr.base + rd_u16p(pc)) = *(t.consts + rd_u16p(pc + 2));
+                pc += 4;
+                continue;
+            }
+            case OP_GETPROP_L: {
+                Value objv = *(stack + fr.base + rd_u16p(pc));
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc + 2))));
+                pc += 6;
+                Value out;
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
+                    *(stack + sp) = out;
+                    sp++;
+                    continue;
+                }
+                vm.sp = sp;
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) { vpush(vm, out); }
+            }
+            case OP_GETIMPORT: { vm.sp = sp;
+                get_import(vm, t, rd_u16p(pc), rd_u16p(pc + 2));
+                pc += 4;
+            }
+            case OP_SETPROP: { vm.sp = sp;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 4;
                 Value v = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
-                if set_prop_atom(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT) {
+                if set_prop_ic(vm, objv, a, v, t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2) {
                     vm.sp -= 2;
                     vpush(vm, v);
                 }
             }
-            case OP_DEFPROP_FIXED: {
-                ip += 2;
+            case OP_SETPROP_POP: { vm.sp = sp;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 4;
+                if set_prop_ic(vm, vpeek(vm, 1), a, vpeek(vm, 0), t.sloppy ? SET_SLOPPY : SET_STRICT, pc - 2) {
+                    vm.sp -= 2;
+                }
+            }
+            case OP_DEFPROP_FIXED: { vm.sp = sp;
+                pc += 2;
                 def_prop_fixed(vpeek(vm, 1), cast(u32,
-                    value_as_int(*(t.consts + rd_u16(code, ip - 2)))), vpeek(vm, 0));
+                    value_as_int(*(t.consts + rd_u16p(pc - 2)))), vpeek(vm, 0));
                 vm.sp--;
             }
-            case OP_DEFMETHOD: {
+            case OP_DEFMETHOD: { vm.sp = sp;
                 // like SETPROP but installs a non-enumerable property
                 // (class methods, static methods, constructor back-link)
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 Value v = vpeek(vm, 0);
                 def_method(vpeek(vm, 1), a, v);
                 vm.sp -= 2;
                 vpush(vm, v);
             }
-            case OP_DEFMETHOD_DYN: {
+            case OP_DEFMETHOD_DYN: { vm.sp = sp;
                 // a class method with a computed name is still non-enumerable
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
@@ -5226,53 +6826,21 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 def_method(vpeek(vm, 2), a, vpeek(vm, 0));
                 vm.sp -= 2;
             }
-            case OP_GETINDEX: {
-                Value key = vpeek(vm, 0);
-                Value objv = vpeek(vm, 1);
-                if value_is_array(objv) {
-                    i32 idx = val_to_index(key);
-                    // an absent element, in range or past the end, is the
-                    // prototype chain's to answer
-                    if idx >= 0 && js_array_has(value_as_object(objv), idx) {
-                        Value r = js_array_get(value_as_object(objv), idx);
-                        vm.sp -= 2;
-                        vpush(vm, r);
-                        break case;
-                    }
-                }
-                if vm_is_typed_array(objv) {
-                    i32 idx = val_to_index(key);
-                    if idx >= 0 {
-                        Value r = vm_ta_get(vm, value_as_object(objv), idx);
-                        vm.sp -= 2;
-                        vpush(vm, r);
-                        break case;
-                    }
-                }
-                if value_is_string(objv) {
-                    i32 idx = val_to_index(key);
-                    if idx >= 0 {
-                        Value ch = value_undefined();
-                        if idx < value_as_string(objv).u16len {
-                            ch = vm_string_char(vm, value_as_string(objv), idx);
-                        }
-                        vm.sp -= 2;
-                        vpush(vm, ch);
-                        break case;
-                    }
-                }
-                u32 a = key_to_atom(vm, key);
-                Value out;
-                if vm_get_prop_value(vm, objv, a, &out) {
-                    vm.sp -= 2;
-                    vpush(vm, out);
-                }
+            case OP_GETINDEX: { vm.sp = sp; op_getindex(vm); }
+            case OP_GETINDEX_LL: {
+                *(stack + sp) = *(stack + fr.base + rd_u16p(pc));
+                *(stack + sp + 1) = *(stack + fr.base + rd_u16p(pc + 2));
+                sp += 2;
+                pc += 4;
+                vm.sp = sp;
+                op_getindex(vm);
             }
-            case OP_SETINDEX: {
+            case OP_SETINDEX: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value key = vpeek(vm, 1);
                 Value objv = vpeek(vm, 2);
-                if value_is_array(objv) {
+                i32 ok = value_kind(objv);
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_ARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         if !array_index_writable(vm, value_as_object(objv), idx,
@@ -5288,7 +6856,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         break case;
                     }
                 }
-                if vm_is_typed_array(objv) {
+                if ok == GC_OBJECT && (value_as_object(objv).obj_flags & OBJF_TYPEDARRAY) != 0 {
                     i32 idx = val_to_index(key);
                     if idx >= 0 {
                         vm_ta_set(vm, value_as_object(objv), idx, v);
@@ -5304,25 +6872,32 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
             }
             case OP_GETMETHOD: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
-                Value objv = vpeek(vm, 0);
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 4;
+                Value objv = *(stack + sp - 1);
                 Value out;
-                if prop_get(vm, objv, a, &out) {
+                if prop_get_ic_fast(vm, t, objv, a, &out, pc - 2) {
+                    *(stack + sp - 1) = out;
+                    *(stack + sp) = objv;
+                    sp++;
+                    continue;
+                }
+                vm.sp = sp;
+                if prop_get_ic(vm, t, objv, a, &out, pc - 2) {
                     vm.sp--;
                     vpush(vm, out);
                     vpush(vm, objv);
                 }
             }
-            case OP_DEFPRIVATE: {
-                ip += 4;
-                def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16(code, ip - 4)))),
-                    cast(i32, rd_u16(code, ip - 2)));
+            case OP_DEFPRIVATE: { vm.sp = sp;
+                pc += 4;
+                def_private(vm, cast(u32, value_as_int(*(t.consts + rd_u16p(pc - 4)))),
+                    cast(i32, rd_u16p(pc - 2)));
             }
-            case OP_GETPRIVATE: { private_get(vm, t, rd_u16(code, ip)); ip += 2; }
-            case OP_SETPRIVATE: { private_set(vm, t, rd_u16(code, ip)); ip += 2; }
-            case OP_GETMETHOD_PRIV: { private_method(vm, t, rd_u16(code, ip)); ip += 2; }
-            case OP_GETMETHOD_DYN: {
+            case OP_GETPRIVATE: { vm.sp = sp; private_get(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_SETPRIVATE: { vm.sp = sp; private_set(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_GETMETHOD_PRIV: { vm.sp = sp; private_method(vm, t, rd_u16p(pc)); pc += 2; }
+            case OP_GETMETHOD_DYN: { vm.sp = sp;
                 Value key = vpeek(vm, 0);
                 Value objv = vpeek(vm, 1);
                 Value out = value_undefined();
@@ -5343,16 +6918,16 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, objv);
                 }
             }
-            case OP_DELPROP: {
-                ip += 2;
-                op_delete_prop(vm, t, rd_u16(code, ip - 2));
+            case OP_DELPROP: { vm.sp = sp;
+                pc += 2;
+                op_delete_prop(vm, t, rd_u16p(pc - 2));
             }
-            case OP_DELINDEX: {
+            case OP_DELINDEX: { vm.sp = sp;
                 op_delete_index(vm, !t.sloppy);
             }
-            case OP_TRY_PUSH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+            case OP_TRY_PUSH: { vm.sp = sp;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if vm.hp >= VM_HANDLERS_MAX {
                     vm_throw_error(vm, ERR_RANGE, "too many nested try blocks");
                 } else {
@@ -5363,60 +6938,62 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vm.hp++;
                 }
             }
-            case OP_TRY_POP: { vm.hp--; }
-            case OP_THROW: {
+            case OP_TRY_POP: { vm.sp = sp; vm.hp--; }
+            case OP_THROW: { vm.sp = sp;
                 // a fresh throw, whatever completion was unwinding
                 vm.unwind_return = false;
                 vm_throw(vm, vpop(vm));
             }
-            case OP_RETHROW: { vm_throw(vm, vpop(vm)); }
-            case OP_SETPROTO: {
+            case OP_RETHROW: { vm.sp = sp; vm_throw(vm, vpop(vm)); }
+            case OP_SETPROTO: { vm.sp = sp;
                 Value protov = vpop(vm);
                 Value objv = vpeek(vm, 0);
                 if value_is_object(objv) {
                     // only an object or null is a prototype; `{__proto__: 5}`
                     // leaves the object's prototype alone
                     if value_is_object(protov) {
-                        value_as_object(objv).proto = value_as_object(protov);
+                        gc_barrier(value_as_cell(objv), protov);
+                        js_set_proto(value_as_object(objv), value_as_object(protov));
                     } else if value_is_null(protov) {
-                        value_as_object(objv).proto = null;
+                        js_set_proto(value_as_object(objv), null);
                     }
                 } else if value_is_function(objv) {
                     // static inheritance: a derived ctor's [[Prototype]]
+                    gc_barrier(value_as_cell(objv), protov);
                     value_as_function(objv).fproto = protov;
                 }
             }
-            case OP_DEFPROP, OP_DEFPROP_NEW: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
+            case OP_DEFPROP, OP_DEFPROP_NEW: { vm.sp = sp;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
                 if op == OP_DEFPROP_NEW { def_prop_new(vm, a); } else { def_prop(vm, a); }
             }
-            case OP_REQUIRE_OBJ: {
+            case OP_REQUIRE_OBJ: { vm.sp = sp;
                 require_object(vm);
             }
-            case OP_DEFPROP_DYN: {
-                ip += 2;
-                def_prop_dyn(vm, rd_u16(code, ip - 2) != 0);
+            case OP_DEFPROP_DYN: { vm.sp = sp;
+                pc += 2;
+                def_prop_dyn(vm, rd_u16p(pc - 2) != 0);
             }
-            case OP_DEFGETTER, OP_DEFSETTER: {
-                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16(code, ip))));
-                ip += 2;
-                bool enumer = rd_u16(code, ip) != 0;
-                ip += 2;
+            case OP_DEFGETTER, OP_DEFSETTER: { vm.sp = sp;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                bool enumer = rd_u16p(pc) != 0;
+                pc += 2;
                 def_accessor(vm, vpeek(vm, 1), a, vpeek(vm, 0), op == OP_DEFGETTER, enumer);
                 vm.sp--;
             }
-            case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: {
+            case OP_DEFGETTER_DYN, OP_DEFSETTER_DYN: { vm.sp = sp;
                 // computed accessor: `get [expr]() {}` / `set [expr](v) {}`
-                bool enumer = rd_u16(code, ip) != 0;
-                ip += 2;
+                bool enumer = rd_u16p(pc) != 0;
+                pc += 2;
                 u32 a = key_to_atom(vm, vpeek(vm, 1));
                 if vm.has_pending { break case; }
                 name_by_key(vm, vpeek(vm, 0), a, op == OP_DEFGETTER_DYN ? "get " : "set ");
                 def_accessor(vm, vpeek(vm, 2), a, vpeek(vm, 0), op == OP_DEFGETTER_DYN, enumer);
                 vm.sp -= 2;
             }
-            case OP_ARR_APPEND: {
+            case OP_ARR_APPEND: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value arrv = vpeek(vm, 1);
                 if value_is_array(arrv) {
@@ -5425,7 +7002,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 vm.sp--;
             }
-            case OP_ARR_SPREAD: {
+            case OP_ARR_SPREAD: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 Value arrv = vpeek(vm, 1);
                 if value_is_array(arrv) {
@@ -5470,7 +7047,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 }
                 if !vm.has_pending { vm.sp--; }
             }
-            case OP_OBJ_SPREAD: {
+            case OP_OBJ_SPREAD: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 Value dstv = vpeek(vm, 1);
                 // `export * from "m"` spreads into the namespace, whose names
@@ -5524,13 +7101,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 if into_ns && !vm.has_pending { vm_ns_sort(vm, value_as_object(dstv)); }
                 if !vm.has_pending { vm.sp--; }
             }
-            case OP_OBJ_REST: {
-                ip += 2;
-                op_obj_rest(vm, fr, rd_u16(code, ip - 2));
+            case OP_OBJ_REST: { vm.sp = sp;
+                pc += 2;
+                op_obj_rest(vm, fr, rd_u16p(pc - 2));
             }
-            case OP_ARR_SLICE_FROM: {
-                i32 start = rd_u16(code, ip);
-                ip += 2;
+            case OP_ARR_SLICE_FROM: { vm.sp = sp;
+                i32 start = rd_u16p(pc);
+                pc += 2;
                 Value src = vpeek(vm, 0);
                 JsObject* out = js_new_array(&vm.heap, vm.array_proto);
                 vpush(vm, value_cell(&out.head));
@@ -5557,8 +7134,8 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                 vm.sp--;
                 vpush(vm, ov);
             }
-            case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: {
-                fr.cur_ip = ip;   // call site, for stack traces
+            case OP_CALL_ARRAY, OP_NEW_ARRAY, OP_SUPERCALL_ARRAY: { vm.sp = sp;
+                fr.cur_ip = cast(i32, pc - code);   // call site, for stack traces
                 // new.target for the frame vm_call_stack is about to build:
                 // the constructor for `new`, the inherited target for super()
                 if op == OP_NEW_ARRAY { vm.pending_new_target = vpeek(vm, 1); }
@@ -5575,7 +7152,7 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                         Value protov = ensure_prototype(vm, fnv2);
                         JsObject* proto = null;
                         if value_is_object(protov) { proto = value_as_object(protov); }
-                        JsObject* inst = js_new_object(&vm.heap, proto);
+                        JsObject* inst = js_new_object_room(&vm.heap, proto, 6);
                         // [ctor, arr] -> [ctor, inst, arr]
                         Value arr = vpeek(vm, 0);
                         *(vm.stack + vm.sp - 1) = value_cell(&inst.head);
@@ -5605,39 +7182,39 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     }
                 }
             }
-            case OP_JUMP_NULLISH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+            case OP_JUMP_NULLISH: { vm.sp = sp;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if is_nullish(vpeek(vm, 0)) {
                     vm.sp--;
-                    ip = target;
+                    pc = code + target;
                 }
             }
-            case OP_JUMP_NULLISH_METH: {
-                i32 target = rd_u16(code, ip);
-                ip += 2;
+            case OP_JUMP_NULLISH_METH: { vm.sp = sp;
+                i32 target = rd_targetp(pc);
+                pc += 4;
                 if is_nullish(vpeek(vm, 1)) {
                     vm.sp -= 2;
-                    ip = target;
+                    pc = code + target;
                 }
             }
-            case OP_CHECK_ITERABLE: {
+            case OP_CHECK_ITERABLE: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 if !value_is_array(v) && !value_is_string(v) {
                     vm_throw_error(vm, ERR_TYPE, "value is not iterable");
                 }
             }
-            case OP_KEYS: {
+            case OP_KEYS: { vm.sp = sp;
                 Value src = vpeek(vm, 0);
                 JsObject* arr = forin_keys(vm, src);
                 vm.sp--;
                 vpush(vm, value_cell(&arr.head));
             }
-            case OP_GEN_START: {
+            case OP_GEN_START: { vm.sp = sp;
                 if fr.gen == null {
                     vm_throw_error(vm, ERR_TYPE, "generator body outside a generator");
                 } else {
-                    gen_start_suspend(vm, fr, ip);
+                    gen_start_suspend(vm, fr, cast(i32, pc - code));
                     vm.sp = fr.base - 2;
                     vpush(vm, value_undefined());
                     vm.fp--;
@@ -5645,10 +7222,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     fr = vm.frames + (vm.fp - 1);
                     t = fr.tmpl;
                     code = t.code;
-                    ip = (vm.frames + vm.fp).ret_ip;
+                    pc = code + (vm.frames + vm.fp).ret_ip;
                 }
             }
-            case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: {
+            case OP_YIELD, OP_AWAIT, OP_YIELD_DELEGATE: { vm.sp = sp;
                 JsGenerator* g = fr.gen;
                 if g == null {
                     vm_throw_error(vm, ERR_TYPE, "yield outside a generator");
@@ -5657,12 +7234,13 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     g.delegating = op == OP_YIELD_DELEGATE;
                     i32 depth = vm.sp - fr.base - 1;
                     if g.saved != null { free(g.saved); }
+                    gc_remember_cell(&g.head);   // the saved stack may hold young cells
                     g.saved = alloc<Value>(depth > 0 ? depth : 1);
                     for i32 i = 0; i < depth; i++ {
                         *(g.saved + i) = *(vm.stack + fr.base + i);
                     }
                     g.saved_len = depth;
-                    g.resume_ip = ip;
+                    g.resume_ip = cast(i32, pc - code);
                     i32 nh = 0;
                     while vm.hp - nh > 0 {
                         Handler* h = vm.handlers + (vm.hp - nh - 1);
@@ -5694,10 +7272,10 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     fr = vm.frames + (vm.fp - 1);
                     t = fr.tmpl;
                     code = t.code;
-                    ip = popped.ret_ip;
+                    pc = code + popped.ret_ip;
                 }
             }
-            case OP_GET_ITER: {
+            case OP_GET_ITER: { vm.sp = sp;
                 Value v = vpeek(vm, 0);
                 Value it;
                 if vm_get_iterator(vm, v, &it) {
@@ -5705,19 +7283,19 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, it);
                 }
             }
-            case OP_GET_AITER: {
+            case OP_GET_AITER: { vm.sp = sp;
                 do_get_aiter(vm);
             }
-            case OP_GET_AITER_W: {
+            case OP_GET_AITER_W: { vm.sp = sp;
                 do_get_aiter_w(vm);
             }
-            case OP_CATCH_ENTER: {
+            case OP_CATCH_ENTER: { vm.sp = sp;
                 catch_enter(vm);
             }
-            case OP_ITER_SEND: {
+            case OP_ITER_SEND: { vm.sp = sp;
                 do_iter_send(vm);
             }
-            case OP_ITER_NEXT: {
+            case OP_ITER_NEXT: { vm.sp = sp;
                 Value iter = vpeek(vm, 0);
                 Value val;
                 bool done = false;
@@ -5727,47 +7305,105 @@ private i32 vm_execute(VM* vm, i32 stop_fp) {
                     vpush(vm, value_bool(done));
                 }
             }
-            case OP_ITER_STEP: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+            case OP_ITER_STEP: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_step(vm, fr.base + dslot);
             }
-            case OP_ITER_REST: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+            case OP_GET_ITER_S: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
+                Value v = vpeek(vm, 0);
+                if iter_direct(vm, v) {
+                    *(vm.stack + fr.base + dslot) = iter_direct_start(v);
+                } else {
+                    *(vm.stack + fr.base + dslot) = value_bool(false);
+                    Value it;
+                    if vm_get_iterator(vm, v, &it) {
+                        vm.sp--;
+                        vpush(vm, it);
+                    }
+                }
+            }
+            case OP_ITER_NEXT_S: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
+                Value iter = vpeek(vm, 0);
+                Value val;
+                bool done = false;
+                if value_is_int(*(vm.stack + fr.base + dslot)) {
+                    done = !iter_direct_next(vm, iter, fr.base + dslot, &val);
+                    vm.sp--;
+                    vpush(vm, val);
+                    vpush(vm, value_bool(done));
+                } else if vm_iter_next(vm, iter, &val, &done) {
+                    *(vm.stack + fr.base + dslot) = value_bool(done);
+                    vm.sp--;
+                    vpush(vm, val);
+                    vpush(vm, value_bool(done));
+                }
+            }
+            case OP_PROTOGET: { vm.sp = sp;
+                u32 a = cast(u32, value_as_int(*(t.consts + rd_u16p(pc))));
+                pc += 2;
+                Value* pv = props_get(&vm.object_proto.props, a);
+                if pv != null && !value_is_accessor(*pv) {
+                    vpush(vm, *pv);
+                } else {
+                    // an accessor wants its receiver, a miss the chain's answer: the object after all
+                    JsObject* o = js_new_object(&vm.heap, vm.object_proto);
+                    vpush(vm, value_cell(&o.head));
+                    Value out;
+                    if prop_get(vm, vpeek(vm, 0), a, &out) {
+                        vm.sp--;
+                        vpush(vm, out);
+                    }
+                }
+            }
+            case OP_ITER_REST: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_rest(vm, fr.base + dslot);
             }
-            case OP_ITER_CLOSE: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+            case OP_ITER_CLOSE: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_close(vm, fr.base + dslot);
             }
-            case OP_ITER_CLOSE_ABRUPT: {
-                i32 dslot = rd_u16(code, ip);
-                ip += 2;
+            case OP_ITER_CLOSE_ABRUPT: { vm.sp = sp;
+                i32 dslot = rd_u16p(pc);
+                pc += 2;
                 iter_close_abrupt(vm, fr.base + dslot);
             }
-            case OP_ITER_CHECK: {
+            case OP_ITER_CHECK: { vm.sp = sp;
                 iter_check_result(vm);
             }
-            case OP_FREEZE: {
+            case OP_FREEZE: { vm.sp = sp;
                 freeze_top(vm);
             }
-            case OP_REGEX: {
-                Value srcv = *(t.consts + rd_u16(code, ip));
-                ip += 2;
-                Value flgv = *(t.consts + rd_u16(code, ip));
-                ip += 2;
+            case OP_REGEX: { vm.sp = sp;
+                Value srcv = *(t.consts + rd_u16p(pc));
+                pc += 2;
+                Value flgv = *(t.consts + rd_u16p(pc));
+                pc += 2;
                 Value re = vm_new_regexp(vm, gc_string_view(value_as_string(srcv)),
                     gc_string_view(value_as_string(flgv)));
                 if !vm.has_pending { vpush(vm, re); }
             }
-            default: {
+            default: { vm.sp = sp;
                 eprint("vm: bad opcode {}\n", op);
                 exit(70);
             }
         }
-
+        sp = vm.sp;
+        if vm.has_pending {
+            if !unwind_pending(vm, stop_fp, &ip) { return 1; }
+            fr = vm.frames + (vm.fp - 1);
+            t = fr.tmpl;
+            code = t.code;
+            pc = code + ip;
+            sp = vm.sp;
+        }
     }
     return 0;
 }
@@ -5786,7 +7422,15 @@ Value vm_string_char(VM* vm, GcString* s, i32 idx) {
     str_buf sb;
     str_buf_init(&sb);
     u16_slice_into_cur(&sb, view, idx, idx + 1, &s.cur_u, &s.cur_off);
-    GcString* g = gc_new_string(&vm.heap, str_buf_to_str(&sb));
+    str one = str_buf_to_str(&sb);
+    if one.len == 2 && (*(one.data) == 0xC2 || *(one.data) == 0xC3) {
+        // U+0080..U+00FF, shared: a decoder walks atob's bytes one by one
+        i32 c = ((*(one.data) & 0x1F) << 6 | (*(one.data + 1) & 0x3F)) - 128;
+        if vm.latin1_chars[c] == null { vm.latin1_chars[c] = gc_new_string(&vm.heap, one); }
+        str_buf_free(&sb);
+        return value_cell(&vm.latin1_chars[c].head);
+    }
+    GcString* g = gc_new_string(&vm.heap, one);
     str_buf_free(&sb);
     return value_cell(&g.head);
 }
@@ -5868,6 +7512,18 @@ private JsObject* forin_keys(VM* vm, Value objv) {
     if !value_is_object(objv) { return own; }
     JsObject* proto = value_as_object(objv).proto;
     if proto == null { return own; }
+    // the chain under an ordinary object adds nothing to enumerate: its own
+    // keys are the answer, without a list per prototype
+    bool bare = true;
+    JsObject* pc = proto;
+    while bare && pc != null {
+        if (pc.obj_flags & (OBJF_PROXY | OBJF_ARRAY | OBJF_TYPEDARRAY)) != 0 || pc.elen > 0 { bare = false; break; }
+        for i32 i = 0; i < pc.props.len; i++ {
+            if prop_enumerable(vm, pc.props.items + i) { bare = false; break; }
+        }
+        pc = pc.proto;
+    }
+    if bare { return own; }
     vpush(vm, value_cell(&own.head));
     JsObject* out = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&out.head));
@@ -5896,6 +7552,24 @@ private JsObject* forin_keys(VM* vm, Value objv) {
     }
     vm.sp -= 2;
     return out;
+}
+
+// The string for an atom's name: a pinned atom's is made once and kept
+// (a key that came from source is asked for by every Object.keys and
+// for-in over an object of its shape); a dynamic atom's, whose id may be
+// reused once it is swept, is made each time.
+GcString* vm_atom_string(VM* vm, u32 a) {
+    i32 i = cast(i32, a);
+    if i < vm.atoms.stamp.len && vec_get(&vm.atoms.stamp, i) == ATOM_PINNED {
+        while vm.atom_strs.len <= i { vec_push(&vm.atom_strs, cast(GcString*, null)); }
+        GcString* g = vm.atom_strs.data[i];
+        if g == null {
+            g = gc_new_string(&vm.heap, atom_name(&vm.atoms, a));
+            vm.atom_strs.data[i] = g;
+        }
+        return g;
+    }
+    return gc_new_string(&vm.heap, atom_name(&vm.atoms, a));
 }
 
 JsObject* vm_own_keys(VM* vm, Value objv) {
@@ -5951,7 +7625,7 @@ JsObject* vm_own_keys(VM* vm, Value objv) {
         for i32 i = 0; i < props.len; i++ {
             if !prop_enumerable(vm, props.items + i) { continue; }
             u32 pk = (props.items + i).key;
-            GcString* g = gc_new_string(&vm.heap, atom_name(&vm.atoms, pk));
+            GcString* g = vm_atom_string(vm, pk);
             js_array_set(arr, n, value_cell(&g.head));
             n++;
         }
@@ -6202,7 +7876,7 @@ private void new_instance(VM* vm, i32 argc) {
     if as_array {
         inst = js_new_array(&vm.heap, proto);
     } else {
-        inst = js_new_object(&vm.heap, proto);
+        inst = js_new_object_room(&vm.heap, proto, 6);
     }
     for i32 i = vm.sp; i > vm.sp - argc; i-- {
         *(vm.stack + i) = *(vm.stack + i - 1);
@@ -6280,6 +7954,13 @@ private i32 cmp_rel(VM* vm, i32 op) {
         if op == OP_GT { r = x > y; }
         if op == OP_LE { r = x <= y; }
         if op == OP_GE { r = x >= y; }
+    } else if value_is_number(a) && value_is_number(b) {
+        f64 x = value_number_f64(a);
+        f64 y = value_number_f64(b);
+        if op == OP_LT { r = x < y; }
+        if op == OP_GT { r = x > y; }
+        if op == OP_LE { r = x <= y; }
+        if op == OP_GE { r = x >= y; }
     } else if value_is_string(a) && value_is_string(b) {
         i32 c = js_str_cmp(gc_string_view(value_as_string(a)),
             gc_string_view(value_as_string(b)));
@@ -6351,8 +8032,75 @@ private void do_get_aiter_w(VM* vm) {
 // (a callback recursing through a builtin) has only so much room.
 // `di` is the absolute stack index of the "exhausted" flag.
 
+// A plain array, Map or Set is iterated as itself, the done slot holding
+// its place as an int (a bool once it is spent, or when the iterator
+// protocol is in use), so a for-of or a destructuring over one allocates
+// no iterator: what Array.prototype.values, Map.prototype.entries or
+// Set.prototype.values would do, which the prototype still has. For an
+// array the place is the next index; for a collection the sequence number
+// of the entry returned last, -1 before the first, which finds the entry
+// again after a compaction.
+private bool iter_direct(VM* vm, Value v) {
+    if value_is_object(v) {
+        JsObject* o = value_as_object(v);
+        if (o.obj_flags & (OBJF_ARRAY | OBJF_PROXY)) != OBJF_ARRAY || o.proto != vm.array_proto { return false; }
+        if o.props.len > 0 && props_get(&o.props, vm.sym_iterator_id) != null { return false; }
+        Value* pv = props_get(&vm.array_proto.props, vm.sym_iterator_id);
+        return pv != null && js_strict_eq(*pv, vm.array_values);
+    }
+    if value_is_map(v) && vm.map_direct != null {
+        JsMap* mp = value_as_map(v);
+        if mp.next_seq > 2147483647 { return false; }
+        JsObject* proto = mp.is_set ? vm.set_proto : vm.map_proto;
+        if mp.proto != proto { return false; }
+        Value* pv = props_get(&proto.props, vm.sym_iterator_id);
+        return pv != null && js_strict_eq(*pv, mp.is_set ? vm.set_values : vm.map_entries);
+    }
+    return false;
+}
+
+private Value iter_direct_start(Value v) {
+    return value_int(value_is_map(v) ? 0 - 1 : 0);
+}
+
+// The next element of the array in the fast mode; false once past the end,
+// the slot then a bool. A hole reads through the prototype chain, as the
+// iterator's Get would.
+private bool iter_direct_next(VM* vm, Value arrv, i32 di, Value* out) {
+    i32 i = value_as_int(*(vm.stack + di));
+    if value_is_map(arrv) {
+        i32 seq = vm.map_direct(cast(void*, vm), value_as_map(arrv), i, out);
+        if seq < 0 {
+            *(vm.stack + di) = value_bool(true);
+            *out = value_undefined();
+            return false;
+        }
+        *(vm.stack + di) = value_int(seq);
+        return true;
+    }
+    JsObject* arr = value_as_object(arrv);
+    if i >= arr.elen {
+        *(vm.stack + di) = value_bool(true);
+        *out = value_undefined();
+        return false;
+    }
+    *(vm.stack + di) = value_int(i + 1);
+    if js_array_has(arr, i) { *out = js_array_get(arr, i); return true; }
+    Value got;
+    if !vm_get_prop_value(vm, arrv, key_to_atom(vm, value_int(i)), &got) { got = value_undefined(); }
+    *out = got;
+    return true;
+}
+
 private void iter_step(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
+    if value_is_int(*(vm.stack + di)) {
+        Value val;
+        ignore iter_direct_next(vm, iter, di, &val);
+        vm.sp--;
+        vpush(vm, val);
+        return;
+    }
     if js_truthy(*(vm.stack + di)) {
         // spent: the element sees undefined and the iterator is left alone
         vm.sp--;
@@ -6375,7 +8123,10 @@ private void iter_rest(VM* vm, i32 di) {
     Value iter = vpeek(vm, 0);
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     vpush(vm, value_cell(&arr.head));   // rooted while draining
-    if !js_truthy(*(vm.stack + di)) {
+    if value_is_int(*(vm.stack + di)) {
+        Value val;
+        while iter_direct_next(vm, iter, di, &val) { js_array_set(arr, arr.elen, val); }
+    } else if !js_truthy(*(vm.stack + di)) {
         while true {
             Value val;
             bool done = false;
@@ -6445,6 +8196,11 @@ private void iter_check_result(VM* vm) {
 // wins, so the method's error and result are dropped.
 private void iter_close_mode(VM* vm, i32 di, bool throwing) {
     Value iter = vpeek(vm, 0);
+    if value_is_int(*(vm.stack + di)) {
+        // an array or a collection iterated directly: nothing to return
+        vm.sp--;
+        return;
+    }
     if !js_truthy(*(vm.stack + di)) {
         Value m;
         if vm_get_prop_value(vm, iter, atom_intern(&vm.atoms, "return"), &m) {
@@ -6597,6 +8353,7 @@ private Value make_generator_from_call(VM* vm, JsFunction* f, i32 argc) {
     normalize_args(vm, ft, argc);
     Value thisv = vpeek(vm, ft.n_params);
     JsGenerator* g = js_new_generator(&vm.heap, f, thisv);
+    gc_barrier(&g.head, argobj);
     g.arguments_obj = argobj;
     i32 n = ft.n_slots;
     g.saved = alloc<Value>(n > 0 ? n : 1);
@@ -6635,6 +8392,7 @@ private void gen_start_suspend(VM* vm, Frame* fr, i32 ip) {
     JsGenerator* g = fr.gen;
     i32 depth = vm.sp - fr.base;
     if g.saved != null { free(g.saved); }
+    gc_remember_cell(&g.head);
     g.saved = alloc<Value>(depth > 0 ? depth : 1);
     for i32 i = 0; i < depth; i++ {
         *(g.saved + i) = *(vm.stack + fr.base + i);
@@ -6883,9 +8641,11 @@ private void run_thenable_job(VM* vm, Value thenv, Value pv, Value thenf) {
     vpush(vm, thenf);
     if value_is_callable(thenf) {
         JsNative* onf = js_new_native(&vm.heap, &nat_adopt_ful, "resolve");
+        gc_barrier(&onf.head, pv);
         onf.env0 = pv;
         vpush(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_adopt_rej, "reject");
+        gc_barrier(&onr.head, pv);
         onr.env0 = pv;
         vpush(vm, value_cell(&onr.head));
         Value[2] a = { vpeek(vm, 1), vpeek(vm, 0) };
@@ -6991,11 +8751,15 @@ void vm_async_step(VM* vm, Value genv, Value rpv, Value input, bool is_throw) {
     }
     if vm_is_promise(vm, target) {
         JsNative* onf = js_new_native(&vm.heap, &nat_async_ful, "step");
+        gc_barrier(&onf.head, genv);
         onf.env0 = genv;
+        gc_barrier(&onf.head, rpv);
         onf.env1 = rpv;
         vpush(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_async_rej, "step");
+        gc_barrier(&onr.head, genv);
         onr.env0 = genv;
+        gc_barrier(&onr.head, rpv);
         onr.env1 = rpv;
         Value onfv = vpop(vm);
         ignore vm_promise_then(vm, target, onfv, value_cell(&onr.head));
@@ -7052,6 +8816,8 @@ private Value agen_head(JsGenerator* g, i32 k) {
 private void agen_push(VM* vm, JsGenerator* g, Value p, Value input, i32 kind) {
     if !value_is_object(g.queue) {
         JsObject* a = js_new_array(&vm.heap, vm.array_proto);
+        gc_barrier(&g.head, value_cell(&a.head));
+        gc_barrier(&g.head, value_cell(&a.head));
         g.queue = value_cell(&a.head);
     }
     JsObject* q = value_as_object(g.queue);
@@ -7178,9 +8944,11 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
         gc_root(&vm.heap, dt);
         vm_promise_settle(vm, dt, res, false);
         JsNative* df = js_new_native(&vm.heap, &nat_agen_done_ful, "step");
+        gc_barrier(&df.head, genv);
         df.env0 = genv;
         gc_root(&vm.heap, value_cell(&df.head));
         JsNative* dr = js_new_native(&vm.heap, &nat_agen_done_rej, "step");
+        gc_barrier(&dr.head, genv);
         dr.env0 = genv;
         gc_root(&vm.heap, value_cell(&dr.head));
         ignore vm_promise_then(vm, dt, value_cell(&df.head), value_cell(&dr.head));
@@ -7204,9 +8972,11 @@ private void vm_agen_step(VM* vm, Value genv, Value input, bool is_throw, bool i
     gc_root(&vm.heap, target);
     vm_promise_settle(vm, target, res, false);
     JsNative* onf = js_new_native(&vm.heap, g.awaiting ? &nat_agen_await_ful : &nat_agen_yield_ful, "step");
+    gc_barrier(&onf.head, genv);
     onf.env0 = genv;
     gc_root(&vm.heap, value_cell(&onf.head));
     JsNative* onr = js_new_native(&vm.heap, &nat_agen_throw_in, "step");
+    gc_barrier(&onr.head, genv);
     onr.env0 = genv;
     gc_root(&vm.heap, value_cell(&onr.head));
     ignore vm_promise_then(vm, target, value_cell(&onf.head), value_cell(&onr.head));
@@ -7370,6 +9140,27 @@ void* vm_handle_ext(VM* vm, i32 idx) {
 
 void vm_set_reactor_hook(VM* vm, ReactorHook h) { vm.reactor_hook = h; }
 void vm_set_dynimport_hook(VM* vm, DynImportHook h) { vm.dynimport_hook = h; }
+
+// One turn of the loop for an embedder that owns its own: the jobs, then
+// the timers already due, for at most `budget_ms`, never waiting. Returns
+// the milliseconds to the next timer, 0 when due work is left, -1 when
+// nothing is scheduled.
+f64 vm_step(VM* vm, f64 budget_ms) {
+    if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
+    f64 saved = vm.loop_budget_ms;
+    bool saved_no_wait = vm.loop_no_wait;
+    vm.loop_budget_ms = budget_ms > 0.0 ? budget_ms : 0.001;
+    vm.loop_no_wait = true;
+    ignore vm_run_event_loop(vm);
+    vm.loop_no_wait = saved_no_wait;
+    vm.loop_budget_ms = saved;
+    if vm.job_head < vm.jobs.len { return 0.0; }
+    vm_timers_compact(vm);
+    VmTimer* next = vm_timer_next(vm);
+    if next == null { return -1.0; }
+    f64 d = next.due - vm_now_ms(vm);
+    return d < 0.0 ? 0.0 : d;
+}
 void* vm_esm_loader(VM* vm) { return vm.esm_loader; }
 void vm_set_esm_loader(VM* vm, void* p) { vm.esm_loader = p; }
 void vm_set_arguments_builder(VM* vm, ArgumentsBuilder b) { vm.arguments_builder = b; }
@@ -7576,9 +9367,11 @@ when defined(NET_POLLER) {
 private void reactor_poll(VM* vm, i64 timeout_ms) {
     vm.last_poll_ms = vm_now_ms(vm);
     u64 w0 = vm_clock_ns();
+    i32 ph_idle = vm_phase_enter(vm, PH_IDLE);
     if vm.poller < 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
         vm.loop_idle_ns += vm_clock_ns() - w0;
+        vm_phase_leave(vm, ph_idle);
         return;
     }
     if vm.poll_events == null { vm.poll_events = cast(void*, alloc<NetPollEvent>(REACTOR_EVENTS)); }
@@ -7586,6 +9379,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     i32 to = timeout_ms < 0 ? -1 : cast(i32, timeout_ms);
     i32 r = net_poller_wait(vm.poller, evs, REACTOR_EVENTS, to);
     vm.loop_idle_ns += vm_clock_ns() - w0;
+    vm_phase_leave(vm, ph_idle);
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < r; j++ {
             NetPollEvent* e = evs + j;
@@ -7623,9 +9417,11 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     }
     i32 npoll = vm.poll_set.len;
     u64 w0 = vm_clock_ns();
+    i32 ph_idle = vm_phase_enter(vm, PH_IDLE);
     if npoll == 0 {
         vm_wait_ms(timeout_ms < 0 ? REACTOR_IDLE_MS : timeout_ms);
         vm.loop_idle_ns += vm_clock_ns() - w0;
+        vm_phase_leave(vm, ph_idle);
         return;
     }
     NetPollFd* pf = vm.poll_set.data;
@@ -7642,6 +9438,7 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
     // The wait counts as idle, as node counts the time in its poll: the
     // event loop utilisation is the rest.
     vm.loop_idle_ns += vm_clock_ns() - w0;
+    vm_phase_leave(vm, ph_idle);
     if r > 0 && vm.reactor_hook != null {
         for i32 j = 0; j < npoll; j++ {
             i16 re = (pf + j).revents;
@@ -7659,7 +9456,10 @@ private void reactor_poll(VM* vm, i64 timeout_ms) {
 
 i32 vm_run_event_loop(VM* vm) {
     if vm.loop_start_ns == 0 { vm.loop_start_ns = vm_clock_ns(); }
+    f64 deadline = vm.loop_budget_ms > 0.0 ? vm_now_ms(vm) + vm.loop_budget_ms : 0.0;
     while true {
+        // the budget spent: what is alive stays for the embedder's next call
+        if deadline > 0.0 && vm.job_head >= vm.jobs.len && vm_now_ms(vm) >= deadline { return 0; }
         while vm.job_head < vm.jobs.len {
             VmJob j = vec_get(&vm.jobs, vm.job_head);
             vm.job_head++;
@@ -7711,7 +9511,7 @@ i32 vm_run_event_loop(VM* vm) {
         if !vm_timers_reffed(vm) && !vm_handles_alive(vm) {
             // Nothing left to do. A beforeExit listener may schedule more, in
             // which case the loop picks it up and asks again later.
-            if vm.before_exit_done { break; }
+            if vm.before_exit_done || vm.loop_no_wait { break; }
             vm.before_exit_done = true;
             if !vm_process_emit(vm, "beforeExit", value_int(0), value_undefined(), 1) { break; }
             if vm.has_pending {
@@ -7727,6 +9527,10 @@ i32 vm_run_event_loop(VM* vm) {
         f64 now = vm_now_ms(vm);
         bool timer_due = next != null && next.due <= now;
         if !timer_due {
+            if vm.loop_no_wait {
+                if vm.handles.len > 0 { reactor_poll(vm, 0); }
+                return 0;
+            }
             // nothing to fire yet — poll the sockets, bounded by the next
             // timer deadline (or block until I/O when only handles remain)
             i64 timeout;
@@ -7735,6 +9539,13 @@ i32 vm_run_event_loop(VM* vm) {
             } else {
                 f64 d = next.due - now;
                 timeout = d < 1.0 ? 1 : cast(i64, d);
+            }
+            if deadline > 0.0 {
+                // the wait ends at the budget; what is still pending then is
+                // left for the embedder's next call
+                f64 left = deadline - now;
+                if left <= 0.0 { return 0; }
+                if timeout < 0 || cast(f64, timeout) > left { timeout = left < 1.0 ? 1 : cast(i64, left); }
             }
             reactor_poll(vm, timeout);
             if vm.has_pending {
@@ -7818,6 +9629,10 @@ i32 vm_report_unhandled(VM* vm) {
         js_set_prop(p, vm.atom_phandled, value_bool(true));
         Value* rv = props_get(&p.props, vm.atom_pvalue);
         Value reason = rv != null ? *rv : value_undefined();
+        if vm.host_uncaught != null {
+            vm.host_uncaught(vm, reason, true);
+            continue;
+        }
         if vm_process_emit(vm, "unhandledRejection", reason, value_cell(&p.head), 2) {
             continue;
         }
@@ -7880,10 +9695,20 @@ Value vm_call_stack(VM* vm, i32 argc) {
     Value fnv = vpeek(vm, argc + 1);
     Value thisv = vpeek(vm, argc);
     if value_is_native(fnv) {
-        // a native base cannot settle a derived constructor's `this`
+        i32 super_for = vm.pending_super_for;
+        Value new_target = vm.pending_new_target;
         vm.pending_super_for = 0 - 1;
+        vm.pending_new_target = value_undefined();
         JsNative* na = value_as_native(fnv);
-        Value res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        Value res;
+        if vm.phases == 0 {
+            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+        } else {
+            NativeSpan nsp = vm_native_begin(vm, na);
+            res = na.fun(cast(void*, vm), fnv, thisv, vm.stack + vm.sp - argc, argc);
+            vm_native_end(vm, na, nsp);
+        }
+        if super_for >= 0 && !vm.has_pending { super_native_result(vm, res, new_target, thisv, super_for); }
         vm.sp = entry_sp;
         return res;
     }
@@ -7899,6 +9724,11 @@ Value vm_call_stack(VM* vm, i32 argc) {
     }
     JsFunction* f = value_as_function(fnv);
     FnTemplate* ft = f.tmpl;
+    if ft.lazy != null && !vm_lazy_compile(vm, ft) {
+        vm.pending_super_for = 0 - 1;
+        vm.sp = entry_sp;
+        return value_undefined();
+    }
     vm.pending_super_for = ft.is_gen || ft.is_async ? 0 - 1 : vm.pending_super_for;
     if ft.is_gen { return make_generator_from_call(vm, f, argc); }
     if ft.is_async { return make_async_from_call(vm, f, argc); }
@@ -7929,7 +9759,7 @@ Value vm_call_stack(VM* vm, i32 argc) {
     nf.arguments_obj = argobj;
     nf.is_ctor = false;
     nf.super_pending = ft.derived_ctor;
-    nf.super_for = vm.pending_super_for;
+    nf.super_for = cast(i16, vm.pending_super_for);
     vm.pending_super_for = 0 - 1;
     // a super()/new spread call stashes the new.target here; consume it once
     nf.new_target = vm.pending_new_target;
@@ -8047,16 +9877,18 @@ Value vm_new_regexp(VM* vm, str source, str flags) {
         str owned = str_buf_to_str(&kb);   // the buffer's bytes become the key
         vec_push(&vm.regex_keys, owned);
         strmap_set(&vm.regex_cache, owned, idx);
+        // an empty pattern reports "(?:)" so String(re) stays a valid literal;
+        // the source string is in its vector, a root, before the flags string's allocation may collect
+        vec_push(&vm.regex_srcs, gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)"));
+        GcString* fs = gc_new_string(&vm.heap, flags);
+        vec_push(&vm.regex_flgs, fs);
     }
     RegexProg* prog = vec_get(&vm.regexps, idx);
     JsObject* re = js_new_object(&vm.heap, vm.regexp_proto);
     vpush(vm, value_cell(&re.head));
     props_set_desc(&re.props, vm.atom_rx, value_int(idx), 0);
-    // an empty pattern reports "(?:)" so String(re) stays a valid literal
-    GcString* src = gc_new_string(&vm.heap, source.len > 0 ? source : "(?:)");
-    props_set_desc(&re.props, vm.atom_source, value_cell(&src.head), 0);
-    GcString* flg = gc_new_string(&vm.heap, flags);
-    props_set_desc(&re.props, vm.atom_flags, value_cell(&flg.head), 0);
+    props_set_desc(&re.props, vm.atom_source, value_cell(&vm.regex_srcs.data[idx].head), 0);
+    props_set_desc(&re.props, vm.atom_flags, value_cell(&vm.regex_flgs.data[idx].head), 0);
     props_set_desc(&re.props, vm.atom_lastindex, value_int(0), PROP_WRITABLE);
     // The flag set, one property per flag. All non-enumerable, so Object.keys
     // and JSON.stringify see a RegExp as the empty object node reports.
@@ -8109,6 +9941,7 @@ AtomTable* vm_atoms(VM* vm) { return &vm.atoms; }
 // Registers a compiled template so its constants stay GC roots.
 void vm_add_template_root(VM* vm, FnTemplate* t) {
     vec_push(&vm.troots, t);
+    vec_push(&vm.fresh_tmpls, t);
 }
 
 // Sorts a namespace's exported names into code unit order, symbols last.
@@ -8238,17 +10071,594 @@ else {
 }
 
 // Full pipeline. 0 ok, 1 uncaught exception, 2 compile errors.
+// A lazy function's first call: reparsed from its source and compiled
+// into its template. False with a SyntaxError thrown when it does not.
+bool vm_lazy_compile(VM* vm, FnTemplate* t) {
+    i32 ph = vm_phase_enter(vm, PH_LAZY);
+    defer vm_phase_leave(vm, ph);
+    if vm.lazy_ahead != null && vm_lazy_from_ahead(vm, t) { return true; }
+    u64 t0 = vm_clock_ns();
+    defer vm_lazy_account(vm, t0);
+    LazyFn* lz = t.lazy;
+    LazySource* s = lz.source;
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    Parser p;
+    parser_init_at(&p, s.src, &d, &arena, lz.start, lz.strict);
+    Node* f = parse_function_skipping(&p, lz.method, true);
+    bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if ok && p.ts_seen { lower_function(&lw, &f); ok = d.n_errors == 0; }
+    if ok {
+        i32 rmark = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_lazy_source(&co, s);
+        co.script_globals = vm.script_globals;
+        ok = compile_lazy(&co, f, t);
+        if ok { vec_push(&vm.fresh_tmpls, t); t.owner.compiled++; }
+        gc_root_reset(&vm.heap, rmark);
+    }
+    if !ok {
+        str msg = d.n_errors > 0 ? d.list.data[0].message : "a function could not be compiled";
+        using string m = str_concat("", msg);
+        vm_throw_error(vm, ERR_SYNTAX, str_from(m.data, m.len));
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    return ok;
+}
+
+// --- phases --------------------------------------------------------------
+//
+// The time of a run between vm_phase_begin and vm_phase_end is charged to
+// the phases (PH_* in object.mc). The boundaries are the native calls, the
+// loop's re-entry under a native, the compiles and the cache reads, and
+// the event loop's waits; the collector's time is taken out of the phase
+// it interrupted from gc.mc's own counters. An op of the loop costs
+// nothing here: the interpreter's time is what is left when everything
+// else is charged, measured rather than inferred. A switch is one read of
+// the counter and a few adds, in the counter's own ticks; the report
+// converts. Its cost is measured when the accounting is turned on and the
+// report says what the switches came to, so a reader can take it out.
+
+struct NativeStat {
+    str name;
+    i64 calls;
+    i64 self;             // ticks of the native's own time: its JS callbacks and the natives under them taken out
+}
+
+struct NativeStats {
+    StrMap<i32> at;       // name to index in list
+    Vec<NativeStat> list;
+    i64 self_total;       // every native's own time so far, for the nesting
+}
+
+// A native call's span: the phase to go back to and the native totals at
+// its start, for its own time.
+struct NativeSpan {
+    i32 prev;
+    i64 n0;
+    i64 s0;
+}
+
+private i64 gc_ticks_total() { return gc_stat_ticks + gc_stat_sweep_ticks + gc_stat_step_ticks; }
+
+// The running phase's time up to `now` goes to its account, the
+// collector's share noted beside it.
+private void vm_phase_flush(VM* vm, i64 now) {
+    i64 gt = gc_ticks_total();
+    vm.phase_ticks[vm.phase] += now - vm.phase_t0;
+    vm.phase_gc[vm.phase] += gt - vm.phase_gc0;
+    vm.phase_t0 = now;
+    vm.phase_gc0 = gt;
+}
+
+void vm_phase_switch(VM* vm, i32 ph) {
+    vm.phase_switches++;
+    if vm.phase_depth == 0 { vm.phase_outside++; vm.phase = ph; return; }
+    vm_phase_flush(vm, qpc());
+    vm.phase = ph;
+}
+
+// A span of the runtime's time: the embedder's call into it. Nested
+// spans are one.
+void vm_phase_begin(VM* vm) {
+    if vm.phases == 0 { return; }
+    if vm.phase_depth == 0 {
+        vm.phase_t0 = qpc();
+        vm.phase_span0 = vm.phase_t0;
+        vm.phase_gc0 = gc_ticks_total();
+        vm.phase = PH_INTERP;
+    }
+    vm.phase_depth++;
+}
+
+void vm_phase_end(VM* vm) {
+    if vm.phases == 0 || vm.phase_depth == 0 { return; }
+    vm.phase_depth--;
+    if vm.phase_depth == 0 {
+        i64 now = qpc();
+        vm_phase_flush(vm, now);
+        vm.phase_wall += now - vm.phase_span0;
+    }
+}
+
+// Enter a phase; returns the one to hand vm_phase_leave, -1 when off.
+@inline
+i32 vm_phase_enter(VM* vm, i32 ph) {
+    if vm.phases == 0 { return -1; }
+    i32 prev = vm.phase;
+    vm_phase_switch(vm, ph);
+    return prev;
+}
+
+void vm_phase_leave(VM* vm, i32 prev) {
+    if prev >= 0 { vm_phase_switch(vm, prev); }
+}
+
+// The loop's entry under whatever phase was running, and its return to it.
+void vm_phase_push_interp(VM* vm) {
+    if vm.phase_sp < PH_STACK { vm.phase_stack[vm.phase_sp] = vm.phase; }
+    vm.phase_sp++;
+    if vm.phase != PH_INTERP { vm_phase_switch(vm, PH_INTERP); }
+}
+
+void vm_phase_pop_interp(VM* vm) {
+    if vm.phases == 0 { return; }
+    vm.phase_sp--;
+    i32 back = vm.phase_sp < PH_STACK ? vm.phase_stack[vm.phase_sp] : PH_INTERP;
+    if back != vm.phase { vm_phase_switch(vm, back); }
+}
+
+// The natives' own ticks so far, both phases, the collector's taken out.
+@inline
+i64 vm_native_ticks(VM* vm) {
+    return vm.phase_ticks[PH_NATIVE] - vm.phase_gc[PH_NATIVE] + vm.phase_ticks[PH_HOST] - vm.phase_gc[PH_HOST];
+}
+
+// The call sites take these only with the accounting on.
+@inline
+NativeSpan vm_native_begin(VM* vm, JsNative* na) {
+    NativeSpan nsp = NativeSpan{ -1, 0, 0 };
+    nsp.prev = vm.phase;
+    nsp.n0 = vm_native_ticks(vm);
+    nsp.s0 = vm.nstats != null ? vm.nstats.self_total : 0;
+    vm_phase_switch(vm, na.phase);
+    return nsp;
+}
+
+@inline
+void vm_native_end(VM* vm, JsNative* na, NativeSpan nsp) {
+    vm_phase_switch(vm, nsp.prev);
+    if vm.nstats == null { return; }
+    // what the native phases gained during the call, less what the natives
+    // under it took for themselves, is this native's own time
+    i64 self = (vm_native_ticks(vm) - nsp.n0) - (vm.nstats.self_total - nsp.s0);
+    vm.nstats.self_total += self;
+    i32* at = strmap_slot<i32>(&vm.nstats.at, na.name, -1);
+    if *at < 0 {
+        *at = vm.nstats.list.len;
+        vec_push(&vm.nstats.list, NativeStat{ na.name, 0, 0 });
+    }
+    NativeStat* st = vm.nstats.list.data + *at;
+    st.calls++;
+    st.self += self;
+}
+
+// Turns the accounting on: 1 the phases, 2 the natives by name as well.
+// Measures a switch while at it: 4096 of them between two phases, the
+// least of eight rounds, the counters then cleared.
+void vm_phases_on(VM* vm, i32 level) {
+    vm.phases = level;
+    if level >= 2 && vm.nstats == null {
+        vm.nstats = new(NativeStats);
+        strmap_init<i32>(&vm.nstats.at);
+        vec_init<NativeStat>(&vm.nstats.list, 256);
+        vm.nstats.self_total = 0;
+    }
+    i64 best = 0;
+    for i32 round = 0; round < 8; round++ {
+        vm_phase_begin(vm);
+        i64 t0 = qpc();
+        for i32 k = 0; k < 2048; k++ {
+            vm_phase_switch(vm, PH_NATIVE);
+            vm_phase_switch(vm, PH_INTERP);
+        }
+        i64 dt = qpc() - t0;
+        vm_phase_end(vm);
+        if round == 0 || dt < best { best = dt; }
+    }
+    vm.phase_switch_cost = best;
+    for i32 k = 0; k < PH_COUNT; k++ { vm.phase_ticks[k] = 0; vm.phase_gc[k] = 0; }
+    vm.phase_wall = 0;
+    vm.phase_switches = 0;
+    vm.phase_outside = 0;
+}
+
+private str ph_name(i32 ph) {
+    if ph == PH_INTERP { return "interp"; }
+    if ph == PH_NATIVE { return "natives"; }
+    if ph == PH_HOST { return "host"; }
+    if ph == PH_GC { return "gc"; }
+    if ph == PH_LAZY { return "lazy"; }
+    if ph == PH_COMPILE { return "compile"; }
+    if ph == PH_CACHE { return "cache"; }
+    return "idle";
+}
+
+private i64 ticks_ms(i64 t) { return t * 1000 / qpf(); }
+private i64 ticks_us(i64 t) { return t * 1000000 / qpf(); }
+
+// The report, each line opened with `prefix`: the phases in ms with the
+// wall of the spans and the residual, the switches and their cost, then
+// at level 2 the `top` natives by their own time. The idle phase is
+// outside the wall's sum; the collector's time is one phase, taken from
+// the others.
+string vm_phase_report(VM* vm, str prefix, i32 top) {
+    str_buf b;
+    str_buf_init(&b);
+    i64 gc = 0;
+    i64 sum = 0;
+    for i32 k = 0; k < PH_COUNT; k++ { gc += vm.phase_gc[k]; if k != PH_IDLE { sum += vm.phase_ticks[k]; } }
+    str_buf_add(&b, prefix);
+    str_buf_add(&b, "phases:");
+    for i32 k = 0; k < PH_COUNT; k++ {
+        i64 t = k == PH_GC ? gc : vm.phase_ticks[k] - vm.phase_gc[k];
+        using string one = format("{} {} {}", k == 0 ? "" : ",", ph_name(k), ticks_ms(t));
+        str_buf_add(&b, str_from(one.data, one.len));
+    }
+    i64 cost = vm.phase_switches * vm.phase_switch_cost / 4096;
+    using string tail = format("; wall {} ms, residual {} us; {} switches at {} ns, about {} ms where the phases met; {} outside a span, depth {}\n",
+        ticks_ms(vm.phase_wall), ticks_us(vm.phase_wall - sum - vm.phase_ticks[PH_IDLE]), vm.phase_switches,
+        ticks_us(vm.phase_switch_cost * 1000) / 4096, ticks_ms(cost), vm.phase_outside, vm.phase_depth);
+    str_buf_add(&b, str_from(tail.data, tail.len));
+    if vm.nstats != null && top > 0 {
+        // selection by own time, the list is a few hundred long
+        Vec<NativeStat>* l = &vm.nstats.list;
+        i32 n = l.len < top ? l.len : top;
+        for i32 i = 0; i < n; i++ {
+            i32 best = i;
+            for i32 j = i + 1; j < l.len; j++ {
+                i64 a = (l.data + j).self - (l.data + j).calls * vm.phase_switch_cost / 4096;
+                i64 bb = (l.data + best).self - (l.data + best).calls * vm.phase_switch_cost / 4096;
+                if a > bb { best = j; }
+            }
+            NativeStat tmp = l.data[i];
+            l.data[i] = l.data[best];
+            l.data[best] = tmp;
+        }
+        str_buf_add(&b, prefix);
+        using string head = format("natives by own time less the switch cost of their calls, {} of {}:", n, l.len);
+        str_buf_add(&b, str_from(head.data, head.len));
+        for i32 i = 0; i < n; i++ {
+            NativeStat* st = l.data + i;
+            // the switch cost of its calls is the accounting's, not the native's
+            i64 us = ticks_us(st.self - st.calls * vm.phase_switch_cost / 4096);
+            if us < 0 { us = 0; }
+            using string one = format("{} {} {}.{} ms/{}", i == 0 ? "" : ",", st.name, us / 1000, (us / 100) % 10, st.calls);
+            str_buf_add(&b, str_from(one.data, one.len));
+        }
+        str_buf_add(&b, "\n");
+    }
+    string out = str_concat("", str_buf_to_str(&b));
+    str_buf_free(&b);
+    return out;
+}
+
+private void vm_lazy_account(VM* vm, u64 t0) {
+    vm.lazy_compiles++;
+    vm.lazy_ns += cast(i64, vm_clock_ns() - t0);
+}
+
+// The function's template from the embedder's compile ahead, when that
+// has reached it: read as the cache is read.
+private bool vm_lazy_from_ahead(VM* vm, FnTemplate* t) {
+    u64 t0 = vm_clock_ns();
+    LazyFn* lz = t.lazy;
+    i32 n = 0;
+    u8* b = vm.lazy_ahead(vm.lazy_ahead_ctx, lz.source.src_name, lz.source.src.len, lz.start, &n);
+    if b == null { return false; }
+    i32 rmark = gc_root_mark(&vm.heap);
+    bool ok = codecache_read_lazy(&vm.heap, &vm.atoms, b, n, t);
+    if ok { vec_push(&vm.fresh_tmpls, t); t.owner.compiled++; }
+    gc_root_reset(&vm.heap, rmark);
+    if ok {
+        vm.lazy_ahead_hits++;
+        vm.lazy_ahead_ns += cast(i64, vm_clock_ns() - t0);
+    }
+    return ok;
+}
+
+// The run of a script's root template: the body, then the jobs it queued.
+private i32 vm_run_root(VM* vm, FnTemplate* t) {
+    i32 status = vm_run_template(vm, t);
+    if status == 0 { status = vm_run_event_loop(vm); }
+    if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
+    return status;
+}
+
+// A script's templates as the code cache writes them; the caller frees
+// the buffer.
+CcOut vm_save_templates(VM* vm, FnTemplate* root, str src) {
+    return codecache_write(&vm.atoms, root, src, lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals);
+}
+
+// The tree a cache holds for `src`, owned by the VM, or null when the
+// bytes are not a cache of it.
+FnTemplate* vm_load_templates(VM* vm, u8* data, i32 len, str src, str src_name) {
+    u64 c0 = vm_clock_ns();
+    i32 ph = vm_phase_enter(vm, PH_CACHE);
+    defer vm_phase_leave(vm, ph);
+    i32 rmark = gc_root_mark(&vm.heap);
+    i32 n = 0;
+    FnTemplate* t = codecache_read(&vm.heap, &vm.atoms, data, len, src, src_name,
+        lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals, &n);
+    if t != null {
+        vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
+        vm.cache_loads++;
+        vm.cache_ns += cast(i64, vm_clock_ns() - c0);
+    }
+    gc_root_reset(&vm.heap, rmark);
+    return t;
+}
+
+// --code-cache-verify: the compiled tree written, read back and written
+// again, the two writings compared; the tree read back is what runs.
+private FnTemplate* vm_verify_cache(VM* vm, FnTemplate* t, str src, str src_name) {
+    CcOut a = vm_save_templates(vm, t, src);
+    i32 n = 0;
+    FnTemplate* t2 = codecache_read(&vm.heap, &vm.atoms, a.data, a.len, src, src_name,
+        lazy_functions && src.len >= LAZY_MIN_SOURCE, vm.script_globals, &n);
+    if t2 == null {
+        eprint("code cache: {} does not read back\n", src_name);
+        free(a.data);
+        return null;
+    }
+    CcOut b = vm_save_templates(vm, t2, src);
+    bool same = a.len == b.len;
+    for i32 i = 0; same && i < a.len; i++ { same = *(a.data + i) == *(b.data + i); }
+    free(a.data);
+    free(b.data);
+    if !same {
+        eprint("code cache: {} differs on the second writing\n", src_name);
+        template_free(t2);
+        return null;
+    }
+    return t2;
+}
+
 i32 vm_run_source(VM* vm, str src, str src_name) {
+    return vm_run_source_root(vm, src, src_name, null);
+}
+
+// A script compiled and kept, not run: its root template, or null with the
+// first diagnostic's message in `err` (owned by the caller). What the
+// Function constructor needs: the function expression the script holds is
+// its first sub-template.
+FnTemplate* vm_compile_source(VM* vm, str src, str src_name, string* err) {
+    i32 ph = vm_phase_enter(vm, PH_COMPILE);
+    defer vm_phase_leave(vm, ph);
     DiagList d;
     diags_init(&d);
     Bump arena;
     bump_init(&arena);
     Parser p;
     parser_init(&p, src, &d, &arena);
-    Node* prog = parse_program(&p);
+    Node* prog = parse_program_skipping(&p, false);
     Lower lw;
     lower_init(&lw, &arena, &d);
-    lower_program(&lw, prog);
+    if p.ts_seen { lower_program(&lw, prog); }
+    FnTemplate* t = null;
+    if d.n_errors == 0 {
+        i32 rmark = gc_root_mark(&vm.heap);
+        Compiler co;
+        compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
+        compiler_set_source(&co, src, src_name);
+        co.script_globals = vm.script_globals;
+        t = compile_program(&co, prog);
+        vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
+        gc_root_reset(&vm.heap, rmark);
+        vm.compiles++;
+    }
+    if d.n_errors > 0 {
+        t = null;
+        str msg = "invalid or unexpected token";
+        for i32 i = 0; i < d.list.len; i++ { if d.list.data[i].severity != 0 || i == d.list.len - 1 { msg = d.list.data[i].message; break; } }
+        *err = str_concat("", msg);
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    return t;
+}
+
+// A script compiled apart from the VM, on a heap and atom table of its
+// own, for a thread that is not the VM's: first into the code cache's
+// form, which the VM reads as it would a cache of the script (vm.cc_data),
+// then its lazy functions one by one in source order, each into bytes of
+// its own, which the VM takes at the function's first call in place of
+// compiling it (vm.lazy_ahead). Source order, since a bundle runs its
+// modules about as they are laid out. The heap never collects, so it
+// needs no roots; everything made goes with ahead_end.
+struct AheadCompile {
+    GcHeap heap;
+    AtomTable atoms;
+    string src;          // its own copy: the embedder's text need not outlive it
+    string src_name;
+    bool script_globals;
+    FnTemplate* root;
+    Vec<TmplPtr> todo;   // the lazy functions not compiled yet, the next last
+    i32 compiled;
+}
+
+// the lazy functions under `t`, pushed last first so they pop in source order
+private void ahead_collect(AheadCompile* a, FnTemplate* t) {
+    for i32 i = t.n_subs - 1; i >= 0; i-- {
+        FnTemplate* s = *(t.subs + i);
+        if s.lazy != null { vec_push(&a.todo, s); } else { ahead_collect(a, s); }
+    }
+}
+
+// The script parsed and compiled. False, with nothing left to end, when
+// it does not compile, which the VM then reports.
+bool ahead_begin(AheadCompile* a, str src, str src_name, bool script_globals) {
+    a.src = str_concat("", src);
+    a.src_name = str_concat("", src_name);
+    a.script_globals = script_globals;
+    a.root = null;
+    a.compiled = 0;
+    gc_init(&a.heap);
+    a.heap.tracer = &js_trace;
+    a.heap.finalizer = &js_finalize;
+    a.heap.props_trace = &js_props_trace;
+    a.heap.minor_threshold = 0x7fffffffffffffff;
+    a.heap.next_gc = 0x7fffffffffffffff;
+    atoms_init(&a.atoms);
+    vec_init<TmplPtr>(&a.todo, 64);
+    str s = str_from(a.src.data, a.src.len);
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    Parser p;
+    parser_init(&p, s, &d, &arena);
+    Node* prog = parse_program_skipping(&p, lazy_functions && s.len >= LAZY_MIN_SOURCE);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if p.ts_seen { lower_program(&lw, prog); }
+    if d.n_errors == 0 {
+        Compiler co;
+        compiler_init(&co, &d, &a.heap, &a.atoms, &arena);
+        compiler_set_source(&co, s, str_from(a.src_name.data, a.src_name.len));
+        co.script_globals = script_globals;
+        FnTemplate* t = compile_program(&co, prog);
+        if d.n_errors == 0 { a.root = t; } else { template_free(t); }
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    bump_destroy(&arena);
+    diags_free(&d);
+    if a.root == null { ahead_end(a); return false; }
+    ahead_collect(a, a.root);
+    return true;
+}
+
+// For threads that split a script between them, before any ahead_next:
+// this one keeps every `parts`-th of the top-level lazy functions from
+// `part` on, with the functions inside them.
+void ahead_share(AheadCompile* a, i32 part, i32 parts) {
+    if parts <= 1 { return; }
+    i32 n = a.todo.len;
+    i32 k = 0;
+    for i32 i = 0; i < n; i++ {
+        if (n - 1 - i) % parts == part { a.todo.data[k] = a.todo.data[i]; k++; }
+    }
+    a.todo.len = k;
+}
+
+// The tree as the code cache's bytes, which the caller frees: before any
+// ahead_next, so it is the tree the VM would have compiled itself.
+CcOut ahead_cache(AheadCompile* a) {
+    str s = str_from(a.src.data, a.src.len);
+    return codecache_write(&a.atoms, a.root, s, lazy_functions && s.len >= LAZY_MIN_SOURCE, a.script_globals);
+}
+
+// The next lazy function compiled, its bytes in *out (the caller frees
+// them) and its start in *start_out; false when none is left. One that
+// does not compile is passed over: the VM compiles it at its call and
+// reports it.
+bool ahead_next(AheadCompile* a, i32* start_out, CcOut* out) {
+    while a.todo.len > 0 {
+        FnTemplate* t = vec_pop(&a.todo);
+        LazyFn* lz = t.lazy;
+        i32 start = lz.start;
+        DiagList d;
+        diags_init(&d);
+        Bump arena;
+        bump_init(&arena);
+        Parser p;
+        parser_init_at(&p, lz.source.src, &d, &arena, lz.start, lz.strict);
+        Node* f = parse_function_skipping(&p, lz.method, true);
+        bool ok = f != null && f.kind == N_FUNCTION && d.n_errors == 0;
+        Lower lw;
+        lower_init(&lw, &arena, &d);
+        if ok && p.ts_seen { lower_function(&lw, &f); ok = d.n_errors == 0; }
+        if ok {
+            Compiler co;
+            compiler_init(&co, &d, &a.heap, &a.atoms, &arena);
+            compiler_set_lazy_source(&co, lz.source);
+            co.script_globals = a.script_globals;
+            ok = compile_lazy(&co, f, t);
+        }
+        lower_destroy(&lw);
+        parser_destroy(&p);
+        bump_destroy(&arena);
+        diags_free(&d);
+        if !ok { continue; }
+        a.compiled++;
+        ahead_collect(a, t);
+        *out = codecache_write_one(&a.atoms, t);
+        *start_out = start;
+        return true;
+    }
+    return false;
+}
+
+void ahead_end(AheadCompile* a) {
+    if a.root != null { template_free(a.root); a.root = null; }
+    vec_free(&a.todo);
+    atoms_free(&a.atoms);
+    gc_destroy(&a.heap);
+    free(a.src);
+    free(a.src_name);
+}
+
+// A script compiled on its own heap into the code cache's form, for a
+// thread that is not the VM's. Empty when the script does not compile.
+CcOut vm_compile_ahead(str src, str src_name, bool script_globals) {
+    AheadCompile a;
+    if !ahead_begin(&a, src, src_name, script_globals) { return CcOut{}; }
+    CcOut out = ahead_cache(&a);
+    ahead_end(&a);
+    return out;
+}
+
+// A script run, its root template left in *root_out when that is given:
+// the embedder's handle for writing the code cache once the page is done.
+i32 vm_run_source_root(VM* vm, str src, str src_name, FnTemplate** root_out) {
+    if vm.cc_data != null {
+        u8* data = vm.cc_data;
+        i32 len = vm.cc_len;
+        vm.cc_data = null;
+        vm.cc_len = 0;
+        FnTemplate* ct = vm_load_templates(vm, data, len, src, src_name);
+        if ct != null {
+            if vm.first_root == null { vm.first_root = ct; }
+            if root_out != null { *root_out = ct; }
+            return vm_run_root(vm, ct);
+        }
+    }
+    DiagList d;
+    diags_init(&d);
+    Bump arena;
+    bump_init(&arena);
+    u64 c0 = vm_clock_ns();
+    i32 ph = vm_phase_enter(vm, PH_COMPILE);
+    Parser p;
+    parser_init(&p, src, &d, &arena);
+    Node* prog = parse_program_skipping(&p, lazy_functions && src.len >= LAZY_MIN_SOURCE);
+    Lower lw;
+    lower_init(&lw, &arena, &d);
+    if p.ts_seen { lower_program(&lw, prog); }
 
     i32 status = 2;
     if d.n_errors == 0 {
@@ -8256,18 +10666,27 @@ i32 vm_run_source(VM* vm, str src, str src_name) {
         Compiler co;
         compiler_init(&co, &d, &vm.heap, &vm.atoms, &arena);
         compiler_set_source(&co, src, src_name);
+        co.script_globals = vm.script_globals;
         FnTemplate* t = compile_program(&co, prog);
+        if d.n_errors == 0 && vm.cc_verify {
+            FnTemplate* t2 = vm_verify_cache(vm, t, src, src_name);
+            if t2 != null { template_free(t); t = t2; }
+            else { status = 3; }
+        }
         vec_push(&vm.troots, t);
+        vec_push(&vm.fresh_tmpls, t);
         gc_root_reset(&vm.heap, rmark);
-        if d.n_errors == 0 {
-            status = vm_run_template(vm, t);
-            if status == 0 {
-                status = vm_run_event_loop(vm);
-            }
-            if status == 0 && vm_report_unhandled(vm) != 0 { status = 1; }
+        vm.compiles++;
+        vm.compile_ns += cast(i64, vm_clock_ns() - c0);
+        vm_phase_leave(vm, ph);
+        if vm.first_root == null { vm.first_root = t; }
+        if root_out != null { *root_out = t; }
+        if d.n_errors == 0 && status == 2 {
+            status = vm_run_root(vm, t);
         }
     }
     if d.n_errors > 0 {
+        vm_phase_leave(vm, ph);
         if !vm.quiet_errors { diags_print(&d, src_name, src); }
         status = 2;
     }

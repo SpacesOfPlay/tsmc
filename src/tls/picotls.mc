@@ -6,9 +6,9 @@
 // and event loop, and drives TLS purely through ptls_handshake /
 // ptls_receive / ptls_send over in-memory buffers.
 
-import cstdlib_shim;
+import ext_libc;
+import uefi_libc;
 import cfile_shim;
-import cvararg_shim;
 import picotls_shim;
 import picotls_lib;
 import picotls_bridges;

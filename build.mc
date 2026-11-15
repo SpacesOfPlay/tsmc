@@ -19,11 +19,11 @@
 // ./minc is preferred over PATH when present, which is how this repo
 // is developed; nothing needs it to be there.
 
-@minc_min_version "0.9.15"
+@minc_min_version "0.9.18"
 
 // Older minc ignores the tag above; this forces a clear error there.
-when !defined(MINC_VERSION) || MINC_VERSION < 9015 {
-    minc_0_9_15_or_newer_required please_update_minc;
+when !defined(MINC_VERSION) || MINC_VERSION < 9018 {
+    minc_0_9_18_or_newer_required please_update_minc;
 }
 
 import process;
@@ -800,6 +800,38 @@ void run_golden_tests(str exe, DirList* scripts) {
             .capture = true,
             .split_stderr = true
         };
+        // the lazy_ tests run with lazy functions on, the way an embedder turns them on
+        if str_starts_with(name, "lazy_") { c.args[1] = "--lazy"; c.args[2] = str_from(src.data, src.len); }
+        golden_check(path_stem(name), str_from(src.data, src.len), &c);
+    }
+    // the same scripts run from their code cache: every compile written
+    // out, read back and compared, and the reading is what runs
+    step("run tests from the code cache");
+    for i32 i = 0; i < scripts.count; i++ {
+        str name = scripts.items[i];
+        string src = path_join("test/run", name);
+        defer free(src);
+        ProcCmd c = {
+            .args = { exe, "--code-cache-verify", str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        if str_starts_with(name, "lazy_") { c.args[2] = "--lazy"; c.args[3] = str_from(src.data, src.len); }
+        golden_check(path_stem(name), str_from(src.data, src.len), &c);
+    }
+    // and compiled apart from the VM, as an embedder's thread compiles a
+    // script it is fetching, the VM reading the bytes
+    step("run tests compiled ahead");
+    for i32 i = 0; i < scripts.count; i++ {
+        str name = scripts.items[i];
+        string src = path_join("test/run", name);
+        defer free(src);
+        ProcCmd c = {
+            .args = { exe, "--code-cache-ahead", str_from(src.data, src.len) },
+            .capture = true,
+            .split_stderr = true
+        };
+        if str_starts_with(name, "lazy_") { c.args[2] = "--lazy"; c.args[3] = str_from(src.data, src.len); }
         golden_check(path_stem(name), str_from(src.data, src.len), &c);
     }
     return;

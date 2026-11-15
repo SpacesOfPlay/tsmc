@@ -181,6 +181,9 @@ build/build.exe release            # -> build/release: a binary per platform
 build/build.exe build --prof       # a profiling build: tsmc --prof <script> then
                                    # reports time per JS function, opcode mix and
                                    # allocations on stderr
+tsmc --phases <script>             # any build: the run's time by phase (interpreter,
+                                   # natives, collector, compiles) and the natives by
+                                   # their own time, on stderr; doc/DESIGN_phases.md
 ```
 
 `release` cross-compiles every published platform from whatever machine

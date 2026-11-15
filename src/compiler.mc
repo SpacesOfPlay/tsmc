@@ -17,6 +17,8 @@ import value;
 import gc;
 import atom;
 import bytecode;
+import parser;
+import lower;
 import regex;
 import bump;
 import object;
@@ -30,10 +32,12 @@ struct CBind {
     str name;
     i32 slot;
     i32 depth;
+    i32 prev;        // the binding of the same name this one shadows, -1 none
     bool is_cell;
     bool is_const;
     bool tdz;
     bool exported;   // module-scope binding with a live export
+    bool global;     // a script's top-level declaration bound on the global object
 }
 
 struct CUp {
@@ -41,6 +45,7 @@ struct CUp {
     bool is_const;
     bool tdz;
     bool exported;
+    bool by_value;   // the closure holds the value, not a box
 }
 
 // A pending break/continue jump, tagged with the loop it targets so an
@@ -80,8 +85,12 @@ struct FScope {
     FScope* parent;
     Chunk ch;
     Vec<CBind> binds;
+    StrMap<i32> index;   // name -> its newest binding in binds
     Vec<CUp> ups;
-    StrMap<i32> inner;   // names mentioned inside nested functions
+    StrMap<i32> inner;   // names free in nested functions, each with the start of the first that has it
+    StrMap<i32> cell_names;    // of those, the ones that have to be boxes: assigned, declared again, a var in a loop
+    StrMap<i32> hoisted_names; // the ones free in a function declaration, made before the statements around it run
+    StrMap<i32> decls;         // the scan's count of declarations by name
     i32 n_slots;
     i32 cur_slots;
     i32 depth;
@@ -91,9 +100,13 @@ struct FScope {
     bool is_async;
     bool needs_arguments;   // references `arguments`; build it at call time
     bool super_call_ok;     // a derived class constructor: super() is allowed
+    Node** ctor_fields;     // a derived constructor's fields, defined where super() returns
+    i32 n_ctor_fields;
     bool static_home;       // a static member: `super.x` is the parent class
     i32 loop_floor;         // loops below this index belong to an enclosing
                             // scope a break or continue may not reach
+    i32 switch_depth;       // the depth of the innermost switch's clause scope,
+                            // -1 outside one: its bindings keep their TDZ checks
     Vec<BrkJump> break_jumps;
     Vec<BrkJump> cont_jumps;
     Vec<LoopCtx> loops;
@@ -174,11 +187,18 @@ struct ExportName {
 }
 
 struct Compiler {
+    bool script_globals;   // a script's top-level declarations bind globals (VM.script_globals)
     DiagList* diags;
     GcHeap* heap;
     AtomTable* atoms;
     Bump* arena;
     FScope* cur;
+    // what the binding being declared is, for capture_by_value: 0 anything
+    // (a box when captured), 1 set before any closure of its scope is made
+    // (a parameter, this, a per-iteration binding), 2 initialized where it
+    // is written, ending at decl_end, 3 a function declaration
+    i32 decl_kind;
+    i32 decl_end;
     str pending_label;
     bool in_module;
     bool strict;        // strict-mode code: modules, classes, after "use strict"
@@ -194,17 +214,29 @@ struct Compiler {
     bool in_static_block;       // directly inside a class static block
     bool in_params;             // compiling parameter defaults
     StrMap<ModImport> mod_imports;   // valid while in_module
+    Vec<NameSet> name_sets;          // the functions' name memos, freed with the compile
     str ns_name;                     // the module namespace binding
     StrMap<i32> export_heads;        // local name -> first ExportName
     Vec<ExportName> export_names;
     Vec<PrivScope> priv_scopes;      // enclosing class bodies, innermost last
+    bool lazy_ok;           // a large source: plain functions compile on their first call
+    LazySource* lazy_src;   // shared by the lazy functions of this compile
+    FnTemplate* prefill;    // a lazy function being compiled: its closures' upvalues, in order
+    Node* eager_fn;         // a function about to be called where it is written
     str src;        // source text, for line/col of stack-trace positions
     str src_name;   // source filename
     i32* line_starts;   // byte offset where each line of src begins
     i32 n_lines;
 }
 
+type NameSet = StrMap<i32>*;
+
 void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms, Bump* arena) {
+    vec_lazy<NameSet>(&co.name_sets);
+    co.lazy_ok = false;
+    co.lazy_src = null;
+    co.prefill = null;
+    co.eager_fn = null;
     co.diags = diags;
     co.heap = heap;
     co.atoms = atoms;
@@ -216,7 +248,7 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.strict = false;
     co.static_this = false;
     co.next_static_home = false;
-    vec_init<str>(&co.outer_names, 4);
+    vec_lazy<str>(&co.outer_names);
     co.outer_is_body = false;
     co.next_is_derived_ctor = false;
     co.in_static_block = false;
@@ -225,8 +257,8 @@ void compiler_init(Compiler* co, DiagList* diags, GcHeap* heap, AtomTable* atoms
     co.ns_name = "";
     co.next_with = 0;
     strmap_init<i32>(&co.export_heads);
-    vec_init<ExportName>(&co.export_names, 8);
-    vec_init<PrivScope>(&co.priv_scopes, 4);
+    vec_lazy<ExportName>(&co.export_names);
+    vec_lazy<PrivScope>(&co.priv_scopes);
     co.src.data = null;
     co.src.len = 0;
     co.src_name = "";
@@ -255,6 +287,42 @@ void compiler_set_source(Compiler* co, str src, str src_name) {
     }
     co.line_starts = starts;
     co.n_lines = n;
+    co.lazy_ok = lazy_functions && src.len >= LAZY_MIN_SOURCE;
+}
+
+// A lazy function's compile: the source it came from, its line table
+// kept, and in a module its imports and exports as the module had them.
+void compiler_set_lazy_source(Compiler* co, LazySource* s) {
+    co.src = s.src;
+    co.src_name = s.src_name;
+    co.line_starts = s.line_starts;
+    co.n_lines = s.n_lines;
+    co.lazy_ok = true;
+    co.lazy_src = s;
+    if !s.module { return; }
+    co.in_module = true;
+    co.ns_name = s.ns_name;
+    strmap_free<ModImport>(&co.mod_imports);
+    strmap_init<ModImport>(&co.mod_imports);
+    for i32 i = 0; i < s.n_imports; i++ {
+        LazyImport* m = s.imports + i;
+        ModImport mi = ModImport{};
+        mi.slot_name = m.slot_name;
+        mi.prop = m.prop;
+        mi.spec = m.spec;
+        mi.msg = value_undefined();
+        mi.has_msg = false;
+        strmap_set<ModImport>(&co.mod_imports, m.name, mi);
+    }
+    for i32 i = 0; i < s.n_exports; i++ {
+        LazyExport* e = s.exports + i;
+        i32* head = strmap_get<i32>(&co.export_heads, e.local);
+        ExportName en = ExportName{};
+        en.exported = e.exported;
+        en.next = head != null ? *head : -1;
+        vec_push(&co.export_names, en);
+        strmap_set<i32>(&co.export_heads, e.local, co.export_names.len - 1);
+    }
 }
 
 private void cerror(Compiler* co, Node* n, str msg) {
@@ -290,8 +358,12 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.parent = parent;
     chunk_init(&fs.ch);
     vec_init<CBind>(&fs.binds, 16);
-    vec_init<CUp>(&fs.ups, 4);
+    strmap_init<i32>(&fs.index);
+    vec_lazy<CUp>(&fs.ups);
     strmap_init<i32>(&fs.inner);
+    strmap_init<i32>(&fs.cell_names);
+    strmap_init<i32>(&fs.hoisted_names);
+    strmap_init<i32>(&fs.decls);
     fs.n_slots = 0;
     fs.cur_slots = 0;
     fs.depth = 0;
@@ -301,14 +373,17 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
     fs.is_async = false;
     fs.needs_arguments = false;
     fs.super_call_ok = false;
+    fs.ctor_fields = null;
+    fs.n_ctor_fields = 0;
     // an arrow has no home object of its own; it uses the one around it
     fs.static_home = is_arrow && parent != null ? parent.static_home : false;
     fs.loop_floor = 0;
-    vec_init<BrkJump>(&fs.break_jumps, 8);
-    vec_init<BrkJump>(&fs.cont_jumps, 8);
-    vec_init<LoopCtx>(&fs.loops, 4);
-    vec_init<FinEntry>(&fs.finallys, 4);
-    vec_init<WithScope>(&fs.withs, 2);
+    fs.switch_depth = 0 - 1;
+    vec_lazy<BrkJump>(&fs.break_jumps);
+    vec_lazy<BrkJump>(&fs.cont_jumps);
+    vec_lazy<LoopCtx>(&fs.loops);
+    vec_lazy<FinEntry>(&fs.finallys);
+    vec_lazy<WithScope>(&fs.withs);
     // a `with` scope is lexical, so a function defined in the body keeps
     // resolving against its object; the hidden binding is captured like any
     // other name the body mentions
@@ -325,8 +400,12 @@ private void fscope_init(FScope* fs, FScope* parent, bool is_arrow) {
 
 private void fscope_free(FScope* fs) {
     vec_free(&fs.binds);
+    strmap_free<i32>(&fs.index);
     vec_free(&fs.ups);
     strmap_free<i32>(&fs.inner);
+    strmap_free<i32>(&fs.cell_names);
+    strmap_free<i32>(&fs.hoisted_names);
+    strmap_free<i32>(&fs.decls);
     vec_free(&fs.break_jumps);
     vec_free(&fs.cont_jumps);
     vec_free(&fs.loops);
@@ -341,35 +420,109 @@ private i32 alloc_slot(FScope* fs) {
     return s;
 }
 
+// A declaration that binds the global object: a script's own top level
+// when the embedder shares one global scope across its scripts. The
+// compiler's own bindings (this, the hidden %names) stay slots.
+private bool binds_global(Compiler* co, FScope* fs, str name) {
+    // depth 0 is where vars hoist, 1 the script's own statement list
+    if !co.script_globals || co.in_module || fs.parent != null || fs.depth > 1 { return false; }
+    if name.len == 0 || *(name.data) == '%' { return false; }
+    return !str_equal(name, "this") && !str_equal(name, "arguments");
+}
+
 private i32 declare(Compiler* co, str name, bool is_const, bool tdz) {
     FScope* fs = co.cur;
     CBind b;
     b.name = name;
+    b.global = binds_global(co, fs, name);
+    if b.global {
+        // no slot: every read and write goes to the global object
+        b.slot = -1;
+        b.depth = 0;
+        b.is_cell = false;
+        b.is_const = false;
+        b.tdz = false;
+        b.exported = false;
+        return bind_push(fs, b);
+    }
     b.slot = alloc_slot(fs);
     b.depth = fs.depth;
-    b.is_cell = strmap_get<i32>(&fs.inner, name) != null;
     b.is_const = is_const;
     b.tdz = tdz;
     b.exported = co.in_module && fs.parent == null && fs.depth == 0
         && strmap_get<i32>(&co.export_heads, name) != null;
+    i32* cap = strmap_get<i32>(&fs.inner, name);
+    b.is_cell = cap != null && (b.exported || !capture_by_value(co, fs, name, *cap));
+    return bind_push(fs, b);
+}
+
+// A captured binding is a plain slot, its value copied into each closure,
+// when every closure can only ever see the one value in it: it is never
+// assigned after its initialization and declared once, and each capturer
+// is made after that. A parameter, this, arguments or a per-iteration
+// binding is set before any closure of its scope is made, a function
+// declaration before the statements run; a var, let, const or class is
+// initialized where it is written, so a function expression after it
+// sees the value, and a function declaration, made at the scope's entry,
+// does not. The rest take a box.
+private bool capture_by_value(Compiler* co, FScope* fs, str name, i32 first_capture) {
+    i32 kind = co.decl_kind;
+    if kind == 0 { return false; }
+    if name.len > 0 && *(name.data) == '%' && !str_equal(name, "%newtarget") { return false; }
+    if strmap_get<i32>(&fs.cell_names, name) != null { return false; }
+    if kind == 1 { return true; }
+    if strmap_get<i32>(&fs.hoisted_names, name) != null { return false; }
+    if kind == 3 { return true; }
+    return first_capture >= co.decl_end;
+}
+
+// Bindings are pushed as scopes open and cut as they close, and the index
+// follows: the newest binding of a name, with the one it shadows behind it.
+private i32 bind_push(FScope* fs, CBind b) {
+    i32* old = strmap_get<i32>(&fs.index, b.name);
+    b.prev = old != null ? *old : -1;
     vec_push(&fs.binds, b);
+    strmap_set<i32>(&fs.index, b.name, fs.binds.len - 1);
     return fs.binds.len - 1;
 }
 
-private i32 find_local(FScope* fs, str name) {
-    for i32 i = fs.binds.len - 1; i >= 0; i-- {
+private void binds_cut(FScope* fs, i32 to) {
+    for i32 i = fs.binds.len - 1; i >= to; i-- {
         CBind b = vec_get(&fs.binds, i);
-        if str_equal(b.name, name) { return i; }
+        if b.prev >= 0 { strmap_set<i32>(&fs.index, b.name, b.prev); }
+        else { ignore strmap_remove<i32>(&fs.index, b.name); }
     }
-    return -1;
+    fs.binds.len = to;
+}
+
+// Two names the same: the length and the first byte decide most pairs in
+// a minified bundle, whose names are a letter or two, before the compare.
+private bool name_eq(str a, str b) {
+    return a.len == b.len && *(a.data) == *(b.data) && (a.len == 1 || str_equal(a, b));
+}
+
+// A declaration of this scope by name, global ones included: what the
+// statement that declares it initializes.
+private i32 find_decl(FScope* fs, str name) {
+    i32* i = strmap_get<i32>(&fs.index, name);
+    return i != null ? *i : -1;
+}
+
+// A binding of this scope by name; a global one is not, its reads and
+// writes resolve to the global object.
+private i32 find_local(FScope* fs, str name) {
+    i32 i = find_decl(fs, name);
+    if i < 0 { return -1; }
+    return vec_get(&fs.binds, i).global ? -1 : i;
 }
 
 private i32 resolve_upval(FScope* fs, str name) {
-    if fs.parent == null { return -1; }
+    // a lazy function's scope has its upvalues from the start and no parent
     for i32 i = 0; i < fs.ups.len; i++ {
         CUp u = vec_get(&fs.ups, i);
-        if str_equal(u.name, name) { return i; }
+        if name_eq(u.name, name) { return i; }
     }
+    if fs.parent == null { return -1; }
     i32 li = find_local(fs.parent, name);
     if li >= 0 {
         CBind b = vec_get(&fs.parent.binds, li);
@@ -378,10 +531,12 @@ private i32 resolve_upval(FScope* fs, str name) {
         u.is_const = b.is_const;
         u.tdz = b.tdz;
         u.exported = b.exported;
+        u.by_value = !b.is_cell;
         vec_push(&fs.ups, u);
         TmplUpval tu;
         tu.from_parent_slot = true;
         tu.index = b.slot;
+        tu.by_value = u.by_value;
         vec_push(&fs.ch.upvals, tu);
         return fs.ups.len - 1;
     }
@@ -393,10 +548,12 @@ private i32 resolve_upval(FScope* fs, str name) {
     u.is_const = pu.is_const;
     u.tdz = pu.tdz;
     u.exported = pu.exported;
+    u.by_value = pu.by_value;
     vec_push(&fs.ups, u);
     TmplUpval tu;
     tu.from_parent_slot = false;
     tu.index = pi;
+    tu.by_value = u.by_value;
     vec_push(&fs.ch.upvals, tu);
     return fs.ups.len - 1;
 }
@@ -421,15 +578,28 @@ private i32 str_const(Compiler* co, str s) {
 }
 
 private i32 name_const(Compiler* co, str name) {
-    u32 a = atom_intern(co.atoms, name);
-    return ch_add_const(&co.cur.ch, value_int(cast(i32, a)));
+    return ch_add_const_atom(&co.cur.ch, atom_intern(co.atoms, name));
 }
 
-// import.meta.url as a file:// URL of the current module, built at compile
-// time from its path (backslashes normalized, a leading slash before a
-// Windows drive letter).
+// Whether the name starts with a URL scheme: letters, digits, + - or .,
+// then a colon, before any slash.
+private bool name_has_scheme(str p) {
+    for i32 i = 0; i < p.len; i++ {
+        u8 c = *(p.data + i);
+        if c == ':' { return i > 0; }
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'));
+        if !ok { return false; }
+    }
+    return false;
+}
+
+// import.meta.url: the module's name when it is a URL already, as an
+// embedder names a module fetched from the web (a bundler derives its
+// public path from it); else a file:// URL of its path (backslashes
+// normalized, a leading slash before a Windows drive letter).
 private i32 import_meta_url_const(Compiler* co) {
     str p = co.src_name;
+    if name_has_scheme(p) { return str_const(co, p); }
     str_buf sb;
     str_buf_init(&sb);
     str_buf_add(&sb, "file://");
@@ -621,10 +791,321 @@ private str hidden_name(Compiler* co, str prefix, i32 n) {
 
 // --- inner-name scan ---------------------------------------------------------
 
+// The names free in a function: mentioned in its body, or free in a
+// function nested in it, and bound by none of its scopes. Found once per
+// function node and kept on it: an enclosing function takes the set, not
+// another walk of the subtree, so a deep nest of functions is scanned
+// once, not once per level. The compiler frees the sets with its scopes.
+// A name is free or not by the scope it is in: a nested function's own
+// parameters and locals are its own, and the enclosing function's binding
+// of the same name (every function of a minified bundle has an `e` and a
+// `t`) is not what it captures.
+// The memo on a node, made the first time anything is kept there.
+private NodeMemo* node_memo(Compiler* co, Node* n) {
+    if n.memo == null { n.memo = cast(NodeMemo*, bump_alloc(co.arena, cast(i32, sizeof(NodeMemo)))); }
+    return n.memo;
+}
+
+private StrMap<i32>* fn_names(Compiler* co, Node* f) {
+    NodeMemo* m = node_memo(co, f);
+    if m.names != null { return m.names; }
+    StrMap<i32>* set = cast(StrMap<i32>*, bump_alloc(co.arena, cast(i32, sizeof(StrMap<i32>))));
+    strmap_init<i32>(set);
+    FreeScan fsn;
+    free_scan_init(&fsn, co, set);
+    free_scan_fn(&fsn, f);
+    free_scan_free(&fsn);
+    m.names = set;
+    vec_push(&co.name_sets, set);
+    return set;
+}
+
+private void names_merge(StrMap<i32>* set, StrMap<i32>* src) {
+    for i32 i = 0; i < src.cap; i++ {
+        StrSlot<i32>* sl = src.slots + i;
+        if sl.state == SLOT_USED { strmap_set<i32>(set, sl.key, 1); }
+    }
+}
+
+struct FreeScan {
+    Compiler* co;
+    StrMap<i32>* set;   // the free names found
+    Vec<str> bound;     // the names the scopes entered so far bind, innermost last
+    StrMap<i32> counts; // how many of the scopes bind each, kept once the list is
+                        // long: a short one (a stand-in's parameters) is compared through
+    bool counted;
+}
+
+const i32 FREE_SCAN_LINEAR = 12;
+
+private void free_scan_init(FreeScan* s, Compiler* co, StrMap<i32>* set) {
+    s.co = co;
+    s.set = set;
+    s.bound = vec_new<str>(16);
+    strmap_init<i32>(&s.counts);
+    s.counted = false;
+}
+
+private void free_scan_free(FreeScan* s) {
+    vec_free(&s.bound);
+    strmap_free<i32>(&s.counts);
+}
+
+private bool free_scan_bound(FreeScan* s, str name) {
+    if !s.counted {
+        for i32 i = s.bound.len - 1; i >= 0; i-- {
+            if name_eq(vec_get(&s.bound, i), name) { return true; }
+        }
+        return false;
+    }
+    i32* c = strmap_get<i32>(&s.counts, name);
+    return c != null && *c > 0;
+}
+
+private void free_scan_push(FreeScan* s, str name) {
+    vec_push(&s.bound, name);
+    if !s.counted {
+        if s.bound.len <= FREE_SCAN_LINEAR { return; }
+        // the list has grown long: count what it holds, and keep counting
+        s.counted = true;
+        for i32 i = 0; i < s.bound.len - 1; i++ { *strmap_slot<i32>(&s.counts, vec_get(&s.bound, i), 0) += 1; }
+    }
+    *strmap_slot<i32>(&s.counts, name, 0) += 1;
+}
+
+// leaves the scopes entered since `mark`
+private void free_scan_unwind(FreeScan* s, i32 mark) {
+    if s.counted {
+        for i32 i = s.bound.len - 1; i >= mark; i-- {
+            i32* c = strmap_get<i32>(&s.counts, vec_get(&s.bound, i));
+            *c -= 1;
+        }
+    }
+    s.bound.len = mark;
+}
+
+// flags: 1 mentioned, 2 assigned
+private void free_scan_mention(FreeScan* s, str name, i32 flags) {
+    if name.len == 0 || free_scan_bound(s, name) { return; }
+    *strmap_slot<i32>(s.set, name, 0) |= flags;
+}
+
+// the names an assignment's target writes, flagged as assigned
+private void free_scan_target(FreeScan* s, Node* t) {
+    if t == null { return; }
+    switch t.kind {
+        case N_IDENT: { free_scan_mention(s, t.name, 3); }
+        case N_MEMBER, N_INDEX: { }
+        case N_ARRAY, N_ARRAY_PATTERN, N_OBJECT, N_OBJECT_PATTERN: {
+            for i32 i = 0; i < t.kids.len; i++ { free_scan_target(s, *(t.kids.items + i)); }
+        }
+        case N_SPREAD, N_REST, N_ASSIGN_PATTERN, N_ASSIGN: { free_scan_target(s, t.a); }
+        case N_PROP: {
+            if (t.flags & NF_SHORTHAND) != 0 && t.a != null { free_scan_mention(s, t.a.name, 3); }
+            else { free_scan_target(s, t.b); }
+        }
+        case N_PATTERN_PROP: { free_scan_target(s, t.b); }
+        default: { }
+    }
+}
+
+private void free_scan_bind_pattern(FreeScan* s, Node* pat) {
+    if pat == null { return; }
+    if pat.kind == N_IDENT { free_scan_push(s, pat.name); return; }
+    if pat.kind == N_ASSIGN_PATTERN || pat.kind == N_REST { free_scan_bind_pattern(s, pat.a); return; }
+    if pat.kind == N_ARRAY_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ { free_scan_bind_pattern(s, *(pat.kids.items + i)); }
+        return;
+    }
+    if pat.kind == N_OBJECT_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pp = *(pat.kids.items + i);
+            free_scan_bind_pattern(s, pp.kind == N_REST ? pp.a : pp.b);
+        }
+    }
+}
+
+// the var-declared names of n, outside the functions and classes in it
+private void free_scan_bind_vars(FreeScan* s, Node* n) {
+    i32 nv;
+    Node** vs = var_decls(s.co, n, &nv);
+    for i32 i = 0; i < nv; i++ { free_scan_bind_pattern(s, (*(vs + i)).a); }
+}
+
+// The lexical declarations at the top of a statement list: let, const, a
+// class, a function declaration. An export carries one.
+private void free_scan_bind_list(FreeScan* s, NodeList* kids) {
+    for i32 i = 0; i < kids.len; i++ {
+        Node* k = *(kids.items + i);
+        if k.kind == N_EXPORT && k.a != null { k = k.a; }
+        if k.kind == N_VAR && (k.flags & (NF_LET | NF_CONST)) != 0 {
+            for i32 j = 0; j < k.kids.len; j++ { free_scan_bind_pattern(s, (*(k.kids.items + j)).a); }
+        } else if (k.kind == N_CLASS || k.kind == N_FUNCTION) && k.name.len > 0 {
+            free_scan_push(s, k.name);
+        }
+    }
+}
+
+private void free_scan_kids(FreeScan* s, Node* n) {
+    for i32 i = 0; i < n.kids.len; i++ { free_scan_walk(s, *(n.kids.items + i)); }
+}
+
+// n's subtree, the scopes it opens entered and left
+private void free_scan_walk(FreeScan* s, Node* n) {
+    if n == null { return; }
+    i32 mark = s.bound.len;
+    switch n.kind {
+        case N_IDENT: { free_scan_mention(s, n.name, 1); }
+        case N_THIS: { free_scan_mention(s, "this", 1); }
+        case N_NEW_TARGET: { free_scan_mention(s, "%newtarget", 1); }
+        case N_SUPER: { free_scan_mention(s, "%super", 1); }
+        case N_ASSIGN: {
+            free_scan_target(s, n.a);
+            free_scan_walk(s, n.a);
+            free_scan_walk(s, n.b);
+        }
+        case N_UPDATE: {
+            free_scan_target(s, n.a);
+            free_scan_walk(s, n.a);
+        }
+        case N_FUNCTION: {
+            // nested: what is free in it and unbound here is free here too
+            StrMap<i32>* inner = fn_names(s.co, n);
+            for i32 i = 0; i < inner.cap; i++ {
+                StrSlot<i32>* sl = inner.slots + i;
+                if sl.state == SLOT_USED { free_scan_mention(s, sl.key, sl.val); }
+            }
+        }
+        case N_STATIC_BLOCK: {
+            // a function of its own, with its own this and vars
+            free_scan_body(s, null, n.a, false);
+        }
+        case N_CLASS: {
+            free_scan_walk(s, n.a);
+            if n.name.len > 0 { free_scan_push(s, n.name); }
+            free_scan_kids(s, n);
+        }
+        case N_CLASS_MEMBER: {
+            if (n.flags & NF_COMPUTED) != 0 { free_scan_walk(s, n.a); }
+            if member_is_field(n) {
+                // the initializer runs in the constructor, whose this it sees
+                free_scan_body(s, null, n.b, true);
+            } else {
+                free_scan_walk(s, n.b);
+            }
+        }
+        case N_PROP: {
+            if (n.flags & NF_COMPUTED) != 0 { free_scan_walk(s, n.a); }
+            else if (n.flags & NF_SHORTHAND) != 0 && n.a != null { free_scan_mention(s, n.a.name, 1); }
+            free_scan_walk(s, n.b);
+        }
+        case N_PATTERN_PROP: {
+            if (n.flags & NF_COMPUTED) != 0 { free_scan_walk(s, n.a); }
+            free_scan_walk(s, n.b);
+        }
+        case N_MEMBER: { free_scan_walk(s, n.a); }
+        case N_BLOCK: {
+            free_scan_bind_list(s, &n.kids);
+            free_scan_kids(s, n);
+        }
+        case N_SWITCH: {
+            free_scan_walk(s, n.a);
+            for i32 i = 0; i < n.kids.len; i++ { free_scan_bind_list(s, &(*(n.kids.items + i)).kids); }
+            free_scan_kids(s, n);
+        }
+        case N_FOR, N_FOR_IN, N_FOR_OF: {
+            if n.a != null && n.a.kind == N_VAR && (n.a.flags & (NF_LET | NF_CONST)) != 0 {
+                for i32 j = 0; j < n.a.kids.len; j++ { free_scan_bind_pattern(s, (*(n.a.kids.items + j)).a); }
+            }
+            if n.kind != N_FOR && n.a != null && n.a.kind != N_VAR { free_scan_target(s, n.a); }
+            free_scan_walk(s, n.a);
+            free_scan_walk(s, n.b);
+            free_scan_walk(s, n.c);
+            free_scan_walk(s, n.d);
+        }
+        case N_CATCH: {
+            if n.a != null { free_scan_bind_pattern(s, n.a); }
+            free_scan_walk(s, n.a);
+            free_scan_walk(s, n.b);
+        }
+        default: {
+            free_scan_walk(s, n.a);
+            free_scan_walk(s, n.b);
+            free_scan_walk(s, n.c);
+            free_scan_walk(s, n.d);
+            free_scan_kids(s, n);
+        }
+    }
+    free_scan_unwind(s, mark);
+}
+
+// A function-like body: its parameters bound first, so their defaults see
+// them and not the body's vars; then the vars hoisted from anywhere in the
+// body, and this, arguments and new.target when the function has its own.
+private void free_scan_body(FreeScan* s, NodeList* params, Node* body, bool arrow) {
+    i32 mark = s.bound.len;
+    if params != null {
+        for i32 i = 0; i < params.len; i++ { free_scan_bind_pattern(s, (*(params.items + i)).a); }
+        for i32 i = 0; i < params.len; i++ { free_scan_walk(s, *(params.items + i)); }
+    }
+    free_scan_bind_vars(s, body);
+    if !arrow {
+        free_scan_push(s, "this");
+        free_scan_push(s, "arguments");
+        free_scan_push(s, "%newtarget");
+    }
+    free_scan_walk(s, body);
+    free_scan_unwind(s, mark);
+}
+
+// A function's own name is not bound here: a declaration's belongs to the
+// scope around it, which a store inside the function (`t = ...` in a
+// polyfill's `function t()`) writes, and an expression's is one more
+// name the enclosing scope looks up and does not find.
+private void free_scan_fn(FreeScan* s, Node* f) {
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    i32 mark = s.bound.len;
+    for i32 i = 0; i < f.kids.len; i++ { free_scan_bind_pattern(s, (*(f.kids.items + i)).a); }
+    for i32 i = 0; i < f.kids.len; i++ { free_scan_walk(s, *(f.kids.items + i)); }
+    free_scan_bind_vars(s, f.a);
+    if !arrow {
+        free_scan_push(s, "this");
+        free_scan_push(s, "arguments");
+        free_scan_push(s, "%newtarget");
+    }
+    free_scan_walk(s, f.a);
+    // a body passed over: the names its scan found, on the node
+    if (f.flags & NF_SKIPPED) != 0 && f.memo != null {
+        for i32 i = 0; i < f.memo.n_refs; i++ {
+            NameRef* r = f.memo.refs + i;
+            if (r.flags & 2) != 0 { free_scan_mention(s, "this", 1); }
+            else if (r.flags & 4) != 0 { free_scan_mention(s, "%newtarget", 1); }
+            else { free_scan_mention(s, r.name, (r.flags & 1) != 0 ? 3 : 1); }
+        }
+    }
+    free_scan_unwind(s, mark);
+}
+
+private void names_free(Compiler* co) {
+    for i32 i = 0; i < co.name_sets.len; i++ {
+        StrMap<i32>* set = vec_get(&co.name_sets, i);
+        strmap_free<i32>(set);
+    }
+    co.name_sets.len = 0;
+}
+
 private void scan_all_names(StrMap<i32>* set, Node* n) {
     if n == null { return; }
     if n.kind == N_IDENT && n.name.len > 0 {
         strmap_set<i32>(set, n.name, 1);
+    }
+    if n.kind == N_FUNCTION && (n.flags & NF_SKIPPED) != 0 && n.memo != null {
+        for i32 i = 0; i < n.memo.n_refs; i++ {
+            NameRef* r = n.memo.refs + i;
+            if (r.flags & 2) != 0 { strmap_set<i32>(set, "this", 1); }
+            else if (r.flags & 4) != 0 { strmap_set<i32>(set, "%newtarget", 1); }
+            else { strmap_set<i32>(set, r.name, 1); }
+        }
     }
     if n.kind == N_THIS {
         strmap_set<i32>(set, "this", 1);
@@ -644,29 +1125,174 @@ private void scan_all_names(StrMap<i32>* set, Node* n) {
     }
 }
 
-// Collects names used by nested functions of n (not n itself).
-private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
+// What the functions nested in n capture, for the bindings n's scope is
+// about to declare: fs.inner gets each name free in one of them, with the
+// start of the first that has it; fs.cell_names the names that have to be
+// boxes however they are declared: assigned somewhere in n (a nested
+// function's own stores ride in its name set), declared more than once,
+// or a var initialized inside a loop; fs.hoisted_names the names free in
+// a function declaration, which is made before the statements around it
+// run. Name by name, not binding by binding: a second binding of a name
+// in another block is taken for the same one, and boxed with it.
+private void scan_inner(Compiler* co, FScope* fs, Node* n, bool root) {
+    root_scan(co, fs, n, root, false, false);
+}
+
+private void root_merge(FScope* fs, StrMap<i32>* names, i32 pos, bool hoisted) {
+    for i32 i = 0; i < names.cap; i++ {
+        StrSlot<i32>* sl = names.slots + i;
+        if sl.state != SLOT_USED { continue; }
+        i32* at = strmap_slot<i32>(&fs.inner, sl.key, pos);
+        if *at > pos { *at = pos; }
+        if (sl.val & 2) != 0 { strmap_set<i32>(&fs.cell_names, sl.key, 1); }
+        if hoisted { strmap_set<i32>(&fs.hoisted_names, sl.key, 1); }
+    }
+}
+
+// one more declaration of the name: a second one makes it a box
+private void root_declared(FScope* fs, str name) {
+    i32* n = strmap_slot<i32>(&fs.decls, name, 0);
+    *n += 1;
+    if *n > 1 { strmap_set<i32>(&fs.cell_names, name, 1); }
+}
+
+private void root_declared_pattern(FScope* fs, Node* pat, bool boxed) {
+    if pat == null { return; }
+    if pat.kind == N_IDENT {
+        root_declared(fs, pat.name);
+        if boxed { strmap_set<i32>(&fs.cell_names, pat.name, 1); }
+        return;
+    }
+    if pat.kind == N_ASSIGN_PATTERN || pat.kind == N_REST { root_declared_pattern(fs, pat.a, boxed); return; }
+    if pat.kind == N_ARRAY_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ { root_declared_pattern(fs, *(pat.kids.items + i), boxed); }
+        return;
+    }
+    if pat.kind == N_OBJECT_PATTERN {
+        for i32 i = 0; i < pat.kids.len; i++ {
+            Node* pp = *(pat.kids.items + i);
+            root_declared_pattern(fs, pp.kind == N_REST ? pp.a : pp.b, boxed);
+        }
+    }
+}
+
+// the names an assignment's target writes
+private void root_target(FScope* fs, Node* t) {
+    if t == null { return; }
+    switch t.kind {
+        case N_IDENT: { strmap_set<i32>(&fs.cell_names, t.name, 1); }
+        case N_MEMBER, N_INDEX: { }
+        case N_ARRAY, N_ARRAY_PATTERN, N_OBJECT, N_OBJECT_PATTERN: {
+            for i32 i = 0; i < t.kids.len; i++ { root_target(fs, *(t.kids.items + i)); }
+        }
+        case N_SPREAD, N_REST, N_ASSIGN_PATTERN, N_ASSIGN: { root_target(fs, t.a); }
+        case N_PROP: {
+            if (t.flags & NF_SHORTHAND) != 0 && t.a != null { strmap_set<i32>(&fs.cell_names, t.a.name, 1); }
+            else { root_target(fs, t.b); }
+        }
+        case N_PATTERN_PROP: { root_target(fs, t.b); }
+        default: { }
+    }
+}
+
+private void root_scan_kids(Compiler* co, FScope* fs, Node* n, bool in_loop, bool decl) {
+    for i32 i = 0; i < n.kids.len; i++ { root_scan(co, fs, *(n.kids.items + i), false, in_loop, decl); }
+}
+
+// `self`: n is the function or program scanned, not one nested in it;
+// `decl`: n is a statement of a list, where a function is a declaration
+private void root_scan(Compiler* co, FScope* fs, Node* n, bool self, bool in_loop, bool decl) {
     if n == null { return; }
-    if n.kind == N_FUNCTION && !root {
-        scan_all_names(set, n);
-        return;
-    }
-    // An instance field initializer is hoisted into the constructor, so its
-    // identifiers are captured by that (possibly synthesized) function just
-    // like a method body. Treat it as inner-function code so the enclosing
-    // scope cellifies anything it closes over. Its computed key is evaluated
-    // where the class is, so that is scanned as ordinary code.
-    if n.kind == N_CLASS_MEMBER && member_is_field(n) {
-        scan_all_names(set, n.b);
-        if (n.flags & NF_COMPUTED) != 0 { scan_inner(set, n.a, false); }
-        return;
-    }
-    scan_inner(set, n.a, false);
-    scan_inner(set, n.b, false);
-    scan_inner(set, n.c, false);
-    scan_inner(set, n.d, false);
-    for i32 i = 0; i < n.kids.len; i++ {
-        scan_inner(set, *(n.kids.items + i), false);
+    switch n.kind {
+        case N_FUNCTION: {
+            if !self {
+                bool hoisted = decl && n.name.len > 0;
+                root_merge(fs, fn_names(co, n), n.span.start, hoisted);
+                if hoisted { root_declared(fs, n.name); }
+                return;
+            }
+            root_scan_kids(co, fs, n, false, false);
+            root_scan(co, fs, n.a, false, false, false);
+        }
+        case N_PARAM: {
+            root_declared_pattern(fs, n.a, false);
+            root_scan(co, fs, n.a, false, in_loop, false);
+            root_scan(co, fs, n.b, false, in_loop, false);
+        }
+        case N_CLASS_MEMBER: {
+            if (n.flags & NF_COMPUTED) != 0 { root_scan(co, fs, n.a, false, in_loop, false); }
+            if member_is_field(n) {
+                // the initializer runs in the constructor, as nested code
+                StrMap<i32> names;
+                strmap_init<i32>(&names);
+                FreeScan fsn;
+                free_scan_init(&fsn, co, &names);
+                free_scan_body(&fsn, null, n.b, true);
+                free_scan_free(&fsn);
+                root_merge(fs, &names, n.span.start, false);
+                strmap_free<i32>(&names);
+            } else {
+                root_scan(co, fs, n.b, false, in_loop, false);
+            }
+        }
+        case N_CLASS: {
+            if decl && n.name.len > 0 { root_declared(fs, n.name); }
+            root_scan(co, fs, n.a, false, in_loop, false);
+            root_scan_kids(co, fs, n, in_loop, false);
+        }
+        case N_ASSIGN: {
+            root_target(fs, n.a);
+            root_scan(co, fs, n.a, false, in_loop, false);
+            root_scan(co, fs, n.b, false, in_loop, false);
+        }
+        case N_UPDATE: {
+            root_target(fs, n.a);
+            root_scan(co, fs, n.a, false, in_loop, false);
+        }
+        case N_FOR_IN, N_FOR_OF: {
+            if n.a != null && n.a.kind != N_VAR { root_target(fs, n.a); }
+            else if n.a != null && (n.a.flags & (NF_LET | NF_CONST)) == 0 {
+                // a var in the head is written once an iteration
+                for i32 i = 0; i < n.a.kids.len; i++ { root_target(fs, (*(n.a.kids.items + i)).a); }
+            }
+            root_scan(co, fs, n.a, false, true, false);
+            root_scan(co, fs, n.b, false, true, false);
+            root_scan(co, fs, n.c, false, true, false);
+        }
+        case N_FOR, N_WHILE, N_DO_WHILE: {
+            root_scan(co, fs, n.a, false, true, false);
+            root_scan(co, fs, n.b, false, true, false);
+            root_scan(co, fs, n.c, false, true, false);
+            root_scan(co, fs, n.d, false, true, false);
+        }
+        case N_VAR: {
+            bool plain = (n.flags & (NF_LET | NF_CONST)) == 0;
+            for i32 i = 0; i < n.kids.len; i++ {
+                Node* d = *(n.kids.items + i);
+                // a var initialized in a loop is written once an iteration
+                root_declared_pattern(fs, d.a, plain && in_loop && d.b != null);
+                root_scan(co, fs, d.a, false, in_loop, false);
+                root_scan(co, fs, d.b, false, in_loop, false);
+            }
+        }
+        case N_CATCH: {
+            if n.a != null { root_declared_pattern(fs, n.a, false); }
+            root_scan(co, fs, n.a, false, in_loop, false);
+            root_scan(co, fs, n.b, false, in_loop, false);
+        }
+        case N_EXPORT, N_LABELED: {
+            root_scan(co, fs, n.a, false, in_loop, decl);
+            root_scan(co, fs, n.b, false, in_loop, false);
+            root_scan_kids(co, fs, n, in_loop, false);
+        }
+        default: {
+            bool list = n.kind == N_BLOCK || n.kind == N_PROGRAM || n.kind == N_CASE;
+            root_scan(co, fs, n.a, false, in_loop, false);
+            root_scan(co, fs, n.b, false, in_loop, false);
+            root_scan(co, fs, n.c, false, in_loop, false);
+            root_scan(co, fs, n.d, false, in_loop, false);
+            root_scan_kids(co, fs, n, in_loop, list);
+        }
     }
 }
 
@@ -676,12 +1302,11 @@ private void scan_inner(StrMap<i32>* set, Node* n, bool root) {
 // open and truncated as they close, so everything at the current depth sits at
 // the end of the list; `want_lexical` narrows the search to let/const/class.
 private bool bound_here(FScope* fs, str name, bool want_lexical) {
-    for i32 i = fs.binds.len - 1; i >= 0; i-- {
-        CBind b = vec_get(&fs.binds, i);
-        if b.depth < fs.depth { return false; }
-        if str_equal(b.name, name) { return !want_lexical || b.tdz; }
-    }
-    return false;
+    i32 i = find_decl(fs, name);
+    if i < 0 { return false; }
+    CBind b = vec_get(&fs.binds, i);
+    if b.depth < fs.depth { return false; }
+    return !want_lexical || b.tdz;
 }
 
 private void redeclared(Compiler* co, Node* at, str name) {
@@ -716,6 +1341,7 @@ private void declare_lexical(Compiler* co, Node* at, str name, bool is_const) {
     if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, is_const, true);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global { return; }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_HOLE, b.slot);
     } else {
@@ -730,6 +1356,7 @@ private void declare_plain_const(Compiler* co, Node* at, str name, bool is_const
     if at != null { check_strict_binding(co, at, name); }
     i32 bi = declare(co, name, is_const, false);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global { return; }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
     }
@@ -784,10 +1411,17 @@ private void declare_pattern(Compiler* co, Node* pat, i32 mode) {
 private void hoist_declare_var(Compiler* co, Node* id) {
     FScope* fs = co.cur;
     check_strict_binding(co, id, id.name);
-    i32 li = find_local(fs, id.name);
+    i32 li = find_decl(fs, id.name);
     if li >= 0 { return; }   // var redeclaration shares the binding
     i32 bi = declare(co, id.name, false, false);
     CBind b = vec_get(&fs.binds, bi);
+    if b.global {
+        // the global exists from here on, keeping a value it had: `var x = x || {}`
+        ch_op_u16(&fs.ch, OP_GETGLOBAL_SOFT, name_const(co, id.name));
+        ch_op_u16(&fs.ch, OP_DEFGLOBAL, name_const(co, id.name));
+        ch_op(&fs.ch, OP_POP);
+        return;
+    }
     if b.is_cell {
         ch_op_u16(&fs.ch, OP_NEWCELL_UNDEF, b.slot);
     }
@@ -796,27 +1430,71 @@ private void hoist_declare_var(Compiler* co, Node* id) {
 // The var-declared names of a statement list, used to reject a lexical name
 // that collides with a `var` in the same scope. `var` hoists out of nested
 // blocks but not out of functions, so the walk mirrors hoist_vars.
-private void collect_var_names(Node* n, Vec<str>* out) {
+// The var declarators under n, outside the functions and classes in it,
+// in source order. Kept on the node once found: hoisting, a block's
+// lexical checks, a lazy template's own names and the free-name scan each
+// ask, and a block inside a block asks for part of what the outer walk
+// passed, which it kept on the way.
+private Node* g_no_vars_slot;
+
+private void collect_var_decls(Compiler* co, Node* n, Vec<NodePtr>* out) {
     if n == null { return; }
-    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
-    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
-        for i32 i = 0; i < n.kids.len; i++ {
-            collect_pattern_names((*(n.kids.items + i)).a, out);
-        }
+    if n.memo != null && n.memo.vars != null {
+        for i32 i = 0; i < n.memo.n_vars; i++ { vec_push(out, *(n.memo.vars + i)); }
         return;
     }
-    collect_var_names(n.a, out);
-    collect_var_names(n.b, out);
-    collect_var_names(n.c, out);
-    collect_var_names(n.d, out);
-    for i32 i = 0; i < n.kids.len; i++ {
-        collect_var_names(*(n.kids.items + i), out);
+    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
+    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
+        for i32 i = 0; i < n.kids.len; i++ { vec_push(out, *(n.kids.items + i)); }
+        return;
     }
+    if n.kind == N_BLOCK {
+        i32 nv;
+        Node** vs = var_decls(co, n, &nv);
+        for i32 i = 0; i < nv; i++ { vec_push(out, *(vs + i)); }
+        return;
+    }
+    collect_var_decls(co, n.a, out);
+    collect_var_decls(co, n.b, out);
+    collect_var_decls(co, n.c, out);
+    collect_var_decls(co, n.d, out);
+    for i32 i = 0; i < n.kids.len; i++ { collect_var_decls(co, *(n.kids.items + i), out); }
+}
+
+private Node** var_decls(Compiler* co, Node* n, i32* count) {
+    if n == null { *count = 0; return null; }
+    NodeMemo* m = node_memo(co, n);
+    if m.vars == null {
+        Vec<NodePtr> v;
+        vec_lazy<NodePtr>(&v);
+        if n.kind == N_BLOCK {
+            for i32 i = 0; i < n.kids.len; i++ { collect_var_decls(co, *(n.kids.items + i), &v); }
+        } else {
+            collect_var_decls(co, n, &v);
+        }
+        if v.len == 0 {
+            m.vars = cast(Node**, &g_no_vars_slot);
+        } else {
+            m.vars = cast(Node**, bump_alloc(co.arena, v.len * 8));
+            memcpy(cast(u8*, m.vars), cast(u8*, v.data), cast(i64, v.len) * 8);
+        }
+        m.n_vars = v.len;
+        vec_free(&v);
+    }
+    *count = m.n_vars;
+    return m.vars;
+}
+
+// the names those declarators bind
+private void collect_var_names(Compiler* co, Node* n, Vec<str>* out) {
+    i32 nv;
+    Node** vs = var_decls(co, n, &nv);
+    for i32 i = 0; i < nv; i++ { collect_pattern_names((*(vs + i)).a, out); }
 }
 
 private bool names_has(Vec<str>* names, str name) {
     for i32 i = 0; i < names.len; i++ {
-        if str_equal(vec_get(names, i), name) { return true; }
+        if name_eq(vec_get(names, i), name) { return true; }
     }
     return false;
 }
@@ -834,21 +1512,14 @@ private void check_lexical_vs_var(Compiler* co, Node* pat, Vec<str>* vnames) {
 }
 
 private void hoist_vars(Compiler* co, Node* n) {
-    if n == null { return; }
-    if n.kind == N_FUNCTION || n.kind == N_CLASS { return; }
-    if n.kind == N_VAR && (n.flags & (NF_LET | NF_CONST)) == 0 {
-        for i32 i = 0; i < n.kids.len; i++ {
-            Node* d = *(n.kids.items + i);
-            declare_pattern(co, d.a, 3);
-        }
-        return;
-    }
-    hoist_vars(co, n.a);
-    hoist_vars(co, n.b);
-    hoist_vars(co, n.c);
-    hoist_vars(co, n.d);
-    for i32 i = 0; i < n.kids.len; i++ {
-        hoist_vars(co, *(n.kids.items + i));
+    i32 nv;
+    Node** vs = var_decls(co, n, &nv);
+    for i32 i = 0; i < nv; i++ {
+        Node* d = *(vs + i);
+        co.decl_kind = 2;
+        co.decl_end = d.span.end;
+        declare_pattern(co, d.a, 3);
+        co.decl_kind = 0;
     }
 }
 
@@ -869,12 +1540,82 @@ private i32 emit_jumpf(Chunk* ch) {
         if was == OP_GT { fused = OP_GT_JF; }
         if was == OP_LE { fused = OP_LE_JF; }
         if was == OP_GE { fused = OP_GE_JF; }
+        if was == OP_SEQ { fused = OP_SEQ_JF; }
+        if was == OP_SNEQ { fused = OP_SNEQ_JF; }
+        if was == OP_SEQ_NULL { fused = OP_SEQ_NULL_JF; }
+        if was == OP_SNEQ_NULL { fused = OP_SNEQ_NULL_JF; }
+        i32 p1 = ch.prev_op;
+        i32 p2 = ch.prev2_op;
+        // a local against a constant, `x === "y"`: the loads fold in
+        if was == OP_SEQ && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL_CONST {
+            vec_set(&ch.code, p1, cast(u8, OP_SEQ_LC_JF));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = p2;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
+        // a loop's test of two locals, `i < n`: the loads fold in as well,
+        // whether they were loaded as two or as one
+        if was == OP_LT && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL2 {
+            vec_set(&ch.code, p1, cast(u8, OP_LT_JF_LL));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = p2;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
+        if was == OP_LT && p2 >= 0 && p1 == at - 3 && p2 == at - 6 && ch.max_target <= p2
+           && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, p2)) == OP_GETLOCAL {
+            u8 lo = vec_get(&ch.code, p1 + 1);
+            u8 hi = vec_get(&ch.code, p1 + 2);
+            vec_set(&ch.code, p2, cast(u8, OP_LT_JF_LL));
+            vec_set(&ch.code, p1, lo);
+            vec_set(&ch.code, p1 + 1, hi);
+            ch.code.len = p1 + 2;
+            ch.last_op = p2;
+            ch.prev_op = -1;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
         if fused >= 0 {
             ch.code.len = at;          // the comparison becomes the fused op
             return ch_jump(ch, fused);
         }
     }
     return ch_jump(ch, OP_JUMPF);
+}
+
+// The jump when true, the same way: a strict comparison just compiled
+// becomes the one instruction that compares and jumps, a local against a
+// constant with its loads (a switch's case).
+private i32 emit_jumpt(Chunk* ch) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len {
+        i32 was = cast(i32, vec_get(&ch.code, at));
+        i32 p1 = ch.prev_op;
+        if was == OP_SEQ && p1 == at - 5 && ch.max_target <= p1 && cast(i32, vec_get(&ch.code, p1)) == OP_GETLOCAL_CONST {
+            vec_set(&ch.code, p1, cast(u8, OP_SEQ_LC_JT));
+            ch.code.len = at;
+            ch.last_op = p1;
+            ch.prev_op = ch.prev2_op;
+            ch.prev2_op = -1;
+            i32 jat = ch.code.len;
+            ch_target(ch, -1);
+            return jat;
+        }
+        if was == OP_SEQ || was == OP_SNEQ {
+            ch.code.len = at;
+            return ch_jump(ch, was == OP_SEQ ? OP_SEQ_JT : OP_SNEQ_JT);
+        }
+    }
+    return ch_jump(ch, OP_JUMPT);
 }
 
 // --- with scopes ---------------------------------------------------------------
@@ -1056,7 +1797,7 @@ private void compile_with(Compiler* co, Node* n) {
     vec_push(&fs.withs, w);
     compile_stmt(co, n.b);
     fs.withs.len--;
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -1105,7 +1846,7 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
     i32 ui = resolve_upval(fs, n.name);
     if ui >= 0 {
         CUp u = vec_get(&fs.ups, ui);
-        ch_op_u16(&fs.ch, u.tdz ? OP_GETUPVAL_CHK : OP_GETUPVAL, ui);
+        ch_op_u16(&fs.ch, u.by_value ? OP_GETUPVALV : u.tdz ? OP_GETUPVAL_CHK : OP_GETUPVAL, ui);
         return;
     }
     // live module import: read the dependency namespace property
@@ -1119,6 +1860,407 @@ private void emit_load_ident_static(Compiler* co, Node* n) {
         }
     }
     ch_op_u16(&fs.ch, OP_GETGLOBAL, name_const(co, n.name));
+}
+
+// --- the register form (doc/PLAN_register_bytecode.md) -------------------
+//
+// compile_expr leaves a value on the operand stack; compile_expr_reg says
+// which frame slot holds it. A plain local is its own slot and costs
+// nothing; anything not yet taught the register form compiles to the stack
+// and is stored into a temporary. Temporaries come from alloc_slot like the
+// compiler's other scratch slots, and are released in stack order by the
+// construct that took them. g_reg_level says how far the form reaches:
+// 0 nowhere; 1 a check that routes every binary operator's operands
+// through the slots and back, exercising the plumbing and speeding
+// nothing; 2 and up the plan's phases from 2 on. The default is the
+// highest level measured to be faster than the stack form.
+i32 g_reg_level = 4;
+// A check (tsmc --reg-clear): a temporary is overwritten with undefined as
+// it is released, so that code reading one after its release shows.
+bool g_reg_clear = false;
+
+// Releases the temporaries taken since `mark`.
+private void reg_release(Compiler* co, i32 mark) {
+    if g_reg_clear {
+        for i32 t = mark; t < co.cur.cur_slots; t++ {
+            ch_op(&co.cur.ch, OP_UNDEF);
+            reg_store(&co.cur.ch, t);
+        }
+    }
+    co.cur.cur_slots = mark;
+}
+
+// The slot of a local this frame reads plainly: no cell, no TDZ check,
+// not global, not exported, not under `with`; written too when `dst`, and
+// then not a const. -1 otherwise.
+private i32 reg_slot(Compiler* co, Node* n, bool dst) {
+    if n == null || n.kind != N_IDENT || str_equal(n.name, "arguments") { return -1; }
+    FScope* fs = co.cur;
+    if with_may_bind(fs, n.name) { return -1; }
+    i32 li = find_local(fs, n.name);
+    if li < 0 { return -1; }
+    CBind b = vec_get(&fs.binds, li);
+    if b.is_cell || b.tdz || (dst && b.is_const) || b.global || b.exported { return -1; }
+    if dst && co.strict && str_equal(n.name, "eval") { return -1; }
+    return b.slot;
+}
+
+// The constant a literal is, as an index in the pool, or -1: numbers,
+// strings, booleans, null and `void` of a literal.
+private i32 reg_const(Compiler* co, Node* n) {
+    Chunk* ch = &co.cur.ch;
+    if n.kind == N_NUMBER { return ch_add_const(ch, num_value(n.num)); }
+    if n.kind == N_STRING { return str_const(co, n.name); }
+    if n.kind == N_BOOL { return ch_add_const(ch, value_bool(str_equal(n.name, "true"))); }
+    if n.kind == N_NULL { return ch_add_const(ch, value_null()); }
+    if n.kind == N_UNARY && n.op == TOK_KW_VOID && is_pure_literal(n.a) { return ch_add_const(ch, value_undefined()); }
+    return -1;
+}
+
+// Whether evaluating n may store to the local named `name`: an assignment
+// or an update whose target mentions it, destructuring included. A nested
+// function is not entered: a binding one can write is a cell, never a
+// plain slot.
+private bool reg_writes(Node* n, str name) {
+    if n == null { return false; }
+    i32 k = n.kind;
+    if k == N_FUNCTION || k == N_CLASS { return false; }
+    if (k == N_ASSIGN || k == N_UPDATE) && reg_mentions(n.a, name) { return true; }
+    if reg_writes(n.a, name) || reg_writes(n.b, name) || reg_writes(n.c, name) || reg_writes(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_writes(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+// Whether a target names `name` anywhere in it: an identifier, or one in
+// a destructuring pattern.
+private bool reg_mentions(Node* n, str name) {
+    if n == null { return false; }
+    if n.kind == N_IDENT { return str_equal(n.name, name); }
+    if n.kind == N_MEMBER || n.kind == N_INDEX { return false; }
+    if reg_mentions(n.a, name) || reg_mentions(n.b, name) || reg_mentions(n.c, name) || reg_mentions(n.d, name) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if reg_mentions(*(n.kids.items + i), name) { return true; }
+    }
+    return false;
+}
+
+// The register op for an arithmetic operator's token (its K form is the
+// next opcode), RBIT for the bitwise ones, or -1.
+private i32 reg_arith_op(i32 tok) {
+    if tok == TOK_PLUS { return OP_RADD; }
+    if tok == TOK_MINUS { return OP_RSUB; }
+    if tok == TOK_STAR { return OP_RMUL; }
+    if tok == TOK_SLASH { return OP_RDIV; }
+    if tok == TOK_AMP || tok == TOK_PIPE || tok == TOK_CARET || tok == TOK_LSHIFT || tok == TOK_RSHIFT || tok == TOK_URSHIFT { return OP_RBIT; }
+    return -1;
+}
+
+private i32 reg_bit_kind(i32 tok) {
+    if tok == TOK_AMP { return RK_BAND; }
+    if tok == TOK_PIPE { return RK_BOR; }
+    if tok == TOK_CARET { return RK_BXOR; }
+    if tok == TOK_LSHIFT { return RK_SHL; }
+    if tok == TOK_RSHIFT { return RK_SHR; }
+    return RK_USHR;
+}
+
+// An integer literal's value in *v, or false: what an I form carries inline.
+private bool reg_int_lit(Node* n, i32* v) {
+    if n.kind != N_NUMBER { return false; }
+    f64 x = n.num;
+    if x != x || x < -2147483648.0 || x > 2147483647.0 || x != cast(f64, cast(i32, x)) { return false; }
+    if x == 0.0 && 1.0 / x < 0.0 { return false; }
+    *v = cast(i32, x);
+    return true;
+}
+
+// `a op b` into a slot: the register op, then the stack form of the same
+// for the values its fast path does not take, nine bytes the fast path
+// steps over.
+// An integer constant b rides in the instruction; any other literal b
+// that is not a number keeps the whole expression on the stack, where
+// `w + "px"` is no slower.
+private i32 reg_arith(Compiler* co, Node* n, i32 want) {
+    Chunk* ch = &co.cur.ch;
+    i32 imm = 0;
+    bool has_imm = reg_int_lit(n.b, &imm);
+    if !has_imm && reg_const_kind(n.b) && n.b.kind != N_NUMBER {
+        compile_expr(co, n);
+        i32 d0 = want >= 0 ? want : alloc_slot(co.cur);
+        reg_store(ch, d0);
+        return d0;
+    }
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    i32 mark = co.cur.cur_slots;
+    i32 op = reg_arith_op(n.op);
+    // `x = (a + b) | 0`: with a constant second operand nothing reads the
+    // destination after the first is in it, so an operator first operand
+    // is computed straight into the destination
+    bool inner = want >= 0 && n.a.kind == N_BIN && reg_arith_op(n.a.op) >= 0 && reg_const_kind(n.b);
+    i32 ra = compile_expr_reg(co, n.a, inner ? d : -1, n.b);
+    i32 rb = has_imm ? 0 : compile_expr_reg(co, n.b, -1, null);
+    if op == OP_RBIT && has_imm && n.op == TOK_PIPE { ch_op(ch, OP_RBORI); }
+    else if op == OP_RBIT && has_imm && n.op == TOK_AMP { ch_op(ch, OP_RBANDI); }
+    else {
+        ch_op(ch, has_imm ? op + 1 : op);
+        if op == OP_RBIT { vec_push(&ch.code, cast(u8, reg_bit_kind(n.op))); }
+    }
+    ch_u16(ch, d);
+    ch_u16(ch, ra);
+    if has_imm { ch_target(ch, imm); } else { ch_u16(ch, rb); }
+    // the stack form, written raw so that no fold changes its nine bytes:
+    // the fast path steps over it by that count
+    i32 at = ch.code.len;
+    vec_push(&ch.code, cast(u8, has_imm ? OP_GETLOCAL_CONST : OP_GETLOCAL2));
+    ch_u16(ch, ra);
+    ch_u16(ch, has_imm ? ch_add_const(ch, value_int(imm)) : rb);
+    vec_push(&ch.code, cast(u8, bin_op_code(n.op)));
+    vec_push(&ch.code, cast(u8, OP_PUTLOCAL));
+    ch_u16(ch, d);
+    ch.prev2_op = -1;
+    ch.prev_op = -1;
+    ch.last_op = at + 6;
+    if ch.max_target < ch.code.len { ch.max_target = ch.code.len; }
+    reg_release(co, mark);
+    return d;
+}
+
+// Whether n is a property or index read the register form takes: a plain
+// `.name` or `[key]`, no optional chain, no private name, no super, no
+// `{}.x`; its object a plain local or such a read itself, its key a plain
+// local or a literal. Anything else stays on the stack, where `this.p`
+// and the chains have fused ops of their own.
+private bool reg_access(Compiler* co, Node* n) {
+    if n.kind != N_MEMBER && n.kind != N_INDEX { return false; }
+    if (n.flags & (NF_OPT_CHAIN | NF_PRIVATE | NF_PARENED)) != 0 || chain_has_opt(n) { return false; }
+    if n.a.kind == N_SUPER || (n.a.kind == N_OBJECT && n.a.kids.len == 0) { return false; }
+    if reg_slot(co, n.a, false) < 0 && !reg_access(co, n.a) { return false; }
+    if n.kind == N_INDEX && reg_slot(co, n.b, false) < 0 && !reg_const_kind(n.b) { return false; }
+    return true;
+}
+
+// A read reg_access takes, into a slot.
+private i32 reg_read(Compiler* co, Node* n, i32 want) {
+    Chunk* ch = &co.cur.ch;
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    i32 mark = co.cur.cur_slots;
+    i32 ro = compile_expr_reg(co, n.a, -1, n.kind == N_INDEX ? n.b : null);
+    if n.kind == N_MEMBER {
+        reg_op3(ch, OP_RGETPROP, d, ro, name_const(co, n.name));
+        ch_u16(ch, IC_EMPTY);
+    } else {
+        i32 rk = compile_expr_reg(co, n.b, -1, null);
+        reg_op3(ch, OP_RGETINDEX, d, ro, rk);
+    }
+    reg_release(co, mark);
+    return d;
+}
+
+private void reg_op3(Chunk* ch, i32 op, i32 a, i32 b, i32 c) {
+    ch_op(ch, op);
+    ch_u16(ch, a);
+    ch_u16(ch, b);
+    ch_u16(ch, c);
+}
+
+// `o.name = v;` and `o[k] = v;` as statements, o and k what reg_access
+// takes: the object, the key and the value in slots, in that order, then
+// one store. False when the statement is not that.
+private bool reg_store_stmt(Compiler* co, Node* e) {
+    if e == null || e.kind != N_ASSIGN || e.op != TOK_EQ { return false; }
+    Node* t = e.a;
+    if !reg_access(co, t) { return false; }
+    Chunk* ch = &co.cur.ch;
+    i32 mark = co.cur.cur_slots;
+    i32 ro = compile_expr_reg(co, t.a, -1, t.kind == N_INDEX ? t.b : e.b);
+    if t.kind == N_MEMBER {
+        i32 rv = compile_expr_reg(co, e.b, -1, null);
+        reg_op3(ch, OP_RSETPROP, ro, name_const(co, t.name), rv);
+        ch_u16(ch, IC_EMPTY);
+    } else {
+        i32 rk = compile_expr_reg(co, t.b, -1, e.b);
+        i32 rv = compile_expr_reg(co, e.b, -1, null);
+        reg_op3(ch, OP_RSETINDEX, ro, rk, rv);
+        // the stack form, raw, ten bytes the fast path steps over
+        i32 at = ch.code.len;
+        vec_push(&ch.code, cast(u8, OP_GETLOCAL));
+        ch_u16(ch, ro);
+        vec_push(&ch.code, cast(u8, OP_GETLOCAL2));
+        ch_u16(ch, rk);
+        ch_u16(ch, rv);
+        vec_push(&ch.code, cast(u8, OP_SETINDEX));
+        vec_push(&ch.code, cast(u8, OP_POP));
+        ch.prev2_op = -1;
+        ch.prev_op = -1;
+        ch.last_op = at + 9;
+        if ch.max_target < ch.code.len { ch.max_target = ch.code.len; }
+    }
+    reg_release(co, mark);
+    return true;
+}
+
+// Whether n is a literal reg_const takes, without adding it to the pool.
+private bool reg_const_kind(Node* n) {
+    return n.kind == N_NUMBER || n.kind == N_STRING || n.kind == N_BOOL || n.kind == N_NULL || is_void_literal(n);
+}
+
+// A slot a condition can read at no cost: a plain local's, or -1.
+private i32 reg_cheap(Compiler* co, Node* n) { return reg_slot(co, n, false); }
+
+private bool is_void_literal(Node* n) { return n.kind == N_UNARY && n.op == TOK_KW_VOID && is_pure_literal(n.a); }
+
+// A condition's jump when it is false, on slots: a comparison of plain
+// locals or of a plain local and a literal, a nullish test, a plain local's
+// truth. The position to patch, or -1 when the condition is not one of
+// these, which the caller then compiles to the stack.
+private i32 reg_cond_jf(Compiler* co, Node* c) {
+    Chunk* ch = &co.cur.ch;
+    if c.kind == N_IDENT {
+        i32 r = reg_cheap(co, c);
+        if r < 0 { return -1; }
+        ch_op_u16(ch, OP_RJF, r);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if c.kind == N_UNARY && c.op == TOK_BANG && c.a.kind == N_IDENT {
+        i32 r = reg_cheap(co, c.a);
+        if r < 0 { return -1; }
+        ch_op_u16(ch, OP_RJT, r);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if c.kind != N_BIN { return -1; }
+    Node* a = c.a;
+    Node* b = c.b;
+    i32 kind = -1;
+    if c.op == TOK_LT { kind = OP_RJLT; }
+    if c.op == TOK_GT { kind = OP_RJGT; }
+    if c.op == TOK_LE { kind = OP_RJLE; }
+    if c.op == TOK_GE { kind = OP_RJGE; }
+    if c.op == TOK_EQEQEQ { kind = OP_RJSEQ; }
+    if c.op == TOK_NEQEQEQ { kind = OP_RJSNEQ; }
+    if c.op == TOK_EQEQ || c.op == TOK_NEQ {
+        // only a nullish test: `x == null`, `null != x`, `x == void 0`
+        Node* x = null;
+        if b.kind == N_NULL || is_void_literal(b) { x = a; }
+        if a.kind == N_NULL || is_void_literal(a) { x = b; }
+        if x == null { return -1; }
+        i32 r = reg_cheap(co, x);
+        if r < 0 { return -1; }
+        ch_op(ch, c.op == TOK_EQEQ ? OP_RJNULLISH : OP_RJNOTNULLISH);
+        ch_u16(ch, r);
+        ch_u16(ch, 0);
+        i32 at = ch.code.len;
+        ch_target(ch, -1);
+        return at;
+    }
+    if kind < 0 { return -1; }
+    // a literal goes second: `null === x` as `x === null`, `0 < i` as `i > 0`
+    if reg_cheap(co, a) < 0 && reg_cheap(co, b) >= 0 {
+        Node* t = a;
+        a = b;
+        b = t;
+        if kind == OP_RJLT { kind = OP_RJGT; } else if kind == OP_RJGT { kind = OP_RJLT; }
+        else if kind == OP_RJLE { kind = OP_RJGE; } else if kind == OP_RJGE { kind = OP_RJLE; }
+    }
+    i32 ra = reg_cheap(co, a);
+    if ra < 0 { return -1; }
+    i32 rb = reg_cheap(co, b);
+    bool imm = false;
+    i32 iv = 0;
+    if rb < 0 {
+        if kind == OP_RJSEQ || kind == OP_RJSNEQ {
+            if !reg_const_kind(b) { return -1; }
+            rb = reg_const(co, b);
+        } else {
+            // a relational compare takes an integer inline, nothing else
+            if !reg_int_lit(b, &iv) { return -1; }
+            imm = true;
+        }
+        kind++;   // the I or K form is the next opcode
+    }
+    ch_op(ch, kind);
+    ch_u16(ch, ra);
+    if imm { ch_target(ch, iv); } else { ch_u16(ch, rb); }
+    i32 at = ch.code.len;
+    ch_target(ch, -1);
+    return at;
+}
+
+// A condition's jump when it is false: on slots where reg_cond_jf can,
+// else the value on the stack and the stack's jump.
+private i32 compile_cond_jf(Compiler* co, Node* c) {
+    if g_reg_level >= 3 {
+        i32 j = reg_cond_jf(co, c);
+        if j >= 0 { return j; }
+    }
+    compile_expr(co, c);
+    return emit_jumpf(&co.cur.ch);
+}
+
+private void reg_op2(Chunk* ch, i32 op, i32 a, i32 b) {
+    ch_op(ch, op);
+    ch_u16(ch, a);
+    ch_u16(ch, b);
+}
+
+// `x = e;` as a statement, x a plain local: e compiled into x's slot, no
+// value left behind. False when the statement is not that.
+private bool reg_assign_stmt(Compiler* co, Node* e) {
+    if e == null || e.kind != N_ASSIGN || e.op != TOK_EQ || e.a.kind != N_IDENT { return false; }
+    if co.strict && strict_reserved(e.a.name) { return false; }
+    i32 d = reg_slot(co, e.a, true);
+    if d < 0 { return false; }
+    infer_name(e.b, e.a.name);
+    ignore compile_expr_reg(co, e.b, d, null);
+    return true;
+}
+
+private void reg_store(Chunk* ch, i32 d) {
+    ch_op_u16(ch, OP_SETLOCAL, d);
+    emit_discard(ch);
+}
+
+// The value of n in a slot: `want` when the caller names one (>= 0),
+// else the local's own slot or a temporary. `later` is what the caller
+// evaluates after n before it reads the slot: a local whose binding that
+// may store to is copied first, so that the read sees the value it had.
+private i32 compile_expr_reg(Compiler* co, Node* n, i32 want, Node* later) {
+    Chunk* ch = &co.cur.ch;
+    i32 s = reg_slot(co, n, false);
+    if s >= 0 {
+        if (want < 0 || want == s) && !reg_writes(later, n.name) { return s; }
+        i32 d = want >= 0 ? want : alloc_slot(co.cur);
+        if g_reg_level >= 2 {
+            reg_op2(ch, OP_MOV, d, s);
+        } else {
+            ch_op_u16(ch, OP_GETLOCAL, s);
+            reg_store(ch, d);
+        }
+        return d;
+    }
+    if g_reg_level >= 2 {
+        i32 k = reg_const(co, n);
+        if k >= 0 {
+            i32 d = want >= 0 ? want : alloc_slot(co.cur);
+            reg_op2(ch, OP_LOADK, d, k);
+            return d;
+        }
+    }
+    if g_reg_level >= 3 && n.kind == N_BIN && reg_arith_op(n.op) >= 0 {
+        return reg_arith(co, n, want);
+    }
+    if g_reg_level >= 4 && reg_access(co, n) {
+        return reg_read(co, n, want);
+    }
+    compile_expr(co, n);
+    i32 d = want >= 0 ? want : alloc_slot(co.cur);
+    reg_store(ch, d);
+    return d;
 }
 
 private void emit_load_name(Compiler* co, str name, Node* at) {
@@ -1184,6 +2326,11 @@ private void emit_store_ident_static(Compiler* co, Node* n) {
     i32 ui = resolve_upval(fs, n.name);
     if ui >= 0 {
         CUp u = vec_get(&fs.ups, ui);
+        if u.by_value {
+            // the scan counts every store: one here means it missed this one
+            cerror(co, n, "internal: a store to a binding captured by value");
+            return;
+        }
         if u.tdz {
             ch_op_u16(&fs.ch, OP_GETUPVAL_CHK, ui);
             ch_op(&fs.ch, OP_POP);
@@ -1204,13 +2351,121 @@ private void emit_store_ident_static(Compiler* co, Node* n) {
     ch_op_u16(&fs.ch, OP_SETGLOBAL, name_const(co, n.name));
 }
 
+// A property read whose object is a plain local just loaded: the two
+// become one instruction, unless a jump lands on the read. The same for
+// an index read whose object and key are two locals just loaded.
+private void emit_getprop(Chunk* ch, i32 kc) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 3 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL {
+        vec_set(&ch.code, at, cast(u8, OP_GETPROP_L));
+        ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
+        return;
+    }
+    // two locals loaded as one: the first stays a load, the second's read
+    // becomes the property read
+    if at >= 0 && at == ch.code.len - 5 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL2 {
+        u8 lo = vec_get(&ch.code, at + 3);
+        u8 hi = vec_get(&ch.code, at + 4);
+        vec_set(&ch.code, at, cast(u8, OP_GETLOCAL));
+        ch.code.len = at + 3;
+        ch.prev_op = at;
+        ch.last_op = at + 3;
+        vec_push(&ch.code, cast(u8, OP_GETPROP_L));
+        vec_push(&ch.code, lo);
+        vec_push(&ch.code, hi);
+        ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
+        return;
+    }
+    if at >= 0 && at == ch.code.len - 1 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_THIS {
+        vec_set(&ch.code, at, cast(u8, OP_GETPROP_THIS));
+        ch_u16(ch, kc);
+        ch_u16(ch, IC_EMPTY);
+        return;
+    }
+    ch_op_ic(ch, OP_GETPROP, kc);
+}
+
+private void emit_getindex(Chunk* ch) {
+    i32 at = ch.last_op;
+    i32 before = ch.prev_op;
+    // two locals loaded as one, the same operands in the same places
+    if at >= 0 && at == ch.code.len - 5 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL2 {
+        vec_set(&ch.code, at, cast(u8, OP_GETINDEX_LL));
+        return;
+    }
+    if at >= 0 && before >= 0 && at == ch.code.len - 3 && before == at - 3 && ch.max_target <= before
+       && cast(i32, vec_get(&ch.code, at)) == OP_GETLOCAL && cast(i32, vec_get(&ch.code, before)) == OP_GETLOCAL {
+        vec_set(&ch.code, before, cast(u8, OP_GETINDEX_LL));
+        // the two slots follow the opcode: the first's two bytes stay, the
+        // second's move up over the second opcode byte
+        u8 lo = vec_get(&ch.code, at + 1);
+        u8 hi = vec_get(&ch.code, at + 2);
+        vec_set(&ch.code, at, lo);
+        vec_set(&ch.code, at + 1, hi);
+        ch.code.len = at + 2;
+        ch.last_op = before;
+        ch.prev_op = -1;
+        return;
+    }
+    ch_op(ch, OP_GETINDEX);
+}
+
+// Drops the value an expression left. A store to a local slot just before it
+// becomes the one instruction that stores and drops, unless a jump lands on
+// the drop (`c ? a = 1 : a = 2;` patches one there).
+private void emit_discard(Chunk* ch) {
+    i32 at = ch.last_op;
+    if at >= 0 && at == ch.code.len - 3 && ch.max_target < ch.code.len
+       && cast(i32, vec_get(&ch.code, at)) == OP_SETLOCAL {
+        vec_set(&ch.code, at, cast(u8, OP_PUTLOCAL));
+        return;
+    }
+    ch_op(ch, OP_POP);
+}
+
 // Direct store for initialization; bypasses the const check.
+// A binding in its own frame's slot is read only by this function's code, so
+// once its initializer has run every later use in the source is initialized
+// too: the hole is written at the block's entry and the declaration runs
+// before anything textually after it. The reads and writes that follow drop
+// their TDZ check. A captured binding keeps it (a hoisted function may run
+// before the declaration), and so does one declared in a switch's clause
+// scope, which a jump into a later clause skips.
+// A declaration's initializer compiled into the binding's own slot, when
+// the binding is one: not global, not a cell, not exported, not a `var`
+// a `with` answers for. What emit_init_binding does after its store, the
+// TDZ check dropped for the reads after it, is done here as well.
+private bool reg_init_binding(Compiler* co, i32 bind_idx, Node* init, bool through_with) {
+    FScope* fs = co.cur;
+    CBind b = vec_get(&fs.binds, bind_idx);
+    if through_with || b.global || b.is_cell || b.exported || b.slot < 0 { return false; }
+    ignore compile_expr_reg(co, init, b.slot, null);
+    if b.tdz && b.depth != fs.switch_depth {
+        (fs.binds.data + bind_idx).tdz = false;
+    }
+    return true;
+}
+
 private void emit_init_binding(Compiler* co, i32 bind_idx) {
     FScope* fs = co.cur;
     CBind b = vec_get(&fs.binds, bind_idx);
+    if b.global {
+        ch_op_u16(&fs.ch, OP_DEFGLOBAL, name_const(co, b.name));
+        ch_op(&fs.ch, OP_POP);
+        return;
+    }
     ch_op_u16(&fs.ch, b.is_cell ? OP_SETCELL : OP_SETLOCAL, b.slot);
     if b.exported { emit_export_writes(co, b.name, null); }
-    ch_op(&fs.ch, OP_POP);
+    emit_discard(&fs.ch);
+    if b.tdz && !b.is_cell && b.depth != fs.switch_depth {
+        (fs.binds.data + bind_idx).tdz = false;
+    }
 }
 
 // In a static member, and in an arrow inside one, `super.x` reads the parent
@@ -1224,7 +2479,7 @@ private bool super_home_is_static(Compiler* co) {
 private void emit_super_home(Compiler* co, Node* at) {
     emit_load_name(co, "%super", at);
     if !super_home_is_static(co) {
-        ch_op_u16(&co.cur.ch, OP_GETPROP, name_const(co, "prototype"));
+        ch_op_ic(&co.cur.ch, OP_GETPROP, name_const(co, "prototype"));
     }
 }
 
@@ -1300,7 +2555,7 @@ private void emit_ref_store(Compiler* co, Node* t, i32 t_obj, i32 t_key) {
         if (t.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
         } else {
-            ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+            ch_op_ic(ch, OP_SETPROP, name_const(co, t.name));
         }
     }
     ch_op(ch, OP_POP);
@@ -1351,7 +2606,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
     i32 k = pat.kind;
     if k == N_IDENT {
         if declare_mode {
-            i32 li = find_local(co.cur, pat.name);
+            i32 li = find_decl(co.cur, pat.name);
             if li < 0 {
                 cerror(co, pat, "unresolved binding");
                 ch_op(ch, OP_POP);
@@ -1379,7 +2634,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             if (pat.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, pat, pat.name));
             } else {
-                ch_op_u16(ch, OP_SETPROP, name_const(co, pat.name));
+                ch_op_ic(ch, OP_SETPROP, name_const(co, pat.name));
             }
         } else {
             compile_expr(co, pat.b);
@@ -1410,11 +2665,8 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
         // whether the iterator still has to be closed at the end.
         i32 t_iter = alloc_slot(co.cur);
         i32 t_done = alloc_slot(co.cur);
-        ch_op(ch, OP_GET_ITER);
+        ch_op_u16(ch, OP_GET_ITER_S, t_done);
         ch_op_u16(ch, OP_SETLOCAL, t_iter);
-        ch_op(ch, OP_POP);
-        ch_op(ch, OP_FALSE);
-        ch_op_u16(ch, OP_SETLOCAL, t_done);
         ch_op(ch, OP_POP);
         // an element that throws, or a resume that returns into a pattern
         // suspended on a yield, still releases the iterator
@@ -1528,7 +2780,7 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
                 if pp.b != null {
                     // default via synthetic assign-pattern shape
                     ch_op_u16(ch, OP_GETLOCAL, tmp);
-                    ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                    emit_getprop(ch, prop_key_const(co, keyn));
                     ch_op(ch, OP_DUP);
                     ch_op(ch, OP_UNDEF);
                     ch_op(ch, OP_SEQ);
@@ -1564,10 +2816,10 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
             if t_k >= 0 {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
                 ch_op_u16(ch, OP_GETLOCAL, t_k);
-                ch_op(ch, OP_GETINDEX);
+                emit_getindex(ch);
             } else {
                 ch_op_u16(ch, OP_GETLOCAL, tmp);
-                ch_op_u16(ch, OP_GETPROP, prop_key_const(co, keyn));
+                emit_getprop(ch, prop_key_const(co, keyn));
                 note_taken_key(co, t_ex, 0 - 1, keyn);
             }
             if by_ref {
@@ -1587,6 +2839,11 @@ private void compile_destructure(Compiler* co, Node* pat, bool declare_mode) {
 }
 
 // --- expressions ------------------------------------------------------------------
+
+// A literal whose evaluation nothing can observe.
+private bool is_pure_literal(Node* n) {
+    return n != null && (n.kind == N_NUMBER || n.kind == N_STRING || n.kind == N_NULL || n.kind == N_BOOL);
+}
 
 private i32 bin_op_code(i32 tok) {
     if tok == TOK_PLUS { return OP_ADD; }
@@ -1679,7 +2936,7 @@ private void compile_assign(Compiler* co, Node* n) {
             if (t.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_SETPRIVATE, private_key_const(co, t, t.name));
             } else {
-                ch_op_u16(ch, OP_SETPROP, name_const(co, t.name));
+                ch_op_ic(ch, OP_SETPROP, name_const(co, t.name));
             }
             return;
         }
@@ -1728,11 +2985,11 @@ private void compile_assign(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_SETLOCAL, t_obj);
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
-            ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
+            if priv { ch_op_u16(ch, OP_GETPRIVATE, kc); } else { emit_getprop(ch, kc); }
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             compile_expr(co, n.b);
-            ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
+            if priv { ch_op_u16(ch, OP_SETPRIVATE, kc); } else { ch_op_ic(ch, OP_SETPROP, kc); }
             ch_patch(ch, j);
             co.cur.cur_slots--;
             return;
@@ -1752,7 +3009,7 @@ private void compile_assign(Compiler* co, Node* n) {
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             ch_op_u16(ch, OP_GETLOCAL, t_key);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
             i32 j = ch_jump(ch, jop);
             ch_op_u16(ch, OP_GETLOCAL, t_obj);
             ch_op_u16(ch, OP_GETLOCAL, t_key);
@@ -1782,17 +3039,17 @@ private void compile_assign(Compiler* co, Node* n) {
         i32 kc = priv ? private_key_const(co, t, t.name) : name_const(co, t.name);
         compile_expr(co, t.a);
         ch_op(ch, OP_DUP);
-        ch_op_u16(ch, priv ? OP_GETPRIVATE : OP_GETPROP, kc);
+        if priv { ch_op_u16(ch, OP_GETPRIVATE, kc); } else { emit_getprop(ch, kc); }
         compile_expr(co, n.b);
         ch_op(ch, op);
-        ch_op_u16(ch, priv ? OP_SETPRIVATE : OP_SETPROP, kc);
+        if priv { ch_op_u16(ch, OP_SETPRIVATE, kc); } else { ch_op_ic(ch, OP_SETPROP, kc); }
         return;
     }
     if t.kind == N_INDEX {
         compile_expr(co, t.a);
         compile_expr(co, t.b);
         ch_op(ch, OP_DUP2);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         compile_expr(co, n.b);
         ch_op(ch, op);
         ch_op(ch, OP_SETINDEX);
@@ -1823,18 +3080,18 @@ private void compile_update(Compiler* co, Node* n) {
             mkc = mpriv ? private_key_const(co, t, t.name) : name_const(co, t.name);
             compile_expr(co, t.a);
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, mpriv ? OP_GETPRIVATE : OP_GETPROP, mkc);
+            if mpriv { ch_op_u16(ch, OP_GETPRIVATE, mkc); } else { emit_getprop(ch, mkc); }
         } else {
             compile_expr(co, t.a);
             compile_expr(co, t.b);
             ch_op(ch, OP_DUP2);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
         }
         ch_op(ch, OP_TONUM);
         ch_op_u16(ch, OP_SETLOCAL, tmp);
         ch_op(ch, step);
         if t.kind == N_MEMBER {
-            ch_op_u16(ch, mpriv ? OP_SETPRIVATE : OP_SETPROP, mkc);
+            if mpriv { ch_op_u16(ch, OP_SETPRIVATE, mkc); } else { ch_op_ic(ch, OP_SETPROP, mkc); }
         } else {
             ch_op(ch, OP_SETINDEX);
         }
@@ -1883,7 +3140,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
         if (n.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_GETPRIVATE, private_key_const(co, n, n.name));
         } else {
-            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+            emit_getprop(ch, name_const(co, n.name));
         }
         return;
     }
@@ -1893,7 +3150,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
             vec_push(nils, ch_jump(ch, OP_JUMP_NULLISH));
         }
         compile_expr(co, n.b);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         return;
     }
     if k == N_CALL {
@@ -1906,7 +3163,7 @@ private void emit_chain(Compiler* co, Node* n, Vec<i32>* nils) {
             if (callee.flags & NF_PRIVATE) != 0 {
                 ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
             } else {
-                ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+                ch_op_ic(ch, OP_GETMETHOD, name_const(co, callee.name));
             }
         } else if callee.kind == N_INDEX {
             emit_chain_base(co, callee.a, nils);
@@ -1977,6 +3234,9 @@ private void compile_delete_opt(Compiler* co, Node* t) {
 private void compile_call(Compiler* co, Node* n) {
     Chunk* ch = &co.cur.ch;
     Node* callee = n.a;
+    // a function called where it is written runs now: compiled now, not twice
+    if callee.kind == N_FUNCTION { co.eager_fn = callee; }
+    else if (callee.kind == N_MEMBER || callee.kind == N_INDEX) && callee.a != null && callee.a.kind == N_FUNCTION { co.eager_fn = callee.a; }
     if callee.kind == N_IMPORT_EXPR {
         // dynamic import(spec): compile the specifier, then hand it and this
         // module's path to the runtime loader (OP_DYNIMPORT -> a promise).
@@ -2003,6 +3263,14 @@ private void compile_call(Compiler* co, Node* n) {
         i32 c = compile_args(co, &n.kids);
         // both super forms forward new.target to the base constructor
         if c >= 0 { ch_op_u16(ch, OP_SUPERCALL, c); } else { ch_op(ch, OP_SUPERCALL_ARRAY); }
+        // the fields go on the object super() returned, as soon as it returns
+        if co.cur.ctor_fields != null {
+            // once: a super() inside an initializer is an error reported elsewhere
+            Node** fields = co.cur.ctor_fields;
+            co.cur.ctor_fields = null;
+            emit_field_inits(co, fields, co.cur.n_ctor_fields);
+            co.cur.ctor_fields = fields;
+        }
         return;
     }
     if (callee.kind == N_MEMBER || callee.kind == N_INDEX) && callee.a.kind == N_SUPER {
@@ -2014,9 +3282,9 @@ private void compile_call(Compiler* co, Node* n) {
         emit_super_home(co, n);
         if callee.kind == N_INDEX {
             compile_expr(co, callee.b);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
         } else {
-            ch_op_u16(ch, OP_GETPROP, name_const(co, callee.name));
+            emit_getprop(ch, name_const(co, callee.name));
         }
         // the receiver stays `this`, as for super.name(...)
         emit_this(co, n);
@@ -2033,7 +3301,7 @@ private void compile_call(Compiler* co, Node* n) {
         if (callee.flags & NF_PRIVATE) != 0 {
             ch_op_u16(ch, OP_GETMETHOD_PRIV, private_key_const(co, callee, callee.name));
         } else {
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, callee.name));
+            ch_op_ic(ch, OP_GETMETHOD, name_const(co, callee.name));
         }
     } else if callee.kind == N_INDEX {
         compile_expr(co, callee.a);
@@ -2098,15 +3366,16 @@ private void compile_expr(Compiler* co, Node* n) {
     if k == N_REGEX {
         // an invalid literal is a syntax error of the program, not of the
         // statement that first evaluates it
-        if !regex_flags_valid(n.aux) {
+        str rflags = n.a.name;
+        if !regex_flags_valid(rflags) {
             cerror(co, n, "invalid regular expression flags");
         } else {
-            RegexProg* probe = regex_compile(n.name, n.aux);
+            RegexProg* probe = regex_compile(n.name, rflags);
             if probe == null { cerror(co, n, "invalid regular expression"); }
             else { regex_free(probe); }
         }
         i32 src = str_const(co, n.name);
-        i32 flags = str_const(co, n.aux);
+        i32 flags = str_const(co, rflags);
         ch_op(ch, OP_REGEX);
         ch_u16(ch, src);
         ch_u16(ch, flags);
@@ -2119,15 +3388,15 @@ private void compile_expr(Compiler* co, Node* n) {
         ch_op_u16(ch, OP_NEWOBJ, 3);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_url_const(co));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "url"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "url"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_path_const(co, false));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "filename"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "filename"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_DUP);
         ch_op_u16(ch, OP_CONST, import_meta_path_const(co, true));
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "dirname"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "dirname"));
         ch_op(ch, OP_POP);
         return;
     }
@@ -2311,7 +3580,7 @@ private void compile_expr(Compiler* co, Node* n) {
         // callee + `this`, mirroring N_CALL: a member tag keeps its receiver
         if tag.kind == N_MEMBER && (tag.flags & NF_PRIVATE) == 0 && tag.a.kind != N_SUPER {
             compile_expr(co, tag.a);
-            ch_op_u16(ch, OP_GETMETHOD, name_const(co, tag.name));
+            ch_op_ic(ch, OP_GETMETHOD, name_const(co, tag.name));
         } else if tag.kind == N_INDEX {
             compile_expr(co, tag.a);
             compile_expr(co, tag.b);
@@ -2335,12 +3604,12 @@ private void compile_expr(Compiler* co, Node* n) {
         for i32 i = 0; i < tmpl.kids.len; i++ {
             Node* e = *(tmpl.kids.items + i);
             if e.kind == N_TEMPLATE_ELEM {
-                ch_op_u16(ch, OP_CONST, str_const(co, e.aux));
+                ch_op_u16(ch, OP_CONST, str_const(co, e.a.name));
             }
         }
         ch_op_u16(ch, OP_NEWARR, nq);
         ch_op(ch, OP_FREEZE);
-        ch_op_u16(ch, OP_SETPROP, name_const(co, "raw"));
+        ch_op_ic(ch, OP_SETPROP, name_const(co, "raw"));
         ch_op(ch, OP_POP);
         ch_op(ch, OP_FREEZE);
         // substitution expressions as the remaining arguments
@@ -2372,20 +3641,40 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_HASPRIVATE, private_key_const(co, n.a, n.a.name));
             return;
         }
-        compile_expr(co, n.a);
-        compile_expr(co, n.b);
         i32 op = bin_op_code(n.op);
         if op < 0 {
             cerror(co, n, "unsupported binary operator");
             return;
+        }
+        // `null === x`, as a minifier writes it: the literal after the
+        // operand, where the emitter folds it into the compare (a literal
+        // evaluates to itself, in either order)
+        bool swap = (op == OP_SEQ || op == OP_SNEQ || op == OP_EQ || op == OP_NEQ)
+            && (n.a.kind == N_NULL || (n.a.kind == N_UNARY && n.a.op == TOK_KW_VOID && is_pure_literal(n.a.a)));
+        if g_reg_level == 1 && !swap {
+            // the operands in slots, then pushed for the stack op
+            i32 mark = co.cur.cur_slots;
+            i32 ra = compile_expr_reg(co, n.a, -1, n.b);
+            i32 rb = compile_expr_reg(co, n.b, -1, null);
+            ch_op_u16(ch, OP_GETLOCAL, ra);
+            ch_op_u16(ch, OP_GETLOCAL, rb);
+            reg_release(co, mark);
+            ch_op(ch, op);
+            return;
+        }
+        if swap {
+            compile_expr(co, n.b);
+            compile_expr(co, n.a);
+        } else {
+            compile_expr(co, n.a);
+            compile_expr(co, n.b);
         }
         ch_op(ch, op);
         return;
     }
     if k == N_ASSIGN { compile_assign(co, n); return; }
     if k == N_COND {
-        compile_expr(co, n.a);
-        i32 j1 = emit_jumpf(ch);
+        i32 j1 = compile_cond_jf(co, n.a);
         compile_expr(co, n.b);
         i32 j2 = ch_jump(ch, OP_JUMP);
         ch_patch(ch, j1);
@@ -2448,8 +3737,11 @@ private void compile_expr(Compiler* co, Node* n) {
             return;
         }
         if n.op == TOK_KW_VOID {
-            compile_expr(co, n.a);
-            ch_op(ch, OP_POP);
+            // `void 0` is undefined itself; an operand with an effect runs first
+            if !is_pure_literal(n.a) {
+                compile_expr(co, n.a);
+                ch_op(ch, OP_POP);
+            }
             ch_op(ch, OP_UNDEF);
             return;
         }
@@ -2471,7 +3763,7 @@ private void compile_expr(Compiler* co, Node* n) {
                 return;
             }
             emit_super_home(co, n);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+            emit_getprop(ch, name_const(co, n.name));
             return;
         }
         // a private read outside an optional chain; `o?.#x` takes the
@@ -2485,8 +3777,14 @@ private void compile_expr(Compiler* co, Node* n) {
             compile_opt_chain(co, n);
             return;
         }
+        // `{}.hasOwnProperty`, `{}.toString`: a babel helper's way to
+        // Object.prototype, read there without making the object
+        if n.a.kind == N_OBJECT && n.a.kids.len == 0 {
+            ch_op_u16(ch, OP_PROTOGET, name_const(co, n.name));
+            return;
+        }
         compile_expr(co, n.a);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, n.name));
+        emit_getprop(ch, name_const(co, n.name));
         return;
     }
     if k == N_INDEX {
@@ -2499,7 +3797,7 @@ private void compile_expr(Compiler* co, Node* n) {
             }
             emit_super_home(co, n);
             compile_expr(co, n.b);
-            ch_op(ch, OP_GETINDEX);
+            emit_getindex(ch);
             return;
         }
         if chain_has_opt(n) {
@@ -2508,7 +3806,7 @@ private void compile_expr(Compiler* co, Node* n) {
         }
         compile_expr(co, n.a);
         compile_expr(co, n.b);
-        ch_op(ch, OP_GETINDEX);
+        emit_getindex(ch);
         return;
     }
     if k == N_CALL { compile_call(co, n); return; }
@@ -2567,7 +3865,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // the next method is read once, as the language's iterator record has it
             i32 t_next = alloc_slot(co.cur);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+            emit_getprop(ch, name_const(co, "next"));
             ch_op_u16(ch, OP_SETLOCAL, t_next);
             ch_op(ch, OP_POP);
             // What resumed this generator: the input, and the completion's
@@ -2610,9 +3908,9 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 lyield = ch_pos(ch);           // [value]
             ch_op(ch, OP_YIELD_DELEGATE);      // resumes with [input, kind]
@@ -2620,9 +3918,9 @@ private void compile_expr(Compiler* co, Node* n) {
             ch_op(ch, OP_POP);
             ch_op_u16(ch, OP_SETLOCAL, t_sent);
             ch_op(ch, OP_POP);
-            ch_op_u16(ch, OP_JUMP, lstart);
+            ch_op_target(ch, OP_JUMP, lstart);
             ch_patch(ch, jdone);               // [res]: the delegate is done
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 jend = ch_jump(ch, OP_JUMP);
 
@@ -2630,7 +3928,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // the delegate is closed and the caller gets a TypeError
             ch_patch(ch, jthrow);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "throw"));
+            emit_getprop(ch, name_const(co, "throw"));
             ch_op_u16(ch, OP_SETLOCAL, t_meth);
             // undefined or null means the delegate has no throw; anything
             // else has to be callable, and is an error on its own if not
@@ -2651,13 +3949,13 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jthrowdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
-            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jthrowdone);          // [res]
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             i32 jend2 = ch_jump(ch, OP_JUMP);
             ch_patch(ch, jnothrow);
@@ -2674,7 +3972,7 @@ private void compile_expr(Compiler* co, Node* n) {
             // finally blocks run.
             ch_patch(ch, jret);
             ch_op_u16(ch, OP_GETLOCAL, t_it);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "return"));
+            emit_getprop(ch, name_const(co, "return"));
             ch_op_u16(ch, OP_SETLOCAL, t_meth);
             i32 jnoret = ch_jump(ch, OP_JUMP_NULLISH);
             ch_op(ch, OP_TYPEOF);
@@ -2693,13 +3991,13 @@ private void compile_expr(Compiler* co, Node* n) {
             if adelegate { ch_op(ch, OP_AWAIT); }
             ch_op(ch, OP_ITER_CHECK);          // [res]
             ch_op(ch, OP_DUP);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+            emit_getprop(ch, name_const(co, "done"));
             i32 jretdone = ch_jump(ch, OP_JUMPT);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
-            ch_op_u16(ch, OP_JUMP, lyield);
+            ch_op_target(ch, OP_JUMP, lyield);
             ch_patch(ch, jretdone);            // [res]
-            ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+            emit_getprop(ch, name_const(co, "value"));
             emit_await_if_wrapped(co, t_wrapped);
             inline_finallys(co, 0);
             ch_op(ch, OP_RETURN);
@@ -2819,6 +4117,22 @@ private void bind_params_in_order(Compiler* co, FScope* fs, Node* f, i32 n_param
 private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, i32 n_fields, bool self_name) {
     FScope fs;
     fscope_init(&fs, co.cur, (f.flags & NF_ARROW) != 0);
+    if co.prefill != null {
+        // a lazy function: the upvalues its closures captured, in their order
+        FnTemplate* lt = co.prefill;
+        co.prefill = null;
+        for i32 i = 0; i < lt.lazy.n_ups; i++ {
+            LazyUp* lu = lt.lazy.ups + i;
+            CUp u;
+            u.name = lu.name;
+            u.is_const = lu.is_const;
+            u.tdz = lu.tdz;
+            u.exported = lu.exported;
+            u.by_value = lu.by_value;
+            vec_push(&fs.ups, u);
+            vec_push(&fs.ch.upvals, *(lt.upvals + i));
+        }
+    }
     fs.is_gen = (f.flags & NF_GENERATOR) != 0;
     fs.is_async = (f.flags & NF_ASYNC) != 0;
     fs.super_call_ok = co.next_is_derived_ctor;
@@ -2830,11 +4144,11 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     co.in_static_block = false;
     co.in_params = false;
     co.cur = &fs;
-    scan_inner(&fs.inner, f, true);
+    scan_inner(co, &fs, f, true);
     for i32 i = 0; i < n_fields; i++ {
         // a private method's body was compiled with the class, not here
         if member_is_private_method(*(fields + i)) { continue; }
-        scan_inner(&fs.inner, *(fields + i), true);
+        scan_inner(co, &fs, *(fields + i), true);
     }
 
     // A repeated parameter name is only tolerated in the simple parameter list
@@ -2861,7 +4175,8 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         check_strict_binding(co, f, f.name);
     }
     if !simple_params || co.strict || (f.flags & (NF_ARROW | NF_METHOD)) != 0 {
-        Vec<str> pnames = vec_new<str>(4);
+        Vec<str> pnames;
+        vec_lazy<str>(&pnames);
         for i32 i = 0; i < f.kids.len; i++ {
             collect_pattern_names((*(f.kids.items + i)).a, &pnames);
         }
@@ -2881,6 +4196,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     // default, a pattern or a rest element binds its names one at a time,
     // each in TDZ until its turn.
     i32 n_params = 0;
+    // a simple parameter is bound by the call; one with a default or a
+    // pattern in its turn, and a closure in a default is made before the later ones
+    co.decl_kind = simple_params ? 1 : 2;
+    co.decl_end = f.a != null ? f.a.span.start : 0;
     for i32 i = 0; i < f.kids.len; i++ {
         Node* prm = *(f.kids.items + i);
         if (prm.flags & NF_REST) != 0 {
@@ -2911,15 +4230,20 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
         bind_params_in_order(co, &fs, f, n_params);
         co.in_params = false;
     }
+    co.decl_kind = 0;
     // a named function EXPRESSION binds its own name inside its body (for
     // recursion), referring to the function itself; the name does not leak to
     // the enclosing scope. Skipped if a parameter shadows it. The binding is
     // declared non-const: the spec makes it immutable (assignment is a no-op
     // in sloppy mode), but rejecting a write at compile time would break a
     // whole module, so a stray write is tolerated as a plain reassignment.
-    if self_name && f.name.len > 0 && (f.flags & NF_ARROW) == 0
+    // A name inferred from a property key or a binding is only the
+    // function's .name: `{ i: function () { i.K } }` reads the outer i.
+    if self_name && f.name.len > 0 && (f.flags & (NF_ARROW | NF_NAME_INFERRED)) == 0
        && find_local(&fs, f.name) < 0 {
+        co.decl_kind = 3;
         i32 bi = declare(co, f.name, false, false);
+        co.decl_kind = 0;
         CBind b = vec_get(&fs.binds, bi);
         ch_op(&fs.ch, OP_CURFUNC);
         ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
@@ -2930,7 +4254,10 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     }
     // implicit `this` binding for arrows below
     if !fs.is_arrow && strmap_get<i32>(&fs.inner, "this") != null {
+        // a derived constructor's this is set by super(): a box until then
+        co.decl_kind = fs.super_call_ok ? 0 : 1;
         i32 bi = declare(co, "this", true, false);
+        co.decl_kind = 0;
         CBind b = vec_get(&fs.binds, bi);
         ch_op(&fs.ch, OP_THIS);
         ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
@@ -2941,7 +4268,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     }
     // implicit `new.target` binding, captured lexically by nested arrows.
     if !fs.is_arrow && strmap_get<i32>(&fs.inner, "%newtarget") != null {
+        co.decl_kind = 1;
         i32 bi = declare(co, "%newtarget", true, false);
+        co.decl_kind = 0;
         CBind b = vec_get(&fs.binds, bi);
         ch_op(&fs.ch, OP_NEWTARGET);
         ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
@@ -2954,7 +4283,9 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
     // Skip if a parameter/local already named `arguments` shadows it.
     if !fs.is_arrow && strmap_get<i32>(&fs.inner, "arguments") != null
        && find_local(&fs, "arguments") < 0 {
+        co.decl_kind = 1;
         i32 bi = declare(co, "arguments", true, false);
+        co.decl_kind = 0;
         CBind b = vec_get(&fs.binds, bi);
         ch_op(&fs.ch, OP_ARGUMENTS);
         ch_op_u16(&fs.ch, OP_SETLOCAL, b.slot);
@@ -2975,7 +4306,7 @@ private FnTemplate* compile_function_tmpl(Compiler* co, Node* f, Node** fields, 
             collect_pattern_names((*(f.kids.items + i)).a, &co.outer_names);
         }
         co.outer_is_body = true;
-        compile_block_stmts_ex(co, &f.a.kids, fields, n_fields);
+        compile_block_stmts_ex(co, f.a, fields, n_fields);
         ch_op(&fs.ch, OP_UNDEF);
         ch_op(&fs.ch, OP_RETURN);
     } else if f.a != null {
@@ -3020,9 +4351,323 @@ private void compile_function(Compiler* co, Node* f, bool self_name) {
     // A method's name is its property key, not a binding: `{ f() { f() } }`
     // calls the outer f. Only a named function expression sees itself.
     if (f.flags & NF_METHOD) != 0 { self_name = false; }
-    FnTemplate* t = compile_function_tmpl(co, f, null, 0, self_name);
+    FnTemplate* t = null;
+    if lazy_eligible(co, f) {
+        t = lazy_template(co, f, self_name);
+    } else if (f.flags & NF_SKIPPED) != 0 {
+        t = compile_skipped(co, f, self_name);
+    } else {
+        t = compile_function_tmpl(co, f, null, 0, self_name);
+    }
     vec_push(&co.cur.ch.subs, t);
     ch_op_u16(&co.cur.ch, OP_CLOSURE, co.cur.ch.subs.len - 1);
+}
+
+// A function the parser passed over that is to be compiled now after all
+// (a default value's, a static block's, one called where it is written):
+// its real body parsed from the source, then compiled as any other.
+private FnTemplate* compile_skipped(Compiler* co, Node* f, bool self_name) {
+    Parser p;
+    parser_init_at(&p, co.src, co.diags, co.arena, f.span.start, co.strict);
+    Node* nf = parse_function_skipping(&p, false, true);
+    Lower lw;
+    lower_init(&lw, co.arena, co.diags);
+    if nf != null && p.ts_seen { lower_function(&lw, &nf); }
+    FnTemplate* t = null;
+    if nf == null || nf.kind != N_FUNCTION || co.diags.n_errors > 0 {
+        cerror(co, f, "a function could not be compiled");
+        t = compile_function_tmpl(co, f, null, 0, self_name);
+    } else {
+        nf.name = f.name;
+        nf.flags |= f.flags & NF_NAME_INFERRED;
+        t = compile_function_tmpl(co, nf, null, 0, self_name);
+    }
+    lower_destroy(&lw);
+    parser_destroy(&p);
+    return t;
+}
+
+// --- lazy functions ----------------------------------------------------------------
+//
+// In a large source a plain function's body is compiled on its first
+// call: a bundle defines far more than one page runs. The closure site
+// resolves every name the function mentions as an upvalue, now, as an
+// eager compile would (an extra one costs a capture); on the first call
+// the function is parsed again from its `function` keyword and compiled
+// against those upvalues, by name, with no enclosing scope. An arrow
+// captures `this`, `arguments` and `new.target` the same way, and a
+// method written as a plain key and its parameters is reparsed from the
+// key. Accessors, generators and async functions stay eager, as does a
+// function that calls eval, uses with or names super, and an arrow in a
+// static block. The source's early errors are
+// the parse's, which still covers the whole source; the few the
+// compiler reports surface on the first call instead. A function called
+// where it is written, (function () { ... })(), runs at once and is
+// compiled at once.
+
+// Off unless the embedder turns it on (tsmc --lazy; brmc does). The first
+// parse passes over the bodies of the functions it can (parser.mc,
+// skip_body), so a body is parsed in full once, on its first call, and one
+// never called not at all. A syntax error in a body passed over is reported
+// when the function is first called, not before the source runs. bsky.app's
+// 9.5 MB bundle: its compile 848 to 220 ms, and 406 ms of first calls after.
+bool lazy_functions = false;
+
+const i32 LAZY_MIN_SOURCE = 65536;
+const i32 LAZY_MIN_FN = 256;
+
+private bool has_eval_or_with(Node* n) {
+    if n == null { return false; }
+    // super and #names need the class around the function
+    if n.kind == N_WITH || n.kind == N_SUPER || n.kind == N_PRIVATE_IDENT || (n.flags & NF_PRIVATE) != 0 { return true; }
+    if n.kind == N_IDENT && str_equal(n.name, "eval") { return true; }
+    if has_eval_or_with(n.a) || has_eval_or_with(n.b) || has_eval_or_with(n.c) || has_eval_or_with(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if has_eval_or_with(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+// A method written as `key(`: a name, a number or a plain string, then
+// its parameters; get, set, async, *, a computed key and anything
+// before the key (static, a modifier) keep it eager.
+private bool plain_method_text(str s, i32 at) {
+    i32 i = at;
+    if i >= s.len { return false; }
+    u8 c = *(s.data + i);
+    if c == '"' || c == 39 {
+        i++;
+        while i < s.len && *(s.data + i) != c { if *(s.data + i) == 92 || *(s.data + i) == '
+' { return false; } i++; }
+        if i >= s.len { return false; }
+        i++;
+    } else {
+        i32 k0 = i;
+        while i < s.len {
+            u8 d = *(s.data + i);
+            if !((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9') || d == '_' || d == '$' || d >= 0x80) { break; }
+            i++;
+        }
+        if i == k0 { return false; }
+        str key = str_slice(s, k0, i);
+        if str_equal(key, "get") || str_equal(key, "set") || str_equal(key, "async") || str_equal(key, "static") { 
+            // `get(`, `set(` are methods of those names; anything else after them is not
+            i32 j = i;
+            while j < s.len && (*(s.data + j) == ' ' || *(s.data + j) == '	') { j++; }
+            if j >= s.len || *(s.data + j) != '(' { return false; }
+        }
+    }
+    while i < s.len && (*(s.data + i) == ' ' || *(s.data + i) == '	' || *(s.data + i) == '
+' || *(s.data + i) == '
+') { i++; }
+    return i < s.len && *(s.data + i) == '(';
+}
+
+private bool lazy_eligible(Compiler* co, Node* f) {
+    if !co.lazy_ok || co.cur == null || co.in_params || co.in_static_block || f == co.eager_fn { return false; }
+    // inside a with body its names resolve against the object, at run time
+    if co.cur.withs.len > 0 { return false; }
+    // one the parser passed over was eligible by everything it could see
+    if (f.flags & NF_SKIPPED) != 0 { return true; }
+    if (f.flags & (NF_GENERATOR | NF_ASYNC | NF_SIGNATURE | NF_GETTER | NF_SETTER)) != 0 { return false; }
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    bool method = (f.flags & NF_METHOD) != 0;
+    if f.a == null || (!arrow && f.a.kind != N_BLOCK) { return false; }
+    if arrow && co.static_this { return false; }
+    if f.span.end - f.span.start < LAZY_MIN_FN || f.span.end > co.src.len { return false; }
+    if method && !plain_method_text(co.src, f.span.start) { return false; }
+    if !arrow && !method && !str_starts_with(str_slice(co.src, f.span.start, co.src.len), "function") { return false; }
+    return !has_eval_or_with(f);
+}
+
+private LazySource* lazy_source(Compiler* co) {
+    if co.lazy_src != null { return co.lazy_src; }
+    LazySource* s = new(LazySource);
+    s.src = lazy_str(co.src);
+    s.src_name = lazy_str(co.src_name);
+    s.n_lines = co.n_lines;
+    s.line_starts = alloc<i32>(co.n_lines > 0 ? co.n_lines : 1);
+    memcpy(cast(u8*, s.line_starts), cast(u8*, co.line_starts), cast(i64, co.n_lines) * 4);
+    s.refs = 0;
+    s.module = co.in_module;
+    if co.in_module {
+        s.ns_name = lazy_str(co.ns_name);
+        // the imports and exports are all known before the body compiles
+        s.n_imports = co.mod_imports.count;
+        s.imports = s.n_imports > 0 ? alloc<LazyImport>(s.n_imports) : null;
+        i32 k = 0;
+        for i32 i = 0; i < co.mod_imports.cap && k < s.n_imports; i++ {
+            StrSlot<ModImport>* sl = co.mod_imports.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            LazyImport* m = s.imports + k;
+            m.name = lazy_str(sl.key);
+            m.slot_name = lazy_str(sl.val.slot_name);
+            m.prop = lazy_str(sl.val.prop);
+            m.spec = lazy_str(sl.val.spec);
+            k++;
+        }
+        s.n_imports = k;
+        s.n_exports = 0;
+        for i32 i = 0; i < co.export_heads.cap; i++ {
+            StrSlot<i32>* sl = co.export_heads.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            i32 e = sl.val;
+            while e >= 0 { s.n_exports++; e = vec_get(&co.export_names, e).next; }
+        }
+        s.exports = s.n_exports > 0 ? alloc<LazyExport>(s.n_exports) : null;
+        k = 0;
+        for i32 i = 0; i < co.export_heads.cap; i++ {
+            StrSlot<i32>* sl = co.export_heads.slots + i;
+            if sl.state != SLOT_USED { continue; }
+            i32 e = sl.val;
+            while e >= 0 {
+                ExportName en = vec_get(&co.export_names, e);
+                (s.exports + k).local = lazy_str(sl.key);
+                (s.exports + k).exported = lazy_str(en.exported);
+                k++;
+                e = en.next;
+            }
+        }
+    }
+    co.lazy_src = s;
+    return s;
+}
+
+private FnTemplate* lazy_template(Compiler* co, Node* f, bool self_name) {
+    bool arrow = (f.flags & NF_ARROW) != 0;
+    FScope fs;
+    fscope_init(&fs, co.cur, arrow);
+    // what the function declares itself is its own, not the scope's around it
+    Vec<str> own;
+    vec_lazy<str>(&own);
+    for i32 i = 0; i < f.kids.len; i++ { collect_pattern_names((*(f.kids.items + i)).a, &own); }
+    // the body's vars are its own too, unless a default value in the
+    // parameters can see past them to the names outside
+    bool simple = true;
+    for i32 i = 0; i < f.kids.len; i++ { Node* prm = *(f.kids.items + i); if prm.b != null || prm.a == null || prm.a.kind != N_IDENT { simple = false; } }
+    if simple && f.a.kind == N_BLOCK { collect_var_names(co, f.a, &own); }
+    StrMap<i32> mine;
+    strmap_init<i32>(&mine);
+    for i32 i = 0; i < own.len; i++ { strmap_set<i32>(&mine, vec_get(&own, i), 1); }
+    StrMap<i32> names;
+    strmap_init<i32>(&names);
+    scan_all_names(&names, f);
+    for i32 i = 0; i < names.cap; i++ {
+        StrSlot<i32>* sl = names.slots + i;
+        if sl.state != SLOT_USED { continue; }
+        str nm = sl.key;
+        // a plain function has these of its own; an arrow takes them from around it
+        if !arrow && (str_equal(nm, "this") || str_equal(nm, "arguments") || str_equal(nm, "%newtarget")) { continue; }
+        if str_equal(nm, "%super") { continue; }
+        if strmap_get<i32>(&mine, nm) != null { continue; }
+        // a binding in scope first, as a load resolves it; else an import,
+        // read through its dependency's namespace binding
+        if resolve_upval(&fs, nm) >= 0 { continue; }
+        if co.in_module {
+            ModImport* mi = strmap_get<ModImport>(&co.mod_imports, nm);
+            if mi != null { ignore resolve_upval(&fs, mi.slot_name); }
+        }
+    }
+    // a store to an exported binding writes the module's namespace too
+    if co.in_module && co.ns_name.len > 0 { ignore resolve_upval(&fs, co.ns_name); }
+    LazyFn* lz = new(LazyFn);
+    lz.source = lazy_source(co);
+    lz.start = f.span.start;
+    lz.strict = co.strict;
+    lz.self_name = self_name;
+    lz.method = (f.flags & NF_METHOD) != 0;
+    lz.name_inferred = (f.flags & NF_NAME_INFERRED) != 0;
+    lz.n_ups = fs.ups.len;
+    lz.ups = lz.n_ups > 0 ? alloc<LazyUp>(lz.n_ups) : null;
+    i32 names_len = 0;
+    for i32 i = 0; i < lz.n_ups; i++ { names_len += vec_get(&fs.ups, i).name.len; }
+    lz.names_buf = lz.n_ups > 0 ? alloc<u8>(names_len > 0 ? names_len : 1) : null;
+    i32 at = 0;
+    for i32 i = 0; i < lz.n_ups; i++ {
+        CUp u = vec_get(&fs.ups, i);
+        LazyUp* lu = lz.ups + i;
+        lu.name.data = lz.names_buf + at;
+        memcpy(lu.name.data, u.name.data, u.name.len);
+        lu.name.len = u.name.len;
+        at += u.name.len;
+        lu.is_const = u.is_const;
+        lu.tdz = u.tdz;
+        lu.exported = u.exported;
+        lu.by_value = u.by_value;
+    }
+    bool has_rest = f.kids.len > 0 && ((*(f.kids.items + f.kids.len - 1)).flags & NF_REST) != 0;
+    FnTemplate* t = chunk_finish(&fs.ch, f.name, f.kids.len, 0, has_rest, false, false);
+    t.lazy = lz;
+    t.owner = lz.source;
+    t.owner.refs++;
+    t.not_ctor = arrow || lz.method;
+    // what compile_function_tmpl would have taken for itself
+    co.next_static_home = false;
+    co.next_is_derived_ctor = false;
+    t.sloppy = !(co.strict || (f.a.kind == N_BLOCK && has_use_strict(&f.a.kids)));
+    t.src_name = lz.source.src_name;
+    t.src_text = lz.source.src;
+    t.src_start = f.span.start;
+    t.src_end = f.span.end;
+    i32 arity = 0;
+    for i32 i = 0; i < f.kids.len; i++ {
+        Node* prm = *(f.kids.items + i);
+        if (prm.flags & NF_REST) != 0 || prm.b != null { break; }
+        arity++;
+    }
+    t.arity = arity;
+    strmap_free<i32>(&names);
+    strmap_free<i32>(&mine);
+    vec_free(&own);
+    fscope_free(&fs);
+    return t;
+}
+
+// A lazy function's body, from its reparsed node `f`: compiled against
+// the upvalues its closures hold, into the template they point at.
+// False on a compile error, which the diagnostics hold.
+bool compile_lazy(Compiler* co, Node* f, FnTemplate* t) {
+    LazyFn* lz = t.lazy;
+    co.strict = lz.strict;
+    // an empty scope around it, so it is a function and not the top level;
+    // its names resolve to its upvalues, else to globals
+    FScope top;
+    fscope_init(&top, null, false);
+    co.cur = &top;
+    co.prefill = t;
+    if lz.name_inferred { f.flags |= NF_NAME_INFERRED; }
+    f.name = t.name;
+    FnTemplate* nt = compile_function_tmpl(co, f, null, 0, lz.self_name);
+    co.prefill = null;
+    co.cur = null;
+    fscope_free(&top);
+    if co.diags.n_errors > 0 || nt.n_upvals != t.n_upvals {
+        template_free(nt);
+        names_free(co);
+        return false;
+    }
+    t.n_params = nt.n_params;
+    t.n_slots = nt.n_slots;
+    t.has_rest = nt.has_rest;
+    t.needs_arguments = nt.needs_arguments;
+    t.sloppy = nt.sloppy;
+    t.code = nt.code;
+    t.code_len = nt.code_len;
+    t.consts = nt.consts;
+    t.n_consts = nt.n_consts;
+    t.catom = nt.catom;
+    t.subs = nt.subs;
+    t.n_subs = nt.n_subs;
+    t.pos = nt.pos;
+    t.n_pos = nt.n_pos;
+    // the shell goes; what it held is the lazy template's now
+    if nt.upvals != null { free(nt.upvals); }
+    if nt.name.data != null { free(nt.name.data); }
+    free(nt);
+    lazy_free(lz);
+    t.lazy = null;
+    names_free(co);
+    return true;
 }
 
 // --- classes -----------------------------------------------------------------------
@@ -3154,6 +4799,25 @@ private bool contains_super_call(Node* n) {
     return false;
 }
 
+// Whether super() is called from an arrow inside `n`.
+private bool arrow_super_call(Node* n) {
+    if n == null { return false; }
+    if n.kind == N_FUNCTION { return (n.flags & NF_ARROW) != 0 && contains_super_call(n); }
+    if arrow_super_call(n.a) || arrow_super_call(n.b)
+        || arrow_super_call(n.c) || arrow_super_call(n.d) { return true; }
+    for i32 i = 0; i < n.kids.len; i++ {
+        if arrow_super_call(*(n.kids.items + i)) { return true; }
+    }
+    return false;
+}
+
+private bool arrow_super_call_list(NodeList* list) {
+    for i32 i = 0; i < list.len; i++ {
+        if arrow_super_call(*(list.items + i)) { return true; }
+    }
+    return false;
+}
+
 // A field initializer or static block is not a function of its own: it may
 // not mention `arguments`, and may not call super().
 private void class_init_rules(Compiler* co, Node* at, Node* body) {
@@ -3211,8 +4875,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // The class's private names, visible to the body and anything nested in
     // it. The heritage above was compiled outside them, as the language says.
     PrivScope ps;
-    ps.id = g_class_seq;
-    g_class_seq++;
+    // the counter is shared with a compile running on another thread
+    ps.id = atomic_add(&g_class_seq, 1);
     // the syntactic name; a name taken from the binding does not count
     ps.class_name = c.name.len > 0 && (c.flags & NF_NAME_INFERRED) == 0 ? c.name : "anonymous";
     vec_init<PrivName>(&ps.names, 4);
@@ -3254,7 +4918,8 @@ private void compile_class_expr(Compiler* co, Node* c) {
     // initializers run. `declare` cellifies it automatically when a method
     // or field initializer closes over it.
     i32 name_bind = 0 - 1;
-    if c.name.len > 0 {
+    // an inferred name (`{ n: class {} }`) is the class's .name alone, not a binding
+    if c.name.len > 0 && (c.flags & NF_NAME_INFERRED) == 0 {
         name_bind = declare(co, c.name, true, true);
         CBind* nb = fs.binds.data + name_bind;
         if nb.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, nb.slot); }
@@ -3361,7 +5026,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
     ch_op_u16(ch, OP_NEWOBJ, 0);
     if derived {
         emit_load_name(co, "%super", c);
-        ch_op_u16(ch, OP_GETPROP, name_const(co, "prototype"));
+        emit_getprop(ch, name_const(co, "prototype"));
         ch_op(ch, OP_SETPROTO);
     }
     i32 t_proto = alloc_slot(fs);
@@ -3523,7 +5188,7 @@ private void compile_class_expr(Compiler* co, Node* c) {
 
     ch_op_u16(ch, OP_GETLOCAL, t_ctor);
     vec_free(&fields);
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
     co.strict = saved_strict;
@@ -3568,13 +5233,14 @@ private void compile_var_stmt(Compiler* co, Node* n) {
     for i32 i = 0; i < n.kids.len; i++ {
         Node* d = *(n.kids.items + i);
         if d.a.kind == N_IDENT {
-            i32 li = find_local(co.cur, d.a.name);
+            i32 li = find_decl(co.cur, d.a.name);
             if li < 0 {
                 cerror(co, d, "unresolved declaration");
                 continue;
             }
             if d.b != null {
                 infer_name(d.b, d.a.name);
+                if g_reg_level >= 2 && reg_init_binding(co, li, d.b, !lexical && with_may_bind(co.cur, d.a.name)) { continue; }
                 compile_expr(co, d.b);
                 // a `var` declares in the function scope, but its initializer
                 // is an ordinary assignment: inside a `with` body it lands on
@@ -3614,12 +5280,18 @@ private void hoist_lexical_decls(Compiler* co, NodeList* list, Vec<str>* vnames)
             for i32 j = 0; j < s.kids.len; j++ {
                 Node* d = *(s.kids.items + j);
                 check_lexical_vs_var(co, d.a, vnames);
+                co.decl_kind = 2;
+                co.decl_end = d.span.end;
                 declare_pattern(co, d.a, (s.flags & NF_CONST) != 0 ? 1 : 0);
+                co.decl_kind = 0;
             }
         }
         if s.kind == N_CLASS && s.name.len > 0 {
             if names_has(vnames, s.name) { redeclared(co, s, s.name); }
+            co.decl_kind = 2;
+            co.decl_end = s.span.end;
             declare_lexical(co, s, s.name, false);
+            co.decl_kind = 0;
         }
     }
 }
@@ -3652,13 +5324,16 @@ private void hoist_function_decls(Compiler* co, NodeList* list, Vec<str>* vnames
             }
             vec_push(seen, f);
         }
+        co.decl_kind = 3;
         declare_plain(co, f, f.name);
+        co.decl_kind = 0;
     }
 }
 
 // Block statement list with optional class-field injection after a
 // leading super() call (constructors only).
-private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields, i32 n_fields) {
+private void compile_block_stmts_ex(Compiler* co, Node* blk, Node** fields, i32 n_fields) {
+    NodeList* list = &blk.kids;
     FScope* fs = co.cur;
     fs.depth++;
     i32 saved_binds = fs.binds.len;
@@ -3668,28 +5343,42 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
     // repeat, along with the parameters of the function whose body this is
     // or the catch parameter the block belongs to
     bool body = co.outer_is_body;
-    Vec<str> vnames = vec_new<str>(4);
+    Vec<str> vnames;
+    vec_lazy<str>(&vnames);
     for i32 i = 0; i < co.outer_names.len; i++ { vec_push(&vnames, vec_get(&co.outer_names, i)); }
     co.outer_names.len = 0;
     co.outer_is_body = false;
-    for i32 i = 0; i < list.len; i++ {
-        collect_var_names(*(list.items + i), &vnames);
+    // the names are only asked for by a lexical declaration here: a block
+    // without one, the usual block, is not walked for them
+    bool lexical_here = false;
+    for i32 i = 0; i < list.len && !lexical_here; i++ {
+        Node* s = *(list.items + i);
+        if (s.kind == N_VAR && (s.flags & (NF_LET | NF_CONST)) != 0) || (s.kind == N_CLASS && s.name.len > 0) || function_decl_of(s) != null { lexical_here = true; }
     }
+    if lexical_here { collect_var_names(co, blk, &vnames); }
     hoist_lexical_decls(co, list, &vnames);
-    Vec<NodePtr> seen = vec_new<NodePtr>(4);
+    Vec<NodePtr> seen;
+    vec_lazy<NodePtr>(&seen);
     hoist_function_decls(co, list, &vnames, body, &seen);
     vec_free(&seen);
     vec_free(&vnames);
     for i32 i = 0; i < list.len; i++ {
         Node* f = function_decl_of(*(list.items + i));
         if f != null {
-            i32 li = find_local(fs, f.name);
+            i32 li = find_decl(fs, f.name);
             compile_function(co, f, false);
             emit_init_binding(co, li);
         }
     }
 
     bool injected = n_fields == 0;
+    // a derived constructor defines them at its super() call instead,
+    // unless that call is in an arrow, where `this` is the arrow's
+    if !injected && co.cur.super_call_ok && !arrow_super_call_list(list) {
+        co.cur.ctor_fields = fields;
+        co.cur.n_ctor_fields = n_fields;
+        injected = true;
+    }
     for i32 i = 0; i < list.len; i++ {
         Node* s = *(list.items + i);
         if function_decl_of(s) != null { continue; }
@@ -3711,13 +5400,13 @@ private void compile_block_stmts_ex(Compiler* co, NodeList* list, Node** fields,
         emit_field_inits(co, fields, n_fields);
     }
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
 
-private void compile_block_stmts(Compiler* co, NodeList* list) {
-    compile_block_stmts_ex(co, list, null, 0);
+private void compile_block_stmts(Compiler* co, Node* blk) {
+    compile_block_stmts_ex(co, blk, null, 0);
 }
 
 private void emit_field_inits(Compiler* co, Node** fields, i32 n_fields) {
@@ -3798,15 +5487,26 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op(ch, OP_POP);
     i32 t_len = alloc_slot(fs);
     ch_op_u16(ch, OP_GETLOCAL, t_obj);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "length"));
+    emit_getprop(ch, name_const(co, "length"));
     ch_op_u16(ch, OP_SETLOCAL, t_len);
     ch_op(ch, OP_POP);
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var {
+            co.decl_kind = 1;   // bound at the top of each iteration, before its body's closures
+            declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+            co.decl_kind = 0;
+        }
     }
     i32 bind_end = fs.binds.len;
 
@@ -3823,9 +5523,9 @@ private void compile_for_in(Compiler* co, Node* n) {
     }
     ch_op_u16(ch, OP_GETLOCAL, t_obj);
     ch_op_u16(ch, OP_GETLOCAL, t_idx);
-    ch_op(ch, OP_GETINDEX);
+    emit_getindex(ch);
     if pattern != null {
-        compile_destructure(co, pattern, true);
+        compile_destructure(co, pattern, !plain_var);
     } else {
         compile_destructure(co, n.a, false);
     }
@@ -3841,12 +5541,12 @@ private void compile_for_in(Compiler* co, Node* n) {
     ch_op(ch, OP_ADD);
     ch_op_u16(ch, OP_SETLOCAL, t_idx);
     ch_op(ch, OP_POP);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_patch(ch, jskip);
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -3876,7 +5576,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     // the next method is read once, as the language's iterator record has it
     i32 t_next = alloc_slot(fs);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "next"));
+    emit_getprop(ch, name_const(co, "next"));
     ch_op_u16(ch, OP_SETLOCAL, t_next);
     ch_op(ch, OP_POP);
     // tracks exhaustion, so a loop left early still releases the iterator
@@ -3887,9 +5587,20 @@ private void compile_for_await_of(Compiler* co, Node* n) {
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var {
+            co.decl_kind = 1;   // bound at the top of each iteration, before its body's closures
+            declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+            co.decl_kind = 0;
+        }
     }
     i32 bind_end = fs.binds.len;
 
@@ -3908,20 +5619,20 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op(ch, OP_ITER_CHECK);
     // if result.done: break (leaving result on the stack for the pop)
     ch_op(ch, OP_DUP);
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "done"));
+    emit_getprop(ch, name_const(co, "done"));
     ch_op(ch, OP_DUP);
     ch_op_u16(ch, OP_SETLOCAL, t_done);
     ch_op(ch, OP_POP);
     i32 jend = ch_jump(ch, OP_JUMPT);
     // value = result.value, awaited when the iterator is a wrapped sync one
-    ch_op_u16(ch, OP_GETPROP, name_const(co, "value"));
+    emit_getprop(ch, name_const(co, "value"));
     emit_await_if_wrapped(co, t_wrapped);
 
     for i32 i = bind_start; i < bind_end; i++ {
         CBind b = vec_get(&fs.binds, i);
         if b.is_cell { ch_op_u16(ch, OP_NEWCELL_HOLE, b.slot); }
     }
-    if pattern != null { compile_destructure(co, pattern, true); }
+    if pattern != null { compile_destructure(co, pattern, !plain_var); }
     else { compile_destructure(co, n.a, false); }
 
     vec_push(&fs.loops, lc);
@@ -3930,7 +5641,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
 
     i32 lcont = ch_pos(ch);
     patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the result object under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -3946,7 +5657,7 @@ private void compile_for_await_of(Compiler* co, Node* n) {
     ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -3960,21 +5671,30 @@ private void compile_for_of(Compiler* co, Node* n) {
     i32 saved_slots = fs.cur_slots;
 
     compile_expr(co, n.b);
-    ch_op(ch, OP_GET_ITER);
+    // tracks exhaustion, so a loop left early still releases the iterator;
+    // over a plain array it is the index instead, and the array is its own iterator
     i32 t_iter = alloc_slot(fs);
-    ch_op_u16(ch, OP_SETLOCAL, t_iter);
-    ch_op(ch, OP_POP);
-    // tracks exhaustion, so a loop left early still releases the iterator
     i32 t_done = alloc_slot(fs);
-    ch_op(ch, OP_FALSE);
-    ch_op_u16(ch, OP_SETLOCAL, t_done);
+    ch_op_u16(ch, OP_GET_ITER_S, t_done);
+    ch_op_u16(ch, OP_SETLOCAL, t_iter);
     ch_op(ch, OP_POP);
 
     i32 bind_start = fs.binds.len;
     Node* pattern = null;
+    bool plain_var = false;
     if n.a.kind == N_VAR {
         pattern = (*(n.a.kids.items)).a;
-        declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+        // a `var` in the head is the function's, hoisted already, and the
+        // loop assigns it: a closure made before the loop reads it, and it
+        // keeps the last value after. let and const are each iteration's
+        // own, as is a var destructured in the head, which the assignment
+        // path does not take.
+        plain_var = (n.a.flags & (NF_LET | NF_CONST)) == 0 && pattern.kind == N_IDENT;
+        if !plain_var {
+            co.decl_kind = 1;   // bound at the top of each iteration, before its body's closures
+            declare_pattern(co, pattern, (n.a.flags & NF_CONST) != 0 ? 4 : 2);
+            co.decl_kind = 0;
+        }
     }
     i32 bind_end = fs.binds.len;
 
@@ -3987,10 +5707,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     LoopCtx lc = make_loop_ctx(co, true);
     i32 lcond = ch_pos(ch);
     ch_op_u16(ch, OP_GETLOCAL, t_iter);
-    ch_op(ch, OP_ITER_NEXT);       // [value, done]
-    ch_op(ch, OP_DUP);
-    ch_op_u16(ch, OP_SETLOCAL, t_done);
-    ch_op(ch, OP_POP);
+    ch_op_u16(ch, OP_ITER_NEXT_S, t_done);   // [value, done], the slot written
     i32 jend = ch_jump(ch, OP_JUMPT);
 
     for i32 i = bind_start; i < bind_end; i++ {
@@ -3999,7 +5716,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     }
     // value is on the stack
     if pattern != null {
-        compile_destructure(co, pattern, true);
+        compile_destructure(co, pattern, !plain_var);
     } else {
         compile_destructure(co, n.a, false);
     }
@@ -4010,7 +5727,7 @@ private void compile_for_of(Compiler* co, Node* n) {
 
     i32 lcont = ch_pos(ch);
     patch_jumps(co, &fs.cont_jumps, lc.id, lcont);
-    ch_op_u16(ch, OP_JUMP, lcond);
+    ch_op_target(ch, OP_JUMP, lcond);
     ch_patch(ch, jend);
     ch_op(ch, OP_POP);             // drop the final value under done
     patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -4027,7 +5744,7 @@ private void compile_for_of(Compiler* co, Node* n) {
     ch_op(ch, OP_RETHROW);
     ch_patch(ch, jdone);
 
-    fs.binds.len = saved_binds;
+    binds_cut(fs, saved_binds);
     fs.cur_slots = saved_slots;
     fs.depth--;
 }
@@ -4041,16 +5758,17 @@ private void compile_stmt(Compiler* co, Node* n) {
 
     if k == N_EXPR_STMT {
         if emit_update_discarded(co, n.a) { return; }
+        if g_reg_level >= 2 && reg_assign_stmt(co, n.a) { return; }
+        if g_reg_level >= 4 && reg_store_stmt(co, n.a) { return; }
         compile_expr(co, n.a);
-        ch_op(ch, OP_POP);
+        emit_discard(ch);
         return;
     }
     if k == N_VAR { compile_var_stmt(co, n); return; }
-    if k == N_BLOCK { compile_block_stmts(co, &n.kids); return; }
+    if k == N_BLOCK { compile_block_stmts(co, n); return; }
     if k == N_EMPTY { return; }
     if k == N_IF {
-        compile_expr(co, n.a);
-        i32 j1 = emit_jumpf(ch);
+        i32 j1 = compile_cond_jf(co, n.a);
         compile_stmt(co, n.b);
         if n.c != null {
             i32 j2 = ch_jump(ch, OP_JUMP);
@@ -4069,13 +5787,12 @@ private void compile_stmt(Compiler* co, Node* n) {
     if k == N_WHILE {
         LoopCtx lc = make_loop_ctx(co, true);
         i32 lcond = ch_pos(ch);
-        compile_expr(co, n.a);
-        i32 jend = emit_jumpf(ch);
+        i32 jend = compile_cond_jf(co, n.a);
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.b);
         ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
-        ch_op_u16(ch, OP_JUMP, lcond);
+        ch_op_target(ch, OP_JUMP, lcond);
         ch_patch(ch, jend);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
@@ -4089,7 +5806,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 lcond = ch_pos(ch);
         patch_jumps(co, &fs.cont_jumps, lc.id, lcond);
         compile_expr(co, n.b);
-        ch_op_u16(ch, OP_JUMPT, lstart);
+        ch_op_target(ch, OP_JUMPT, lstart);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
         return;
     }
@@ -4103,13 +5820,16 @@ private void compile_stmt(Compiler* co, Node* n) {
                 if (n.a.flags & (NF_LET | NF_CONST)) != 0 {
                     for i32 j = 0; j < n.a.kids.len; j++ {
                         Node* d = *(n.a.kids.items + j);
+                        co.decl_kind = 2;
+                        co.decl_end = d.span.end;
                         declare_pattern(co, d.a, (n.a.flags & NF_CONST) != 0 ? 1 : 0);
+                        co.decl_kind = 0;
                     }
                 }
                 compile_var_stmt(co, n.a);
             } else {
                 compile_expr(co, n.a);
-                ch_op(ch, OP_POP);
+                emit_discard(ch);
             }
         }
         i32 bind_end = fs.binds.len;
@@ -4117,8 +5837,7 @@ private void compile_stmt(Compiler* co, Node* n) {
         i32 lcond = ch_pos(ch);
         i32 jend = -1;
         if n.b != null {
-            compile_expr(co, n.b);
-            jend = emit_jumpf(ch);
+            jend = compile_cond_jf(co, n.b);
         }
         vec_push(&fs.loops, lc);
         compile_stmt(co, n.d);
@@ -4137,12 +5856,12 @@ private void compile_stmt(Compiler* co, Node* n) {
         }
         if n.c != null && !emit_update_discarded(co, n.c) {
             compile_expr(co, n.c);
-            ch_op(ch, OP_POP);
+            emit_discard(ch);
         }
-        ch_op_u16(ch, OP_JUMP, lcond);
+        ch_op_target(ch, OP_JUMP, lcond);
         if jend >= 0 { ch_patch(ch, jend); }
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
-        fs.binds.len = saved_binds;
+        binds_cut(fs, saved_binds);
         fs.cur_slots = saved_slots;
         fs.depth--;
         return;
@@ -4261,7 +5980,9 @@ private void compile_stmt(Compiler* co, Node* n) {
             i32 saved_binds = fs.binds.len;
             i32 saved_slots = fs.cur_slots;
             if cat.a != null {
+                co.decl_kind = 1;
                 declare_pattern(co, cat.a, 2);
+                co.decl_kind = 0;
                 compile_destructure(co, cat.a, true);
                 co.outer_names.len = 0;
                 collect_pattern_names(cat.a, &co.outer_names);
@@ -4270,7 +5991,7 @@ private void compile_stmt(Compiler* co, Node* n) {
                 ch_op(ch, OP_POP);
             }
             compile_stmt(co, cat.b);
-            fs.binds.len = saved_binds;
+            binds_cut(fs, saved_binds);
             fs.cur_slots = saved_slots;
             fs.depth--;
             if fin != null {
@@ -4299,17 +6020,18 @@ private void compile_stmt(Compiler* co, Node* n) {
         // comparisons, because the jump table branches straight into a body
         // and would otherwise skip the code that puts the bindings in TDZ.
         fs.depth++;
+        i32 saved_switch = fs.switch_depth;
+        fs.switch_depth = fs.depth;
         i32 saved_binds = fs.binds.len;
         i32 saved_slots = fs.cur_slots;
-        Vec<str> svars = vec_new<str>(4);
-        for i32 i = 0; i < n.kids.len; i++ {
-            NodeList* cl = &(*(n.kids.items + i)).kids;
-            for i32 s = 0; s < cl.len; s++ { collect_var_names(*(cl.items + s), &svars); }
-        }
+        Vec<str> svars;
+        vec_lazy<str>(&svars);
+        for i32 i = 0; i < n.kids.len; i++ { collect_var_names(co, *(n.kids.items + i), &svars); }
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_lexical_decls(co, &(*(n.kids.items + i)).kids, &svars);
         }
-        Vec<NodePtr> seen = vec_new<NodePtr>(4);
+        Vec<NodePtr> seen;
+    vec_lazy<NodePtr>(&seen);
         for i32 i = 0; i < n.kids.len; i++ {
             hoist_function_decls(co, &(*(n.kids.items + i)).kids, &svars, false, &seen);
         }
@@ -4320,7 +6042,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             for i32 s = 0; s < cl.len; s++ {
                 Node* st = function_decl_of(*(cl.items + s));
                 if st != null {
-                    i32 li = find_local(fs, st.name);
+                    i32 li = find_decl(fs, st.name);
                     compile_function(co, st, false);
                     emit_init_binding(co, li);
                 }
@@ -4339,7 +6061,7 @@ private void compile_stmt(Compiler* co, Node* n) {
             ch_op_u16(ch, OP_GETLOCAL, tmp);
             compile_expr(co, c.a);
             ch_op(ch, OP_SEQ);
-            vec_push(&case_jumps, ch_jump(ch, OP_JUMPT));
+            vec_push(&case_jumps, emit_jumpt(ch));
         }
         i32 jdefault = ch_jump(ch, OP_JUMP);
         vec_push(&fs.loops, lc);
@@ -4359,8 +6081,9 @@ private void compile_stmt(Compiler* co, Node* n) {
             }
         }
         if default_idx < 0 { ch_patch(ch, jdefault); }
-        fs.binds.len = saved_binds;
+        binds_cut(fs, saved_binds);
         fs.cur_slots = saved_slots;
+        fs.switch_depth = saved_switch;
         fs.depth--;
         ignore vec_pop(&fs.loops);
         patch_jumps(co, &fs.break_jumps, lc.id, ch_pos(ch));
@@ -4394,7 +6117,7 @@ private void compile_stmt(Compiler* co, Node* n) {
     }
     if k == N_CLASS {
         if n.name.len > 0 {
-            i32 li = find_local(fs, n.name);
+            i32 li = find_decl(fs, n.name);
             compile_class_expr(co, n);
             if li >= 0 {
                 emit_init_binding(co, li);
@@ -4436,13 +6159,13 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     fscope_init(&fs, null, false);
     co.cur = &fs;
     co.strict = has_use_strict(&prog.kids);
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs, prog, true);
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     // a script's top level binds function declarations the way a function
     // body does, so one may repeat a `var` or another function
     co.outer_is_body = true;
-    compile_block_stmts(co, &prog.kids);
+    compile_block_stmts(co, prog);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
     str empty;
@@ -4451,9 +6174,13 @@ FnTemplate* compile_program(Compiler* co, Node* prog) {
     FnTemplate* t = chunk_finish(&fs.ch, empty, 0, fs.n_slots, false, false, false);
     t.src_name = co.src_name;
     t.sloppy = !co.strict;
+    // the root holds the lazy functions' source too, so an embedder can
+    // see on it what has been compiled since (the code cache)
+    if co.lazy_src != null { t.owner = co.lazy_src; t.owner.refs++; }
     co.strict = false;
     co.cur = null;
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 
@@ -4466,7 +6193,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     fscope_init(&fs, null, false);
     co.cur = &fs;
     co.strict = has_use_strict(&prog.kids);
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs, prog, true);
     str[5] pnames = { "exports", "require", "module", "__dirname", "__filename" };
     for i32 i = 0; i < 5; i++ { strmap_set<i32>(&fs.inner, pnames[i], 1); }
     Vec<i32> pslots = vec_new<i32>(5);
@@ -4479,7 +6206,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     bind_toplevel_this(co, &fs);
     hoist_vars(co, prog);
     co.outer_is_body = true;   // as in a script, not a block
-    compile_block_stmts(co, &prog.kids);
+    compile_block_stmts(co, prog);
     ch_op(&fs.ch, OP_UNDEF);
     ch_op(&fs.ch, OP_RETURN);
     str empty;
@@ -4491,6 +6218,7 @@ FnTemplate* compile_cjs_module(Compiler* co, Node* prog) {
     t.src_name = co.src_name;
     co.cur = null;
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 
@@ -4714,7 +6442,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     FScope fs;
     fscope_init(&fs, null, false);
     co.cur = &fs;
-    scan_inner(&fs.inner, prog, true);
+    scan_inner(co, &fs, prog, true);
 
     // A module using top-level await compiles as an async function; its
     // body runs as a coroutine that the event loop drains.
@@ -4803,11 +6531,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     if links != null { collect_links(co, prog, links); }
 
     // 4. hoist vars (unwrapping exports)
-    for i32 i = 0; i < prog.kids.len; i++ {
-        Node* s = *(prog.kids.items + i);
-        Node* d = s.kind == N_EXPORT && s.a != null ? s.a : s;
-        hoist_vars(co, d);
-    }
+    hoist_vars(co, prog);
 
     // 5. lexical/class TDZ holes at top level (before functions, whose
     //    bodies may reference them)
@@ -4817,7 +6541,10 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
         if d == null { continue; }
         if d.kind == N_VAR && (d.flags & (NF_LET | NF_CONST)) != 0 {
             for i32 j = 0; j < d.kids.len; j++ {
+                co.decl_kind = 2;
+                co.decl_end = (*(d.kids.items + j)).span.end;
                 declare_pattern(co, (*(d.kids.items + j)).a, (d.flags & NF_CONST) != 0 ? 1 : 0);
+                co.decl_kind = 0;
             }
         }
         if d.kind == N_CLASS && d.name.len > 0 {
@@ -4831,10 +6558,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     //    A module's top level is lexical, unlike a script's: a function
     //    declared there may not repeat another declaration, nor a `var`.
     Vec<str> mod_vars = vec_new<str>(4);
-    for i32 i = 0; i < prog.kids.len; i++ {
-        Node* s = *(prog.kids.items + i);
-        collect_var_names(s.kind == N_EXPORT && s.a != null ? s.a : s, &mod_vars);
-    }
+    collect_var_names(co, prog, &mod_vars);
     Vec<NodePtr> mod_fns = vec_new<NodePtr>(4);
     for i32 i = 0; i < prog.kids.len; i++ {
         Node* s = *(prog.kids.items + i);
@@ -4890,6 +6614,7 @@ FnTemplate* compile_module(Compiler* co, Node* prog, Vec<str>* out_specs, ModLin
     vec_free(&mod_names);
     strmap_free<i32>(&spec_slot);
     fscope_free(&fs);
+    names_free(co);
     return t;
 }
 
@@ -4945,7 +6670,7 @@ private void compile_export(Compiler* co, Node* s, str ns_name,
             str exported = sp.a != null ? sp.a.name : sp.name;
             emit_load_name(co, ns_name, null);
             emit_load_name(co, mname, null);
-            ch_op_u16(ch, OP_GETPROP, name_const(co, sp.name));
+            emit_getprop(ch, name_const(co, sp.name));
             ch_op_u16(ch, OP_SETEXPORT, name_const(co, exported));
             ch_op(ch, OP_POP);
         }

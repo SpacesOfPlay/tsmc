@@ -30,7 +30,7 @@
 // The output is micro-ecc's, r || s big-endian, so a signature from here
 // verifies wherever micro-ecc's does.
 
-import cstdlib_shim;
+import ext_libc;
 import picotls_shim;
 import picotls_lib;
 import picotls_bridges;

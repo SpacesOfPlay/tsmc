@@ -27,6 +27,8 @@ struct Prof {
     i64 js_calls;
     i64 native_calls;
     i64[256] hist;
+    i64* pairs;          // 256 by 256: each op followed by each, for the fusions
+    i32 prev_op;
     i32 budget;
     u64 last_ns;
     u64 start_ns;
@@ -47,6 +49,9 @@ Prof* prof_new() {
     p.js_calls = 0;
     p.native_calls = 0;
     for i32 i = 0; i < 256; i++ { p.hist[i] = 0; }
+    p.pairs = alloc<i64>(65536);
+    for i32 i = 0; i < 65536; i++ { *(p.pairs + i) = 0; }
+    p.prev_op = -1;
     p.budget = PROF_STRIDE;
     p.start_ns = vm_clock_ns();
     p.last_ns = p.start_ns;
@@ -58,12 +63,21 @@ Prof* prof_new() {
 
 void prof_step(Prof* p, FnTemplate* t, i32 op) {
     p.ops++;
-    if op >= 0 && op < 256 { p.hist[op]++; }
+    if op >= 0 && op < 256 {
+        p.hist[op]++;
+        if p.prev_op >= 0 { *(p.pairs + p.prev_op * 256 + op) += 1; }
+        p.prev_op = op;
+    }
     if t.prof_ops == 0 {
         vec_push(&p.seen, t);
         vec_push(&p.files, format("{}", t.src_name.len > 0 ? t.src_name : "<anonymous>"));
+        if t.prof_allocs == null {
+            t.prof_allocs = alloc<i64>(16);
+            for i32 k = 0; k < 16; k++ { *(t.prof_allocs + k) = 0; }
+        }
     }
     t.prof_ops++;
+    gc_stat_allocs_at = t.prof_allocs;
     p.budget--;
     if p.budget <= 0 {
         p.budget = PROF_STRIDE;
@@ -224,6 +238,73 @@ str op_name(i32 op) {
         case 145: { return "ITER_CHECK"; }
         case 146: { return "FREEZE"; }
         case 147: { return "REGEX"; }
+        case 148: { return "DEFGLOBAL"; }
+        case 149: { return "PUTLOCAL"; }
+        case 150: { return "GETPROP_L"; }
+        case 151: { return "GETINDEX_LL"; }
+        case 152: { return "LT_JF_LL"; }
+        case 153: { return "GETPROP_THIS"; }
+        case 154: { return "SEQ_JF"; }
+        case 155: { return "SNEQ_JF"; }
+        case 156: { return "GETUPVALV"; }
+        case 157: { return "GET_ITER_S"; }
+        case 158: { return "ITER_NEXT_S"; }
+        case 159: { return "PROTOGET"; }
+        case 160: { return "SETPROP_POP"; }
+        case 161: { return "SETUPVAL_POP"; }
+        case 162: { return "SETCELL_POP"; }
+        case 163: { return "GETLOCAL_UNDEF"; }
+        case 164: { return "GETUPVAL_UNDEF"; }
+        case 165: { return "GETUPVALV_UNDEF"; }
+        case 166: { return "RETURN_UNDEF"; }
+        case 167: { return "SEQ_NULL"; }
+        case 168: { return "SNEQ_NULL"; }
+        case 169: { return "SEQ_UNDEF"; }
+        case 170: { return "SNEQ_UNDEF"; }
+        case 171: { return "EQ_NULLISH"; }
+        case 172: { return "NEQ_NULLISH"; }
+        case 173: { return "GETLOCAL_CONST"; }
+        case 174: { return "GETLOCAL2"; }
+        case 175: { return "SEQ_JT"; }
+        case 176: { return "SNEQ_JT"; }
+        case 177: { return "SEQ_LC_JF"; }
+        case 178: { return "SEQ_LC_JT"; }
+        case 179: { return "SEQ_NULL_JF"; }
+        case 180: { return "SNEQ_NULL_JF"; }
+        case 181: { return "MOV"; }
+        case 182: { return "LOADK"; }
+        case 183: { return "RJF"; }
+        case 184: { return "RJT"; }
+        case 185: { return "RADD"; }
+        case 186: { return "RADDI"; }
+        case 187: { return "RSUB"; }
+        case 188: { return "RSUBI"; }
+        case 189: { return "RMUL"; }
+        case 190: { return "RMULI"; }
+        case 191: { return "RDIV"; }
+        case 192: { return "RDIVI"; }
+        case 193: { return "RBIT"; }
+        case 194: { return "RBITI"; }
+        case 195: { return "RBORI"; }
+        case 196: { return "RBANDI"; }
+        case 197: { return "RJLT"; }
+        case 198: { return "RJLTI"; }
+        case 199: { return "RJGT"; }
+        case 200: { return "RJGTI"; }
+        case 201: { return "RJLE"; }
+        case 202: { return "RJLEI"; }
+        case 203: { return "RJGE"; }
+        case 204: { return "RJGEI"; }
+        case 205: { return "RJSEQ"; }
+        case 206: { return "RJSEQK"; }
+        case 207: { return "RJSNEQ"; }
+        case 208: { return "RJSNEQK"; }
+        case 209: { return "RJNULLISH"; }
+        case 210: { return "RJNOTNULLISH"; }
+        case 211: { return "RGETPROP"; }
+        case 212: { return "RSETPROP"; }
+        case 213: { return "RGETINDEX"; }
+        case 214: { return "RSETINDEX"; }
     }
     return "?";
 }
@@ -360,6 +441,20 @@ void prof_report(Prof* p, i64 collections) {
     }
     eprint("\n");
 
+    // the pairs: each op and the one after it, the twenty-four most seen
+    eprint("  pairs:");
+    for i32 k = 0; k < 24; k++ {
+        i32 best = -1;
+        i64 most = 0;
+        for i32 i = 0; i < 65536; i++ { if *(p.pairs + i) > most { most = *(p.pairs + i); best = i; } }
+        if best < 0 { break; }
+        string c = pct(most, p.ops);
+        eprint(" {}+{} {}%", op_name(best / 256), op_name(best % 256), c);
+        free(c);
+        *(p.pairs + best) = 0;
+    }
+    eprint("\n");
+
     // the allocations
     eprint("  allocations:");
     for i32 k = 0; k < 16; k++ {
@@ -369,6 +464,81 @@ void prof_report(Prof* p, i64 collections) {
         free(c);
     }
     eprint("\n");
+
+    // the functions by cells allocated while they ran, a native's charged
+    // to the function that called it; the three kinds that lead each one
+    if allocs > 0 && n > 0 {
+        i64* sum = alloc<i64>(n);
+        for i32 i = 0; i < n; i++ {
+            FnTemplate* t = vec_get(&p.seen, i);
+            i64 s = 0;
+            if t.prof_allocs != null { for i32 k = 0; k < 16; k++ { s = s + *(t.prof_allocs + k); } }
+            *(sum + i) = s;
+        }
+        i32* ai = alloc<i32>(n);
+        for i32 i = 0; i < n; i++ { *(ai + i) = i; }
+        for i32 i = 1; i < n; i++ {
+            i32 key = *(ai + i);
+            i64 ks = *(sum + key);
+            i32 j = i - 1;
+            while j >= 0 && *(sum + *(ai + j)) < ks { *(ai + j + 1) = *(ai + j); j--; }
+            *(ai + j + 1) = key;
+        }
+        eprint("  alloc%  cells      per call  function (file:line)  kinds\n");
+        i32 ashown = n < 30 ? n : 30;
+        for i32 i = 0; i < ashown; i++ {
+            i32 at = *(ai + i);
+            FnTemplate* t = vec_get(&p.seen, at);
+            i64 s = *(sum + at);
+            if s * 200 < allocs { break; }   // under half a percent
+            i32 line = t.n_pos > 0 ? (t.pos + 0).line : 0;
+            str_buf sb;
+            str_buf_init(&sb);
+            string a = pct(s, allocs);
+            pad_to(&sb, 7 - a.len); str_buf_add(&sb, a); free(a);
+            string c = with_commas(s);
+            pad_to(&sb, 18 - c.len); str_buf_add(&sb, c); free(c);
+            i64 calls = t.prof_calls > 0 ? t.prof_calls : 1;
+            string pc = format("{}", s / calls);
+            pad_to(&sb, 28 - pc.len); str_buf_add(&sb, pc); free(pc);
+            str_buf_add(&sb, "  ");
+            if t.name.len > 0 { str_buf_add(&sb, t.name); } else { str_buf_add(&sb, "<anonymous>"); }
+            str_buf_add(&sb, " (");
+            string* file = p.files.data + at;
+            i32 cut = 0;
+            for i32 k = 0; k < file.len; k++ {
+                u8 ch = *(file.data + k);
+                if ch == '/' || ch == 92 { cut = k + 1; }
+            }
+            str tail;
+            tail.data = file.data + cut;
+            tail.len = file.len - cut;
+            str_buf_add(&sb, tail);
+            string ls = format(":{})", line);
+            str_buf_add(&sb, ls);
+            free(ls);
+            for i32 r = 0; r < 3; r++ {
+                i32 best = -1;
+                for i32 k = 0; k < 16; k++ {
+                    i64 v = *(t.prof_allocs + k);
+                    if v > 0 && (best < 0 || v > *(t.prof_allocs + best)) { best = k; }
+                }
+                if best < 0 { break; }
+                string kc = with_commas(*(t.prof_allocs + best));
+                str_buf_add(&sb, " ");
+                str_buf_add(&sb, gc_kind_name(best));
+                str_buf_add(&sb, " ");
+                str_buf_add(&sb, kc);
+                free(kc);
+                *(t.prof_allocs + best) = 0 - *(t.prof_allocs + best);   // taken; restored below
+            }
+            for i32 k = 0; k < 16; k++ { if *(t.prof_allocs + k) < 0 { *(t.prof_allocs + k) = 0 - *(t.prof_allocs + k); } }
+            eprint("{}\n", str_buf_to_str(&sb));
+            str_buf_free(&sb);
+        }
+        free(ai);
+        free(sum);
+    }
 }
 
 // Reports, then starts over: the counts, the opcode mix and the charges to
@@ -380,7 +550,10 @@ void prof_report_reset(Prof* p, i64 collections) {
         t.prof_ns = 0;
         t.prof_ops = 0;
         t.prof_samples = 0;
+        t.prof_calls = 0;
+        if t.prof_allocs != null { for i32 k = 0; k < 16; k++ { *(t.prof_allocs + k) = 0; } }
     }
+    gc_stat_allocs_at = null;
     for i32 i = 0; i < p.files.len; i++ { free(*(p.files.data + i)); }
     p.seen.len = 0;
     p.files.len = 0;
@@ -388,6 +561,8 @@ void prof_report_reset(Prof* p, i64 collections) {
     p.js_calls = 0;
     p.native_calls = 0;
     for i32 i = 0; i < 256; i++ { p.hist[i] = 0; }
+    for i32 i = 0; i < 65536; i++ { *(p.pairs + i) = 0; }
+    p.prev_op = -1;
     p.budget = PROF_STRIDE;
     p.start_ns = vm_clock_ns();
     p.last_ns = p.start_ns;

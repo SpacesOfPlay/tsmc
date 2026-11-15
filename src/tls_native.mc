@@ -46,15 +46,28 @@ when os(wasm) {
     bool tls_failed(TlsSession* s) { return true; }
     i32 tls_chain_error(TlsSession* s) { return 0; }
     i32 tls_error_code(TlsSession* s) { return 0; }
+    bool tls_resumed(TlsSession* s) { return false; }
+    bool tls_offered_ticket(TlsSession* s) { return false; }
+    bool tls_client_resumes = true;
+    void tls_tickets_forget() { }
+    i64 tls_tickets_issued = 0;
+    i64 tls_tickets_resumed = 0;
     str tls_alert_str(i32 alert) { return ""; }
+    const i32 TLS_SERVER_CHAIN_MAX = 4;
     i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
                            u8* key_der, u64 key_len) { return -1; }
     void tls_server_ctx_free(i32 id) { }
     TlsSession* tls_server_session_new(i32 ctx_id) { return null; }
+    void tls_select_ctx(TlsSession* s, i32 ctx_id) { }
+    i32 tls_pump_read(TlsSession* s, i64 fd) { return TLS_ERR; }
+    u8* tls_buffered(TlsSession* s, i32* n) { *n = 0; return null; }
+    i32 tls_handshake_step(TlsSession* s) { return TLS_ERR; }
 }
 else {
 // --- native implementation (everything below) --------------------------------
 import "tls/picotls.mc";
+import thread;
+import vec;
 import "tls_x509.mc";
 import "tls_verify.mc";
 import "tls_p384.mc";
@@ -158,6 +171,26 @@ private i32 tls_arm_leaf(X509Cert* leaf, verify_sign_fn* out_verify_sign,
 // (the reactor is single-threaded, so the handoff is synchronous).
 private threadlocal i32 g_last_chain_err = 0;
 
+// The leaf the peer presented, as its SHA-256 in the session: what a
+// client can ask afterwards to tell one certificate from another.
+private void tls_note_leaf(ptls_t* tls, ptls_iovec_t leaf) {
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s == null { return; }
+    cf_sha256_context ctx;
+    cf_sha256_init(&ctx);
+    cf_sha256_update(&ctx, leaf.base, leaf.len);
+    cf_sha256_digest_final(&ctx, &s.peer_leaf[0]);
+    s.has_peer_leaf = true;
+}
+
+// The SHA-256 of the peer's leaf certificate into out32, once the
+// handshake has shown it; false before.
+bool tls_peer_leaf_sha256(TlsSession* s, u8* out32) {
+    if !s.has_peer_leaf { return false; }
+    for i32 i = 0; i < 32; i++ { *(out32 + i) = s.peer_leaf[i]; }
+    return true;
+}
+
 // Secure default: validate the presented chain against the bundled root
 // store and the SNI hostname at the real wall clock, then arm the
 // CertificateVerify check for the leaf key.
@@ -173,6 +206,7 @@ private i32 tls_chain_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
         return 0 - 1;
     }
     i32 n = cast(i32, num_certs);
+    tls_note_leaf(tls, certs[0]);
     u8*[8] ders;
     u64[8] lens;
     for i32 i = 0; i < n; i++ {
@@ -204,13 +238,177 @@ private i32 tls_insecure_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
                                    u8* server_name, verify_sign_fn* out_verify_sign,
                                    void** out_verify_data, ptls_iovec_t* certs, u64 num_certs) {
     if num_certs == cast(u64, 0) { return 0 - 1; }
+    tls_note_leaf(tls, certs[0]);
     X509Cert leaf;
     if !x509_parse(certs[0].base, certs[0].len, &leaf) { return 0 - 1; }
     return tls_arm_leaf(&leaf, out_verify_sign, out_verify_data);
 }
 
+// --- session tickets: resumption ---------------------------------------------
+// A server's NewSessionTicket after a handshake, kept by host, up to a
+// few per host, for a week at most or the ticket's own lifetime. The
+// next session to the host offers the newest, once, as its pre-shared
+// key: the handshake then takes one round trip, not two. The store is
+// the process's, under a lock: each thread has its own contexts.
+private struct TlsTicket {
+    string host;
+    u8* data;
+    i32 len;
+    u64 saved_ms;
+    u32 lifetime_s;
+}
+private const i32 TLS_TICKETS_MAX = 64;
+private const i32 TLS_TICKET_MAX_LEN = 16384;
+private Vec<TlsTicket> g_tickets;
+private Mutex g_tickets_mu;
+private bool g_tickets_up = false;
+private threadlocal ptls_save_ticket_t g_save_ticket;
+
+private void tls_tickets_init() {
+    if g_tickets_up { return; }
+    mutex_init(&g_tickets_mu);
+    g_tickets = vec_new<TlsTicket>(16);
+    g_tickets_up = true;
+}
+
+private i32 tls_save_ticket_cb(st_ptls_save_ticket_t* self, ptls_t* tls, ptls_iovec_t ticket, ptls_save_ticket_properties_t* props) {
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s == null || s.host.len == 0 || ticket.len == cast(u64, 0) || ticket.len > cast(u64, TLS_TICKET_MAX_LEN) { return 0; }
+    TlsTicket t = TlsTicket{};
+    t.host = str_concat("", str_from(s.host.data, s.host.len));
+    t.len = cast(i32, ticket.len);
+    t.data = alloc<u8>(t.len);
+    memcpy(t.data, ticket.base, t.len);
+    t.saved_ms = tls_wall_time_cb(&g_tls_time);
+    t.lifetime_s = props != null ? props.lifetime : 0;
+    mutex_lock(&g_tickets_mu);
+    if g_tickets.len >= TLS_TICKETS_MAX {
+        // the oldest out
+        i32 v = 0;
+        for i32 i = 1; i < g_tickets.len; i++ { if g_tickets.data[i].saved_ms < g_tickets.data[v].saved_ms { v = i; } }
+        free(g_tickets.data[v].host);
+        free(g_tickets.data[v].data);
+        g_tickets.data[v] = g_tickets.data[g_tickets.len - 1];
+        g_tickets.len--;
+    }
+    vec_push(&g_tickets, t);
+    g_tickets_gen++;
+    mutex_unlock(&g_tickets_mu);
+    return 0;
+}
+
+// The newest ticket for the host still in its lifetime, taken out of the
+// store (a ticket is for one handshake); the caller owns the bytes.
+// Whether a client offers the tickets it saved. A test that reads the
+// certificate a name is served turns it off: a resumed handshake
+// carries none.
+bool tls_client_resumes = true;
+
+// Drops every ticket the client saved, so the next handshakes are full.
+void tls_tickets_forget() {
+    tls_tickets_init();
+    mutex_lock(&g_tickets_mu);
+    for i32 i = 0; i < g_tickets.len; i++ { free(g_tickets.data[i].host); free(g_tickets.data[i].data); }
+    g_tickets.len = 0;
+    mutex_unlock(&g_tickets_mu);
+}
+
+private bool tls_take_ticket(str host, u8** data, i32* len) {
+    if !tls_client_resumes { return false; }
+    tls_tickets_init();
+    u64 now = tls_wall_time_cb(&g_tls_time);
+    bool got = false;
+    mutex_lock(&g_tickets_mu);
+    i32 best = -1;
+    for i32 i = 0; i < g_tickets.len; i++ {
+        TlsTicket* t = &g_tickets.data[i];
+        u64 life = cast(u64, t.lifetime_s) * 1000;
+        if life == cast(u64, 0) || life > cast(u64, 604800000) { life = 604800000; }
+        if now - t.saved_ms > life { continue; }
+        if !str_equal(str_from(t.host.data, t.host.len), host) { continue; }
+        if best < 0 || t.saved_ms > g_tickets.data[best].saved_ms { best = i; }
+    }
+    if best >= 0 {
+        *data = g_tickets.data[best].data;
+        *len = g_tickets.data[best].len;
+        free(g_tickets.data[best].host);
+        g_tickets.data[best] = g_tickets.data[g_tickets.len - 1];
+        g_tickets.len--;
+        got = true;
+    }
+    mutex_unlock(&g_tickets_mu);
+    return got;
+}
+
+private i64 g_tickets_gen = 0;
+
+// Counts the tickets saved, for a keeper that writes them out when they change.
+i64 tls_tickets_generation() { return g_tickets_gen; }
+
+private void put_u32(u8* p, u32 v) { memcpy(p, cast(u8*, &v), 4); }
+private void put_u64(u8* p, u64 v) { memcpy(p, cast(u8*, &v), 8); }
+private u32 get_u32(u8* p) { u32 v = 0; memcpy(cast(u8*, &v), p, 4); return v; }
+private u64 get_u64(u8* p) { u64 v = 0; memcpy(cast(u8*, &v), p, 8); return v; }
+
+// The tickets as bytes, for keeping across runs: each is its host's length
+// and bytes, the wall time it was saved (ms), its lifetime (s), and its
+// length and bytes. The caller owns the result; *len is 0 for none.
+u8* tls_tickets_export(i32* len) {
+    tls_tickets_init();
+    mutex_lock(&g_tickets_mu);
+    i32 total = 0;
+    for i32 i = 0; i < g_tickets.len; i++ { total += 4 + g_tickets.data[i].host.len + 8 + 4 + 4 + g_tickets.data[i].len; }
+    u8* out = alloc<u8>(total > 0 ? total : 1);
+    i32 at = 0;
+    for i32 i = 0; i < g_tickets.len; i++ {
+        TlsTicket* t = &g_tickets.data[i];
+        put_u32(out + at, cast(u32, t.host.len)); at += 4;
+        memcpy(out + at, t.host.data, t.host.len); at += t.host.len;
+        put_u64(out + at, t.saved_ms); at += 8;
+        put_u32(out + at, t.lifetime_s); at += 4;
+        put_u32(out + at, cast(u32, t.len)); at += 4;
+        memcpy(out + at, t.data, t.len); at += t.len;
+    }
+    mutex_unlock(&g_tickets_mu);
+    *len = total;
+    return out;
+}
+
+// Tickets kept by an earlier run, in tls_tickets_export's form: the ones
+// still in their lifetime join the store. Anything malformed ends the read.
+void tls_tickets_import(u8* data, i32 len) {
+    tls_tickets_init();
+    u64 now = tls_wall_time_cb(&g_tls_time);
+    i32 at = 0;
+    mutex_lock(&g_tickets_mu);
+    while at + 4 <= len {
+        i32 hl = cast(i32, get_u32(data + at)); at += 4;
+        if hl < 0 || hl > 255 || at + hl + 16 > len { break; }
+        str host = str_from(data + at, hl); at += hl;
+        u64 saved = get_u64(data + at); at += 8;
+        u32 life = get_u32(data + at); at += 4;
+        i32 tl = cast(i32, get_u32(data + at)); at += 4;
+        if tl <= 0 || tl > TLS_TICKET_MAX_LEN || at + tl > len { break; }
+        u64 life_ms = cast(u64, life) * 1000;
+        if life_ms == cast(u64, 0) || life_ms > cast(u64, 604800000) { life_ms = 604800000; }
+        if saved <= now && now - saved <= life_ms && g_tickets.len < TLS_TICKETS_MAX {
+            TlsTicket t = TlsTicket{};
+            t.host = str_concat("", host);
+            t.len = tl;
+            t.data = alloc<u8>(tl);
+            memcpy(t.data, data + at, tl);
+            t.saved_ms = saved;
+            t.lifetime_s = life;
+            vec_push(&g_tickets, t);
+        }
+        at += tl;
+    }
+    mutex_unlock(&g_tickets_mu);
+}
+
 private void tls_ctx_init() {
     if g_inited { return; }
+    tls_tickets_init();
     g_x25519 = ptls_key_exchange_algorithm_t{
         .id = cast(u16, 29),
         .create = x25519_pl_create,
@@ -253,6 +451,8 @@ private void tls_ctx_init() {
     g_chain_verify.cb = tls_chain_verify_cb;
     g_chain_verify.algos = &g_leaf_algos[0];
     g_ctx.verify_certificate = &g_chain_verify;
+    g_save_ticket.cb = tls_save_ticket_cb;
+    g_ctx.save_ticket = &g_save_ticket;
     // The insecure context differs only in its verifier.
     g_ctx_insecure = g_ctx;
     g_insecure_verify.cb = tls_insecure_verify_cb;
@@ -287,6 +487,8 @@ struct TlsSession {
     ptls_buffer_t recvbuf;    // decrypted plaintext accumulated for the reader
     i64 recv_off;             // consumed prefix of recvbuf
     void* server;             // the TlsServerCtx a server session holds, or null
+    u8[32] peer_leaf;         // SHA-256 of the peer's leaf certificate, once seen
+    bool has_peer_leaf;
     u8* cipher_in;            // inbound ciphertext picotls has not taken, or null
     i32 cipher_in_len;
     i32 cipher_in_cap;
@@ -299,6 +501,12 @@ struct TlsSession {
     bool established;
     bool failed;
     bool eof;
+    string host;              // the server name, the key of its tickets
+    ptls_handshake_properties_t props;   // the ticket offered, through the handshake
+    u8* ticket;               // the offered ticket's bytes, the session's own
+    i32 ticket_len;
+    u64 max_early;            // the early data the offered ticket allows, once the ClientHello is out; 0 none
+    bool ctx_chosen;          // a server session whose context the embedder picked before the handshake (tls_select_ctx)
 }
 
 TlsSession* tls_session_new(u8* sni, bool insecure) {
@@ -306,10 +514,19 @@ TlsSession* tls_session_new(u8* sni, bool insecure) {
     TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(insecure ? &g_ctx_insecure : &g_ctx, 0);
     if s.tls == null { free(s); return null; }
+    *ptls_get_data_ptr(s.tls) = cast(void*, s);
     if sni != null {
         i32 slen = 0;
         while *(sni + slen) != cast(u8, 0) { slen++; }
         ptls_set_server_name(s.tls, sni, cast(u64, slen));
+        s.host = str_concat("", str_from(sni, slen));
+        // a ticket from an earlier session to the host: the pre-shared key offered
+        if tls_take_ticket(str_from(s.host.data, s.host.len), &s.ticket, &s.ticket_len) {
+            s.props.client.session_ticket = ptls_iovec_init(cast(void*, s.ticket), cast(u64, s.ticket_len));
+            // and early data with it, when the ticket allows it: the session's
+            // field receives the allowance as the ClientHello goes out
+            s.props.client.max_early_data_size = &s.max_early;
+        }
     }
     ptls_buffer_init(&s.sendbuf, "", 0);
     ptls_buffer_init(&s.recvbuf, "", 0);
@@ -337,6 +554,8 @@ void tls_session_free(TlsSession* s) {
     tls_buf_release(&s.sendbuf);
     tls_buf_release(&s.recvbuf);
     free(s.cipher_in);
+    free(s.host);
+    free(s.ticket);
     free(s);
 }
 
@@ -457,7 +676,7 @@ private i32 tls_step(TlsSession* s, u8* p, i32 len, i32* used) {
         u64 consumed = cast(u64, len - *used);
         void* input = cast(void*, p + *used);
         if !s.established {
-            i32 r = ptls_handshake(s.tls, &s.sendbuf, input, &consumed, null);
+            i32 r = ptls_handshake(s.tls, &s.sendbuf, input, &consumed, &s.props);
             if r != 0 && r != 514 {
                 s.failed = true;
                 s.tls_err = r;
@@ -553,7 +772,7 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         if !s.started {
             s.started = true;
             u64 c = 0;
-            i32 r = ptls_handshake(s.tls, &s.sendbuf, null, &c, null);
+            i32 r = ptls_handshake(s.tls, &s.sendbuf, null, &c, &s.props);
             if r != 0 && r != 514 { s.failed = true; s.tls_err = r; return TLS_ERR; }
         }
     }
@@ -604,6 +823,48 @@ i32 tls_pump(TlsSession* s, i64 fd) {
         }
         if (flags & TLS_ERR) != 0 || (flags & TLS_EOF) != 0 { break; }
     }
+    if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
+    if tls_wants_write(s) { flags = flags | TLS_WANT_WRITE; }
+    return flags;
+}
+
+// The handshake in two halves, for an embedder that runs the
+// handshake's crypto on another thread: the socket side here, on the
+// thread that owns the socket, and the step on buffered bytes anywhere.
+//
+// tls_pump_read flushes what is queued and reads what the socket has
+// into the session's buffer without stepping picotls. Its result bits
+// are TLS_EOF and TLS_ERR; the bytes wait in tls_buffered.
+i32 tls_pump_read(TlsSession* s, i64 fd) {
+    if s.failed { return TLS_ERR; }
+    if !tls_flush(s, fd) { s.failed = true; return TLS_ERR; }
+    u8* tmp = tls_pump_buf();
+    if tmp == null { s.failed = true; return TLS_ERR; }
+    i32 budget = TLS_PUMP_BUDGET;
+    while budget > 0 {
+        i32 n = net_try_recv(fd, tmp, budget < TLS_PUMP_READ ? budget : TLS_PUMP_READ);
+        if n == 0 { s.eof = true; return TLS_EOF; }
+        if n == NET_WOULDBLOCK { return 0; }
+        if n < 0 { s.failed = true; s.tls_err = TLS_ERR_READ; return TLS_ERR; }
+        if !tls_keep(s, tmp, n) { s.failed = true; return TLS_ERR; }
+        budget = budget - n;
+    }
+    return 0;
+}
+
+// The bytes a session holds that picotls has not taken.
+u8* tls_buffered(TlsSession* s, i32* n) {
+    *n = s.cipher_in_len;
+    return s.cipher_in;
+}
+
+// Steps picotls over the buffered bytes: the handshake's crypto, with
+// no socket access, so it may run on any thread while the owner does
+// not touch the session. The result bits are those of tls_pump; the
+// output waits for tls_flush_out on the owner's thread.
+i32 tls_handshake_step(TlsSession* s) {
+    if s.failed { return TLS_ERR; }
+    i32 flags = s.cipher_in_len > 0 ? tls_feed(s, null, 0) : 0;
     if cast(i64, s.recvbuf.off) > s.recv_off { flags = flags | TLS_HAS_DATA; }
     if tls_wants_write(s) { flags = flags | TLS_WANT_WRITE; }
     return flags;
@@ -671,6 +932,23 @@ i32 tls_read(TlsSession* s, u8* out, i32 max) {
 }
 
 bool tls_established(TlsSession* s) { return s.established; }
+// whether the handshake resumed an earlier session with its ticket
+bool tls_resumed(TlsSession* s) { return s.established && ptls_is_psk_handshake(s.tls) != 0; }
+bool tls_offered_ticket(TlsSession* s) { return s.ticket != null; }
+// Whether application data may go out now as 0-RTT early data: the
+// ClientHello of a resumed handshake is out, its ticket allows early data,
+// and the handshake has not ended. What is written then reaches the
+// server before its first flight; tls_early_state says whether it took it.
+bool tls_early_ok(TlsSession* s) { return s.started && !s.established && !s.failed && s.max_early > cast(u64, 0); }
+// The early data the offered ticket allows, in bytes; 0 for none or no ticket.
+u64 tls_early_max(TlsSession* s) { return s.max_early; }
+// After the handshake: 0 no early data was sent, 1 the server rejected it
+// (what was written must be written again), 2 it was accepted.
+i32 tls_early_state(TlsSession* s) {
+    if s.max_early == cast(u64, 0) { return 0; }
+    if s.props.client.early_data_acceptance == PTLS_EARLY_DATA_ACCEPTED { return 2; }
+    return 1;
+}
 bool tls_failed(TlsSession* s) { return s.failed; }
 
 // X509_V_* code when the failure was certificate validation, else 0.
@@ -858,6 +1136,96 @@ private bool tls_parse_rsa_key(u8* der, u64 der_len, TlsRsaKey* k) {
 // server's lifetime (all its connections share it). Referenced from JS by a
 // small registry id. Holds both sign-context shapes; whichever matches the
 // key is wired into ctx.sign_certificate.
+// --- session tickets a server issues ---------------------------------------------
+//
+// picotls hands the session's identifier to encrypt_ticket and gets the
+// ticket back; a returning client presents the ticket and the callback
+// gives the identifier back. The ticket is AES-128-GCM under a key the
+// server draws at first use and rotates daily, the previous key kept so
+// a ticket outlives one rotation: a key index byte, a 12-byte nonce,
+// the ciphertext and the tag. The state is shared by every thread
+// under a lock, since a ticket from one loop's context comes back on
+// another's; the AEAD here is the global algorithm, not a thread's
+// copy, since the callback runs where the handshake does.
+const i32 TLS_TICKET_KEYS = 2;
+private u8[32] g_ticket_keys;              // two 16-byte keys
+private i32 g_ticket_cur = 0;              // the index of the key tickets are made under
+private u64 g_ticket_made_ms = 0;          // when the current key was drawn
+private bool[2] g_ticket_valid;
+private Mutex g_ticket_mu;
+private bool g_ticket_up = false;
+private ptls_aead_algorithm_t g_ticket_aead;
+private ptls_encrypt_ticket_t g_ticket_cb;
+i64 tls_tickets_issued = 0;                // for a report
+i64 tls_tickets_resumed = 0;               // tickets that decrypted on a later handshake
+
+private void tls_tickets_rotate_locked(u64 now_ms) {
+    i32 next = g_ticket_valid[0] && !g_ticket_valid[1] ? 1 : (g_ticket_cur + 1) % TLS_TICKET_KEYS;
+    mc_csprng_bytes(cast(void*, &g_ticket_keys[next * 16]), cast(u64, 16));
+    g_ticket_valid[next] = true;
+    g_ticket_cur = next;
+    g_ticket_made_ms = now_ms;
+}
+
+private void tls_tickets_server_init() {
+    if g_ticket_up { return; }
+    mutex_init(&g_ticket_mu);
+    g_ticket_aead = ptls_aead_algorithm_t{
+        .name = "AES128-GCM",
+        .confidentiality_limit = cast(u64, 16777216),
+        .integrity_limit = cast(u64, 68719476736),
+        .ctr_cipher = null,
+        .ecb_cipher = null,
+        .key_size = cast(u64, 16),
+        .iv_size = cast(u64, 12),
+        .tag_size = cast(u64, 16),
+        .tls12 = { .fixed_iv_size = cast(u64, 4), .record_iv_size = cast(u64, 8) },
+        .non_temporal = cast(u32, 0),
+        .align_bits = cast(u8, 0),
+        .context_size = sizeof(aesgcm_picotls_ctx_t),
+        .setup_crypto = aesgcm_pl_setup_crypto_128,
+    };
+    g_ticket_cb = ptls_encrypt_ticket_t{ .cb = tls_ticket_cb };
+    tls_tickets_rotate_locked(tls_wall_time_cb(&g_tls_time));
+    g_ticket_up = true;
+}
+
+private i32 tls_ticket_cb(st_ptls_encrypt_ticket_t* self, ptls_t* tls, i32 is_encrypt, ptls_buffer_t* dst, ptls_iovec_t src) {
+    mutex_lock(&g_ticket_mu);
+    defer mutex_unlock(&g_ticket_mu);
+    u64 now = tls_wall_time_cb(&g_tls_time);
+    if is_encrypt != 0 {
+        if now > g_ticket_made_ms + 86400000 { tls_tickets_rotate_locked(now); }
+        u8[12] iv;
+        mc_csprng_bytes(cast(void*, &iv[0]), cast(u64, 12));
+        ptls_aead_context_t* a = ptls_aead_new_direct(&g_ticket_aead, 1, cast(void*, &g_ticket_keys[g_ticket_cur * 16]), cast(void*, &iv[0]));
+        if a == null { return 0x201; }
+        defer ptls_aead_free(a);
+        u64 need = 13 + src.len + 16;
+        if ptls_buffer_reserve(dst, need) != 0 { return 0x201; }
+        u8* out = dst.base + dst.off;
+        *out = cast(u8, g_ticket_cur);
+        memcpy(out + 1, &iv[0], 12);
+        u64 n = ptls_aead_encrypt(a, cast(void*, out + 13), cast(void*, src.base), src.len, cast(u64, 0), cast(void*, out), cast(u64, 13));
+        dst.off = dst.off + 13 + n;
+        tls_tickets_issued++;
+        return 0;
+    }
+    if src.len < cast(u64, 13 + 16) { return 0x201; }
+    i32 k = cast(i32, *src.base);
+    if k < 0 || k >= TLS_TICKET_KEYS || !g_ticket_valid[k] { return 0x201; }
+    ptls_aead_context_t* a = ptls_aead_new_direct(&g_ticket_aead, 0, cast(void*, &g_ticket_keys[k * 16]), cast(void*, src.base + 1));
+    if a == null { return 0x201; }
+    defer ptls_aead_free(a);
+    u64 plain = src.len - 13;
+    if ptls_buffer_reserve(dst, plain) != 0 { return 0x201; }
+    u64 n = ptls_aead_decrypt(a, cast(void*, dst.base + dst.off), cast(void*, src.base + 13), plain, cast(u64, 0), cast(void*, src.base), cast(u64, 13));
+    if n == cast(u64, 0 - 1) { return 0x201; }
+    dst.off = dst.off + n;
+    tls_tickets_resumed++;
+    return 0;
+}
+
 struct TlsServerCtx {
     ptls_context_t ctx;
     ecdsa_sign_cert_ctx_t ec_sign;
@@ -865,7 +1233,7 @@ struct TlsServerCtx {
     // leaf first, then each issuer above it. A client holds only root
     // certificates, so it can build a path to one only if the intermediates
     // travel with the leaf.
-    ptls_iovec_t[TLS_CHAIN_MAX] certs;
+    ptls_iovec_t[TLS_SERVER_CHAIN_MAX] certs;
     u8* cert_der;             // owned copy of the whole chain, concatenated
     u64 cert_len;
     i32 n_certs;
@@ -876,15 +1244,43 @@ struct TlsServerCtx {
 }
 
 // Enough for a leaf plus the intermediates any public CA issues under.
-const i32 TLS_CHAIN_MAX = 4;
+const i32 TLS_SERVER_CHAIN_MAX = 4;
 
 private const i32 TLS_SERVER_CTX_MAX = 64;
 private threadlocal TlsServerCtx*[64] g_server_ctxs;
 private threadlocal bool g_server_ctxs_inited = false;
+private threadlocal ptls_on_client_hello_t g_on_client_hello;
+
+// The server's choice of context by the name the client asks for
+// (SNI): called on the session's thread with the name's bytes and
+// length, it returns a context id from tls_server_ctx_new, or -1 to
+// keep the one the session was made from. Null: every session keeps
+// its own.
+fn(u8*, i32): i32 tls_server_sni_hook = null;
+
+private i32 tls_on_client_hello_cb(st_ptls_on_client_hello_t* self, ptls_t* tls,
+                                   ptls_on_client_hello_parameters_t* params) {
+    TlsSession* s = cast(TlsSession*, *ptls_get_data_ptr(tls));
+    if s != null && s.ctx_chosen { return 0; }   // the embedder chose on its own thread; this one may be another
+    if tls_server_sni_hook == null || params.server_name.base == null || params.server_name.len == cast(u64, 0) { return 0; }
+    i32 id = tls_server_sni_hook(params.server_name.base, cast(i32, params.server_name.len));
+    if id < 0 || id >= TLS_SERVER_CTX_MAX || g_server_ctxs[id] == null { return 0; }
+    TlsServerCtx* sc = g_server_ctxs[id];
+    ptls_set_context(tls, &sc.ctx);
+    // the session's reference moves to the context it will sign with
+    if s != null && s.server != cast(void*, sc) {
+        TlsServerCtx* old = cast(TlsServerCtx*, s.server);
+        sc.sessions++;
+        s.server = cast(void*, sc);
+        if old != null { tls_server_ctx_release(old); }
+    }
+    return 0;
+}
 
 private void tls_server_ctxs_init() {
     if g_server_ctxs_inited { return; }
     for i32 i = 0; i < TLS_SERVER_CTX_MAX; i++ { g_server_ctxs[i] = null; }
+    g_on_client_hello = ptls_on_client_hello_t{ .cb = tls_on_client_hello_cb };
     g_server_ctxs_inited = true;
 }
 
@@ -915,7 +1311,7 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     }
     if slot < 0 { return 0 - 1; }
 
-    if n_certs < 1 || n_certs > TLS_CHAIN_MAX { return 0 - 1; }
+    if n_certs < 1 || n_certs > TLS_SERVER_CHAIN_MAX { return 0 - 1; }
     i32 total = 0;
     for i32 i = 0; i < n_certs; i++ {
         if cert_lens[i] <= 0 { return 0 - 1; }
@@ -942,6 +1338,14 @@ i32 tls_server_ctx_new(u8* cert_blob, i32* cert_lens, i32 n_certs,
     sc.ctx.cipher_suites = &g_cslist[0];
     sc.ctx.certificates.list = &sc.certs[0];
     sc.ctx.certificates.count = cast(u64, n_certs);
+    sc.ctx.on_client_hello = &g_on_client_hello;
+    // Session tickets: a returning client resumes with a PSK, the key
+    // exchange kept and early data off (tls_ticket_cb).
+    tls_tickets_server_init();
+    sc.ctx.ticket_lifetime = cast(u32, 86400);
+    sc.ctx.encrypt_ticket = &g_ticket_cb;
+    sc.ctx.require_dhe_on_psk = cast(u32, 1);
+    sc.ctx.max_early_data_size = cast(u32, 0);
 
     if is_ec {
         sc.ec_sign = ecdsa_sign_cert_ctx_t{
@@ -1026,6 +1430,7 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     TlsSession* s = new(TlsSession);   // zeroed: tls_err and saw_input start clear
     s.tls = ptls_new(&sc.ctx, 1);   // is_server = 1
     if s.tls == null { free(s); return null; }
+    *ptls_get_data_ptr(s.tls) = cast(void*, s);
     s.server = cast(void*, sc);
     sc.sessions++;
     ptls_buffer_init(&s.sendbuf, "", 0);
@@ -1039,9 +1444,52 @@ TlsSession* tls_server_session_new(i32 ctx_id) {
     s.checked_connect = false;
     s.started = false;
     s.is_server = true;
+    s.ctx_chosen = false;
     s.established = false;
     s.failed = false;
     s.eof = false;
     return s;
+}
+
+// The context a server session signs with, chosen by the embedder from
+// this thread's contexts before the handshake runs (it has read the
+// client's name off the ClientHello itself); -1 keeps the one the
+// session was made with. The handshake's own name callback then does
+// nothing, so the handshake can run on a thread that has no contexts.
+void tls_select_ctx(TlsSession* s, i32 ctx_id) {
+    s.ctx_chosen = true;
+    if ctx_id < 0 || ctx_id >= TLS_SERVER_CTX_MAX || !s.is_server { return; }
+    TlsServerCtx* sc = g_server_ctxs[ctx_id];
+    if sc == null || s.server == cast(void*, sc) { return; }
+    ptls_set_context(s.tls, &sc.ctx);
+    TlsServerCtx* old = cast(TlsServerCtx*, s.server);
+    sc.sessions++;
+    s.server = cast(void*, sc);
+    if old != null { tls_server_ctx_release(old); }
+}
+
+// A context for QUIC (RFC 9001): picotls gives each epoch's traffic
+// secret to `cb` instead of protecting records itself, and a client
+// omits EndOfEarlyData. server_id is a tls_server_ctx_new id, whose
+// certificates and key the copy uses while that context lives, or -1 for
+// a client (`insecure` as in tls_session_new). The caller frees the
+// copy with free() after the last ptls_t made from it. Null for an
+// unknown id.
+ptls_context_t* tls_quic_ctx(i32 server_id, bool insecure, ptls_update_traffic_key_t* cb) {
+    tls_ctx_init();
+    ptls_context_t* c = alloc<ptls_context_t>(1);
+    if server_id < 0 {
+        *c = insecure ? g_ctx_insecure : g_ctx;
+    } else {
+        tls_server_ctxs_init();
+        if server_id >= TLS_SERVER_CTX_MAX || g_server_ctxs[server_id] == null {
+            free(c);
+            return null;
+        }
+        *c = g_server_ctxs[server_id].ctx;
+    }
+    c.update_traffic_key = cb;
+    c.omit_end_of_early_data = 1;
+    return c;
 }
 }   // end !wasm native implementation

@@ -301,10 +301,28 @@ private Value nat_object_entries(void* vmp, Value callee, Value thisv, Value* ar
 private Value nat_object_assign(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value tv = arg_at(args, argc, 0);
-    if !value_is_object(tv) {
-        vm_throw_error(vm, ERR_TYPE, "Object.assign target must be an object");
+    if value_is_function(tv) || value_is_native(tv) {
+        // a function is an object too: its own properties take the sources'
+        for i32 s = 1; s < argc; s++ {
+            Value sv2 = *(args + s);
+            if !value_is_object(sv2) { continue; }
+            JsObject* src = value_as_object(sv2);
+            vm_props_order(vm, &src.props);
+            for i32 i = 0; i < src.props.len; i++ {
+                if !prop_copyable(vm, src.props.items + i) { continue; }
+                u32 pk = (src.props.items + i).key;
+                Value pv = (src.props.items + i).val;
+                if value_is_accessor(pv) && !vm_get_prop_value(vm, sv2, pk, &pv) { return value_undefined(); }
+                if !vm_set_prop_value(vm, tv, pk, pv) { return value_undefined(); }
+            }
+        }
+        return tv;
+    }
+    if value_is_null(tv) || value_is_undefined(tv) {
+        vm_throw_error(vm, ERR_TYPE, "Cannot convert undefined or null to object");
         return value_undefined();
     }
+    if !value_is_object(tv) { return tv; }
     JsObject* t = value_as_object(tv);
     for i32 s = 1; s < argc; s++ {
         Value sv2 = *(args + s);
@@ -397,7 +415,16 @@ private Value proto_of_value(VM* vm, Value v) {
         if value_is_null(fp) { return value_null(); }
         return proto_cell(vm.function_proto);
     }
-    if value_is_native(v) { return proto_cell(vm.function_proto); }
+    if value_is_native(v) {
+        // the native error constructors inherit from Error, as TypeError's [[Prototype]] is Error
+        NativeFn f = value_as_native(v).fun;
+        if f == &nat_typeerror_ctor || f == &nat_rangeerror_ctor || f == &nat_referror_ctor || f == &nat_syntaxerror_ctor
+            || f == &nat_evalerror_ctor || f == &nat_urierror_ctor || f == &nat_aggregateerror_ctor {
+            Value e;
+            if vm_get_prop_value(vm, value_cell(&vm.global_obj.head), bi_atom(vm, "Error"), &e) && value_is_native(e) { return e; }
+        }
+        return proto_cell(vm.function_proto);
+    }
     if value_is_string(v) { return proto_cell(vm.string_proto); }
     if value_is_symbol(v) { return proto_cell(vm.symbol_proto); }
     if value_is_bigint(v) { return proto_cell(vm.bigint_proto); }
@@ -575,14 +602,16 @@ private bool set_proto_core(void* vmp, Value* args, i32 argc, bool report) {
             return false;
         }
         if value_is_object(pv) {
-            o.proto = value_as_object(pv);
+            gc_barrier(&o.head, pv);
+            js_set_proto(o, value_as_object(pv));
         } else if value_is_null(pv) {
-            o.proto = null;
+            js_set_proto(o, null);
         }
     } else if value_is_function(ov) {
         // a function's [[Prototype]] is stored inline; accept a plain object,
         // another callable, or null (undefined means "unchanged").
         if value_is_object(pv) || value_is_function(pv) || value_is_native(pv) {
+            gc_barrier(value_as_cell(ov), pv);
             value_as_function(ov).fproto = pv;
         } else if value_is_null(pv) {
             value_as_function(ov).fproto = value_null();
@@ -792,14 +821,34 @@ private bool define_property_core(void* vmp, Value* args, i32 argc, bool report)
     } else if (existing.flags & PROP_CONFIGURABLE) == 0 {
         // A non-configurable property admits almost no change: only turning a
         // writable data property read-only, or rewriting its value while it is
-        // still writable.
-        bool bad = desc_has(vm, desc, "configurable") || wants_accessor
-            || value_is_accessor(existing.val);
+        // still writable. A descriptor that restates what the property has
+        // is allowed, as ValidateAndApplyPropertyDescriptor allows it: a
+        // library that reads every own descriptor and defines them again
+        // (axios's freezeMethods over a function's prototype) relies on it.
+        bool bad = false;
+        if desc_has(vm, desc, "configurable") {
+            ignore vm_get_prop_value(vm, desc, bi_atom(vm, "configurable"), &tmp0);
+            if js_truthy(tmp0) { bad = true; }
+        }
         if desc_has(vm, desc, "enumerable") {
             ignore vm_get_prop_value(vm, desc, bi_atom(vm, "enumerable"), &tmp0);
             if js_truthy(tmp0) != ((existing.flags & PROP_ENUMERABLE) != 0) { bad = true; }
         }
-        if (existing.flags & PROP_WRITABLE) == 0 {
+        bool generic = !wants_accessor && !desc_has(vm, desc, "value") && !desc_has(vm, desc, "writable");
+        bool was_accessor = value_is_accessor(existing.val);
+        if !generic && wants_accessor != was_accessor { bad = true; }
+        else if !generic && was_accessor {
+            // the same getter and setter, or halves left out
+            JsAccessor* was = value_as_accessor(existing.val);
+            if desc_has(vm, desc, "get") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "get"), &tmp0);
+                if !js_strict_eq(tmp0, was.get) { bad = true; }
+            }
+            if desc_has(vm, desc, "set") {
+                ignore vm_get_prop_value(vm, desc, bi_atom(vm, "set"), &tmp0);
+                if !js_strict_eq(tmp0, was.set) { bad = true; }
+            }
+        } else if !generic && (existing.flags & PROP_WRITABLE) == 0 {
             if desc_has(vm, desc, "writable") {
                 ignore vm_get_prop_value(vm, desc, bi_atom(vm, "writable"), &tmp0);
                 if js_truthy(tmp0) { bad = true; }
@@ -846,7 +895,9 @@ private bool define_property_core(void* vmp, Value* args, i32 argc, bool report)
             s = value_is_callable(tmp) ? tmp : value_undefined();
         }
         JsAccessor* ac = js_new_accessor(&vm.heap);
+        gc_barrier(&ac.head, g);
         ac.get = g;
+        gc_barrier(&ac.head, s);
         ac.set = s;
         stored = value_cell(&ac.head);
         flags = flags & cast(u8, ~PROP_WRITABLE);
@@ -922,7 +973,7 @@ private u32 reflect_key(VM* vm, Value kv, str* sk) {
     Value ks = js_to_string_value(vm, kv);
     vm_pop(vm);
     vm_push(vm, ks);
-    u32 a = vm_atom_dyn(vm, sview(ks));
+    u32 a = vm_atom_of_string(vm, value_as_string(ks));
     *sk = atom_name(&vm.atoms, a);
     vm_pop(vm);
     return a;
@@ -1873,12 +1924,21 @@ private Value nat_arr_splice(void* vmp, Value callee, Value thisv, Value* args, 
 
 private Value nat_arr_concat(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
-    // concat does not spread a non-array `this` (IsConcatSpreadable), so it
-    // keeps the strict receiver rather than materializing an array-like.
-    JsObject* a = this_array(vm, thisv);
-    if a == null { return value_undefined(); }
-    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
+    // concat does not spread a non-array `this` (IsConcatSpreadable): it is
+    // the result's first element
+    if value_is_null(thisv) || value_is_undefined(thisv) {
+        vm_throw_error(vm, ERR_TYPE, "Array.prototype.concat called on null or undefined");
+        return value_undefined();
+    }
     i32 rm = gc_root_mark(&vm.heap);
+    JsObject* a;
+    if value_is_array(thisv) { a = value_as_object(thisv); }
+    else {
+        a = js_new_array(&vm.heap, vm.array_proto);
+        gc_root(&vm.heap, value_cell(&a.head));
+        js_array_set(a, 0, thisv);
+    }
+    JsObject* r = js_new_array(&vm.heap, vm.array_proto);
     gc_root(&vm.heap, value_cell(&r.head));
     i32 total = a.elen;
     for i32 s = 0; s < argc; s++ {
@@ -2398,6 +2458,7 @@ private Value nat_arr_fill(void* vmp, Value callee, Value thisv, Value* args, i3
     Value v = arg_at(args, argc, 0);
     i32 start = argc > 1 ? rel_index(to_int_sat(*(args + 1)), a.elen) : 0;
     i32 end = argc > 2 ? rel_index(to_int_sat(*(args + 2)), a.elen) : a.elen;
+    gc_barrier(&a.head, v);
     for i32 i = start; i < end; i++ {
         *(a.elems + i) = v;
     }
@@ -2517,7 +2578,7 @@ private Value nat_arr_sort(void* vmp, Value callee, Value thisv, Value* args, i3
             return value_undefined();
         }
         // a comparator may have shrunk the array under us; write what fits
-        for i32 i = 0; i < count && i < a.elen; i++ { *(a.elems + i) = *(res + i); }
+        for i32 i = 0; i < count && i < a.elen; i++ { gc_barrier(&a.head, *(res + i)); *(a.elems + i) = *(res + i); }
     } else if count == 1 && a.elen > 0 {
         *(a.elems) = *(src.elems);
     }
@@ -3114,9 +3175,20 @@ private Value str_case_map(VM* vm, Value thisv, bool upper) {
     Value sv2 = js_to_string_value(vm, thisv);
     gc_root(&vm.heap, sv2);
     str s = sview(sv2);
+    // a string already in the case asked for is its own answer: a style
+    // key or a tag name is lowercased on every write
+    i32 off = 0;
+    bool same = true;
+    while same && off < s.len {
+        i32 n;
+        i32 cp = utf8_decode(s, off, &n);
+        off += n;
+        if (upper && cp == 0xDF) || (!upper && cp == 0x3A3) || case_map_cp(cp, upper) != cp { same = false; }
+    }
+    if same { gc_root_reset(&vm.heap, rm); return sv2; }
     str_buf sb;
     str_buf_init(&sb);
-    i32 off = 0;
+    off = 0;
     while off < s.len {
         i32 n;
         i32 cp = utf8_decode(s, off, &n);
@@ -3268,6 +3340,7 @@ private Value nat_str_trim(void* vmp, Value callee, Value thisv, Value* args, i3
     i32 a = 0;
     i32 b = s.len;
     trim_bounds(s, &a, &b, true, true);
+    if a == 0 && b == s.len { gc_root_reset(&vm.heap, rm); return sv2; }
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -3516,6 +3589,7 @@ private Value str_trim_side(VM* vm, Value thisv, bool left, bool right) {
     i32 a = 0;
     i32 b = s.len;
     trim_bounds(s, &a, &b, left, right);
+    if a == 0 && b == s.len { gc_root_reset(&vm.heap, rm); return sv2; }
     str sub;
     sub.data = s.data + a;
     sub.len = b - a;
@@ -3545,7 +3619,7 @@ private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value
                 JsObject* p = value_as_object(pair);
                 Value ks = js_to_string_value(vm, js_array_get(p, 0));
                 vm_push(vm, ks);
-                u32 atom = vm_atom_dyn(vm, sview(ks));
+                u32 atom = vm_atom_of_string(vm, value_as_string(ks));
                 vm_pop(vm);
                 js_set_prop(o, atom, js_array_get(p, 1));
             }
@@ -3564,7 +3638,7 @@ private Value nat_object_fromentries(void* vmp, Value callee, Value thisv, Value
                     JsObject* p = value_as_object(e);
                     Value ks = js_to_string_value(vm, js_array_get(p, 0));
                     vm_push(vm, ks);
-                    u32 atom = vm_atom_dyn(vm, sview(ks));
+                    u32 atom = vm_atom_of_string(vm, value_as_string(ks));
                     vm_pop(vm);
                     js_set_prop(o, atom, js_array_get(p, 1));
                 }
@@ -5337,6 +5411,18 @@ private void json_ws(JsonParser* p) {
     }
 }
 
+// Where the run of plain string bytes from p.pos ends: at a quote, a
+// backslash or the end of the text.
+private i32 json_plain_end(JsonParser* p) {
+    i32 i = p.pos;
+    while i < p.s.len {
+        u8 d = *(p.s.data + i);
+        if d == '"' || d == '\\' { break; }
+        i++;
+    }
+    return i;
+}
+
 private Value json_parse_value(VM* vm, JsonParser* p) {
     json_ws(p);
     if p.pos >= p.s.len {
@@ -5358,9 +5444,23 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
     }
     if c == '"' {
         p.pos++;
+        // most strings have no escape: the bytes up to the quote are the string
+        i32 end = json_plain_end(p);
+        if end < p.s.len && *(p.s.data + end) == '"' {
+            Value plain = new_str(vm, str_from(p.s.data + p.pos, end - p.pos));
+            p.pos = end + 1;
+            return plain;
+        }
         str_buf sb;
         str_buf_init(&sb);
         while p.pos < p.s.len {
+            // the run up to the next quote or escape, whole
+            i32 run = json_plain_end(p);
+            if run > p.pos {
+                str_buf_add(&sb, str_from(p.s.data + p.pos, run - p.pos));
+                p.pos = run;
+                if p.pos >= p.s.len { break; }
+            }
             u8 d = *(p.s.data + p.pos);
             if d == '"' { break; }
             if d == '\\' && p.pos + 1 < p.s.len {
@@ -5473,13 +5573,32 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
         } else {
             while !p.failed {
                 json_ws(p);
-                Value key = json_parse_value(vm, p);
-                if p.failed { break; }
-                if !value_is_string(key) {
-                    p.failed = true;
-                    break;
+                // a key without escapes goes to its atom from the text,
+                // with no string made for it; interned after the value, so
+                // that nothing the value allocates can find it unused
+                i32 kstart = -1;
+                i32 klen = 0;
+                Value key = value_undefined();
+                if p.pos < p.s.len && *(p.s.data + p.pos) == '"' {
+                    p.pos++;
+                    i32 kend = json_plain_end(p);
+                    if kend < p.s.len && *(p.s.data + kend) == '"' {
+                        kstart = p.pos;
+                        klen = kend - p.pos;
+                        p.pos = kend + 1;
+                    } else {
+                        p.pos--;
+                    }
                 }
-                gc_root(&vm.heap, key);
+                if kstart < 0 {
+                    key = json_parse_value(vm, p);
+                    if p.failed { break; }
+                    if !value_is_string(key) {
+                        p.failed = true;
+                        break;
+                    }
+                    gc_root(&vm.heap, key);
+                }
                 json_ws(p);
                 if p.pos >= p.s.len || *(p.s.data + p.pos) != ':' {
                     p.failed = true;
@@ -5488,7 +5607,8 @@ private Value json_parse_value(VM* vm, JsonParser* p) {
                 p.pos++;
                 Value val = json_parse_value(vm, p);
                 if p.failed { break; }
-                js_set_prop(obj, vm_atom_dyn(vm, sview(key)), val);
+                u32 katom = kstart >= 0 ? vm_atom_dyn(vm, str_from(p.s.data + kstart, klen)) : vm_atom_of_string(vm, value_as_string(key));
+                js_set_prop(obj, katom, val);
                 json_ws(p);
                 if p.pos < p.s.len && *(p.s.data + p.pos) == ',' {
                     p.pos++;
@@ -5630,12 +5750,43 @@ private Value nat_json_parse(void* vmp, Value callee, Value thisv, Value* args, 
 
 // --- Function.prototype ------------------------------------------------------------------
 
-// The Function constructor compiles source at runtime; the interpreter
-// does not support dynamic code. The global exists so that references to
-// `Function` and `Function.prototype` resolve (only calling it throws).
+// The Function constructor: the parameters and the body spelled as a
+// function expression in parentheses, compiled as a script of its own,
+// whose one sub-template the function is. It closes over nothing, as
+// the spec has it (its scope is the global one), so a template with
+// upvalues is a compile the caller cannot have asked for.
 private Value nat_function_ctor(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
-    vm_throw_error(as_vm(vmp), ERR_TYPE, "Function constructor (dynamic code) is not supported");
-    return value_undefined();
+    VM* vm = as_vm(vmp);
+    str_buf sb;
+    str_buf_init(&sb);
+    defer str_buf_free(&sb);
+    str_buf_add(&sb, "(function anonymous(");
+    for i32 i = 0; i + 1 < argc; i++ {
+        if i > 0 { str_buf_add(&sb, ","); }
+        Value s = js_to_string_value(vm, *(args + i));
+        if vm.has_pending { return value_undefined(); }
+        str_buf_add(&sb, gc_string_view(value_as_string(s)));
+    }
+    str_buf_add(&sb, "\n) {\n");
+    if argc > 0 {
+        Value b = js_to_string_value(vm, *(args + argc - 1));
+        if vm.has_pending { return value_undefined(); }
+        str_buf_add(&sb, gc_string_view(value_as_string(b)));
+    }
+    str_buf_add(&sb, "\n})");
+    string err = str_concat("", "");
+    defer free(err);
+    FnTemplate* root = vm_compile_source(vm, str_buf_to_str(&sb), "Function", &err);
+    if root == null {
+        vm_throw_error(vm, ERR_SYNTAX, str_from(err.data, err.len));
+        return value_undefined();
+    }
+    if root.n_subs != 1 || (*(root.subs + 0)).n_upvals != 0 {
+        vm_throw_error(vm, ERR_SYNTAX, "Function constructor: not a function body");
+        return value_undefined();
+    }
+    JsFunction* f = js_new_function(&vm.heap, *(root.subs + 0), 0);
+    return value_cell(&f.head);
 }
 
 private Value nat_fn_tostring(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
@@ -5710,8 +5861,11 @@ private Value nat_fn_bind(void* vmp, Value callee, Value thisv, Value* args, i32
     // the visible name is set as a property below; the internal one stays
     // empty so toString reads "function () { [native code] }" like node's
     JsNative* w = js_new_native(&vm.heap, &nat_bound_entry, "");
+    gc_barrier(&w.head, thisv);
     w.env0 = thisv;
+    gc_barrier(&w.head, arg_at(args, argc, 0));
     w.env1 = arg_at(args, argc, 0);
+    gc_barrier(&w.head, value_cell(&pre.head));
     w.env2 = value_cell(&pre.head);
     vm_push(vm, value_cell(&w.head));
     // a bound function reports "bound <target>" and the target's remaining arity
@@ -6929,9 +7083,11 @@ private Value nat_iterator_from(void* vmp, Value callee, Value thisv, Value* arg
     Value wv = value_cell(&w.head);
     gc_root(&vm.heap, wv);
     JsNative* nx = js_new_native(&vm.heap, &nat_iterwrap_next, "next");
+    gc_barrier(&nx.head, it);
     nx.env0 = it;
     props_set_desc(&w.props, bi_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     JsNative* rt = js_new_native(&vm.heap, &nat_iterwrap_return, "return");
+    gc_barrier(&rt.head, it);
     rt.env0 = it;
     props_set_desc(&w.props, bi_atom(vm, "return"), value_cell(&rt.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
@@ -7008,30 +7164,52 @@ private Value nat_map_iter_next(void* vmp, Value callee, Value thisv, Value* arg
 // kind: 0 keys, 1 values, 2 entries
 private Value make_map_iterator(VM* vm, JsMap* mp, i32 kind) {
     i32 rm = gc_root_mark(&vm.heap);
-    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
+    JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, mp.proto == vm.set_proto ? ITER_KIND_SET : ITER_KIND_MAP));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_map_iter_next, "next");
+    gc_barrier(&nx.head, value_cell(&mp.head));
     nx.env0 = value_cell(&mp.head);
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
     nx.env3 = value_number(-1.0);
-    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    props_set_desc(&it.props, vm_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
 }
 
 private Value make_index_iterator(VM* vm, Value src, i32 kind) {
+    return make_index_iterator_of(vm, src, kind, value_is_string(src) ? ITER_KIND_STRING : ITER_KIND_ARRAY);
+}
+
+private Value make_index_iterator_of(VM* vm, Value src, i32 kind, i32 iter_kind) {
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, src);
-    JsObject* it = js_new_object(&vm.heap, vm.iterator_proto);
+    JsObject* it = js_new_object(&vm.heap, iter_kind_proto(vm, iter_kind));
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_arr_iter_next, "next");
+    gc_barrier(&nx.head, src);
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
-    js_set_prop(it, vm_atom(vm, "next"), value_cell(&nx.head));
+    props_set_desc(&it.props, vm_atom(vm, "next"), value_cell(&nx.head), METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&it.head);
+}
+
+// The kinds of built-in iterator, each with its prototype between its
+// iterators and Iterator.prototype, as scripts that find Iterator.prototype
+// two steps up from [].values() expect.
+private {
+    const i32 ITER_KIND_ARRAY = 0;
+    const i32 ITER_KIND_MAP = 1;
+    const i32 ITER_KIND_SET = 2;
+    const i32 ITER_KIND_STRING = 3;
+    const i32 ITER_KIND_REGEXP = 4;
+}
+
+private JsObject* iter_kind_proto(VM* vm, i32 k) {
+    JsObject* p = vm.iter_kind_protos[k];
+    return p != null ? p : vm.iterator_proto;
 }
 
 // Build the `arguments` object: an array-like plain object (Object.prototype
@@ -7047,8 +7225,8 @@ Value build_arguments_object(VM* vm, Value* argstart, i32 argc) {
     }
     props_set_desc(&o.props, vm.atom_length, value_int(argc),
         PROP_WRITABLE | PROP_CONFIGURABLE);   // length: own, non-enumerable
-    JsNative* si = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
-    props_set_desc(&o.props, vm_sym_iterator_id(vm), value_cell(&si.head), METHOD_ATTRS);
+    // its iterator is Array.prototype.values itself, as the language has it
+    props_set_desc(&o.props, vm_sym_iterator_id(vm), vm.array_values, METHOD_ATTRS);
     gc_root_reset(&vm.heap, rm);
     return value_cell(&o.head);
 }
@@ -7075,6 +7253,26 @@ private i32 index_iter_len(VM* vm, Value src, bool* ok) {
 
 // One step of a Map or Set iterator, in the state make_map_iterator left it.
 // `entries` still builds the pair it yields, but no result object around it.
+// The step of a Map or Set iterated as its own iterator (MapDirectFn).
+i32 map_iter_direct(void* vmp, JsMap* mp, i32 last, Value* out) {
+    VM* vm = as_vm(vmp);
+    i32 i = map_iter_pos(mp, mp.hint, cast(f64, last));
+    while i < mp.len && !*(mp.live + i) { i++; }
+    mp.hint = i < mp.len ? i + 1 : i;
+    if i >= mp.len { return 0 - 1; }
+    i32 seq = cast(i32, *(mp.seqs + i));
+    Value key = *(mp.keys + i);
+    if mp.is_set { *out = key; return seq; }
+    JsObject* pair = js_new_array(&vm.heap, vm.array_proto);
+    vm_push(vm, value_cell(&pair.head));
+    js_array_reserve(pair, 2);
+    js_array_set(pair, 0, key);
+    js_array_set(pair, 1, *(mp.vals + i));
+    vm_pop(vm);
+    *out = value_cell(&pair.head);
+    return seq;
+}
+
 private i32 map_iter_step(VM* vm, JsNative* nx, Value* val, bool* done) {
     JsMap* mp = value_as_map(nx.env0);
     i32 i = map_iter_pos(mp, value_as_int(nx.env1), js_to_number(nx.env3));
@@ -7318,9 +7516,11 @@ private Value nat_promise_withresolvers(void* vmp, Value callee, Value thisv, Va
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, p);
     JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    gc_barrier(&res.head, p);
     res.env0 = p;
     gc_root(&vm.heap, value_cell(&res.head));
     JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    gc_barrier(&rej.head, p);
     rej.env0 = p;
     gc_root(&vm.heap, value_cell(&rej.head));
     JsObject* o = js_new_object(&vm.heap, vm.object_proto);
@@ -7343,9 +7543,11 @@ private Value nat_promise_ctor(void* vmp, Value callee, Value thisv, Value* args
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, p);
     JsNative* res = js_new_native(&vm.heap, &nat_resolve_fn, "resolve");
+    gc_barrier(&res.head, p);
     res.env0 = p;
     gc_root(&vm.heap, value_cell(&res.head));
     JsNative* rej = js_new_native(&vm.heap, &nat_reject_fn, "reject");
+    gc_barrier(&rej.head, p);
     rej.env0 = p;
     gc_root(&vm.heap, value_cell(&rej.head));
     Value[2] ca = { value_cell(&res.head), value_cell(&rej.head) };
@@ -7451,9 +7653,11 @@ private Value nat_promise_finally(void* vmp, Value callee, Value thisv, Value* a
     Value cb = arg_at(args, argc, 0);
     i32 rm = gc_root_mark(&vm.heap);
     JsNative* onf = js_new_native(&vm.heap, &nat_finally_pass, "finally");
+    gc_barrier(&onf.head, cb);
     onf.env0 = cb;
     gc_root(&vm.heap, value_cell(&onf.head));
     JsNative* onr = js_new_native(&vm.heap, &nat_finally_throw, "finally");
+    gc_barrier(&onr.head, cb);
     onr.env0 = cb;
     gc_root(&vm.heap, value_cell(&onr.head));
     Value r = vm_promise_then(vm, thisv, value_cell(&onf.head), value_cell(&onr.head));
@@ -7558,10 +7762,12 @@ private Value nat_promise_all(void* vmp, Value callee, Value thisv, Value* args,
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, &nat_all_elem, "all");
+        gc_barrier(&onf.head, value_cell(&st.head));
         onf.env0 = value_cell(&st.head);
         onf.env1 = value_int(i);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_all_rej, "all");
+        gc_barrier(&onr.head, value_cell(&st.head));
         onr.env0 = value_cell(&st.head);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
         ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
@@ -7606,11 +7812,15 @@ private Value nat_promise_race(void* vmp, Value callee, Value thisv, Value* args
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, &nat_race_settle, "race");
+        gc_barrier(&onf.head, p);
         onf.env0 = p;
+        gc_barrier(&onf.head, value_bool(false));
         onf.env1 = value_bool(false);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, &nat_race_settle, "race");
+        gc_barrier(&onr.head, p);
         onr.env0 = p;
+        gc_barrier(&onr.head, value_bool(true));
         onr.env1 = value_bool(true);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
         ignore vm_promise_then(vm, evp, onfv, value_cell(&onr.head));
@@ -7753,10 +7963,12 @@ private Value promise_combine(VM* vm, Value list, NativeFn onful, NativeFn onrej
         }
         vm_push(vm, evp);
         JsNative* onf = js_new_native(&vm.heap, onful, "combine");
+        gc_barrier(&onf.head, value_cell(&st.head));
         onf.env0 = value_cell(&st.head);
         onf.env1 = value_int(i);
         vm_push(vm, value_cell(&onf.head));
         JsNative* onr = js_new_native(&vm.heap, onrej, "combine");
+        gc_barrier(&onr.head, value_cell(&st.head));
         onr.env0 = value_cell(&st.head);
         onr.env1 = value_int(i);
         Value onfv = vm_pop_ret(vm, value_cell(&onf.head));
@@ -7996,10 +8208,12 @@ private void map_put(JsMap* mp, Value key, Value val) {
     // lookup already treats the two as the same (SameValueZero)
     if value_is_double(key) && value_as_f64(key) == 0.0 { key = value_number(0.0); }
     i32 at = map_find(mp, key);
+    gc_barrier(&mp.head, val);
     if at >= 0 {
         *(mp.vals + at) = val;
         return;
     }
+    gc_barrier(&mp.head, key);
     map_reserve(mp);
     *(mp.keys + mp.len) = key;
     *(mp.vals + mp.len) = val;
@@ -8638,7 +8852,9 @@ private Value nat_util_debuglog(void* vmp, Value callee, Value thisv, Value* arg
     gc_root(&vm.heap, prefix);
     str_buf_free(&pre);
     JsNative* logfn = js_new_native(&vm.heap, &nat_debuglog_call, "debuglog");
+    gc_barrier(&logfn.head, value_bool(on));
     logfn.env0 = value_bool(on);
+    gc_barrier(&logfn.head, prefix);
     logfn.env1 = prefix;
     Value fv = value_cell(&logfn.head);
     gc_root(&vm.heap, fv);
@@ -8682,6 +8898,7 @@ private Value make_weak(VM* vm, Value iterable, bool is_set) {
     JsMap* mp = js_new_map(&vm.heap, proto, is_set);
     mp.weak = true;
     vm.any_weak = true;
+    vec_push(&vm.weak_maps, mp);
     if bi_nullish(iterable) { return value_cell(&mp.head); }
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, value_cell(&mp.head));
@@ -9561,7 +9778,7 @@ private Value match_span(VM* vm, GcString* sg, bool ascii, i32 gs, i32 ge) {
     return value_cell(&pair.head);
 }
 
-private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
+private Value regexp_exec_impl(VM* vm, Value re, Value subjectv, bool build) {
     RegexProg* prog = vm_regexp_prog(vm, re);
     if prog == null { return value_null(); }
     GcString* sg = value_as_string(subjectv);
@@ -9592,6 +9809,15 @@ private Value regexp_exec_impl(VM* vm, Value re, Value subjectv) {
             js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(0));
         }
         return value_null();
+    }
+    if !build {
+        // test(): the match's extent is all that is wanted
+        if regex_is_global(prog) || regex_is_sticky(prog) {
+            i32 end_u = ascii ? *(caps + 1) : u16_byte_to_unit_cur(s, *(caps + 1), &sg.cur_u, &sg.cur_off);
+            js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(end_u));
+        }
+        free(caps);
+        return value_bool(true);
     }
     JsObject* arr = js_new_array(&vm.heap, vm.array_proto);
     i32 rm = gc_root_mark(&vm.heap);
@@ -9674,7 +9900,7 @@ private Value nat_regexp_exec(void* vmp, Value callee, Value thisv, Value* args,
     gc_root(&vm.heap, thisv);
     Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, sv2);
-    Value r = regexp_exec_impl(vm, thisv, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2, true);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -9689,7 +9915,7 @@ private Value nat_regexp_test(void* vmp, Value callee, Value thisv, Value* args,
     gc_root(&vm.heap, thisv);
     Value sv2 = js_to_string_value(vm, arg_at(args, argc, 0));
     gc_root(&vm.heap, sv2);
-    Value r = regexp_exec_impl(vm, thisv, sv2);
+    Value r = regexp_exec_impl(vm, thisv, sv2, false);
     gc_root_reset(&vm.heap, rm);
     return value_bool(!value_is_null(r));
 }
@@ -9744,7 +9970,7 @@ private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i
         i32 guard = 0;
         while guard < 1000000 {
             guard++;
-            Value mv = regexp_exec_impl(vm, re, sv2);
+            Value mv = regexp_exec_impl(vm, re, sv2, true);
             if value_is_null(mv) { break; }
             gc_root(&vm.heap, mv);
             Value whole = js_array_get(value_as_object(mv), 0);
@@ -9762,7 +9988,7 @@ private Value nat_str_match(void* vmp, Value callee, Value thisv, Value* args, i
         if n == 0 { return value_null(); }
         return value_cell(&out.head);
     }
-    Value r = regexp_exec_impl(vm, re, sv2);
+    Value r = regexp_exec_impl(vm, re, sv2, true);
     gc_root_reset(&vm.heap, rm);
     return r;
 }
@@ -9792,7 +10018,7 @@ private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args
     i32 guard = 0;
     while guard < 1000000 {
         guard++;
-        Value m = regexp_exec_impl(vm, re, sv2);
+        Value m = regexp_exec_impl(vm, re, sv2, true);
         if value_is_null(m) { break; }
         gc_root(&vm.heap, m);
         js_array_set(out, n, m);
@@ -9805,7 +10031,7 @@ private Value nat_str_matchall(void* vmp, Value callee, Value thisv, Value* args
             js_set_prop(value_as_object(re), vm_atom_lastindex(vm), value_int(to_int_arg(liv) + 1));
         }
     }
-    Value it = make_index_iterator(vm, value_cell(&out.head), 0);
+    Value it = make_index_iterator_of(vm, value_cell(&out.head), 0, ITER_KIND_REGEXP);
     gc_root_reset(&vm.heap, rm);
     return it;
 }
@@ -9823,7 +10049,8 @@ private Value nat_str_search(void* vmp, Value callee, Value thisv, Value* args, 
     if prog != null {
         i32 ncap = 2 * (regex_ngroups(prog) + 1);
         i32* caps = alloc<i32>(ncap);
-        if regex_exec(prog, sview(sv2), 0, caps) { result = *(caps + 0); }
+        // the index in UTF-16 units, as every other match reports it
+        if regex_exec(prog, sview(sv2), 0, caps) { result = u16_byte_to_unit(sview(sv2), *(caps + 0)); }
         free(caps);
     }
     gc_root_reset(&vm.heap, rm);
@@ -9998,10 +10225,12 @@ private Value regexp_replace(VM* vm, Value sv2, Value re, Value repl) {
         } else {
             append_replacement(vm, &sb, sview(rtmpl), s, caps, ng, prog);
         }
-        if me > pos {
+        if me > ms {
             pos = me;
         } else {
-            // zero-width match: emit one char and advance
+            // zero-width match, here or ahead of where the search began:
+            // the next search starts one past it, the char between kept
+            pos = ms;
             if pos < s.len {
                 str one;
                 one.data = s.data + pos;
@@ -10214,6 +10443,7 @@ private void def_accessor(VM* vm, JsObject* obj, str name, NativeFn getter) {
     // keep the getter alive across the accessor allocation, which can GC
     vm_push(vm, value_cell(&g.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&g.head));
     ac.get = value_cell(&g.head);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -10506,7 +10736,9 @@ private Value nat_process_emit_warning(void* vmp, Value callee, Value thisv, Val
     // node hands a warning out on the next tick rather than inline, so a
     // listener installed in the same block still hears it
     JsNative* job = js_new_native(&vm.heap, &nat_warning_deliver, "emitWarning");
+    gc_barrier(&job.head, err);
     job.env0 = err;
+    gc_barrier(&job.head, codev);
     job.env1 = codev;
     gc_root(&vm.heap, value_cell(&job.head));
     Value p = vm_promise_new(vm);
@@ -12360,6 +12592,7 @@ private Value make_ta_iterator(VM* vm, Value src, i32 kind) {
     JsObject* it = js_new_object(&vm.heap, vm.object_proto);
     gc_root(&vm.heap, value_cell(&it.head));
     JsNative* nx = js_new_native(&vm.heap, &nat_ta_iter_next, "next");
+    gc_barrier(&nx.head, src);
     nx.env0 = src;
     nx.env1 = value_int(0);
     nx.env2 = value_int(kind);
@@ -12608,6 +12841,8 @@ private void typedarray_install(VM* vm) {
     install_one_ta(vm, 6, "Uint32Array");
     install_one_ta(vm, 7, "Float32Array");
     install_one_ta(vm, 8, "Float64Array");
+    install_one_ta(vm, 9, "BigInt64Array");
+    install_one_ta(vm, 10, "BigUint64Array");
 
     dataview_install(vm);
 }
@@ -13045,7 +13280,7 @@ private i32 tls_js_bytes(VM* vm, Value bufv, u8* out, i32 cap) {
 private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     u8[16384] blob;
-    i32[TLS_CHAIN_MAX] lens;
+    i32[TLS_SERVER_CHAIN_MAX] lens;
     i32 n = 0;
     i32 used = 0;
     Value cv = arg_at(args, argc, 0);
@@ -13053,7 +13288,7 @@ private Value nat_tls_server_ctx(void* vmp, Value callee, Value thisv, Value* ar
     bool is_chain = value_is_array(cv);
     if is_chain {
         JsObject* a = value_as_object(cv);
-        if a.elen > TLS_CHAIN_MAX { return value_int(-1); }
+        if a.elen > TLS_SERVER_CHAIN_MAX { return value_int(-1); }
         for i32 i = 0; i < a.elen; i++ {
             i32 got = tls_js_bytes(vm, js_array_get(a, i), &blob[used], 16384 - used);
             if got <= 0 { return value_int(-1); }
@@ -13332,7 +13567,7 @@ private Value nat_http_parse_head(void* vmp, Value callee, Value thisv, Value* a
             str_buf_add(&sb, v);
             Value j = new_str(vm, str_buf_to_str(&sb));
             str_buf_free(&sb);
-            *props_get(&h.props, key) = j;
+            props_set(&h.props, key, j);
         }
         vm_pop(vm);
     }
@@ -16102,8 +16337,11 @@ private void fs_schedule_cb(VM* vm, Value cb, Value err, Value value) {
     gc_root(&vm.heap, err);
     gc_root(&vm.heap, value);
     JsNative* inv = js_new_native(&vm.heap, &nat_fs_cb_invoke, "");
+    gc_barrier(&inv.head, cb);
     inv.env0 = cb;
+    gc_barrier(&inv.head, err);
     inv.env1 = err;
+    gc_barrier(&inv.head, value);
     inv.env2 = value;
     gc_root(&vm.heap, value_cell(&inv.head));
     Value p = vm_promise_new(vm);
@@ -16753,8 +16991,11 @@ private Value ee_make_once(VM* vm, Value thisv, Value namev, Value cb) {
     vm_push(vm, namev);
     vm_push(vm, cb);
     JsNative* w = js_new_native(&vm.heap, &nat_ee_once_wrap, "");
+    gc_barrier(&w.head, thisv);
     w.env0 = thisv;
+    gc_barrier(&w.head, namev);
     w.env1 = namev;
+    gc_barrier(&w.head, cb);
     w.env2 = cb;
     // rawListeners hands out the wrapper, so it carries the original for
     // callers that need to recognise it
@@ -17047,6 +17288,7 @@ private Value nat_promisified(void* vmp, Value callee, Value thisv, Value* args,
     Value p = vm_promise_new(vm);
     vm_push(vm, p);
     JsNative* cb = js_new_native(&vm.heap, &nat_promisify_cb, "");
+    gc_barrier(&cb.head, p);
     cb.env0 = p;
     Value cbv = value_cell(&cb.head);
     vm_push(vm, cbv);
@@ -17069,6 +17311,7 @@ private Value nat_util_promisify(void* vmp, Value callee, Value thisv, Value* ar
     }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_promisified, "");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -17104,9 +17347,11 @@ private Value nat_callbackified(void* vmp, Value callee, Value thisv, Value* arg
     gc_root(&vm.heap, p);
     if vm_is_promise(vm, p) {
         JsNative* onok = js_new_native(&vm.heap, &nat_callbackify_ok, "");
+        gc_barrier(&onok.head, cbv);
         onok.env0 = cbv;
         gc_root(&vm.heap, value_cell(&onok.head));   // the next allocation would sweep it
         JsNative* onerr = js_new_native(&vm.heap, &nat_callbackify_err, "");
+        gc_barrier(&onerr.head, cbv);
         onerr.env0 = cbv;
         ignore vm_promise_then(vm, p, value_cell(&onok.head), value_cell(&onerr.head));
     }
@@ -17122,6 +17367,7 @@ private Value nat_util_callbackify(void* vmp, Value callee, Value thisv, Value* 
     }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_callbackified, "");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -17272,6 +17518,7 @@ private Value nat_util_deprecate(void* vmp, Value callee, Value thisv, Value* ar
     if !value_is_callable(orig) { return orig; }
     vm_push(vm, orig);
     JsNative* w = js_new_native(&vm.heap, &nat_deprecated_call, "deprecated");
+    gc_barrier(&w.head, orig);
     w.env0 = orig;
     vm_pop(vm);
     return value_cell(&w.head);
@@ -20236,7 +20483,9 @@ private void def_get_set_pair(VM* vm, JsObject* obj, u32 key, JsNative* getter, 
     JsNative* s = js_new_native(&vm.heap, setter, "set");
     vm_push(vm, value_cell(&s.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&getter.head));
     ac.get = value_cell(&getter.head);
+    gc_barrier(&ac.head, value_cell(&s.head));
     ac.set = value_cell(&s.head);
     props_set_desc(&obj.props, key, value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -20248,7 +20497,9 @@ private void def_get_set(VM* vm, JsObject* obj, str name, NativeFn getter, Nativ
     JsNative* s = js_new_native(&vm.heap, setter, name);
     vm_push(vm, value_cell(&s.head));
     JsAccessor* ac = js_new_accessor(&vm.heap);
+    gc_barrier(&ac.head, value_cell(&g.head));
     ac.get = value_cell(&g.head);
+    gc_barrier(&ac.head, value_cell(&s.head));
     ac.set = value_cell(&s.head);
     props_set_desc(&obj.props, bi_atom(vm, name), value_cell(&ac.head), PROP_CONFIGURABLE);
     vm_pop(vm);
@@ -20347,6 +20598,7 @@ private Value nat_proxy_revocable(void* vmp, Value callee, Value thisv, Value* a
     i32 rm = gc_root_mark(&vm.heap);
     gc_root(&vm.heap, pv);
     JsNative* revoke = js_new_native(&vm.heap, &nat_proxy_revoke, "revoke");
+    gc_barrier(&revoke.head, pv);
     revoke.env0 = pv;
     gc_root(&vm.heap, value_cell(&revoke.head));
     JsObject* result = js_new_object(&vm.heap, vm.object_proto);
@@ -20628,7 +20880,9 @@ void builtins_install(VM* vm) {
         JsNative* ps = js_new_native(&vm.heap, &nat_proto_set, "__proto__");
         vm_push(vm, value_cell(&ps.head));
         JsAccessor* pac = js_new_accessor(&vm.heap);
+        gc_barrier(&pac.head, value_cell(&pg.head));
         pac.get = value_cell(&pg.head);
+        gc_barrier(&pac.head, value_cell(&ps.head));
         pac.set = value_cell(&ps.head);
         props_set_desc(&vm.object_proto.props, bi_atom(vm, "__proto__"),
             value_cell(&pac.head), PROP_CONFIGURABLE);
@@ -20855,7 +21109,9 @@ void builtins_install(VM* vm) {
     JsNative* lim_set = js_new_native(&vm.heap, &nat_error_limit_set, "stackTraceLimit");
     vm_push(vm, value_cell(&lim_set.head));
     JsAccessor* lim_ac = js_new_accessor(&vm.heap);
+    gc_barrier(&lim_ac.head, value_cell(&lim_get.head));
     lim_ac.get = value_cell(&lim_get.head);
+    gc_barrier(&lim_ac.head, value_cell(&lim_set.head));
     lim_ac.set = value_cell(&lim_set.head);
     props_set_desc(&err_ctor.props, bi_atom(vm, "stackTraceLimit"), value_cell(&lim_ac.head),
         PROP_WRITABLE | PROP_CONFIGURABLE);
@@ -20959,6 +21215,7 @@ void builtins_install(VM* vm) {
     // and Array.prototype.values are one and the same function object.
     u32 iter_id = vm_sym_iterator_id(vm);
     JsNative* arr_it = js_new_native(&vm.heap, &nat_arr_symiter, "values");
+    vm.array_values = value_cell(&arr_it.head);
     js_set_prop(vm.array_proto, iter_id, value_cell(&arr_it.head));
     props_set_desc(&vm.array_proto.props, bi_atom(vm, "values"), value_cell(&arr_it.head), METHOD_ATTRS);
     JsNative* str_it = js_new_native(&vm.heap, &nat_arr_symiter, "[Symbol.iterator]");
@@ -20983,6 +21240,7 @@ void builtins_install(VM* vm) {
     JsNative* it_si = js_new_native(&vm.heap, &nat_return_this, "[Symbol.iterator]");
     props_set_desc(&vm.iterator_proto.props, iter_id, value_cell(&it_si.head), METHOD_ATTRS);
     JsNative* it_cg = js_new_native(&vm.heap, &nat_iter_ctor_get, "constructor");
+    gc_barrier(&it_cg.head, value_cell(&iter_ctor.head));
     it_cg.env0 = value_cell(&iter_ctor.head);
     vm_push(vm, value_cell(&it_cg.head));
     def_get_set_pair(vm, vm.iterator_proto, bi_atom(vm, "constructor"), it_cg, &nat_iter_ctor_set);
@@ -20991,6 +21249,12 @@ void builtins_install(VM* vm) {
     vm_push(vm, value_cell(&it_tg.head));
     def_get_set_pair(vm, vm.iterator_proto, vm_sym_to_string_tag_id(vm), it_tg, &nat_iter_tag_set);
     vm_pop(vm);
+
+    str[5] kind_tags = { "Array Iterator", "Map Iterator", "Set Iterator", "String Iterator", "RegExp String Iterator" };
+    for i32 k = 0; k < 5; k++ {
+        vm.iter_kind_protos[k] = js_new_object(&vm.heap, vm.iterator_proto);
+        def_tag(vm, vm.iter_kind_protos[k], kind_tags[k]);
+    }
 
     // What map/filter/take/drop/flatMap return
     vm.iter_helper_proto = js_new_object(&vm.heap, vm.iterator_proto);
@@ -21051,6 +21315,7 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.map_proto, "entries", &nat_map_entries);
     def_accessor(vm, vm.map_proto, "size", &nat_map_size);
     JsNative* map_it = js_new_native(&vm.heap, &nat_map_entries, "[Symbol.iterator]");
+    vm.map_entries = value_cell(&map_it.head);
     js_set_prop(vm.map_proto, iter_id, value_cell(&map_it.head));
 
     // Set
@@ -21075,7 +21340,9 @@ void builtins_install(VM* vm) {
     def_method(vm, vm.set_proto, "isSupersetOf", &nat_set_is_superset);
     def_method(vm, vm.set_proto, "isDisjointFrom", &nat_set_is_disjoint);
     JsNative* set_it = js_new_native(&vm.heap, &nat_map_values, "[Symbol.iterator]");
+    vm.set_values = value_cell(&set_it.head);
     js_set_prop(vm.set_proto, iter_id, value_cell(&set_it.head));
+    vm.map_direct = &map_iter_direct;
 
     // WeakMap / WeakSet (keys held weakly; get/has/delete reuse Map's)
     vm.weakmap_proto = js_new_object(&vm.heap, vm.object_proto);

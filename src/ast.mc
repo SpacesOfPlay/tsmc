@@ -7,6 +7,7 @@
 import str;
 import diag;
 import lexer;
+import map;
 
 enum NodeKind {
     N_ERROR,
@@ -56,7 +57,7 @@ enum NodeKind {
     N_NUMBER,         // num
     N_STRING,         // name: value
     N_BIGINT,         // name: raw text
-    N_REGEX,          // name: pattern, aux: flags
+    N_REGEX,          // name: pattern, a: the flags as a string node
     N_BOOL,           // name: true/false
     N_NULL,
     N_THIS,
@@ -126,25 +127,52 @@ const i32 NF_EXPORTED = 134217728;  // dotted-inner namespace
 const i32 NF_METHOD = 268435456;    // method definition: parameters must be unique
 const i32 NF_PARENED = 536870912;   // was written in parentheses: ends an optional chain
 const i32 NF_NAME_INFERRED = 1073741824; // function/class name came from its binding, not syntax
+// a function whose body the parser passed over, to be compiled on its first
+// call: its body is a stand-in naming what the real one mentions
+const i32 NF_SKIPPED = -2147483648;
 
 struct NodeList {
     Node** items;
     i32 len;
 }
 
+// The deepest tree the lowering and the compiler recurse over: the
+// lowering, which walks every node, refuses a deeper one. A wasm
+// module's stack is a sixth of a native thread's.
+when os(wasm) { const i32 AST_DEPTH_MAX = 500; }
+when !os(wasm) { const i32 AST_DEPTH_MAX = 3000; }
+
+// A regex literal's flags and a template element's raw text are N_STRING
+// nodes in `a`, so a node stays at 104 bytes: a parse makes one per token
+// or so, and the arena clears every byte of them.
 struct Node {
     i32 kind;
     i32 flags;
     i32 op;         // operator token kind
     Span span;
     str name;
-    str aux;        // regex flags
     f64 num;
     Node* a;
     Node* b;
     Node* c;
     Node* d;
     NodeList kids;
+    NodeMemo* memo;       // what the parser and the compiler keep on a node, made when first needed
+}
+
+// A name a passed-over function body mentions, as its scan found it
+// (parser.mc, skip_body): what the compiler sees of the body.
+struct NameRef {
+    str name;
+    i32 flags;      // 1: the body stores to it; 2: this; 4: new.target
+}
+
+struct NodeMemo {
+    StrMap<i32>* names;   // a function: the compiler's memo of every name free in it
+    Node** vars;          // the compiler's memo of the var declarators in the subtree, outside its functions
+    i32 n_vars;
+    NameRef* refs;        // a passed-over function: the names its body mentions
+    i32 n_refs;
 }
 
 str node_kind_name(i32 kind) {

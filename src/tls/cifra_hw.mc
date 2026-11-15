@@ -116,14 +116,22 @@ u64x2 cifra_hw_reduce(u64x2 lo, u64x2 hi) {
     return u64x2{z0, z1};
 }
 
-// a * b in GF(2^128): four clmuls give the 256-bit product.
-u64x2 cifra_hw_gf_mul(u64x2 a, u64x2 b) {
+// a * b in GF(2^128) into *out: four clmuls give the 256-bit product.
+//
+// The functions here that are not inlined hand their 128-bit result
+// back through a pointer, not as a return value: on arm64 the compiler
+// returns a vector by the address of a slot in the callee's own frame,
+// which the caller reads after the return, from below the stack
+// pointer. An interrupt taken in that window (a kernel's tick) writes
+// its frame there first, and the caller reads another value. The
+// small helpers that are inlined keep their returns.
+void cifra_hw_gf_mul(u64x2 a, u64x2 b, u64x2* out) {
     u64x2 p00 = clmul(a, b, 0x00);
     u64x2 p11 = clmul(a, b, 0x11);
     u64x2 mid = clmul(a, b, 0x01) ^ clmul(a, b, 0x10);
     u64x2 lo = p00 ^ cast(u64x2, byte_shl(cast(i8x16, mid), 8));
     u64x2 hi = p11 ^ cast(u64x2, byte_shr(cast(i8x16, mid), 8));
-    return cifra_hw_reduce(lo, hi);
+    *out = cifra_hw_reduce(lo, hi);
 }
 
 // out = x * y in GF(2^128), each a cifra cf_gf128 (four u32 words).
@@ -133,7 +141,9 @@ i32 cf_gf128_hw_mul(u32* x, u32* y, u32* out) {
     i8x16 swap = i8x16_load(&g_cifra_hw_word_swap[0]);
     u64x2 a = cast(u64x2, cifra_hw_bitrev(byte_shuffle(i8x16_load(cast(i8*, x)), swap)));
     u64x2 b = cast(u64x2, cifra_hw_bitrev(byte_shuffle(i8x16_load(cast(i8*, y)), swap)));
-    i8x16 r = byte_shuffle(cifra_hw_bitrev(cast(i8x16, cifra_hw_gf_mul(a, b))), swap);
+    u64x2 m;
+    cifra_hw_gf_mul(a, b, &m);
+    i8x16 r = byte_shuffle(cifra_hw_bitrev(cast(i8x16, m)), swap);
     i8x16_store(cast(i8*, out), r);
     return 1;
 }
@@ -252,7 +262,8 @@ void cifra_hw_ghash_powers(u8* h, u8* hp, u64 nb) {
 // returns Y and leaves the bytes past the last whole group to the caller.
 // Written out block by block: the blocks' multiplies are independent, and
 // a loop would add a branch and a counter to each.
-u64x2 cifra_hw_ghash4(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
+void cifra_hw_ghash4(u64x2* yp, u8* hp, u8* p, u64 n, u64* done) {
+    u64x2 y = *yp;
     i8x16 bswap = i8x16_load(&g_cifra_hw_bswap[0]);
     u64 i = 0;
     while i + 64 <= n {
@@ -294,14 +305,15 @@ u64x2 cifra_hw_ghash4(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
         i = i + 64;
     }
     *done = i;
-    return y;
+    *yp = y;
 }
 
 // cifra_hw_ghash for whole groups of 16 blocks, against H^16 down to H;
 // returns Y and leaves the bytes past the last whole group to the caller.
 // Written out block by block: the blocks' multiplies are independent, and
 // a loop would add a branch and a counter to each.
-u64x2 cifra_hw_ghash16(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
+void cifra_hw_ghash16(u64x2* yp, u8* hp, u8* p, u64 n, u64* done) {
+    u64x2 y = *yp;
     i8x16 bswap = i8x16_load(&g_cifra_hw_bswap[0]);
     u64 i = 0;
     while i + 256 <= n {
@@ -427,7 +439,7 @@ u64x2 cifra_hw_ghash16(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
         i = i + 256;
     }
     *done = i;
-    return y;
+    *yp = y;
 }
 
 when defined(CIFRA_HW_256) {
@@ -437,7 +449,8 @@ when defined(CIFRA_HW_256) {
 // into one 256-bit product before the reduction, as the 128-bit form
 // does. The powers are laid out in pairs first, high power in the low
 // lane, since `hp` holds them in ascending order.
-u64x2 cifra_hw_ghash16w(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
+void cifra_hw_ghash16w(u64x2* yp, u8* hp, u8* p, u64 n, u64* done) {
+    u64x2 y = *yp;
     noinit u8[512] hw;
     for i32 j = 0; j < 8; j++ {
         i8x16_store(cast(i8*, &hw[32 * j]), i8x16_load(cast(i8*, hp + 16 * (15 - 2 * j))));
@@ -475,22 +488,23 @@ u64x2 cifra_hw_ghash16w(u64x2 y, u8* hp, u8* p, u64 n, u64* done) {
         i = i + 256;
     }
     *done = i;
-    return y;
+    *yp = y;
 }
 }
 
-u64x2 cifra_hw_ghash(u64x2 y, u8* hp, u64 nb, u8* p, u64 n) {
+void cifra_hw_ghash(u64x2* yp, u8* hp, u64 nb, u8* p, u64 n) {
+    u64x2 y = *yp;
     u64 i = 0;
     bool wide = false;
     when defined(CIFRA_HW_256) {
         if nb == 16 && cifra_hw_wide() {
-            y = cifra_hw_ghash16w(y, hp, p, n, &i);
+            cifra_hw_ghash16w(&y, hp, p, n, &i);
             wide = true;
         }
     }
     if wide { }
-    else if nb == 16 { y = cifra_hw_ghash16(y, hp, p, n, &i); }
-    else { y = cifra_hw_ghash4(y, hp, p, n, &i); }
+    else if nb == 16 { cifra_hw_ghash16(&y, hp, p, n, &i); }
+    else { cifra_hw_ghash4(&y, hp, p, n, &i); }
     u64x2 h1 = u64x2_load(cast(u64*, hp));
     u64x2 h1k = u64x2_load(cast(u64*, hp + 16 * nb));
     i8x16 bswap = i8x16_load(&g_cifra_hw_bswap[0]);
@@ -504,7 +518,7 @@ u64x2 cifra_hw_ghash(u64x2 y, u8* hp, u64 nb, u8* p, u64 n) {
         for u64 k = 0; i + k < n; k++ { last[k] = *(p + i + k); }
         y = cifra_hw_mul_rev(y ^ cifra_hw_load_rev(&last[0]), h1, h1k);
     }
-    return y;
+    *yp = y;
 }
 
 // The powers a message of `n` bytes is hashed with: sixteen from 4 KB,
@@ -681,7 +695,7 @@ void cifra_hw_gcm_tag(u64x2 y, u8* hp, u64 nb, u64 naad, u64 n, u8* ej0, u8* out
         lens[k] = cast(u8, abits >> cast(u64, 56 - 8 * k));
         lens[8 + k] = cast(u8, cbits >> cast(u64, 56 - 8 * k));
     }
-    y = cifra_hw_ghash(y, hp, nb, &lens[0], 16);
+    cifra_hw_ghash(&y, hp, nb, &lens[0], 16);
     i8x16 t = byte_shuffle(cast(i8x16, y), i8x16_load(&g_cifra_hw_bswap[0])) ^ i8x16_load(cast(i8*, ej0));
     i8x16_store(cast(i8*, out), t);
 }
@@ -697,7 +711,8 @@ i32 cf_gcm_hw_seal(u8* rk, u32 rounds, u8* plain, u64 n, u8* aad, u64 naad,
     u8[16] full;
     u64 nb = cifra_hw_ghash_powers_for(n + naad);
     cifra_hw_gcm_setup(rk, rounds, nonce, &hp[0], nb, &j0[0], &ej0[0]);
-    u64x2 y = cifra_hw_ghash(u64x2{0, 0}, &hp[0], nb, aad, naad);
+    u64x2 y = u64x2{0, 0};
+    cifra_hw_ghash(&y, &hp[0], nb, aad, naad);
     // Encrypt and hash 4 KB at a time, so the hash reads the ciphertext
     // from the cache. Every piece but the last is whole blocks.
     u64 done = 0;
@@ -706,7 +721,7 @@ i32 cf_gcm_hw_seal(u8* rk, u32 rounds, u8* plain, u64 n, u8* aad, u64 naad,
         u64 m = n - done;
         if m > 4096 { m = 4096; }
         cifra_hw_ctr(rk, rounds, &j0[0], ctr, plain + done, cipher + done, m);
-        y = cifra_hw_ghash(y, &hp[0], nb, cipher + done, m);
+        cifra_hw_ghash(&y, &hp[0], nb, cipher + done, m);
         ctr = ctr + cast(u32, m / 16);
         done = done + m;
     }
@@ -729,8 +744,9 @@ i32 cf_gcm_hw_open(u8* rk, u32 rounds, u8* cipher, u64 n, u8* aad, u64 naad,
     u8[16] full;
     u64 nb = cifra_hw_ghash_powers_for(n + naad);
     cifra_hw_gcm_setup(rk, rounds, nonce, &hp[0], nb, &j0[0], &ej0[0]);
-    u64x2 y = cifra_hw_ghash(u64x2{0, 0}, &hp[0], nb, aad, naad);
-    y = cifra_hw_ghash(y, &hp[0], nb, cipher, n);
+    u64x2 y = u64x2{0, 0};
+    cifra_hw_ghash(&y, &hp[0], nb, aad, naad);
+    cifra_hw_ghash(&y, &hp[0], nb, cipher, n);
     cifra_hw_gcm_tag(y, &hp[0], nb, naad, n, &ej0[0], &full[0]);
     // Compared without an early exit, so the time does not depend on
     // where the tags differ.
