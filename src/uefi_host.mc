@@ -56,6 +56,16 @@ struct UefiHost {
 
     // Whether descriptor `fd` (0, 1 or 2) is a terminal. Null is no.
     fn(i32): bool isatty;
+
+    // The terminal behind the console. tty_raw asks for the keys' bytes
+    // as they come, unshown, or for lines again; false when it cannot.
+    // tty_size gives the columns and the rows; false with no terminal.
+    // stdin_pending is how many bytes a read of standard input gives
+    // without waiting, -1 when the embedder cannot say: process.stdin
+    // then has no input. Null throughout is a console with none of it.
+    fn(bool): bool tty_raw;
+    fn(i32*, i32*): bool tty_size;
+    fn(): i32 stdin_pending;
 }
 
 UefiHost* g_uefi_host = null;
@@ -126,6 +136,25 @@ i32 uefi_cwd(u8* buf, i32 cap) {
 bool uefi_isatty(i32 fd) {
     if g_uefi_host == null || g_uefi_host.isatty == null { return false; }
     return g_uefi_host.isatty(fd);
+}
+
+bool uefi_tty_raw(bool on) {
+    if g_uefi_host == null || g_uefi_host.tty_raw == null { return false; }
+    return g_uefi_host.tty_raw(on);
+}
+
+// The columns << 16 | the rows, 0 with no terminal.
+i64 uefi_tty_size() {
+    if g_uefi_host == null || g_uefi_host.tty_size == null { return 0; }
+    i32 cols = 0;
+    i32 rows = 0;
+    if !g_uefi_host.tty_size(&cols, &rows) || cols <= 0 || rows <= 0 { return 0; }
+    return (cast(i64, cols) << 16) | cast(i64, rows & 0xFFFF);
+}
+
+i32 uefi_stdin_pending() {
+    if g_uefi_host == null || g_uefi_host.stdin_pending == null { return 0 - 1; }
+    return g_uefi_host.stdin_pending();
 }
 
 i32 uefi_list(u8* dir, i32 index, u8* buf, i32 cap) {

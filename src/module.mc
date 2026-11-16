@@ -38,6 +38,7 @@ import node_webevents;
 import node_webcrypto;
 import node_tls;
 import node_https;
+import node_stdin;
 import "wasm_host.mc";
 
 // Canonical file identity for module dedup: resolves symlinks and
@@ -1585,7 +1586,7 @@ module.exports = { once: once };
 private str node_tty_source() {
     return
         "'use strict';\n"
-        "exports.isatty = function () { return false; };\n"
+        "exports.isatty = function (fd) { return __tty_isatty(fd | 0); };\n"
         "function TTY() {}\n"
         "exports.ReadStream = TTY;\n"
         "exports.WriteStream = TTY;\n"
@@ -2387,7 +2388,11 @@ str module_entry_name(str path) {
     return strip_unc(canon_path(path));
 }
 
+// process.stdin, built on its first mention (builtins.mc's accessor).
+private Value stdin_load(VM* vm) { return run_js_builtin(vm, "_stdin", node_stdin_source()); }
+
 i32 module_run_entry(VM* vm, str src, str path) {
+    g_process_stdin_loader = &stdin_load;
     // `fetch` is a global in Node 18+; install it as a lazy native.
     vm_set_global(vm, "fetch", vm_make_native(vm, &nat_fetch, "fetch"));
     // its data types are globals too, resolved on first mention

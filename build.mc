@@ -698,6 +698,16 @@ void run_cli_smoke(str exe) {
         proc_result_free(&r);
     }
     if bad == 0 { pass("exit codes"); } else { g_fail = g_fail + bad; }
+
+    // process.stdin on a pipe: what is fed comes as 'data', then 'end'.
+    // Windows only: the other hosts' standard input is not read yet.
+    when os(windows) {
+        ProcCmd si = { .args = { exe, "test/cli/stdin.js" }, .capture = true, .has_stdin = true, .stdin_feed = "one\ntwo\n" };
+        ProcResult rs = proc_run(&si);
+        if rs.exit_code == 0 && str_equal(str_from(rs.out.data, rs.out.len), "read \"one\\ntwo\\n\" tty false\n") { pass("stdin piped"); }
+        else { fail("stdin piped", str_from(rs.out.data, rs.out.len)); }
+        proc_result_free(&rs);
+    }
     return;
 }
 

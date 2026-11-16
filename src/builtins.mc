@@ -10627,6 +10627,129 @@ private void proc_raw_write(VM* vm, Value sv, bool to_err) {
     }
 }
 
+// --- the terminal and standard input ----------------------------------------
+//
+// What process.stdin and the size on process.stdout are made of
+// (node_stdin.mc). os_stdin_read gives the bytes that wait on standard
+// input and does not wait itself: their count, 0 for none now, -1 at
+// the end of input. os_tty_raw asks the terminal for the keys' bytes as
+// they come. os_tty_size is its columns << 16 | its rows, 0 with none.
+when os(windows) {
+    private extern "kernel32.dll" i64 GetStdHandle(u32 which);
+    private extern "kernel32.dll" u32 GetFileType(i64 h);
+    private extern "kernel32.dll" i32 PeekNamedPipe(i64 h, void* buf, u32 n, u32* got, u32* avail, u32* left);
+    private extern "kernel32.dll" i32 ReadFile(i64 h, u8* buf, u32 n, u32* got, void* ov);
+    private extern "kernel32.dll" i32 GetConsoleScreenBufferInfo(i64 h, u8* info);
+
+    // A pipe is read as far as it has bytes, a file to its end. A
+    // console's keys come as events, not bytes, and are not read here.
+    private i32 os_stdin_read(u8* buf, i32 cap) {
+        i64 h = GetStdHandle(0xFFFFFFF6);          // STD_INPUT_HANDLE
+        if h == 0 || h == 0 - 1 { return 0 - 1; }
+        u32 kind = GetFileType(h);
+        u32 got = 0;
+        if kind == 3 {                              // a pipe
+            u32 avail = 0;
+            if PeekNamedPipe(h, null, 0, null, &avail, null) == 0 { return 0 - 1; }   // its writer is gone
+            if avail == 0 { return 0; }
+            u32 want = avail < cast(u32, cap) ? avail : cast(u32, cap);
+            if ReadFile(h, buf, want, &got, null) == 0 || got == 0 { return 0 - 1; }
+            return cast(i32, got);
+        }
+        if kind == 1 {                              // a file
+            if ReadFile(h, buf, cast(u32, cap), &got, null) == 0 || got == 0 { return 0 - 1; }
+            return cast(i32, got);
+        }
+        return 0;
+    }
+    private bool os_tty_raw(bool on) { return false; }
+    private i64 os_tty_size() {
+        // CONSOLE_SCREEN_BUFFER_INFO: the window's left, top, right and
+        // bottom are four 16-bit words from offset 10.
+        noinit u8[32] info;
+        i64 h = GetStdHandle(0xFFFFFFF5);          // STD_OUTPUT_HANDLE
+        if h == 0 || h == 0 - 1 || GetConsoleScreenBufferInfo(h, &info[0]) == 0 { return 0; }
+        i64 left = cast(i64, info[10]) | (cast(i64, info[11]) << 8);
+        i64 top = cast(i64, info[12]) | (cast(i64, info[13]) << 8);
+        i64 right = cast(i64, info[14]) | (cast(i64, info[15]) << 8);
+        i64 bottom = cast(i64, info[16]) | (cast(i64, info[17]) << 8);
+        i64 cols = right - left + 1;
+        i64 rows = bottom - top + 1;
+        if cols <= 0 || rows <= 0 || cols > 65535 || rows > 65535 { return 0; }
+        return (cols << 16) | rows;
+    }
+}
+else when os(uefi) {
+    // The embedder says how much waits, and a read of that much does
+    // not wait (uefi_host.mc).
+    private i32 os_stdin_read(u8* buf, i32 cap) {
+        i32 n = uefi_stdin_pending();
+        if n < 0 { return 0 - 1; }
+        if n == 0 { return 0; }
+        i32 got = read(stdin(), buf, n < cap ? n : cap);
+        return got > 0 ? got : 0 - 1;
+    }
+    private bool os_tty_raw(bool on) { return uefi_tty_raw(on); }
+    private i64 os_tty_size() { return uefi_tty_size(); }
+}
+else {
+    // Not read on this target yet: standard input is at its end.
+    private i32 os_stdin_read(u8* buf, i32 cap) { return 0 - 1; }
+    private bool os_tty_raw(bool on) { return false; }
+    private i64 os_tty_size() { return 0; }
+}
+
+// __tty_read(): a Buffer of what waits, null for nothing now, 0 at the end.
+private Value nat_tty_read(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    VM* vm = as_vm(vmp);
+    noinit u8[4096] buf;
+    i32 n = os_stdin_read(&buf[0], 4096);
+    if n > 0 { return buf_from_bytes(vm, &buf[0], n); }
+    if n == 0 { return value_null(); }
+    return value_int(0);
+}
+
+private Value nat_tty_raw(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(os_tty_raw(js_truthy(arg_at(args, argc, 0))));
+}
+
+private Value nat_tty_isatty(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    return value_bool(os_isatty(to_int_arg(arg_at(args, argc, 0))));
+}
+
+// process.stdout.columns and .rows: the terminal's size as it is now.
+private Value nat_stdout_columns(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    i64 s = os_tty_size();
+    return s == 0 ? value_undefined() : value_int(cast(i32, s >> 16));
+}
+private Value nat_stdout_rows(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    i64 s = os_tty_size();
+    return s == 0 ? value_undefined() : value_int(cast(i32, s & 0xFFFF));
+}
+
+// process.stdin is built on first mention, by the loader the module
+// layer names: the stream is JavaScript (node_stdin.mc).
+type StdinLoader = fn(VM*): Value;
+StdinLoader g_process_stdin_loader = null;
+private Value nat_process_stdin(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
+    if g_process_stdin_loader == null { return value_undefined(); }
+    return g_process_stdin_loader(as_vm(vmp));
+}
+
+// A stream object's listeners: process.stdout and process.stderr take
+// them as process does ('resize', 'drain', 'error').
+private void def_emitter_methods(VM* vm, JsObject* o) {
+    def_method(vm, o, "on", &nat_ee_on);
+    def_method(vm, o, "addListener", &nat_ee_on);
+    def_method(vm, o, "once", &nat_ee_once);
+    def_method(vm, o, "off", &nat_ee_off);
+    def_method(vm, o, "removeListener", &nat_ee_off);
+    def_method(vm, o, "removeAllListeners", &nat_ee_remove_all);
+    def_method(vm, o, "emit", &nat_ee_emit);
+    def_method(vm, o, "listeners", &nat_ee_listeners);
+    def_method(vm, o, "listenerCount", &nat_ee_listener_count);
+}
+
 private Value nat_process_stdout_write(void* vmp, Value callee, Value thisv, Value* args, i32 argc) {
     VM* vm = as_vm(vmp);
     Value s = js_to_string_value(vm, arg_at(args, argc, 0));
@@ -10888,12 +11011,23 @@ private void process_install(VM* vm) {
     JsObject* out = js_new_object(&vm.heap, vm.object_proto);
     def_value_enum(vm, proc, "stdout", value_cell(&out.head));
     def_method(vm, out, "write", &nat_process_stdout_write);
-    if os_isatty(1) { def_value_enum(vm, out, "isTTY", value_bool(true)); }
+    def_emitter_methods(vm, out);
+    if os_isatty(1) {
+        def_value_enum(vm, out, "isTTY", value_bool(true));
+        def_accessor(vm, out, "columns", &nat_stdout_columns);
+        def_accessor(vm, out, "rows", &nat_stdout_rows);
+    }
 
     JsObject* errobj = js_new_object(&vm.heap, vm.object_proto);
     def_value_enum(vm, proc, "stderr", value_cell(&errobj.head));
     def_method(vm, errobj, "write", &nat_process_stderr_write);
-    if os_isatty(2) { def_value_enum(vm, errobj, "isTTY", value_bool(true)); }
+    def_emitter_methods(vm, errobj);
+    if os_isatty(2) {
+        def_value_enum(vm, errobj, "isTTY", value_bool(true));
+        def_accessor(vm, errobj, "columns", &nat_stdout_columns);
+        def_accessor(vm, errobj, "rows", &nat_stdout_rows);
+    }
+    def_accessor(vm, proc, "stdin", &nat_process_stdin);
 
     def_method(vm, proc, "cwd", &nat_process_cwd);
     def_method(vm, proc, "uptime", &nat_process_uptime);
@@ -13909,6 +14043,9 @@ private void net_install(VM* vm) {
     ignore def_global_fn(vm, "__tls_pending", &nat_tls_pending);
     ignore def_global_fn(vm, "__tls_shutdown", &nat_tls_shutdown);
     ignore def_global_fn(vm, "__tls_pin_ecdsa", &nat_tls_pin_ecdsa);
+    ignore def_global_fn(vm, "__tty_read", &nat_tty_read);
+    ignore def_global_fn(vm, "__tty_raw", &nat_tty_raw);
+    ignore def_global_fn(vm, "__tty_isatty", &nat_tty_isatty);
     ignore def_global_fn(vm, "__net_connect", &nat_net_connect);
     ignore def_global_fn(vm, "__net_listen", &nat_net_listen);
     ignore def_global_fn(vm, "__net_accept", &nat_net_accept);

@@ -53,7 +53,19 @@ A namespace object installed as the `process` global (and mirrored onto
   queue. Ordering note: modeled as a microtask, so it runs in FIFO with
   promise reactions rather than strictly ahead of them as in Node.
 - **`stdout`** / **`stderr`** — objects with `write(chunk)` (ToString,
-  no trailing newline, returns `true`) and `isTTY: false`.
+  no trailing newline, returns `true`) that take listeners as `process`
+  does. On a terminal they have `isTTY: true` and `columns` and `rows`,
+  read from the terminal at each mention; no `'resize'` is emitted.
+- **`stdin`** — built on first mention (`src/node_stdin.mc`): `'data'`,
+  `'end'` and `'close'`, `setEncoding`, `setRawMode`, `pause`, `resume`,
+  `isPaused`, `ref`, `unref`, `read()` and `pipe()`, with `isTTY` and
+  `isRaw` on a terminal. While it flows a timer looks for input every
+  ten milliseconds through `__tty_read`, which does not wait; a paused
+  or unref'd stream does not hold the program. Windows reads a pipe and
+  a file; a Windows console's keys are not read. On uefi the embedder
+  says how much input waits, sets raw mode and gives the terminal's
+  size (`src/uefi_host.mc`). On the other targets standard input is at
+  its end.
 - **`hrtime([prev])`** — `[seconds, nanoseconds]` from a monotonic clock;
   `hrtime.bigint()` returns nanoseconds as a BigInt.
 
@@ -61,7 +73,6 @@ A namespace object installed as the `process` global (and mirrored onto
 
 - **Signals / IPC / child_process / streams** — no event loop surface for
   `process.on`, no real streams behind `stdout`/`stderr`.
-- **`process.stdin`** — no interactive input.
 - **Live `env`** — snapshot only; no propagation to spawned processes.
 
 ## 2. Buffer — DONE
