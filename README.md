@@ -28,8 +28,11 @@ not boxed. `with` runs in sloppy code, `Symbol.unscopables` and all.
 
 A subset of the Node standard library: `fs` (with `fs/promises`),
 `path`, `os`, `events`, `stream`, `util`, `buffer`, `zlib`, `assert`,
-`process`, `timers` (with `timers/promises`), `tty`, `querystring`,
-`string_decoder`, `punycode` and `perf_hooks`. `crypto` has
+`process`, `timers` (with `timers/promises`), `tty`, `readline` (with
+`readline/promises`), `querystring`, `string_decoder`, `punycode` and
+`perf_hooks`. `readline` edits its line on a terminal (the arrows,
+Home and End, the history, Ctrl+A E U K W) and splits a pipe's input
+into lines; it has no completer and draws the line on one row. `crypto` has
 MD5, SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, HMAC, `pbkdf2Sync`,
 `timingSafeEqual`, and the `random*` functions. The globals include
 `fetch`, `URL`, `URLSearchParams`, `TextEncoder`/`TextDecoder`,

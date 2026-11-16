@@ -39,6 +39,7 @@ import node_webcrypto;
 import node_tls;
 import node_https;
 import node_stdin;
+import node_readline;
 import "wasm_host.mc";
 
 // Canonical file identity for module dedup: resolves symlinks and
@@ -419,6 +420,7 @@ private str builtin_name(str spec) {
         || str_equal(s, "punycode") || str_equal(s, "perf_hooks")
         || str_equal(s, "_webevents") || str_equal(s, "_eventsx") || str_equal(s, "_websocket")
         || str_equal(s, "_webcrypto")
+        || str_equal(s, "readline") || str_equal(s, "readline/promises")
         || str_equal(s, "timers/promises") { return s; }
     str none;
     none.data = null;
@@ -1595,6 +1597,8 @@ private str node_tty_source() {
 
 private str builtin_js_source(str name) {
     if str_equal(name, "tty") { return node_tty_source(); }
+    if str_equal(name, "readline") { return node_readline_source(); }
+    if str_equal(name, "readline/promises") { return "'use strict'; module.exports = require('readline').promises;"; }
     if str_equal(name, "stream") { return node_stream_source(); }
     if str_equal(name, "assert") { return node_assert_source(); }
     if str_equal(name, "net") { return node_net_source(); }

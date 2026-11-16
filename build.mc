@@ -707,6 +707,14 @@ void run_cli_smoke(str exe) {
         if rs.exit_code == 0 && str_equal(str_from(rs.out.data, rs.out.len), "read \"one\\ntwo\\n\" tty false\n") { pass("stdin piped"); }
         else { fail("stdin piped", str_from(rs.out.data, rs.out.len)); }
         proc_result_free(&rs);
+
+        // readline on the same: a question's answer, then lines, the
+        // last with no line feed at its end.
+        ProcCmd rl = { .args = { exe, "test/cli/readline.js" }, .capture = true, .has_stdin = true, .stdin_feed = "ada\r\nsecond\nthird" };
+        ProcResult rr = proc_run(&rl);
+        if rr.exit_code == 0 && str_equal(str_from(rr.out.data, rr.out.len), "name? |answer=ada|line=second|line=third|terminal=false\n") { pass("readline piped"); }
+        else { fail("readline piped", str_from(rr.out.data, rr.out.len)); }
+        proc_result_free(&rr);
     }
     return;
 }
