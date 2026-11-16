@@ -10582,14 +10582,23 @@ else when os(macos) || os(ios) || os(linux) || os(android) {
     }
 }
 else when os(uefi) {
-    // One program, one address space, no environment to inherit and
-    // nowhere to have been started from. The console is a framebuffer or
-    // a serial line rather than a terminal, so nothing here claims a TTY
-    // and the colour paths stay off.
+    // One program, one address space and no environment to inherit.
+    // Where it was started and whether its console is a terminal are
+    // the embedder's to say (uefi_host.mc): without an answer the
+    // directory is the root and nothing claims a TTY, so the colour
+    // paths stay off.
     private str os_platform_name() { return "uefi"; }
-    private bool os_isatty(i32 fd) { return false; }
+    private bool os_isatty(i32 fd) { return uefi_isatty(fd); }
     private i32 os_pid() { return 0; }
-    private Value os_cwd_str(VM* vm) { return new_str(vm, "/"); }
+    private Value os_cwd_str(VM* vm) {
+        noinit u8[1024] buf;
+        i32 n = uefi_cwd(&buf[0], 1024);
+        if n <= 0 || n > 1024 { return new_str(vm, "/"); }
+        str s;
+        s.data = &buf[0];
+        s.len = n;
+        return new_str(vm, s);
+    }
     private void os_env_install(VM* vm, JsObject* env) { }
 }
 else {

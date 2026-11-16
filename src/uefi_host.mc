@@ -49,6 +49,13 @@ struct UefiHost {
     // on purpose: what is worth reporting is the embedder's business,
     // and os.machine() hands the text to the caller to parse.
     fn(u8*, i32): i32 machine;
+
+    // The directory the program was started in, written into `buf`
+    // without a trailing zero. Its length; null, or 0, is "/".
+    fn(u8*, i32): i32 cwd;
+
+    // Whether descriptor `fd` (0, 1 or 2) is a terminal. Null is no.
+    fn(i32): bool isatty;
 }
 
 UefiHost* g_uefi_host = null;
@@ -109,6 +116,16 @@ bool uefi_mkdir(u8* path) {
 bool uefi_rmdir(u8* path) {
     if g_uefi_host == null || g_uefi_host.rmdir == null { return false; }
     return g_uefi_host.rmdir(path);
+}
+
+i32 uefi_cwd(u8* buf, i32 cap) {
+    if g_uefi_host == null || g_uefi_host.cwd == null { return 0; }
+    return g_uefi_host.cwd(buf, cap);
+}
+
+bool uefi_isatty(i32 fd) {
+    if g_uefi_host == null || g_uefi_host.isatty == null { return false; }
+    return g_uefi_host.isatty(fd);
 }
 
 i32 uefi_list(u8* dir, i32 index, u8* buf, i32 cap) {

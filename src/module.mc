@@ -323,13 +323,24 @@ private str resolve_specifier(str importer, str spec) {
 }
 
 when os(wasm) || os(uefi) {
-    // No realpath on either: the working directory is "/" and the
-    // canonical form is the lexical one, made absolute.
+    // No realpath on either: the canonical form is the lexical one,
+    // made absolute from the working directory, which is "/" on wasm
+    // and what the embedder says on uefi.
     private bool canon_into(u8* cpath, u8* buf, i32 cap) {
         str p = str_from_cstr(cpath);
         str a;
+        str base = "/";
+        when os(uefi) {
+            // with a slash at its end, for the join
+            noinit u8[1025] cwd;
+            i32 n = uefi_cwd(&cwd[0], 1024);
+            if n > 0 && n <= 1024 {
+                if cwd[n - 1] != '/' { cwd[n] = '/'; n++; }
+                base = str_from(&cwd[0], n);
+            }
+        }
         if p.len > 0 && *(p.data) == '/' { a = path_norm_join(p, ""); }
-        else { a = path_norm_join("/", p); }
+        else { a = path_norm_join(base, p); }
         bool ok = a.len < cap;
         if ok {
             if a.len > 0 { memcpy(buf, a.data, a.len); }
