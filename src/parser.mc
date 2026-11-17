@@ -2625,7 +2625,10 @@ private Node* parse_import_decl(Parser* p) {
         advance(p);
         while !at(p, TOK_RBRACE) && !at(p, TOK_EOF) {
             Node* sp = nnew(p, N_IMPORT_SPEC);
-            if at(p, TOK_KW_TYPE) && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_STRING) {
+            // `type` before a name marks a type-only import; before `as`
+            // it is the name imported (import { type as t } from "os")
+            if at(p, TOK_KW_TYPE) && (is_ident_like(peek(p).kind) || peek(p).kind == TOK_STRING)
+                && peek(p).kind != TOK_KW_AS {
                 sp.flags |= NF_TYPE_ONLY;
                 p.ts_seen = true;
                 advance(p);
