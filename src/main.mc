@@ -130,7 +130,9 @@ i32 tsmc_main() {
     }
     if phases { vm_phases_on(&m, 2); }
     vm_phase_begin(&m);
+    tsmc_console_setup();
     i32 status = module_run_entry(&m, source, arg);
+    tsmc_console_restore();
     vm_phase_end(&m);
     if phases {
         using string rep = vm_phase_report(&m, "tsmc: ", 20);

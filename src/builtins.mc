@@ -10640,14 +10640,164 @@ when os(windows) {
     private extern "kernel32.dll" i32 PeekNamedPipe(i64 h, void* buf, u32 n, u32* got, u32* avail, u32* left);
     private extern "kernel32.dll" i32 ReadFile(i64 h, u8* buf, u32 n, u32* got, void* ov);
     private extern "kernel32.dll" i32 GetConsoleScreenBufferInfo(i64 h, u8* info);
+    private extern "kernel32.dll" i32 GetConsoleMode(i64 h, u32* mode);
+    private extern "kernel32.dll" i32 SetConsoleMode(i64 h, u32 mode);
+    private extern "kernel32.dll" i32 GetNumberOfConsoleInputEvents(i64 h, u32* n);
+    private extern "kernel32.dll" i32 PeekConsoleInputW(i64 h, u8* recs, u32 n, u32* got);
+    private extern "kernel32.dll" i32 ReadConsoleInputW(i64 h, u8* recs, u32 n, u32* got);
+    private extern "kernel32.dll" i32 ReadConsoleW(i64 h, u16* buf, u32 n, u32* got, void* ctl);
+    private extern "kernel32.dll" u32 GetConsoleOutputCP();
+    private extern "kernel32.dll" i32 SetConsoleOutputCP(u32 cp);
 
-    // A pipe is read as far as it has bytes, a file to its end. A
-    // console's keys come as events, not bytes, and are not read here.
+    private const u32 CON_STDIN = 0xFFFFFFF6;
+    private const u32 CON_STDOUT = 0xFFFFFFF5;
+    private const u32 CON_STDERR = 0xFFFFFFF4;
+    private const i32 CON_REC = 20;               // an INPUT_RECORD's bytes
+
+    // The console's modes and code page as the program found them, put
+    // back at its end (tsmc_console_restore).
+    private bool con_in_saved = false;
+    private u32 con_in_mode = 0;
+    private bool con_out_saved = false;
+    private u32 con_out_mode = 0;
+    private bool con_err_saved = false;
+    private u32 con_err_mode = 0;
+    private u32 con_out_cp = 0;
+    private bool con_raw = false;
+    private u32 con_high = 0;                     // a high surrogate waiting for its low half
+    private u8[256] con_left;                     // the bytes of keys read that a read had no room for
+    private i32 con_left_n = 0;
+
+    private i32 con_utf8(u32 cp, u8* out) {
+        if cp < 0x80 { *out = cast(u8, cp); return 1; }
+        if cp < 0x800 { *out = cast(u8, 0xC0 | (cp >> 6)); *(out + 1) = cast(u8, 0x80 | (cp & 0x3F)); return 2; }
+        if cp < 0x10000 {
+            *out = cast(u8, 0xE0 | (cp >> 12)); *(out + 1) = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+            *(out + 2) = cast(u8, 0x80 | (cp & 0x3F)); return 3;
+        }
+        *out = cast(u8, 0xF0 | (cp >> 18)); *(out + 1) = cast(u8, 0x80 | ((cp >> 12) & 0x3F));
+        *(out + 2) = cast(u8, 0x80 | ((cp >> 6) & 0x3F)); *(out + 3) = cast(u8, 0x80 | (cp & 0x3F)); return 4;
+    }
+
+    // UTF-16 to UTF-8; the bytes written.
+    private i32 con_utf16_to_utf8(u16* w, i32 n, u8* out) {
+        i32 o = 0;
+        for i32 i = 0; i < n; i++ {
+            u32 c = cast(u32, *(w + i));
+            if c >= 0xD800 && c <= 0xDBFF && i + 1 < n {
+                u32 lo = cast(u32, *(w + i + 1));
+                if lo >= 0xDC00 && lo <= 0xDFFF { c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }
+            }
+            o += con_utf8(c, out + o);
+        }
+        return o;
+    }
+
+    // A key event as the bytes a terminal sends for it: the character it
+    // types, or for the keys that type none the sequence a terminal
+    // sends (the arrows, Home, End, Insert, Delete, Page Up and Down),
+    // with the modifiers held as a terminal says them. Up to 16 bytes.
+    private i32 con_key_bytes(u8* rec, u8* out) {
+        if (cast(u32, *rec) | (cast(u32, *(rec + 1)) << 8)) != 1 { return 0; }     // KEY_EVENT
+        if *(rec + 4) == 0 && *(rec + 5) == 0 { return 0; }                         // a key coming up
+        u32 vk = cast(u32, *(rec + 10)) | (cast(u32, *(rec + 11)) << 8);
+        u32 ch = cast(u32, *(rec + 14)) | (cast(u32, *(rec + 15)) << 8);
+        u32 st = cast(u32, *(rec + 16)) | (cast(u32, *(rec + 17)) << 8);
+        if ch != 0 {
+            if ch >= 0xD800 && ch <= 0xDBFF { con_high = ch; return 0; }
+            if ch >= 0xDC00 && ch <= 0xDFFF {
+                if con_high == 0 { return 0; }
+                ch = 0x10000 + ((con_high - 0xD800) << 10) + (ch - 0xDC00);
+            }
+            con_high = 0;
+            return con_utf8(ch, out);
+        }
+        u8 fin = 0;
+        u32 num = 0;
+        if vk == 0x26 { fin = 'A'; } else if vk == 0x28 { fin = 'B'; }
+        else if vk == 0x27 { fin = 'C'; } else if vk == 0x25 { fin = 'D'; }
+        else if vk == 0x24 { fin = 'H'; } else if vk == 0x23 { fin = 'F'; }
+        else if vk == 0x2D { num = 2; } else if vk == 0x2E { num = 3; }
+        else if vk == 0x21 { num = 5; } else if vk == 0x22 { num = 6; }
+        else { return 0; }
+        u32 mods = 1;
+        if (st & 0x10) != 0 { mods += 1; }          // Shift
+        if (st & 0x03) != 0 { mods += 2; }          // Alt
+        if (st & 0x0C) != 0 { mods += 4; }          // Ctrl
+        i32 n = 0;
+        *(out + n) = 27; n++;
+        *(out + n) = '['; n++;
+        if num != 0 { *(out + n) = cast(u8, '0' + num); n++; }
+        else if mods > 1 { *(out + n) = '1'; n++; }
+        if mods > 1 { *(out + n) = ';'; n++; *(out + n) = cast(u8, '0' + mods); n++; }
+        *(out + n) = num != 0 ? '~' : fin; n++;
+        return n;
+    }
+
+    // Raw: the keys that wait, as bytes, without waiting for more.
+    private i32 con_read_raw(i64 h, u8* buf, i32 cap) {
+        i32 got = 0;
+        while con_left_n > 0 && got < cap {
+            *(buf + got) = con_left[0];
+            got++;
+            for i32 k = 1; k < con_left_n; k++ { con_left[k - 1] = con_left[k]; }
+            con_left_n--;
+        }
+        noinit u8[640] recs;                       // 32 records
+        noinit u8[16] one;
+        while got < cap {
+            u32 n = 0;
+            if GetNumberOfConsoleInputEvents(h, &n) == 0 || n == 0 { break; }
+            u32 r = 0;
+            if ReadConsoleInputW(h, &recs[0], n < 32 ? n : 32, &r) == 0 || r == 0 { break; }
+            for u32 i = 0; i < r; i++ {
+                i32 k = con_key_bytes(&recs[cast(i32, i) * CON_REC], &one[0]);
+                for i32 j = 0; j < k; j++ {
+                    if got < cap { *(buf + got) = one[j]; got++; }
+                    else if con_left_n < 256 { con_left[con_left_n] = one[j]; con_left_n++; }
+                }
+            }
+        }
+        return got;
+    }
+
+    // Not raw: a line once Enter is among what waits. The console gives
+    // it whole, edited as it was typed; it shows the line as it reads it,
+    // so what is typed appears at Enter.
+    private i32 con_read_line(i64 h, u8* buf, i32 cap) {
+        u32 n = 0;
+        if GetNumberOfConsoleInputEvents(h, &n) == 0 || n == 0 { return 0; }
+        noinit u8[2560] recs;                      // 128 records
+        u32 r = 0;
+        if PeekConsoleInputW(h, &recs[0], n < 128 ? n : 128, &r) == 0 { return 0; }
+        bool enter = false;
+        for u32 i = 0; i < r && !enter; i++ {
+            u8* rec = &recs[cast(i32, i) * CON_REC];
+            enter = *rec == 1 && *(rec + 1) == 0 && *(rec + 4) != 0 && *(rec + 14) == 13 && *(rec + 15) == 0;
+        }
+        if !enter { return 0; }
+        noinit u16[1024] w;
+        u32 want = cast(u32, cap / 4 < 1024 ? cap / 4 : 1024);
+        u32 got = 0;
+        if ReadConsoleW(h, &w[0], want, &got, null) == 0 { return 0 - 1; }
+        if got == 0 { return 0 - 1; }
+        // Ctrl+Z at a line's start is the end of input, as on Windows
+        if got >= 1 && w[0] == 26 { return 0 - 1; }
+        return con_utf16_to_utf8(&w[0], cast(i32, got), buf);
+    }
+
+    // A pipe is read as far as it has bytes, a file to its end, a
+    // console as its key events (con_read_raw, con_read_line).
     private i32 os_stdin_read(u8* buf, i32 cap) {
-        i64 h = GetStdHandle(0xFFFFFFF6);          // STD_INPUT_HANDLE
+        i64 h = GetStdHandle(CON_STDIN);
         if h == 0 || h == 0 - 1 { return 0 - 1; }
         u32 kind = GetFileType(h);
         u32 got = 0;
+        if kind == 2 {                              // a character device: a console, or NUL
+            u32 mode = 0;
+            if GetConsoleMode(h, &mode) == 0 { return 0 - 1; }
+            return con_raw ? con_read_raw(h, buf, cap) : con_read_line(h, buf, cap);
+        }
         if kind == 3 {                              // a pipe
             u32 avail = 0;
             if PeekNamedPipe(h, null, 0, null, &avail, null) == 0 { return 0 - 1; }   // its writer is gone
@@ -10662,7 +10812,53 @@ when os(windows) {
         }
         return 0;
     }
-    private bool os_tty_raw(bool on) { return false; }
+
+    // Raw: no line editing, no echo and Ctrl+C a key, the keys read as
+    // events (con_key_bytes). Off: the console as it was found.
+    private bool os_tty_raw(bool on) {
+        i64 h = GetStdHandle(CON_STDIN);
+        u32 mode = 0;
+        if h == 0 || h == 0 - 1 || GetConsoleMode(h, &mode) == 0 { return false; }
+        if !con_in_saved { con_in_mode = mode; con_in_saved = true; }
+        // line input, echo, processed input, and the console's own
+        // translation of keys to terminal sequences, which is done here
+        u32 want = on ? con_in_mode & ~cast(u32, 0x0207) : con_in_mode;
+        if SetConsoleMode(h, want) == 0 { return false; }
+        con_raw = on;
+        return true;
+    }
+
+    // The console's handling of display attributes and UTF-8 for what is
+    // written, on for the run.
+    private void con_setup() {
+        i64 h = GetStdHandle(CON_STDOUT);
+        u32 mode = 0;
+        if h != 0 && h != 0 - 1 && GetConsoleMode(h, &mode) != 0 {
+            con_out_mode = mode;
+            con_out_saved = true;
+            ignore SetConsoleMode(h, mode | 0x0005);   // processed output, terminal sequences
+        }
+        i64 e = GetStdHandle(CON_STDERR);
+        if e != 0 && e != 0 - 1 && GetConsoleMode(e, &mode) != 0 {
+            con_err_mode = mode;
+            con_err_saved = true;
+            ignore SetConsoleMode(e, mode | 0x0005);
+        }
+        if con_out_saved || con_err_saved {
+            con_out_cp = GetConsoleOutputCP();
+            ignore SetConsoleOutputCP(65001);
+        }
+    }
+
+    private void con_restore() {
+        if con_in_saved { ignore SetConsoleMode(GetStdHandle(CON_STDIN), con_in_mode); con_raw = false; }
+        // stderr first: where the two are one screen buffer, stdout's
+        // mode is the one found first
+        if con_err_saved { ignore SetConsoleMode(GetStdHandle(CON_STDERR), con_err_mode); }
+        if con_out_saved { ignore SetConsoleMode(GetStdHandle(CON_STDOUT), con_out_mode); }
+        if (con_out_saved || con_err_saved) && con_out_cp != 0 { ignore SetConsoleOutputCP(con_out_cp); }
+    }
+
     private i64 os_tty_size() {
         // CONSOLE_SCREEN_BUFFER_INFO: the window's left, top, right and
         // bottom are four 16-bit words from offset 10.
@@ -10697,6 +10893,16 @@ else {
     private i32 os_stdin_read(u8* buf, i32 cap) { return 0 - 1; }
     private bool os_tty_raw(bool on) { return false; }
     private i64 os_tty_size() { return 0; }
+}
+
+// The console for a run: on Windows the handling of display attributes
+// and UTF-8 for output is switched on at the start and the console put
+// back as it was found at the end, raw mode included. Nothing elsewhere.
+void tsmc_console_setup() {
+    when os(windows) { con_setup(); }
+}
+void tsmc_console_restore() {
+    when os(windows) { con_restore(); }
 }
 
 // __tty_read(): a Buffer of what waits, null for nothing now, 0 at the end.
@@ -10830,6 +11036,7 @@ private Value nat_process_exit(void* vmp, Value callee, Value thisv, Value* args
     // 'exit' still runs, though nothing scheduled from it will
     ignore vm_process_emit(vm, "exit", value_int(code), value_undefined(), 1);
     if vm.prof != null { prof_report(vm.prof, vm.heap.n_collections); }
+    tsmc_console_restore();
     exit(code);
     return value_undefined();
 }

@@ -61,8 +61,17 @@ A namespace object installed as the `process` global (and mirrored onto
   `isPaused`, `ref`, `unref`, `read()` and `pipe()`, with `isTTY` and
   `isRaw` on a terminal. While it flows a timer looks for input every
   ten milliseconds through `__tty_read`, which does not wait; a paused
-  or unref'd stream does not hold the program. Windows reads a pipe and
-  a file; a Windows console's keys are not read. On uefi the embedder
+  or unref'd stream does not hold the program. Windows reads a pipe, a
+  file and a console. At a console in raw mode the key events are read
+  as the bytes a terminal sends (the arrows, Home, End, Insert, Delete,
+  Page Up and Down as their sequences, with the modifiers; a character
+  outside the first plane whole); not raw, a line is read once Enter
+  is among the events waiting, and the console shows it as it reads
+  it, so what is typed appears at Enter. For the run the console's
+  handling of display attributes is on and its output code page is
+  UTF-8; its modes and code page are put back at the end, at
+  `process.exit` too (`tsmc_console_setup`, `tsmc_console_restore`).
+  `test/console/console_check.ps1` checks it in a console of its own. On uefi the embedder
   says how much input waits, sets raw mode and gives the terminal's
   size (`src/uefi_host.mc`). On the other targets standard input is at
   its end.
