@@ -17,8 +17,19 @@ const i32 EXIT_OK = 0;
 const i32 EXIT_USAGE = 2;
 
 private void print_usage() {
-    print("usage: tsmc [--gc-stress] [--prof] [--phases] [--lazy] <script.ts>\n");
-    print("       tsmc --version\n");
+    print("tsmc [OPTION...] SCRIPT [WORD...]\n");
+    print("A TypeScript or JavaScript file run; the words after it are the script's.\n");
+    print("  --gc-stress           the memory collected at every allocation: slow, for finding a missing root\n");
+    print("  --prof                a sampling profile of the run, written at its end\n");
+    print("  --phases              where the run's time went, by phase and by native, at its end\n");
+    print("  --lazy                functions in a large source compiled when first called\n");
+    print("  --reg=N               how far the register form of the code reaches: 0 nowhere, 4 the most (4)\n");
+    print("  --reg-clear           a check: a temporary set to undefined when released, so a late read shows\n");
+    print("  --code-cache FILE     the script's compiled form read from FILE when it holds it, written after the run\n");
+    print("  --code-cache-verify   every compile written out, read back and run from the reading\n");
+    print("  --code-cache-ahead    the script compiled apart from the run, and run from the bytes\n");
+    print("  --version             the version\n");
+    print("  --help, -h            this text\n");
 }
 
 // The run itself. Separate from main() because a freestanding embedder
